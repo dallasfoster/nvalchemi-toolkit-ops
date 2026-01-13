@@ -1,0 +1,4601 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+NPT and NPH Integrators with Isotropic and Anisotropic Pressure Control.
+
+This module implements the Martyna-Tobias-Klein (MTK) equations of motion
+for NPT and NPH molecular dynamics simulations.
+
+NPT (Isothermal-Isobaric)
+-------------------------
+Constant temperature and pressure via coupled Nosé-Hoover thermostat
+and barostat. Samples the canonical NPT ensemble.
+
+NPH (Isenthalpic-Isobaric)
+--------------------------
+Constant enthalpy and pressure without thermostat. The system evolves
+on a constant enthalpy surface at fixed pressure.
+
+Pressure Control Modes
+----------------------
+- Isotropic: Single pressure value, cell scales uniformly
+- Anisotropic (orthorhombic): Independent x, y, z pressure control
+- Anisotropic (triclinic): Full stress tensor control (9 components)
+
+References
+----------
+- Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
+- Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+- LAMMPS fix_nh documentation
+
+All kernels are dtype-agnostic and support both float32 and float64.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import warp as wp
+
+from ..utils.cell_utils import compute_cell_inverse, compute_cell_volume
+
+__all__ = [
+    # Tensor types for pressure/virial
+    "vec9f",
+    "vec9d",
+    "vec3f",
+    "vec3d",
+    # Pressure calculations
+    "compute_pressure_tensor",
+    "compute_scalar_pressure",
+    # Barostat utilities
+    "compute_barostat_mass",
+    "compute_cell_kinetic_energy",
+    "compute_barostat_potential_energy",
+    # NPT integration steps - Mutating
+    "npt_thermostat_half_step",
+    "npt_barostat_half_step",  # Unified: dispatches based on target_pressures dtype
+    "npt_velocity_half_step",  # Unified: dispatches based on mode parameter
+    "npt_position_update",
+    "npt_cell_update",
+    # NPT integration steps - Non-mutating
+    "npt_velocity_half_step_out",
+    "npt_position_update_out",
+    "npt_cell_update_out",
+    # High-level NPT integration
+    "run_npt_step",
+    # NPH integration steps - Mutating
+    "nph_barostat_half_step",  # Unified: dispatches based on target_pressures dtype
+    "nph_velocity_half_step",  # Unified: dispatches based on mode parameter
+    "nph_position_update",
+    "nph_cell_update",
+    # NPH integration steps - Non-mutating
+    "nph_velocity_half_step_out",
+    "nph_position_update_out",
+    # High-level NPH integration
+    "run_nph_step",
+]
+
+
+# ==============================================================================
+# Tensor Types
+# ==============================================================================
+
+# 9-element vector types for symmetric tensor storage
+# Order: [xx, xy, xz, yx, yy, yz, zx, zy, zz]
+vec9f = wp.types.vector(length=9, dtype=wp.float32)
+vec9d = wp.types.vector(length=9, dtype=wp.float64)
+
+# 3-element vector types for anisotropic (orthorhombic) pressure
+# Order: [Pxx, Pyy, Pzz]
+vec3f = wp.vec3f
+vec3d = wp.vec3d
+
+
+# ==============================================================================
+# Pressure Calculation Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _compute_kinetic_tensor_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    kinetic_tensors: wp.array2d(dtype=Any),
+):
+    """Compute kinetic contribution to pressure tensor (single system).
+
+    P_kin[i,j] = sum_k m_k * v_k[i] * v_k[j]
+
+    Launch Grid: dim = [num_atoms]
+    Note: Uses array2d for atomic operations, converted to vec9 after.
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+
+    # Outer product: m * v ⊗ v
+    wp.atomic_add(kinetic_tensors, 0, 0, m * v[0] * v[0])  # xx
+    wp.atomic_add(kinetic_tensors, 0, 1, m * v[0] * v[1])  # xy
+    wp.atomic_add(kinetic_tensors, 0, 2, m * v[0] * v[2])  # xz
+    wp.atomic_add(kinetic_tensors, 0, 3, m * v[1] * v[0])  # yx
+    wp.atomic_add(kinetic_tensors, 0, 4, m * v[1] * v[1])  # yy
+    wp.atomic_add(kinetic_tensors, 0, 5, m * v[1] * v[2])  # yz
+    wp.atomic_add(kinetic_tensors, 0, 6, m * v[2] * v[0])  # zx
+    wp.atomic_add(kinetic_tensors, 0, 7, m * v[2] * v[1])  # zy
+    wp.atomic_add(kinetic_tensors, 0, 8, m * v[2] * v[2])  # zz
+
+
+@wp.kernel
+def _compute_kinetic_tensor_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    kinetic_tensors: wp.array2d(dtype=Any),
+):
+    """Compute kinetic contribution to pressure tensor (batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+
+    wp.atomic_add(kinetic_tensors, sys_id, 0, m * v[0] * v[0])
+    wp.atomic_add(kinetic_tensors, sys_id, 1, m * v[0] * v[1])
+    wp.atomic_add(kinetic_tensors, sys_id, 2, m * v[0] * v[2])
+    wp.atomic_add(kinetic_tensors, sys_id, 3, m * v[1] * v[0])
+    wp.atomic_add(kinetic_tensors, sys_id, 4, m * v[1] * v[1])
+    wp.atomic_add(kinetic_tensors, sys_id, 5, m * v[1] * v[2])
+    wp.atomic_add(kinetic_tensors, sys_id, 6, m * v[2] * v[0])
+    wp.atomic_add(kinetic_tensors, sys_id, 7, m * v[2] * v[1])
+    wp.atomic_add(kinetic_tensors, sys_id, 8, m * v[2] * v[2])
+
+
+@wp.kernel
+def _finalize_pressure_tensor_kernel(
+    kinetic_tensors: wp.array2d(dtype=Any),
+    virial_tensors: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+):
+    """Finalize pressure tensor: P = (kinetic + virial) / V.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    V = volumes[sys_id]
+    vir = virial_tensors[sys_id]
+
+    # Compute each component explicitly to avoid type inference issues
+    p0 = (kinetic_tensors[sys_id, 0] + vir[0]) / V
+    p1 = (kinetic_tensors[sys_id, 1] + vir[1]) / V
+    p2 = (kinetic_tensors[sys_id, 2] + vir[2]) / V
+    p3 = (kinetic_tensors[sys_id, 3] + vir[3]) / V
+    p4 = (kinetic_tensors[sys_id, 4] + vir[4]) / V
+    p5 = (kinetic_tensors[sys_id, 5] + vir[5]) / V
+    p6 = (kinetic_tensors[sys_id, 6] + vir[6]) / V
+    p7 = (kinetic_tensors[sys_id, 7] + vir[7]) / V
+    p8 = (kinetic_tensors[sys_id, 8] + vir[8]) / V
+
+    pressure_tensors[sys_id] = type(vir)(p0, p1, p2, p3, p4, p5, p6, p7, p8)
+
+
+@wp.kernel
+def _compute_scalar_pressure_kernel(
+    pressure_tensors: wp.array(dtype=Any),
+    scalar_pressures: wp.array(dtype=Any),
+):
+    """Compute scalar pressure: P = (P_xx + P_yy + P_zz) / 3.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    P = pressure_tensors[sys_id]
+    trace = P[0] + P[4] + P[8]
+    scalar_pressures[sys_id] = trace / type(trace)(3.0)
+
+
+# ==============================================================================
+# Barostat Energy Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _compute_cell_kinetic_energy_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energy: wp.array(dtype=Any),
+):
+    """Compute cell kinetic energy: KE = 0.5 * W * ||ḣ||²_F.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    W = cell_masses[sys_id]
+
+    # Frobenius norm squared
+    ke = type(W)(0.0)
+    for i in range(3):
+        for j in range(3):
+            ke = ke + h_dot[i, j] * h_dot[i, j]
+
+    kinetic_energy[sys_id] = type(W)(0.5) * W * ke
+
+
+@wp.kernel
+def _compute_barostat_potential_kernel(
+    target_pressures: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    potential_energy: wp.array(dtype=Any),
+):
+    """Compute barostat potential: U = P_ext * V.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    P_ext = target_pressures[sys_id]
+    V = volumes[sys_id]
+    potential_energy[sys_id] = P_ext * V
+
+
+# ==============================================================================
+# NPT Velocity Update Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_velocity_half_step_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """NPT velocity half-step for single system.
+
+    v_new = v + dt/2 * (F/m - (1 + 1/N_f) * ε̇ * v - η̇₁ * v)
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    eta_dot_1 = eta_dot[0, 0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volume[0]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = (coupling * eps_dot + eta_dot_1) * v
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPT velocity half-step (batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volumes[sys_id]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = (coupling * eps_dot + eta_dot_1) * v
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT velocity half-step (non-mutating, single system).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    eta_dot_1 = eta_dot[0, 0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volume[0]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = (coupling * eps_dot + eta_dot_1) * v
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT velocity half-step (non-mutating, batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volumes[sys_id]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = (coupling * eps_dot + eta_dot_1) * v
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+# ==============================================================================
+# NPH Velocity Update Kernels (no thermostat coupling)
+# ==============================================================================
+
+
+@wp.kernel
+def _nph_velocity_half_step_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """NPH velocity half-step for single system (no thermostat).
+
+    v_new = v + dt/2 * (F/m - (1 + 1/N_f) * ε̇ * v)
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volume[0]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = coupling * eps_dot * v
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPH velocity half-step (batched, no thermostat).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volumes[sys_id]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = coupling * eps_dot * v
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH velocity half-step (non-mutating, single system).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volume[0]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = coupling * eps_dot * v
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH velocity half-step (non-mutating, batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    trace_h_dot = h_dot[0, 0] + h_dot[1, 1] + h_dot[2, 2]
+    V = volumes[sys_id]
+    eps_dot = trace_h_dot / (type(m)(3.0) * V)
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+    drag = coupling * eps_dot * v
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+# ==============================================================================
+# Position Update Kernels (shared by NPT and NPH)
+# ==============================================================================
+
+
+@wp.kernel
+def _position_update_single_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    dt: Any,
+):
+    """Position update for single system.
+
+    r_new = r + dt * v + dt * ε̇ @ r
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    r = positions[atom_idx]
+    v = velocities[atom_idx]
+    h_inv = cell_inv[0]
+    h_dot = cell_velocity[0]
+
+    # Strain rate: ε̇ = ḣ @ h⁻¹
+    eps_dot = wp.mul(h_dot, h_inv)
+    eps_dot_r = wp.mul(eps_dot, r)
+
+    positions[atom_idx] = r + dt * (v + eps_dot_r)
+
+
+@wp.kernel
+def _position_update_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    cell_velocities: wp.array(dtype=Any),
+    dt: Any,
+):
+    """Position update (batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    r = positions[atom_idx]
+    v = velocities[atom_idx]
+    h_inv = cells_inv[sys_id]
+    h_dot = cell_velocities[sys_id]
+
+    eps_dot = wp.mul(h_dot, h_inv)
+    eps_dot_r = wp.mul(eps_dot, r)
+
+    positions[atom_idx] = r + dt * (v + eps_dot_r)
+
+
+@wp.kernel
+def _position_update_out_single_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    dt: Any,
+    positions_out: wp.array(dtype=Any),
+):
+    """Position update (non-mutating, single system).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    r = positions[atom_idx]
+    v = velocities[atom_idx]
+    h_inv = cell_inv[0]
+    h_dot = cell_velocity[0]
+
+    eps_dot = wp.mul(h_dot, h_inv)
+    eps_dot_r = wp.mul(eps_dot, r)
+
+    positions_out[atom_idx] = r + dt * (v + eps_dot_r)
+
+
+@wp.kernel
+def _position_update_out_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    cell_velocities: wp.array(dtype=Any),
+    dt: Any,
+    positions_out: wp.array(dtype=Any),
+):
+    """Position update (non-mutating, batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    r = positions[atom_idx]
+    v = velocities[atom_idx]
+    h_inv = cells_inv[sys_id]
+    h_dot = cell_velocities[sys_id]
+
+    eps_dot = wp.mul(h_dot, h_inv)
+    eps_dot_r = wp.mul(eps_dot, r)
+
+    positions_out[atom_idx] = r + dt * (v + eps_dot_r)
+
+
+# ==============================================================================
+# Cell Velocity Update Kernels (Barostat)
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_cell_velocity_update_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    eta_dots: wp.array2d(dtype=Any),
+    dt_half: Any,
+):
+    """
+    NPT isotropic cell velocity update with Nosé-Hoover thermostat coupling.
+
+    Algorithm
+    ---------
+    Updates the cell velocity matrix for isotropic pressure control. The cell
+    velocity evolves according to the Martyna-Tobias-Klein (MTK) equations:
+
+        ḧ = (V/W) * (P_inst - P_ext) - η̇₁ * ḣ
+
+    where:
+    - P_inst = Tr(P_tensor)/3 + 2*KE/(3N*V) is the instantaneous isotropic pressure
+    - P_ext is the target external pressure (scalar)
+    - V is the cell volume, W is the barostat mass
+    - η̇₁ is the first thermostat chain velocity (provides drag)
+
+    For isotropic mode, only diagonal cell velocity components are updated,
+    and they are all set equal (uniform scaling).
+
+    Launch Grid
+    -----------
+    dim = [num_systems]
+        One thread per system in the batch.
+
+    Parameters
+    ----------
+    cell_velocities : wp.array(dtype=mat33f/mat33d)
+        Cell velocity matrices ḣ. Shape (B,). MODIFIED in-place.
+    pressure_tensors : wp.array(dtype=vec9f/vec9d)
+        Pressure tensors from virial. Components [xx,xy,xz,yx,yy,yz,zx,zy,zz].
+    target_pressures : wp.array(dtype=float32/float64)
+        Target scalar pressures. Shape (B,).
+    volumes : wp.array(dtype=float32/float64)
+        Cell volumes V. Shape (B,).
+    cell_masses : wp.array(dtype=float32/float64)
+        Barostat masses W. Shape (B,).
+    kinetic_energies : wp.array(dtype=float32/float64)
+        System kinetic energies. Shape (B,).
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Atom counts per system. Shape (B,).
+    eta_dots : wp.array2d(dtype=float32/float64)
+        Thermostat chain velocities. Shape (B, chain_length).
+    dt_half : float32/float64
+        Half time step (dt/2).
+
+    Notes
+    -----
+    - This kernel assumes isotropic pressure control (uniform cell scaling).
+    - Off-diagonal cell velocity components are set to zero.
+    - The kinetic correction 2*KE/(3N*V) accounts for ideal gas contribution.
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+
+    # Current pressure from tensor
+    P = pressure_tensors[sys_id]
+    P_current = (P[0] + P[4] + P[8]) / type(V)(3.0)
+
+    # Cast KE to match V's type
+    KE_typed = type(V)(KE)
+
+    # Degrees of freedom contribution
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+
+    # Pressure difference
+    P_diff = P_current + dof_term / V - P_ext
+
+    # Cell velocity acceleration (isotropic)
+    h_dot_accel = V * P_diff / W
+
+    # Apply thermostat drag
+    zero = type(V)(0.0)
+    h_dot_new_diag = h_dot[0, 0] + dt_half * (h_dot_accel - eta_dot_1 * h_dot[0, 0])
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_diag,
+        zero,
+        zero,
+        zero,
+        h_dot_new_diag,
+        zero,
+        zero,
+        zero,
+        h_dot_new_diag,
+    )
+
+
+@wp.kernel
+def _nph_cell_velocity_update_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """
+    NPH isotropic cell velocity update (no thermostat coupling).
+
+    Algorithm
+    ---------
+    Updates cell velocity for constant enthalpy (NPH) dynamics. Without
+    thermostat coupling, the equation simplifies to:
+
+        ḧ = (V/W) * (P_inst - P_ext)
+
+    The system evolves on a constant-enthalpy surface with temperature
+    fluctuating naturally.
+
+    Launch Grid
+    -----------
+    dim = [num_systems]
+
+    Parameters
+    ----------
+    cell_velocities : wp.array(dtype=mat33f/mat33d)
+        Cell velocity matrices. MODIFIED in-place.
+    pressure_tensors : wp.array(dtype=vec9f/vec9d)
+        Pressure tensors from virial.
+    target_pressures : wp.array(dtype=float32/float64)
+        Target scalar pressures.
+    volumes, cell_masses, kinetic_energies : wp.array
+        System properties.
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Atom counts per system.
+    dt_half : float
+        Half time step.
+
+    Notes
+    -----
+    - No thermostat drag term (η̇₁ * ḣ) compared to NPT.
+    - Temperature is not controlled; enthalpy H = KE + PE + PV is conserved.
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    # Current pressure from tensor
+    P = pressure_tensors[sys_id]
+    P_current = (P[0] + P[4] + P[8]) / type(V)(3.0)
+
+    # Cast KE to match V's type
+    KE_typed = type(V)(KE)
+
+    # Degrees of freedom contribution
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+
+    # Pressure difference
+    P_diff = P_current + dof_term / V - P_ext
+
+    # Cell velocity acceleration (isotropic, no thermostat drag)
+    h_dot_accel = V * P_diff / W
+
+    zero = type(V)(0.0)
+    h_dot_new_diag = h_dot[0, 0] + dt_half * h_dot_accel
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_diag,
+        zero,
+        zero,
+        zero,
+        h_dot_new_diag,
+        zero,
+        zero,
+        zero,
+        h_dot_new_diag,
+    )
+
+
+# ==============================================================================
+# Anisotropic Cell Velocity Update Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_cell_velocity_update_aniso_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),  # vec3: [Pxx, Pyy, Pzz]
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    eta_dots: wp.array2d(dtype=Any),
+    dt_half: Any,
+):
+    """NPT cell velocity update - anisotropic/orthorhombic.
+
+    Independent pressure control for x, y, z axes.
+    Cell remains orthorhombic (diagonal h_dot).
+
+    ḧ_ii = V/W * (P_ii - P_ext_ii) - η̇₁ * ḣ_ii
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]  # vec3: [Pxx, Pyy, Pzz]
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+
+    # Current pressure tensor components
+    P = pressure_tensors[sys_id]
+    P_xx = P[0]
+    P_yy = P[4]
+    P_zz = P[8]
+
+    KE_typed = type(V)(KE)
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+    dof_V = dof_term / V
+
+    # Pressure differences for each axis
+    P_diff_x = P_xx + dof_V - P_ext[0]
+    P_diff_y = P_yy + dof_V - P_ext[1]
+    P_diff_z = P_zz + dof_V - P_ext[2]
+
+    # Cell velocity accelerations (independent per axis)
+    h_dot_accel_x = V * P_diff_x / W
+    h_dot_accel_y = V * P_diff_y / W
+    h_dot_accel_z = V * P_diff_z / W
+
+    # Apply thermostat drag per axis
+    zero = type(V)(0.0)
+    h_dot_new_xx = h_dot[0, 0] + dt_half * (h_dot_accel_x - eta_dot_1 * h_dot[0, 0])
+    h_dot_new_yy = h_dot[1, 1] + dt_half * (h_dot_accel_y - eta_dot_1 * h_dot[1, 1])
+    h_dot_new_zz = h_dot[2, 2] + dt_half * (h_dot_accel_z - eta_dot_1 * h_dot[2, 2])
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_xx, zero, zero, zero, h_dot_new_yy, zero, zero, zero, h_dot_new_zz
+    )
+
+
+@wp.kernel
+def _nph_cell_velocity_update_aniso_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),  # vec3: [Pxx, Pyy, Pzz]
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPH cell velocity update - anisotropic/orthorhombic (no thermostat).
+
+    ḧ_ii = V/W * (P_ii - P_ext_ii)
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    P = pressure_tensors[sys_id]
+    P_xx = P[0]
+    P_yy = P[4]
+    P_zz = P[8]
+
+    KE_typed = type(V)(KE)
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+    dof_V = dof_term / V
+
+    P_diff_x = P_xx + dof_V - P_ext[0]
+    P_diff_y = P_yy + dof_V - P_ext[1]
+    P_diff_z = P_zz + dof_V - P_ext[2]
+
+    h_dot_accel_x = V * P_diff_x / W
+    h_dot_accel_y = V * P_diff_y / W
+    h_dot_accel_z = V * P_diff_z / W
+
+    zero = type(V)(0.0)
+    h_dot_new_xx = h_dot[0, 0] + dt_half * h_dot_accel_x
+    h_dot_new_yy = h_dot[1, 1] + dt_half * h_dot_accel_y
+    h_dot_new_zz = h_dot[2, 2] + dt_half * h_dot_accel_z
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_xx, zero, zero, zero, h_dot_new_yy, zero, zero, zero, h_dot_new_zz
+    )
+
+
+# ==============================================================================
+# Triclinic Cell Velocity Update Kernels (Full Stress Tensor Control)
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_cell_velocity_update_triclinic_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),  # vec9: full stress tensor
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    eta_dots: wp.array2d(dtype=Any),
+    dt_half: Any,
+):
+    """NPT cell velocity update - full triclinic.
+
+    Full stress tensor control (all 9 components).
+    ḧ_ij = V/W * (P_ij - P_ext_ij) - η̇₁ * ḣ_ij
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]  # vec9
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+
+    P = pressure_tensors[sys_id]
+
+    KE_typed = type(V)(KE)
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+    dof_V = dof_term / V
+
+    # For triclinic, dof correction only applies to diagonal
+    # P_diff for each component
+    P_diff_00 = P[0] + dof_V - P_ext[0]
+    P_diff_01 = P[1] - P_ext[1]
+    P_diff_02 = P[2] - P_ext[2]
+    P_diff_10 = P[3] - P_ext[3]
+    P_diff_11 = P[4] + dof_V - P_ext[4]
+    P_diff_12 = P[5] - P_ext[5]
+    P_diff_20 = P[6] - P_ext[6]
+    P_diff_21 = P[7] - P_ext[7]
+    P_diff_22 = P[8] + dof_V - P_ext[8]
+
+    # Cell velocity accelerations
+    V_W = V / W
+    h_dot_new_00 = h_dot[0, 0] + dt_half * (V_W * P_diff_00 - eta_dot_1 * h_dot[0, 0])
+    h_dot_new_01 = h_dot[0, 1] + dt_half * (V_W * P_diff_01 - eta_dot_1 * h_dot[0, 1])
+    h_dot_new_02 = h_dot[0, 2] + dt_half * (V_W * P_diff_02 - eta_dot_1 * h_dot[0, 2])
+    h_dot_new_10 = h_dot[1, 0] + dt_half * (V_W * P_diff_10 - eta_dot_1 * h_dot[1, 0])
+    h_dot_new_11 = h_dot[1, 1] + dt_half * (V_W * P_diff_11 - eta_dot_1 * h_dot[1, 1])
+    h_dot_new_12 = h_dot[1, 2] + dt_half * (V_W * P_diff_12 - eta_dot_1 * h_dot[1, 2])
+    h_dot_new_20 = h_dot[2, 0] + dt_half * (V_W * P_diff_20 - eta_dot_1 * h_dot[2, 0])
+    h_dot_new_21 = h_dot[2, 1] + dt_half * (V_W * P_diff_21 - eta_dot_1 * h_dot[2, 1])
+    h_dot_new_22 = h_dot[2, 2] + dt_half * (V_W * P_diff_22 - eta_dot_1 * h_dot[2, 2])
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_00,
+        h_dot_new_01,
+        h_dot_new_02,
+        h_dot_new_10,
+        h_dot_new_11,
+        h_dot_new_12,
+        h_dot_new_20,
+        h_dot_new_21,
+        h_dot_new_22,
+    )
+
+
+@wp.kernel
+def _nph_cell_velocity_update_triclinic_kernel(
+    cell_velocities: wp.array(dtype=Any),
+    pressure_tensors: wp.array(dtype=Any),
+    target_pressures: wp.array(dtype=Any),  # vec9: full stress tensor
+    volumes: wp.array(dtype=Any),
+    cell_masses: wp.array(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPH cell velocity update - full triclinic (no thermostat).
+
+    ḧ_ij = V/W * (P_ij - P_ext_ij)
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h_dot = cell_velocities[sys_id]
+    P_ext = target_pressures[sys_id]
+    V = volumes[sys_id]
+    W = cell_masses[sys_id]
+    KE = kinetic_energies[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    P = pressure_tensors[sys_id]
+
+    KE_typed = type(V)(KE)
+    N_f = type(V)(3 * N)
+    dof_term = type(V)(2.0) * KE_typed / N_f
+    dof_V = dof_term / V
+
+    P_diff_00 = P[0] + dof_V - P_ext[0]
+    P_diff_01 = P[1] - P_ext[1]
+    P_diff_02 = P[2] - P_ext[2]
+    P_diff_10 = P[3] - P_ext[3]
+    P_diff_11 = P[4] + dof_V - P_ext[4]
+    P_diff_12 = P[5] - P_ext[5]
+    P_diff_20 = P[6] - P_ext[6]
+    P_diff_21 = P[7] - P_ext[7]
+    P_diff_22 = P[8] + dof_V - P_ext[8]
+
+    V_W = V / W
+    h_dot_new_00 = h_dot[0, 0] + dt_half * V_W * P_diff_00
+    h_dot_new_01 = h_dot[0, 1] + dt_half * V_W * P_diff_01
+    h_dot_new_02 = h_dot[0, 2] + dt_half * V_W * P_diff_02
+    h_dot_new_10 = h_dot[1, 0] + dt_half * V_W * P_diff_10
+    h_dot_new_11 = h_dot[1, 1] + dt_half * V_W * P_diff_11
+    h_dot_new_12 = h_dot[1, 2] + dt_half * V_W * P_diff_12
+    h_dot_new_20 = h_dot[2, 0] + dt_half * V_W * P_diff_20
+    h_dot_new_21 = h_dot[2, 1] + dt_half * V_W * P_diff_21
+    h_dot_new_22 = h_dot[2, 2] + dt_half * V_W * P_diff_22
+
+    cell_velocities[sys_id] = type(h_dot)(
+        h_dot_new_00,
+        h_dot_new_01,
+        h_dot_new_02,
+        h_dot_new_10,
+        h_dot_new_11,
+        h_dot_new_12,
+        h_dot_new_20,
+        h_dot_new_21,
+        h_dot_new_22,
+    )
+
+
+# ==============================================================================
+# Anisotropic Velocity Update Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_velocity_half_step_aniso_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """NPT velocity half-step for anisotropic pressure (single system).
+
+    Uses full strain rate tensor instead of scalar trace.
+    v_new = v + dt/2 * (F/m - ε̇ @ v - η̇₁ * v)
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    eta_dot_1 = eta_dot[0, 0]
+
+    # For anisotropic, we use the full diagonal strain rate
+    # ε̇_ii = ḣ_ii / h_ii (simplified for orthorhombic)
+    V = volume[0]
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    # Strain rate components (diagonal for orthorhombic)
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    # Drag per component
+    drag_x = (coupling * eps_dot_xx + eta_dot_1) * v[0]
+    drag_y = (coupling * eps_dot_yy + eta_dot_1) * v[1]
+    drag_z = (coupling * eps_dot_zz + eta_dot_1) * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_aniso_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPT velocity half-step for anisotropic pressure (batched).
+
+    Launch Grid: dim = [num_atoms]
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+    V = volumes[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (coupling * eps_dot_xx + eta_dot_1) * v[0]
+    drag_y = (coupling * eps_dot_yy + eta_dot_1) * v[1]
+    drag_z = (coupling * eps_dot_zz + eta_dot_1) * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_aniso_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT velocity half-step anisotropic (non-mutating, single system)."""
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    eta_dot_1 = eta_dot[0, 0]
+    V = volume[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (coupling * eps_dot_xx + eta_dot_1) * v[0]
+    drag_y = (coupling * eps_dot_yy + eta_dot_1) * v[1]
+    drag_z = (coupling * eps_dot_zz + eta_dot_1) * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_aniso_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT velocity half-step anisotropic (non-mutating, batched)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+    V = volumes[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (coupling * eps_dot_xx + eta_dot_1) * v[0]
+    drag_y = (coupling * eps_dot_yy + eta_dot_1) * v[1]
+    drag_z = (coupling * eps_dot_zz + eta_dot_1) * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+# =============================================================================
+# Triclinic NPT Velocity Kernels
+# =============================================================================
+
+
+@wp.kernel
+def _npt_velocity_half_step_triclinic_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """
+    NPT triclinic velocity half-step (single system, full tensor coupling).
+
+    Algorithm
+    ---------
+    For triclinic cells, the velocity update uses the full strain rate tensor:
+
+        v_new = v + dt/2 * (F/m - (γ * ε̇ + η̇₁ * I) @ v)
+
+    where ε̇ = ḣ @ h⁻¹ is the full strain rate tensor (3x3 matrix).
+    This couples all velocity components through off-diagonal strain rates.
+
+    Launch Grid
+    -----------
+    dim = [num_atoms]
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=vec3f/vec3d)
+        Particle velocities. MODIFIED in-place.
+    masses : wp.array(dtype=float32/float64)
+        Particle masses.
+    forces : wp.array(dtype=vec3f/vec3d)
+        Forces on particles.
+    cell_velocity : wp.array(dtype=mat33f/mat33d)
+        Cell velocity matrix ḣ. Shape (1,).
+    cell_inv : wp.array(dtype=mat33f/mat33d)
+        Inverse cell matrix h⁻¹. Shape (1,).
+    volume : wp.array(dtype=float32/float64)
+        Cell volume. Shape (1,).
+    eta_dot : wp.array2d(dtype=float32/float64)
+        Thermostat chain velocities. Shape (1, chain_length).
+    num_atoms : wp.int32
+        Number of atoms.
+    dt_half : float
+        Half time step.
+
+    Notes
+    -----
+    - Uses full strain rate tensor ε̇ = ḣ @ h⁻¹ for triclinic coupling.
+    - Off-diagonal strain rates couple x/y/z velocity components.
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    h_inv = cell_inv[0]
+    eta_dot_1 = eta_dot[0, 0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    # Full strain rate tensor: eps_dot = h_dot @ h_inv
+    eps_dot = h_dot * h_inv  # Matrix multiplication
+
+    # Force acceleration
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    # Full tensor drag: (coupling * eps_dot + eta_dot_1 * I) @ v
+    drag_x = (
+        coupling * (eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2])
+        + eta_dot_1 * v[0]
+    )
+    drag_y = (
+        coupling * (eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2])
+        + eta_dot_1 * v[1]
+    )
+    drag_z = (
+        coupling * (eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2])
+        + eta_dot_1 * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_triclinic_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPT triclinic velocity half-step (batched, full tensor coupling)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    h_inv = cells_inv[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    # Full strain rate tensor
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (
+        coupling * (eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2])
+        + eta_dot_1 * v[0]
+    )
+    drag_y = (
+        coupling * (eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2])
+        + eta_dot_1 * v[1]
+    )
+    drag_z = (
+        coupling * (eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2])
+        + eta_dot_1 * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_triclinic_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT triclinic velocity half-step (non-mutating, single system)."""
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    h_inv = cell_inv[0]
+    eta_dot_1 = eta_dot[0, 0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (
+        coupling * (eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2])
+        + eta_dot_1 * v[0]
+    )
+    drag_y = (
+        coupling * (eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2])
+        + eta_dot_1 * v[1]
+    )
+    drag_z = (
+        coupling * (eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2])
+        + eta_dot_1 * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _npt_velocity_half_step_triclinic_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    eta_dots: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPT triclinic velocity half-step (non-mutating, batched)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    h_inv = cells_inv[sys_id]
+    eta_dot_1 = eta_dots[sys_id, 0]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = (
+        coupling * (eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2])
+        + eta_dot_1 * v[0]
+    )
+    drag_y = (
+        coupling * (eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2])
+        + eta_dot_1 * v[1]
+    )
+    drag_z = (
+        coupling * (eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2])
+        + eta_dot_1 * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+# =============================================================================
+# Triclinic NPH Velocity Kernels
+# =============================================================================
+
+
+@wp.kernel
+def _nph_velocity_half_step_triclinic_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """
+    NPH triclinic velocity half-step (single system, no thermostat).
+
+    Algorithm
+    ---------
+    Same as NPT triclinic but without thermostat coupling (η̇₁ = 0).
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    h_inv = cell_inv[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * (
+        eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2]
+    )
+    drag_y = coupling * (
+        eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2]
+    )
+    drag_z = coupling * (
+        eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_triclinic_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPH triclinic velocity half-step (batched, no thermostat)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    h_inv = cells_inv[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * (
+        eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2]
+    )
+    drag_y = coupling * (
+        eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2]
+    )
+    drag_z = coupling * (
+        eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_triclinic_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH triclinic velocity half-step (non-mutating, single system)."""
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    h_inv = cell_inv[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * (
+        eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2]
+    )
+    drag_y = coupling * (
+        eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2]
+    )
+    drag_z = coupling * (
+        eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_triclinic_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    cells_inv: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH triclinic velocity half-step (non-mutating, batched)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    h_inv = cells_inv[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot = h_dot * h_inv
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * (
+        eps_dot[0, 0] * v[0] + eps_dot[0, 1] * v[1] + eps_dot[0, 2] * v[2]
+    )
+    drag_y = coupling * (
+        eps_dot[1, 0] * v[0] + eps_dot[1, 1] * v[1] + eps_dot[1, 2] * v[2]
+    )
+    drag_z = coupling * (
+        eps_dot[2, 0] * v[0] + eps_dot[2, 1] * v[1] + eps_dot[2, 2] * v[2]
+    )
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_aniso_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+):
+    """NPH velocity half-step anisotropic (single system, no thermostat)."""
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    V = volume[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * eps_dot_xx * v[0]
+    drag_y = coupling * eps_dot_yy * v[1]
+    drag_z = coupling * eps_dot_zz * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_aniso_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+):
+    """NPH velocity half-step anisotropic (batched, no thermostat)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    N = num_atoms_per_system[sys_id]
+    V = volumes[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * eps_dot_xx * v[0]
+    drag_y = coupling * eps_dot_yy * v[1]
+    drag_z = coupling * eps_dot_zz * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_aniso_out_single_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    cell_velocity: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    num_atoms: wp.int32,
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH velocity half-step anisotropic (non-mutating, single, no thermostat)."""
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocity[0]
+    V = volume[0]
+
+    N_f = type(m)(3 * num_atoms)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * eps_dot_xx * v[0]
+    drag_y = coupling * eps_dot_yy * v[1]
+    drag_z = coupling * eps_dot_zz * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+@wp.kernel
+def _nph_velocity_half_step_aniso_out_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell_velocities: wp.array(dtype=Any),
+    volumes: wp.array(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    dt_half: Any,
+    velocities_out: wp.array(dtype=Any),
+):
+    """NPH velocity half-step anisotropic (non-mutating, batched, no thermostat)."""
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+    f = forces[atom_idx]
+    h_dot = cell_velocities[sys_id]
+    N = num_atoms_per_system[sys_id]
+    V = volumes[sys_id]
+
+    N_f = type(m)(3 * N)
+    coupling = type(m)(1.0) + type(m)(1.0) / N_f
+
+    eps_dot_xx = h_dot[0, 0] / V
+    eps_dot_yy = h_dot[1, 1] / V
+    eps_dot_zz = h_dot[2, 2] / V
+
+    accel = type(v)(f[0] / m, f[1] / m, f[2] / m)
+
+    drag_x = coupling * eps_dot_xx * v[0]
+    drag_y = coupling * eps_dot_yy * v[1]
+    drag_z = coupling * eps_dot_zz * v[2]
+    drag = type(v)(drag_x, drag_y, drag_z)
+
+    velocities_out[atom_idx] = v + dt_half * (accel - drag)
+
+
+# ==============================================================================
+# Cell Position Update Kernels
+# ==============================================================================
+
+
+@wp.kernel
+def _cell_update_kernel(
+    cells: wp.array(dtype=Any),
+    cell_velocities: wp.array(dtype=Any),
+    dt: Any,
+):
+    """Update cell matrix: h_new = h + dt * ḣ.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h = cells[sys_id]
+    h_dot = cell_velocities[sys_id]
+    cells[sys_id] = h + dt * h_dot
+
+
+@wp.kernel
+def _cell_update_out_kernel(
+    cells: wp.array(dtype=Any),
+    cell_velocities: wp.array(dtype=Any),
+    dt: Any,
+    cells_out: wp.array(dtype=Any),
+):
+    """Update cell matrix (non-mutating).
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    h = cells[sys_id]
+    h_dot = cell_velocities[sys_id]
+    cells_out[sys_id] = h + dt * h_dot
+
+
+# ==============================================================================
+# NPT Thermostat Kernel
+# ==============================================================================
+
+
+@wp.kernel
+def _npt_thermostat_chain_update_kernel(
+    eta: wp.array2d(dtype=Any),
+    eta_dot: wp.array2d(dtype=Any),
+    kinetic_energies: wp.array(dtype=Any),
+    target_temps: wp.array(dtype=Any),
+    thermostat_masses: wp.array2d(dtype=Any),
+    num_atoms_per_system: wp.array(dtype=wp.int32),
+    chain_length: wp.int32,
+    dt_chain: Any,
+):
+    """Update Nosé-Hoover chain for NPT thermostat.
+
+    Launch Grid: dim = [num_systems]
+    """
+    sys_id = wp.tid()
+    KE = kinetic_energies[sys_id]
+    T_target = target_temps[sys_id]
+    N = num_atoms_per_system[sys_id]
+
+    # Use eta_dot dtype as reference
+    eta_dot_0 = eta_dot[sys_id, 0]
+
+    N_f = type(eta_dot_0)(3 * N)
+    kT = type(eta_dot_0)(T_target)
+    KE_typed = type(eta_dot_0)(KE)
+
+    # First thermostat driven by kinetic energy difference
+    G1 = (type(eta_dot_0)(2.0) * KE_typed - N_f * kT) / thermostat_masses[sys_id, 0]
+
+    dt_half = dt_chain * type(eta_dot_0)(0.5)
+    dt_quarter = dt_chain * type(eta_dot_0)(0.25)
+
+    # Last thermostat
+    M_last = chain_length - 1
+    eta_dot[sys_id, M_last] = (
+        eta_dot[sys_id, M_last]
+        + dt_quarter
+        * (
+            thermostat_masses[sys_id, M_last - 1]
+            * eta_dot[sys_id, M_last - 1]
+            * eta_dot[sys_id, M_last - 1]
+            - kT
+        )
+        / thermostat_masses[sys_id, M_last]
+    )
+
+    # Middle thermostats (reverse order)
+    for k in range(M_last - 1, 0, -1):
+        eta_dot_k = eta_dot[sys_id, k]
+        G_k = (
+            thermostat_masses[sys_id, k - 1]
+            * eta_dot[sys_id, k - 1]
+            * eta_dot[sys_id, k - 1]
+            - kT
+        ) / thermostat_masses[sys_id, k]
+        exp_factor = wp.exp(-dt_quarter * eta_dot[sys_id, k + 1])
+        eta_dot[sys_id, k] = eta_dot_k * exp_factor + dt_quarter * G_k
+
+    # First thermostat
+    exp_factor = wp.exp(-dt_quarter * eta_dot[sys_id, 1])
+    eta_dot[sys_id, 0] = eta_dot[sys_id, 0] * exp_factor + dt_quarter * G1
+
+    # Update positions
+    for k in range(chain_length):
+        eta[sys_id, k] = eta[sys_id, k] + dt_half * eta_dot[sys_id, k]
+
+    # Second half of velocity updates
+    G1_new = (type(eta_dot_0)(2.0) * KE_typed - N_f * kT) / thermostat_masses[sys_id, 0]
+    exp_factor = wp.exp(-dt_quarter * eta_dot[sys_id, 1])
+    eta_dot[sys_id, 0] = eta_dot[sys_id, 0] * exp_factor + dt_quarter * G1_new
+
+    for k in range(1, M_last):
+        G_k = (
+            thermostat_masses[sys_id, k - 1]
+            * eta_dot[sys_id, k - 1]
+            * eta_dot[sys_id, k - 1]
+            - kT
+        ) / thermostat_masses[sys_id, k]
+        exp_factor = wp.exp(-dt_quarter * eta_dot[sys_id, k + 1])
+        eta_dot[sys_id, k] = eta_dot[sys_id, k] * exp_factor + dt_quarter * G_k
+
+    # Last thermostat
+    G_last = (
+        thermostat_masses[sys_id, M_last - 1]
+        * eta_dot[sys_id, M_last - 1]
+        * eta_dot[sys_id, M_last - 1]
+        - kT
+    ) / thermostat_masses[sys_id, M_last]
+    eta_dot[sys_id, M_last] = eta_dot[sys_id, M_last] + dt_quarter * G_last
+
+
+# ==============================================================================
+# Functional Interfaces - Pressure Calculations
+# ==============================================================================
+
+
+def compute_pressure_tensor(
+    velocities: wp.array,
+    masses: wp.array,
+    virial_tensors: wp.array,
+    cells: wp.array,
+    pressure_tensors: wp.array = None,
+    batch_idx: wp.array = None,
+    volumes: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Compute full pressure tensor.
+
+    P = (kinetic + virial) / V
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Particle velocities. Shape (N,).
+    masses : wp.array
+        Particle masses. Shape (N,).
+    virial_tensors : wp.array(dtype=vec9f or vec9d)
+        Virial tensor from forces. Shape (B,).
+    cells : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell matrices. Shape (B,).
+    pressure_tensors : wp.array, optional
+        Output pressure tensor. If None, allocated internally.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. If None, assumes single system.
+    volumes : wp.array, optional
+        Pre-computed volumes. If None, computed internally.
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array(dtype=vec9f or vec9d)
+        Pressure tensor. Shape (B,).
+    """
+    if device is None:
+        device = velocities.device
+
+    num_atoms = velocities.shape[0]
+    num_systems = cells.shape[0]
+
+    if velocities.dtype == wp.vec3f:
+        tensor_dtype = vec9f
+        scalar_dtype = wp.float32
+    else:
+        tensor_dtype = vec9d
+        scalar_dtype = wp.float64
+
+    if volumes is None:
+        volumes = compute_cell_volume(cells, device=device)
+
+    # Use array2d for atomic accumulation
+    kinetic_tensors = wp.zeros((num_systems, 9), dtype=scalar_dtype, device=device)
+
+    if batch_idx is None:
+        wp.launch(
+            _compute_kinetic_tensor_single_kernel,
+            dim=num_atoms,
+            inputs=[velocities, masses, kinetic_tensors],
+            device=device,
+        )
+    else:
+        wp.launch(
+            _compute_kinetic_tensor_kernel,
+            dim=num_atoms,
+            inputs=[velocities, masses, batch_idx, kinetic_tensors],
+            device=device,
+        )
+
+    if pressure_tensors is None:
+        pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
+
+    wp.launch(
+        _finalize_pressure_tensor_kernel,
+        dim=num_systems,
+        inputs=[kinetic_tensors, virial_tensors, volumes, pressure_tensors],
+        device=device,
+    )
+
+    return pressure_tensors
+
+
+def compute_scalar_pressure(
+    pressure_tensors: wp.array,
+    scalar_pressures: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Compute scalar pressure from pressure tensor.
+
+    P_scalar = (P_xx + P_yy + P_zz) / 3
+
+    Parameters
+    ----------
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Pressure tensor. Shape (B,).
+    scalar_pressures : wp.array, optional
+        Output scalar pressure. If None, allocated internally.
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        Scalar pressure. Shape (B,).
+    """
+    if device is None:
+        device = pressure_tensors.device
+
+    num_systems = pressure_tensors.shape[0]
+
+    if pressure_tensors.dtype == vec9f:
+        scalar_dtype = wp.float32
+    else:
+        scalar_dtype = wp.float64
+
+    if scalar_pressures is None:
+        scalar_pressures = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
+
+    wp.launch(
+        _compute_scalar_pressure_kernel,
+        dim=num_systems,
+        inputs=[pressure_tensors, scalar_pressures],
+        device=device,
+    )
+
+    return scalar_pressures
+
+
+# ==============================================================================
+# Array Broadcast Kernels (Pure Warp - no numpy)
+# ==============================================================================
+
+
+@wp.kernel
+def _broadcast_scalar_f32_kernel(
+    src: wp.array(dtype=wp.float32),
+    dst: wp.array(dtype=wp.float32),
+):
+    """Broadcast scalar from src[0] to all elements of dst.
+
+    Launch Grid: dim = [dst.shape[0]]
+    """
+    idx = wp.tid()
+    dst[idx] = src[0]
+
+
+@wp.kernel
+def _broadcast_scalar_f64_kernel(
+    src: wp.array(dtype=wp.float64),
+    dst: wp.array(dtype=wp.float64),
+):
+    """Broadcast scalar from src[0] to all elements of dst.
+
+    Launch Grid: dim = [dst.shape[0]]
+    """
+    idx = wp.tid()
+    dst[idx] = src[0]
+
+
+@wp.kernel
+def _broadcast_scalar_i32_kernel(
+    src: wp.array(dtype=wp.int32),
+    dst: wp.array(dtype=wp.int32),
+):
+    """Broadcast scalar from src[0] to all elements of dst.
+
+    Launch Grid: dim = [dst.shape[0]]
+    """
+    idx = wp.tid()
+    dst[idx] = src[0]
+
+
+# ==============================================================================
+# Barostat Mass Kernel
+# ==============================================================================
+
+
+@wp.kernel
+def _compute_barostat_mass_kernel(
+    temperatures: wp.array(dtype=Any),
+    tau_p: wp.array(dtype=Any),
+    num_atoms: wp.array(dtype=wp.int32),
+    masses_out: wp.array(dtype=Any),
+):
+    """
+    Compute barostat masses for NPT/NPH simulations.
+
+    Algorithm
+    ---------
+    The barostat mass is computed from the MTK equations:
+
+        W = (N_f + d) * kT * τ_p²
+
+    where N_f = 3N is degrees of freedom, d = 3 is dimensionality.
+
+    Launch Grid
+    -----------
+    dim = [num_systems]
+
+    Parameters
+    ----------
+    temperatures : wp.array(dtype=float32/float64)
+        Target temperatures per system. Shape (B,).
+    tau_p : wp.array(dtype=float32/float64)
+        Pressure relaxation times per system. Shape (B,).
+    num_atoms : wp.array(dtype=wp.int32)
+        Atom counts per system. Shape (B,).
+    masses_out : wp.array(dtype=float32/float64)
+        Output barostat masses. Shape (B,).
+
+    Notes
+    -----
+    - Larger W = slower pressure equilibration (more stable)
+    - Smaller W = faster equilibration (may cause oscillations)
+    """
+    sys_id = wp.tid()
+    T = temperatures[sys_id]
+    tau = tau_p[sys_id]
+    N = num_atoms[sys_id]
+
+    # N_f = 3N degrees of freedom, d = 3 dimensionality
+    N_f = type(T)(3 * N)
+    d = type(T)(3.0)
+
+    # W = (N_f + d) * kT * τ_p²
+    masses_out[sys_id] = (N_f + d) * T * tau * tau
+
+
+# ==============================================================================
+# Functional Interfaces - Barostat Utilities
+# ==============================================================================
+
+
+def compute_barostat_mass(
+    target_temperature,
+    tau_p,
+    num_atoms,
+    dtype: type = wp.float32,
+    device: str = None,
+) -> wp.array:
+    """
+    Compute barostat mass(es) for desired pressure fluctuation timescale.
+
+    The barostat mass determines the inertia of cell volume/shape fluctuations
+    in NPT/NPH simulations. It is computed from the Martyna-Tobias-Klein
+    equations to give a characteristic pressure relaxation time τ_p:
+
+    .. math::
+
+        W = (N_f + d) \\cdot k_B T \\cdot \\tau_p^2
+
+    where:
+    - N_f = 3N is the number of degrees of freedom (N atoms in 3D)
+    - d = 3 is the dimensionality (for 3D simulations)
+    - k_B T is the thermal energy (in reduced units, k_B = 1)
+    - τ_p is the pressure relaxation time
+
+    Larger W gives slower pressure equilibration (more stable but slower to
+    reach target pressure). Smaller W gives faster equilibration but may
+    cause oscillations.
+
+    Parameters
+    ----------
+    target_temperature : float or wp.array
+        Target temperature(s). Can be:
+        - float: Same temperature for all systems
+        - wp.array: Per-system temperatures, shape (num_systems,)
+    tau_p : float or wp.array
+        Pressure relaxation time(s). Typical values: 0.5-2.0 ps.
+        Can be float (same for all) or wp.array (per-system).
+    num_atoms : int or wp.array
+        Number of atoms. Can be:
+        - int: Same for all systems
+        - wp.array: Per-system atom counts, shape (num_systems,)
+    dtype : type, optional
+        Warp data type for output (wp.float32 or wp.float64).
+        Default: wp.float32.
+    device : str, optional
+        Warp device. Default: "cuda:0" if available, else "cpu".
+
+    Returns
+    -------
+    wp.array
+        Barostat mass(es) W. Shape (num_systems,).
+
+    Examples
+    --------
+    Single system:
+
+    >>> W = compute_barostat_mass(
+    ...     target_temperature=1.0,
+    ...     tau_p=1.0,
+    ...     num_atoms=100,
+    ...     dtype=wp.float32
+    ... )
+    >>> print(W.numpy())  # W = (300 + 3) * 1.0 * 1.0 = 303.0
+
+    Batched systems (using wp.arrays):
+
+    >>> temps = wp.array([1.0, 2.0], dtype=wp.float64, device="cuda:0")
+    >>> tau = wp.array([1.0, 1.0], dtype=wp.float64, device="cuda:0")
+    >>> n_atoms = wp.array([100, 200], dtype=wp.int32, device="cuda:0")
+    >>> W = compute_barostat_mass(temps, tau, n_atoms, dtype=wp.float64)
+    >>> print(W.numpy())  # [303.0, 1206.0]
+
+    Notes
+    -----
+    - The formula assumes k_B = 1 (reduced units). Scale τ_p accordingly
+      for real units.
+    - For isotropic barostat, a single mass controls all cell dimensions.
+    - For anisotropic/triclinic barostat, the same mass is typically used
+      for all cell velocity components.
+
+    References
+    ----------
+    .. [1] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
+    .. [2] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    """
+    if device is None:
+        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+
+    # Handle scalar/array inputs
+    if isinstance(target_temperature, (int, float)):
+        T_arr = wp.array([float(target_temperature)], dtype=dtype, device=device)
+    elif isinstance(target_temperature, wp.array):
+        T_arr = target_temperature
+    else:
+        # Try to convert from list/tuple
+        T_arr = wp.array(list(target_temperature), dtype=dtype, device=device)
+
+    if isinstance(tau_p, (int, float)):
+        tau_arr = wp.array([float(tau_p)], dtype=dtype, device=device)
+    elif isinstance(tau_p, wp.array):
+        tau_arr = tau_p
+    else:
+        tau_arr = wp.array(list(tau_p), dtype=dtype, device=device)
+
+    if isinstance(num_atoms, int):
+        N_arr = wp.array([num_atoms], dtype=wp.int32, device=device)
+    elif isinstance(num_atoms, wp.array):
+        N_arr = num_atoms
+    else:
+        N_arr = wp.array(list(num_atoms), dtype=wp.int32, device=device)
+
+    # Determine number of systems from largest input
+    num_systems = max(T_arr.shape[0], tau_arr.shape[0], N_arr.shape[0])
+
+    # Broadcast scalar inputs to match num_systems using Warp kernels (no numpy)
+    if T_arr.shape[0] == 1 and num_systems > 1:
+        T_broadcast = wp.zeros(num_systems, dtype=dtype, device=device)
+        if dtype == wp.float32:
+            wp.launch(
+                _broadcast_scalar_f32_kernel,
+                dim=num_systems,
+                inputs=[T_arr, T_broadcast],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _broadcast_scalar_f64_kernel,
+                dim=num_systems,
+                inputs=[T_arr, T_broadcast],
+                device=device,
+            )
+        T_arr = T_broadcast
+
+    if tau_arr.shape[0] == 1 and num_systems > 1:
+        tau_broadcast = wp.zeros(num_systems, dtype=dtype, device=device)
+        if dtype == wp.float32:
+            wp.launch(
+                _broadcast_scalar_f32_kernel,
+                dim=num_systems,
+                inputs=[tau_arr, tau_broadcast],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _broadcast_scalar_f64_kernel,
+                dim=num_systems,
+                inputs=[tau_arr, tau_broadcast],
+                device=device,
+            )
+        tau_arr = tau_broadcast
+
+    if N_arr.shape[0] == 1 and num_systems > 1:
+        N_broadcast = wp.zeros(num_systems, dtype=wp.int32, device=device)
+        wp.launch(
+            _broadcast_scalar_i32_kernel,
+            dim=num_systems,
+            inputs=[N_arr, N_broadcast],
+            device=device,
+        )
+        N_arr = N_broadcast
+
+    # Allocate output
+    masses_out = wp.zeros(num_systems, dtype=dtype, device=device)
+
+    # Launch kernel
+    wp.launch(
+        _compute_barostat_mass_kernel,
+        dim=num_systems,
+        inputs=[T_arr, tau_arr, N_arr, masses_out],
+        device=device,
+    )
+
+    return masses_out
+
+
+def compute_cell_kinetic_energy(
+    cell_velocities: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Compute kinetic energy of cell degrees of freedom.
+
+    KE_cell = 0.5 * W * ||ḣ||²_F
+
+    Parameters
+    ----------
+    cell_velocities : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell velocity matrices. Shape (B,).
+    cell_masses : wp.array
+        Barostat masses. Shape (B,).
+    kinetic_energy : wp.array, optional
+        Output kinetic energy. If None, allocated internally.
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        Cell kinetic energy. Shape (B,).
+    """
+    if device is None:
+        device = cell_velocities.device
+
+    num_systems = cell_velocities.shape[0]
+
+    if cell_velocities.dtype == wp.mat33f:
+        scalar_dtype = wp.float32
+    else:
+        scalar_dtype = wp.float64
+
+    if kinetic_energy is None:
+        kinetic_energy = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
+
+    wp.launch(
+        _compute_cell_kinetic_energy_kernel,
+        dim=num_systems,
+        inputs=[cell_velocities, cell_masses, kinetic_energy],
+        device=device,
+    )
+
+    return kinetic_energy
+
+
+def compute_barostat_potential_energy(
+    target_pressures: wp.array,
+    volumes: wp.array,
+    potential_energy: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Compute barostat potential energy: U = P_ext * V.
+
+    Parameters
+    ----------
+    target_pressures : wp.array
+        External/target pressures. Shape (B,).
+    volumes : wp.array
+        Cell volumes. Shape (B,).
+    potential_energy : wp.array, optional
+        Output potential energy. If None, allocated internally.
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        Barostat potential energy. Shape (B,).
+    """
+    if device is None:
+        device = target_pressures.device
+
+    num_systems = target_pressures.shape[0]
+
+    if potential_energy is None:
+        potential_energy = wp.zeros(
+            num_systems, dtype=target_pressures.dtype, device=device
+        )
+
+    wp.launch(
+        _compute_barostat_potential_kernel,
+        dim=num_systems,
+        inputs=[target_pressures, volumes, potential_energy],
+        device=device,
+    )
+
+    return potential_energy
+
+
+# ==============================================================================
+# Functional Interfaces - NPT Integration
+# ==============================================================================
+
+
+def npt_thermostat_half_step(
+    eta: wp.array,
+    eta_dot: wp.array,
+    kinetic_energy: wp.array,
+    target_temperature: wp.array,
+    thermostat_masses: wp.array,
+    num_atoms_per_system: wp.array,
+    chain_length: int,
+    dt: float,
+    device: str = None,
+) -> None:
+    """
+    Perform thermostat half-step for NPT.
+
+    Parameters
+    ----------
+    eta : wp.array2d
+        Thermostat positions. Shape (B, chain_length). MODIFIED in-place.
+    eta_dot : wp.array2d
+        Thermostat velocities. Shape (B, chain_length). MODIFIED in-place.
+    kinetic_energy : wp.array
+        Kinetic energy per system. Shape (B,).
+    target_temperature : wp.array
+        Target temperatures. Shape (B,).
+    thermostat_masses : wp.array2d
+        Thermostat masses. Shape (B, chain_length).
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Number of atoms per system. Shape (B,).
+    chain_length : int
+        Number of thermostats in chain.
+    dt : float
+        Half-step time (dt/2 for typical integration).
+    device : str, optional
+        Warp device.
+    """
+    if device is None:
+        device = eta.device
+
+    num_systems = eta.shape[0]
+
+    if eta.dtype == wp.float32:
+        dt_typed = wp.float32(dt)
+    else:
+        dt_typed = wp.float64(dt)
+
+    wp.launch(
+        _npt_thermostat_chain_update_kernel,
+        dim=num_systems,
+        inputs=[
+            eta,
+            eta_dot,
+            kinetic_energy,
+            target_temperature,
+            thermostat_masses,
+            num_atoms_per_system,
+            chain_length,
+            dt_typed,
+        ],
+        device=device,
+    )
+
+
+def npt_barostat_half_step(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    eta_dots: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """
+    Perform barostat half-step for NPT ensemble (Martyna-Tobias-Klein equations).
+
+    This function updates the cell velocity matrix ḣ based on the pressure
+    difference between the instantaneous and target pressures, coupled with
+    the Nosé-Hoover thermostat chain. The pressure control mode is automatically
+    detected from the ``target_pressures`` array dtype:
+
+    - **Isotropic** (scalar dtype): Uniform scaling in all directions
+    - **Anisotropic/Orthorhombic** (vec3 dtype): Independent x, y, z control
+    - **Triclinic** (vec9 dtype): Full stress tensor control
+
+    Mathematical Formulation
+    ------------------------
+    The cell velocity follows the MTK equations of motion:
+
+    **Isotropic mode:**
+
+    .. math::
+
+        \\ddot{h} = \\frac{V}{W}(P - P_{ext}) - \\dot{\\eta}_1 \\dot{h}
+
+    where P is the scalar trace of the pressure tensor (P = Tr(P)/3).
+
+    **Anisotropic mode:**
+
+    .. math::
+
+        \\ddot{h}_{ii} = \\frac{V}{W}(P_{ii} - P_{ext,ii}) - \\dot{\\eta}_1 \\dot{h}_{ii}
+
+    for i ∈ {x, y, z}, with off-diagonal elements remaining zero.
+
+    **Triclinic mode:**
+
+    .. math::
+
+        \\ddot{h}_{ij} = \\frac{V}{W}(P_{ij} - P_{ext,ij}) - \\dot{\\eta}_1 \\dot{h}_{ij}
+
+    for all i, j ∈ {x, y, z}.
+
+    The instantaneous pressure includes a kinetic correction:
+
+    .. math::
+
+        P_{ij}^{inst} = P_{ij}^{virial} + \\frac{2 KE}{N_f V} \\delta_{ij}
+
+    Parameters
+    ----------
+    cell_velocities : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell velocity matrices ḣ. Shape (B,) where B is batch size.
+        **MODIFIED in-place.**
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Current pressure tensors from virial. Shape (B,).
+        Components ordered as [xx, xy, xz, yx, yy, yz, zx, zy, zz].
+    target_pressures : wp.array
+        External/target pressure(s). The dtype determines the mode:
+
+        - ``wp.float32`` or ``wp.float64``: Isotropic (scalar P). Shape (B,).
+        - ``wp.vec3f`` or ``wp.vec3d``: Anisotropic [Pxx, Pyy, Pzz]. Shape (B,).
+        - ``vec9f`` or ``vec9d``: Full stress tensor. Shape (B,).
+
+    volumes : wp.array(dtype=scalar)
+        Cell volumes V. Shape (B,).
+    cell_masses : wp.array(dtype=scalar)
+        Barostat masses W. Shape (B,). See :func:`compute_barostat_mass`.
+    kinetic_energy : wp.array(dtype=scalar)
+        System kinetic energies. Shape (B,).
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Number of atoms per system. Shape (B,).
+    eta_dots : wp.array2d(dtype=scalar)
+        Thermostat chain velocities η̇. Shape (B, chain_length).
+        Only eta_dots[:, 0] (first thermostat) couples to barostat.
+    dt : float
+        Integration time step. The half-step uses dt/2.
+    device : str, optional
+        Warp device. Default: inferred from cell_velocities.
+
+    Examples
+    --------
+    Isotropic pressure control (most common):
+
+    >>> target_P = wp.array([1.0], dtype=wp.float32, device="cuda:0")
+    >>> npt_barostat_half_step(
+    ...     cell_velocities, pressure_tensors, target_P,
+    ...     volumes, cell_masses, kinetic_energy,
+    ...     num_atoms_per_system, eta_dots, dt=0.001
+    ... )
+
+    Anisotropic (orthorhombic) pressure control:
+
+    >>> # Different pressures for x, y, z axes
+    >>> target_P = wp.array([[1.0, 2.0, 1.5]], dtype=wp.vec3f, device="cuda:0")
+    >>> npt_barostat_half_step(
+    ...     cell_velocities, pressure_tensors, target_P,
+    ...     volumes, cell_masses, kinetic_energy,
+    ...     num_atoms_per_system, eta_dots, dt=0.001
+    ... )
+
+    Full triclinic stress control:
+
+    >>> # Full 3x3 stress tensor (9 components)
+    >>> target_stress = wp.array(
+    ...     [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]],
+    ...     dtype=vec9f, device="cuda:0"
+    ... )
+    >>> npt_barostat_half_step(
+    ...     cell_velocities, pressure_tensors, target_stress,
+    ...     volumes, cell_masses, kinetic_energy,
+    ...     num_atoms_per_system, eta_dots, dt=0.001
+    ... )
+
+    See Also
+    --------
+    nph_barostat_half_step : Barostat without thermostat coupling.
+    npt_velocity_half_step : Velocity update with barostat/thermostat coupling.
+    compute_barostat_mass : Compute barostat mass from relaxation time.
+
+    References
+    ----------
+    .. [1] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
+    .. [2] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    """
+    if device is None:
+        device = cell_velocities.device
+
+    num_systems = cell_velocities.shape[0]
+
+    if cell_velocities.dtype == wp.mat33f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    # Dispatch based on target_pressures dtype
+    tp_dtype = target_pressures.dtype
+    if tp_dtype in (wp.float32, wp.float64):
+        # Isotropic
+        wp.launch(
+            _npt_cell_velocity_update_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                eta_dots,
+                dt_half,
+            ],
+            device=device,
+        )
+    elif tp_dtype in (wp.vec3f, wp.vec3d):
+        # Anisotropic (orthorhombic)
+        wp.launch(
+            _npt_cell_velocity_update_aniso_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                eta_dots,
+                dt_half,
+            ],
+            device=device,
+        )
+    elif tp_dtype in (vec9f, vec9d):
+        # Triclinic (full tensor)
+        wp.launch(
+            _npt_cell_velocity_update_triclinic_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                eta_dots,
+                dt_half,
+            ],
+            device=device,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported target_pressures dtype: {tp_dtype}. "
+            f"Expected scalar (float32/float64) for isotropic, "
+            f"vec3 for anisotropic, or vec9 for triclinic."
+        )
+
+
+# Keep separate functions for backwards compatibility and explicit control
+def npt_barostat_half_step_aniso(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    eta_dots: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """Anisotropic NPT barostat. See :func:`npt_barostat_half_step` with vec3 target."""
+    if device is None:
+        device = cell_velocities.device
+    num_systems = cell_velocities.shape[0]
+    dt_half = (
+        wp.float32(dt * 0.5)
+        if cell_velocities.dtype == wp.mat33f
+        else wp.float64(dt * 0.5)
+    )
+    wp.launch(
+        _npt_cell_velocity_update_aniso_kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt_half,
+        ],
+        device=device,
+    )
+
+
+def npt_barostat_half_step_triclinic(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    eta_dots: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """Triclinic NPT barostat. See :func:`npt_barostat_half_step` with vec9 target."""
+    if device is None:
+        device = cell_velocities.device
+    num_systems = cell_velocities.shape[0]
+    dt_half = (
+        wp.float32(dt * 0.5)
+        if cell_velocities.dtype == wp.mat33f
+        else wp.float64(dt * 0.5)
+    )
+    wp.launch(
+        _npt_cell_velocity_update_triclinic_kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt_half,
+        ],
+        device=device,
+    )
+
+
+def npt_velocity_half_step(
+    velocities: wp.array,
+    masses: wp.array,
+    forces: wp.array,
+    cell_velocities: wp.array,
+    volumes: wp.array,
+    eta_dots: wp.array,
+    num_atoms: int,
+    dt: float,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    cells_inv: wp.array = None,
+    mode: str = "isotropic",
+    device: str = None,
+) -> None:
+    """
+    Perform half-step velocity update for NPT ensemble.
+
+    Updates particle velocities accounting for:
+    1. Forces from the potential energy surface
+    2. Coupling to barostat (cell velocity / strain rate)
+    3. Coupling to thermostat (Nosé-Hoover chain)
+
+    Mathematical Formulation
+    ------------------------
+    The velocity equation of motion in NPT is:
+
+    .. math::
+
+        \\dot{v}_i = \\frac{F_i}{m_i} - \\left(\\gamma \\cdot \\dot{\\varepsilon} + \\dot{\\eta}_1\\right) v_i
+
+    where:
+
+    - F_i / m_i is the acceleration from forces
+    - γ = 1 + 1/N_f is the coupling factor (N_f = 3N degrees of freedom)
+    - ε̇ is the strain rate from cell velocity
+    - η̇₁ is the first thermostat chain velocity
+
+    **Isotropic mode** (default):
+        Uses scalar strain rate ε̇ = Tr(ḣ)/V
+
+    **Anisotropic mode**:
+        Uses diagonal strain rates ε̇_ii = ḣ_ii/V for direction-dependent drag
+
+    **Triclinic mode**:
+        Uses full strain rate tensor ε̇ = ḣ @ h⁻¹ for full coupling.
+        Requires ``cells_inv`` parameter.
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Particle velocities. Shape (N,). **MODIFIED in-place.**
+    masses : wp.array(dtype=scalar)
+        Particle masses. Shape (N,).
+    forces : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Forces on particles. Shape (N,).
+    cell_velocities : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell velocity matrices ḣ. Shape (B,).
+    volumes : wp.array(dtype=scalar)
+        Cell volumes. Shape (B,).
+    eta_dots : wp.array2d(dtype=scalar)
+        Thermostat chain velocities. Shape (B, chain_length).
+    num_atoms : int
+        Total number of atoms (for single system) or used with num_atoms_per_system.
+    dt : float
+        Integration time step.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. Required for batched simulations.
+    num_atoms_per_system : wp.array(dtype=wp.int32), optional
+        Number of atoms per system. Required for batched simulations.
+    cells_inv : wp.array(dtype=wp.mat33f or wp.mat33d), optional
+        Inverse cell matrices h⁻¹. Shape (B,). **Required for triclinic mode.**
+    mode : str, optional
+        Pressure control mode. One of:
+
+        - ``"isotropic"`` (default): Uniform scalar strain rate coupling
+        - ``"anisotropic"``: Diagonal strain rate coupling (orthorhombic)
+        - ``"triclinic"``: Full tensor strain rate coupling (requires cells_inv)
+
+    device : str, optional
+        Warp device.
+
+    Examples
+    --------
+    Single system (isotropic):
+
+    >>> npt_velocity_half_step(
+    ...     velocities, masses, forces, cell_velocities, volumes,
+    ...     eta_dots, num_atoms=100, dt=0.001
+    ... )
+
+    Triclinic cell:
+
+    >>> npt_velocity_half_step(
+    ...     velocities, masses, forces, cell_velocities, volumes,
+    ...     eta_dots, num_atoms=100, dt=0.001,
+    ...     cells_inv=cells_inv, mode="triclinic"
+    ... )
+
+    See Also
+    --------
+    npt_barostat_half_step : Cell velocity update step.
+    npt_position_update : Position update step.
+    """
+    if device is None:
+        device = velocities.device
+
+    n_atoms = velocities.shape[0]
+
+    if velocities.dtype == wp.vec3f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    if mode == "isotropic":
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    elif mode == "anisotropic":
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_aniso_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_aniso_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    elif mode == "triclinic":
+        if cells_inv is None:
+            raise ValueError("mode='triclinic' requires cells_inv parameter.")
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_triclinic_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_triclinic_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    else:
+        raise ValueError(
+            f"Unknown mode: '{mode}'. Expected 'isotropic', 'anisotropic', or 'triclinic'."
+        )
+
+
+def npt_velocity_half_step_out(
+    velocities: wp.array,
+    masses: wp.array,
+    forces: wp.array,
+    cell_velocities: wp.array,
+    volumes: wp.array,
+    eta_dots: wp.array,
+    num_atoms: int,
+    dt: float,
+    velocities_out: wp.array = None,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    cells_inv: wp.array = None,
+    mode: str = "isotropic",
+    device: str = None,
+) -> wp.array:
+    """
+    Perform half-step velocity update for NPT (non-mutating).
+
+    Non-mutating version of :func:`npt_velocity_half_step` that returns
+    a new array instead of modifying in-place. Useful for gradient tracking.
+
+    Parameters
+    ----------
+    velocities : wp.array
+        Input velocities (not modified).
+    masses, forces, cell_velocities, volumes, eta_dots : wp.array
+        System state arrays.
+    num_atoms : int
+        Number of atoms.
+    dt : float
+        Time step.
+    velocities_out : wp.array, optional
+        Pre-allocated output array. Created if None.
+    batch_idx : wp.array, optional
+        System indices for batched simulations.
+    num_atoms_per_system : wp.array, optional
+        Atom counts per system.
+    cells_inv : wp.array, optional
+        Inverse cell matrices. Required for triclinic mode.
+    mode : str, optional
+        Pressure control mode: "isotropic", "anisotropic", or "triclinic".
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        Updated velocities (new array).
+    """
+    if device is None:
+        device = velocities.device
+
+    n_atoms = velocities.shape[0]
+
+    if velocities_out is None:
+        velocities_out = wp.zeros(n_atoms, dtype=velocities.dtype, device=device)
+
+    if velocities.dtype == wp.vec3f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    if mode == "isotropic":
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    elif mode == "anisotropic":
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_aniso_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_aniso_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    elif mode == "triclinic":
+        if cells_inv is None:
+            raise ValueError("mode='triclinic' requires cells_inv parameter.")
+        if batch_idx is None:
+            wp.launch(
+                _npt_velocity_half_step_triclinic_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    eta_dots,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _npt_velocity_half_step_triclinic_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    eta_dots,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    else:
+        raise ValueError(f"Unknown mode: '{mode}'.")
+
+    return velocities_out
+
+
+def npt_position_update(
+    positions: wp.array,
+    velocities: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    cells_inv: wp.array = None,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> None:
+    """
+    Update positions for NPT integration.
+
+    Parameters
+    ----------
+    positions : wp.array
+        Particle positions. MODIFIED in-place.
+    velocities : wp.array
+        Particle velocities.
+    cells : wp.array
+        Cell matrices.
+    cell_velocities : wp.array
+        Cell velocity matrices.
+    dt : float
+        Time step.
+    cells_inv : wp.array, optional
+        Pre-computed cell inverses.
+    batch_idx : wp.array, optional
+        System index for each atom.
+    device : str, optional
+        Warp device.
+    """
+    if device is None:
+        device = positions.device
+
+    num_atoms = positions.shape[0]
+
+    if cells_inv is None:
+        cells_inv = compute_cell_inverse(cells, device=device)
+
+    if positions.dtype == wp.vec3f:
+        dt_typed = wp.float32(dt)
+    else:
+        dt_typed = wp.float64(dt)
+
+    if batch_idx is None:
+        wp.launch(
+            _position_update_single_kernel,
+            dim=num_atoms,
+            inputs=[positions, velocities, cells, cells_inv, cell_velocities, dt_typed],
+            device=device,
+        )
+    else:
+        wp.launch(
+            _position_update_kernel,
+            dim=num_atoms,
+            inputs=[
+                positions,
+                velocities,
+                batch_idx,
+                cells,
+                cells_inv,
+                cell_velocities,
+                dt_typed,
+            ],
+            device=device,
+        )
+
+
+def npt_position_update_out(
+    positions: wp.array,
+    velocities: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    positions_out: wp.array = None,
+    cells_inv: wp.array = None,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Update positions for NPT integration (non-mutating).
+
+    Returns
+    -------
+    wp.array
+        Updated positions.
+    """
+    if device is None:
+        device = positions.device
+
+    num_atoms = positions.shape[0]
+
+    if positions_out is None:
+        positions_out = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
+
+    if cells_inv is None:
+        cells_inv = compute_cell_inverse(cells, device=device)
+
+    if positions.dtype == wp.vec3f:
+        dt_typed = wp.float32(dt)
+    else:
+        dt_typed = wp.float64(dt)
+
+    if batch_idx is None:
+        wp.launch(
+            _position_update_out_single_kernel,
+            dim=num_atoms,
+            inputs=[
+                positions,
+                velocities,
+                cells,
+                cells_inv,
+                cell_velocities,
+                dt_typed,
+                positions_out,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            _position_update_out_kernel,
+            dim=num_atoms,
+            inputs=[
+                positions,
+                velocities,
+                batch_idx,
+                cells,
+                cells_inv,
+                cell_velocities,
+                dt_typed,
+                positions_out,
+            ],
+            device=device,
+        )
+
+    return positions_out
+
+
+def npt_cell_update(
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """
+    Update cell matrices: h_new = h + dt * ḣ.
+
+    Parameters
+    ----------
+    cells : wp.array
+        Cell matrices. MODIFIED in-place.
+    cell_velocities : wp.array
+        Cell velocity matrices.
+    dt : float
+        Time step.
+    device : str, optional
+        Warp device.
+    """
+    if device is None:
+        device = cells.device
+
+    num_systems = cells.shape[0]
+
+    if cells.dtype == wp.mat33f:
+        dt_typed = wp.float32(dt)
+    else:
+        dt_typed = wp.float64(dt)
+
+    wp.launch(
+        _cell_update_kernel,
+        dim=num_systems,
+        inputs=[cells, cell_velocities, dt_typed],
+        device=device,
+    )
+
+
+def npt_cell_update_out(
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    cells_out: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Update cell matrices (non-mutating).
+
+    Returns
+    -------
+    wp.array
+        Updated cell matrices.
+    """
+    if device is None:
+        device = cells.device
+
+    num_systems = cells.shape[0]
+
+    if cells_out is None:
+        cells_out = wp.zeros(num_systems, dtype=cells.dtype, device=device)
+
+    if cells.dtype == wp.mat33f:
+        dt_typed = wp.float32(dt)
+    else:
+        dt_typed = wp.float64(dt)
+
+    wp.launch(
+        _cell_update_out_kernel,
+        dim=num_systems,
+        inputs=[cells, cell_velocities, dt_typed, cells_out],
+        device=device,
+    )
+
+    return cells_out
+
+
+def run_npt_step(
+    positions: wp.array,
+    velocities: wp.array,
+    forces: wp.array,
+    masses: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    virial_tensors: wp.array,
+    eta: wp.array,
+    eta_dot: wp.array,
+    thermostat_masses: wp.array,
+    cell_masses: wp.array,
+    target_temperature: wp.array,
+    target_pressure: wp.array,
+    num_atoms: int,
+    chain_length: int,
+    dt: float,
+    compute_forces_fn=None,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    device: str = None,
+) -> None:
+    """
+    Perform a complete NPT integration step.
+
+    Integration order:
+    1. Thermostat half-step
+    2. Barostat half-step
+    3. Velocity half-step
+    4. Position update
+    5. Cell update
+    6. Recompute forces
+    7. Velocity half-step
+    8. Barostat half-step
+    9. Thermostat half-step
+
+    Parameters
+    ----------
+    positions, velocities, forces : wp.array
+        Particle state arrays. MODIFIED in-place.
+    masses : wp.array
+        Particle masses.
+    cells : wp.array
+        Cell matrices. MODIFIED in-place.
+    cell_velocities : wp.array
+        Cell velocity matrices. MODIFIED in-place.
+    virial_tensors : wp.array(dtype=vec9f or vec9d)
+        Virial tensor. Updated by compute_forces_fn.
+    eta, eta_dot : wp.array2d
+        Thermostat state. MODIFIED in-place.
+    thermostat_masses : wp.array2d
+        Thermostat masses.
+    cell_masses : wp.array
+        Barostat masses.
+    target_temperature, target_pressure : wp.array
+        Target conditions.
+    num_atoms : int
+        Total number of atoms.
+    chain_length : int
+        Number of thermostats in chain.
+    dt : float
+        Time step.
+    compute_forces_fn : callable, optional
+        Force computation function.
+    batch_idx : wp.array, optional
+        System index for each atom.
+    num_atoms_per_system : wp.array, optional
+        Number of atoms per system.
+    device : str, optional
+        Warp device.
+    """
+    if device is None:
+        device = positions.device
+
+    num_systems = cells.shape[0]
+
+    if masses.dtype == wp.float32:
+        tensor_dtype = vec9f
+    else:
+        tensor_dtype = vec9d
+
+    volumes = compute_cell_volume(cells, device=device)
+
+    from ..utils.thermostat_utils import compute_kinetic_energy
+
+    kinetic_energy = compute_kinetic_energy(
+        velocities, masses, batch_idx=batch_idx, device=device
+    )
+
+    pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
+    pressure_tensors = compute_pressure_tensor(
+        velocities,
+        masses,
+        virial_tensors,
+        cells,
+        pressure_tensors=pressure_tensors,
+        batch_idx=batch_idx,
+        volumes=volumes,
+        device=device,
+    )
+
+    if batch_idx is None:
+        num_atoms_per_system_local = wp.array(
+            [num_atoms], dtype=wp.int32, device=device
+        )
+    else:
+        num_atoms_per_system_local = num_atoms_per_system
+
+    # 1. Thermostat half-step
+    npt_thermostat_half_step(
+        eta,
+        eta_dot,
+        kinetic_energy,
+        target_temperature,
+        thermostat_masses,
+        num_atoms_per_system_local,
+        chain_length,
+        dt * 0.5,
+        device=device,
+    )
+
+    # 2. Barostat half-step
+    npt_barostat_half_step(
+        cell_velocities,
+        pressure_tensors,
+        target_pressure,
+        volumes,
+        cell_masses,
+        kinetic_energy,
+        num_atoms_per_system_local,
+        eta_dot,
+        dt,
+        device=device,
+    )
+
+    # 3. Velocity half-step
+    npt_velocity_half_step(
+        velocities,
+        masses,
+        forces,
+        cell_velocities,
+        volumes,
+        eta_dot,
+        num_atoms,
+        dt,
+        batch_idx=batch_idx,
+        num_atoms_per_system=num_atoms_per_system,
+        device=device,
+    )
+
+    # 4. Position update
+    cells_inv = compute_cell_inverse(cells, device=device)
+    npt_position_update(
+        positions,
+        velocities,
+        cells,
+        cell_velocities,
+        dt,
+        cells_inv=cells_inv,
+        batch_idx=batch_idx,
+        device=device,
+    )
+
+    # 5. Cell update
+    npt_cell_update(cells, cell_velocities, dt, device=device)
+
+    # 6. Recompute forces
+    if compute_forces_fn is not None:
+        compute_forces_fn(positions, cells, forces, virial_tensors)
+
+    # Recompute pressure and volumes
+    volumes = compute_cell_volume(cells, device=device)
+    kinetic_energy = compute_kinetic_energy(
+        velocities, masses, batch_idx=batch_idx, device=device
+    )
+    pressure_tensors = compute_pressure_tensor(
+        velocities,
+        masses,
+        virial_tensors,
+        cells,
+        pressure_tensors=pressure_tensors,
+        batch_idx=batch_idx,
+        volumes=volumes,
+        device=device,
+    )
+
+    # 7. Velocity half-step
+    npt_velocity_half_step(
+        velocities,
+        masses,
+        forces,
+        cell_velocities,
+        volumes,
+        eta_dot,
+        num_atoms,
+        dt,
+        batch_idx=batch_idx,
+        num_atoms_per_system=num_atoms_per_system,
+        device=device,
+    )
+
+    # 8. Barostat half-step
+    npt_barostat_half_step(
+        cell_velocities,
+        pressure_tensors,
+        target_pressure,
+        volumes,
+        cell_masses,
+        kinetic_energy,
+        num_atoms_per_system_local,
+        eta_dot,
+        dt,
+        device=device,
+    )
+
+    # 9. Thermostat half-step
+    npt_thermostat_half_step(
+        eta,
+        eta_dot,
+        kinetic_energy,
+        target_temperature,
+        thermostat_masses,
+        num_atoms_per_system_local,
+        chain_length,
+        dt * 0.5,
+        device=device,
+    )
+
+
+# ==============================================================================
+# Functional Interfaces - NPH Integration
+# ==============================================================================
+
+
+def nph_barostat_half_step(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """
+    Perform barostat half-step for NPH ensemble (no thermostat coupling).
+
+    NPH (isenthalpic-isobaric) simulations maintain constant pressure and
+    enthalpy. Unlike NPT, there is no thermostat - the temperature evolves
+    naturally on the constant-enthalpy surface.
+
+    This function updates the cell velocity matrix ḣ based on the pressure
+    difference. The pressure control mode is automatically detected from
+    the ``target_pressures`` array dtype:
+
+    - **Isotropic** (scalar dtype): Uniform scaling in all directions
+    - **Anisotropic/Orthorhombic** (vec3 dtype): Independent x, y, z control
+    - **Triclinic** (vec9 dtype): Full stress tensor control
+
+    Mathematical Formulation
+    ------------------------
+    The cell velocity follows the MTK equations without thermostat:
+
+    **Isotropic mode:**
+
+    .. math::
+
+        \\ddot{h} = \\frac{V}{W}(P - P_{ext})
+
+    **Anisotropic mode:**
+
+    .. math::
+
+        \\ddot{h}_{ii} = \\frac{V}{W}(P_{ii} - P_{ext,ii})
+
+    **Triclinic mode:**
+
+    .. math::
+
+        \\ddot{h}_{ij} = \\frac{V}{W}(P_{ij} - P_{ext,ij})
+
+    Parameters
+    ----------
+    cell_velocities : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell velocity matrices ḣ. Shape (B,). **MODIFIED in-place.**
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Current pressure tensors from virial. Shape (B,).
+    target_pressures : wp.array
+        External/target pressure(s). The dtype determines the mode:
+
+        - ``wp.float32`` or ``wp.float64``: Isotropic. Shape (B,).
+        - ``wp.vec3f`` or ``wp.vec3d``: Anisotropic [Pxx, Pyy, Pzz]. Shape (B,).
+        - ``vec9f`` or ``vec9d``: Full stress tensor. Shape (B,).
+
+    volumes : wp.array(dtype=scalar)
+        Cell volumes V. Shape (B,).
+    cell_masses : wp.array(dtype=scalar)
+        Barostat masses W. Shape (B,).
+    kinetic_energy : wp.array(dtype=scalar)
+        System kinetic energies. Shape (B,).
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Number of atoms per system. Shape (B,).
+    dt : float
+        Integration time step.
+    device : str, optional
+        Warp device.
+
+    Examples
+    --------
+    Isotropic NPH:
+
+    >>> target_P = wp.array([1.0], dtype=wp.float32, device="cuda:0")
+    >>> nph_barostat_half_step(
+    ...     cell_velocities, pressure_tensors, target_P,
+    ...     volumes, cell_masses, kinetic_energy,
+    ...     num_atoms_per_system, dt=0.001
+    ... )
+
+    Anisotropic NPH:
+
+    >>> target_P = wp.array([[1.0, 2.0, 1.5]], dtype=wp.vec3f, device="cuda:0")
+    >>> nph_barostat_half_step(
+    ...     cell_velocities, pressure_tensors, target_P, ...
+    ... )
+
+    See Also
+    --------
+    npt_barostat_half_step : Barostat with thermostat coupling.
+    run_nph_step : Complete NPH integration step.
+    """
+    if device is None:
+        device = cell_velocities.device
+
+    num_systems = cell_velocities.shape[0]
+
+    if cell_velocities.dtype == wp.mat33f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    # Dispatch based on target_pressures dtype
+    tp_dtype = target_pressures.dtype
+    if tp_dtype in (wp.float32, wp.float64):
+        # Isotropic
+        wp.launch(
+            _nph_cell_velocity_update_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                dt_half,
+            ],
+            device=device,
+        )
+    elif tp_dtype in (wp.vec3f, wp.vec3d):
+        # Anisotropic
+        wp.launch(
+            _nph_cell_velocity_update_aniso_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                dt_half,
+            ],
+            device=device,
+        )
+    elif tp_dtype in (vec9f, vec9d):
+        # Triclinic
+        wp.launch(
+            _nph_cell_velocity_update_triclinic_kernel,
+            dim=num_systems,
+            inputs=[
+                cell_velocities,
+                pressure_tensors,
+                target_pressures,
+                volumes,
+                cell_masses,
+                kinetic_energy,
+                num_atoms_per_system,
+                dt_half,
+            ],
+            device=device,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported target_pressures dtype: {tp_dtype}. "
+            f"Expected scalar for isotropic, vec3 for anisotropic, vec9 for triclinic."
+        )
+
+
+# Keep separate functions for backwards compatibility
+def nph_barostat_half_step_aniso(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """Anisotropic NPH barostat. See :func:`nph_barostat_half_step` with vec3 target."""
+    if device is None:
+        device = cell_velocities.device
+    num_systems = cell_velocities.shape[0]
+    dt_half = (
+        wp.float32(dt * 0.5)
+        if cell_velocities.dtype == wp.mat33f
+        else wp.float64(dt * 0.5)
+    )
+    wp.launch(
+        _nph_cell_velocity_update_aniso_kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt_half,
+        ],
+        device=device,
+    )
+
+
+def nph_barostat_half_step_triclinic(
+    cell_velocities: wp.array,
+    pressure_tensors: wp.array,
+    target_pressures: wp.array,
+    volumes: wp.array,
+    cell_masses: wp.array,
+    kinetic_energy: wp.array,
+    num_atoms_per_system: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """Triclinic NPH barostat. See :func:`nph_barostat_half_step` with vec9 target."""
+    if device is None:
+        device = cell_velocities.device
+
+    num_systems = cell_velocities.shape[0]
+
+    if cell_velocities.dtype == wp.mat33f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    wp.launch(
+        _nph_cell_velocity_update_triclinic_kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt_half,
+        ],
+        device=device,
+    )
+
+
+def nph_velocity_half_step(
+    velocities: wp.array,
+    masses: wp.array,
+    forces: wp.array,
+    cell_velocities: wp.array,
+    volumes: wp.array,
+    num_atoms: int,
+    dt: float,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    cells_inv: wp.array = None,
+    mode: str = "isotropic",
+    device: str = None,
+) -> None:
+    """
+    Perform half-step velocity update for NPH ensemble (no thermostat).
+
+    Updates particle velocities accounting for:
+    1. Forces from the potential energy surface
+    2. Coupling to barostat (cell velocity / strain rate)
+
+    Unlike NPT, there is no thermostat coupling - the temperature evolves
+    naturally on the constant-enthalpy surface.
+
+    Mathematical Formulation
+    ------------------------
+    The NPH velocity equation of motion:
+
+    .. math::
+
+        \\dot{v}_i = \\frac{F_i}{m_i} - \\gamma \\cdot \\dot{\\varepsilon} \\cdot v_i
+
+    where γ = 1 + 1/N_f is the coupling factor.
+
+    **Isotropic mode**: Uses scalar strain rate ε̇ = Tr(ḣ)/V
+
+    **Anisotropic mode**: Uses diagonal strain rates ε̇_ii = ḣ_ii/V
+
+    **Triclinic mode**: Uses full strain rate tensor ε̇ = ḣ @ h⁻¹
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Particle velocities. **MODIFIED in-place.**
+    masses : wp.array(dtype=scalar)
+        Particle masses.
+    forces : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Forces on particles.
+    cell_velocities : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Cell velocity matrices.
+    volumes : wp.array(dtype=scalar)
+        Cell volumes.
+    num_atoms : int
+        Total number of atoms.
+    dt : float
+        Integration time step.
+    batch_idx : wp.array, optional
+        System index for each atom.
+    num_atoms_per_system : wp.array, optional
+        Number of atoms per system.
+    cells_inv : wp.array, optional
+        Inverse cell matrices. Required for triclinic mode.
+    mode : str, optional
+        Pressure control mode:
+
+        - ``"isotropic"``: Uniform scalar strain rate coupling
+        - ``"anisotropic"``: Diagonal strain rate coupling (orthorhombic)
+        - ``"triclinic"``: Full tensor coupling (requires cells_inv)
+
+    device : str, optional
+        Warp device.
+
+    See Also
+    --------
+    nph_barostat_half_step : Cell velocity update.
+    npt_velocity_half_step : Velocity update with thermostat.
+    """
+    if device is None:
+        device = velocities.device
+
+    n_atoms = velocities.shape[0]
+
+    if velocities.dtype == wp.vec3f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    if mode == "isotropic":
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    elif mode == "anisotropic":
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_aniso_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_aniso_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    elif mode == "triclinic":
+        if cells_inv is None:
+            raise ValueError("mode='triclinic' requires cells_inv parameter.")
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_triclinic_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_triclinic_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                ],
+                device=device,
+            )
+    else:
+        raise ValueError(
+            f"Unknown mode: '{mode}'. Expected 'isotropic', 'anisotropic', or 'triclinic'."
+        )
+
+
+# NOTE: nph_velocity_half_step_aniso removed - use nph_velocity_half_step(mode="anisotropic")
+
+
+def nph_velocity_half_step_out(
+    velocities: wp.array,
+    masses: wp.array,
+    forces: wp.array,
+    cell_velocities: wp.array,
+    volumes: wp.array,
+    num_atoms: int,
+    dt: float,
+    velocities_out: wp.array = None,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    cells_inv: wp.array = None,
+    mode: str = "isotropic",
+    device: str = None,
+) -> wp.array:
+    """
+    Perform half-step velocity update for NPH (non-mutating).
+
+    Non-mutating version of :func:`nph_velocity_half_step`. Useful for
+    gradient tracking through the simulation.
+
+    Parameters
+    ----------
+    velocities : wp.array
+        Input velocities (not modified).
+    masses, forces, cell_velocities, volumes : wp.array
+        System state arrays.
+    num_atoms : int
+        Number of atoms.
+    dt : float
+        Time step.
+    velocities_out : wp.array, optional
+        Pre-allocated output array.
+    batch_idx, num_atoms_per_system : wp.array, optional
+        For batched simulations.
+    cells_inv : wp.array, optional
+        Inverse cell matrices. Required for triclinic mode.
+    mode : str, optional
+        Pressure control mode: "isotropic", "anisotropic", or "triclinic".
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        Updated velocities (new array).
+    """
+    if device is None:
+        device = velocities.device
+
+    n_atoms = velocities.shape[0]
+
+    if velocities_out is None:
+        velocities_out = wp.zeros(n_atoms, dtype=velocities.dtype, device=device)
+
+    if velocities.dtype == wp.vec3f:
+        dt_half = wp.float32(dt * 0.5)
+    else:
+        dt_half = wp.float64(dt * 0.5)
+
+    if mode == "isotropic":
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    elif mode == "anisotropic":
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_aniso_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_aniso_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    elif mode == "triclinic":
+        if cells_inv is None:
+            raise ValueError("mode='triclinic' requires cells_inv parameter.")
+        if batch_idx is None:
+            wp.launch(
+                _nph_velocity_half_step_triclinic_out_single_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    num_atoms,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _nph_velocity_half_step_triclinic_out_kernel,
+                dim=n_atoms,
+                inputs=[
+                    velocities,
+                    masses,
+                    forces,
+                    batch_idx,
+                    cell_velocities,
+                    cells_inv,
+                    volumes,
+                    num_atoms_per_system,
+                    dt_half,
+                    velocities_out,
+                ],
+                device=device,
+            )
+    else:
+        raise ValueError(f"Unknown mode: '{mode}'.")
+
+    return velocities_out
+
+
+def nph_position_update(
+    positions: wp.array,
+    velocities: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    cells_inv: wp.array = None,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> None:
+    """
+    Update positions for NPH integration.
+
+    Uses same kernel as NPT since position update is identical.
+    """
+    npt_position_update(
+        positions,
+        velocities,
+        cells,
+        cell_velocities,
+        dt,
+        cells_inv=cells_inv,
+        batch_idx=batch_idx,
+        device=device,
+    )
+
+
+def nph_position_update_out(
+    positions: wp.array,
+    velocities: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    positions_out: wp.array = None,
+    cells_inv: wp.array = None,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Update positions for NPH integration (non-mutating).
+
+    Returns
+    -------
+    wp.array
+        Updated positions.
+    """
+    return npt_position_update_out(
+        positions,
+        velocities,
+        cells,
+        cell_velocities,
+        dt,
+        positions_out=positions_out,
+        cells_inv=cells_inv,
+        batch_idx=batch_idx,
+        device=device,
+    )
+
+
+def nph_cell_update(
+    cells: wp.array,
+    cell_velocities: wp.array,
+    dt: float,
+    device: str = None,
+) -> None:
+    """
+    Update cell matrices for NPH.
+
+    Uses same kernel as NPT since cell update is identical.
+    """
+    npt_cell_update(cells, cell_velocities, dt, device=device)
+
+
+def run_nph_step(
+    positions: wp.array,
+    velocities: wp.array,
+    forces: wp.array,
+    masses: wp.array,
+    cells: wp.array,
+    cell_velocities: wp.array,
+    virial_tensors: wp.array,
+    cell_masses: wp.array,
+    target_pressure: wp.array,
+    num_atoms: int,
+    dt: float,
+    compute_forces_fn=None,
+    batch_idx: wp.array = None,
+    num_atoms_per_system: wp.array = None,
+    device: str = None,
+) -> None:
+    """
+    Perform a complete NPH integration step.
+
+    Integration order (no thermostat):
+    1. Barostat half-step
+    2. Velocity half-step
+    3. Position update
+    4. Cell update
+    5. Recompute forces
+    6. Velocity half-step
+    7. Barostat half-step
+
+    Parameters
+    ----------
+    positions, velocities, forces : wp.array
+        Particle state arrays. MODIFIED in-place.
+    masses : wp.array
+        Particle masses.
+    cells : wp.array
+        Cell matrices. MODIFIED in-place.
+    cell_velocities : wp.array
+        Cell velocity matrices. MODIFIED in-place.
+    virial_tensors : wp.array(dtype=vec9f or vec9d)
+        Virial tensor. Updated by compute_forces_fn.
+    cell_masses : wp.array
+        Barostat masses.
+    target_pressure : wp.array
+        Target/external pressures.
+    num_atoms : int
+        Total number of atoms.
+    dt : float
+        Time step.
+    compute_forces_fn : callable, optional
+        Force computation function.
+    batch_idx : wp.array, optional
+        System index for each atom.
+    num_atoms_per_system : wp.array, optional
+        Number of atoms per system.
+    device : str, optional
+        Warp device.
+    """
+    if device is None:
+        device = positions.device
+
+    num_systems = cells.shape[0]
+
+    if masses.dtype == wp.float32:
+        tensor_dtype = vec9f
+    else:
+        tensor_dtype = vec9d
+
+    volumes = compute_cell_volume(cells, device=device)
+
+    from ..utils.thermostat_utils import compute_kinetic_energy
+
+    kinetic_energy = compute_kinetic_energy(
+        velocities, masses, batch_idx=batch_idx, device=device
+    )
+
+    pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
+    pressure_tensors = compute_pressure_tensor(
+        velocities,
+        masses,
+        virial_tensors,
+        cells,
+        pressure_tensors=pressure_tensors,
+        batch_idx=batch_idx,
+        volumes=volumes,
+        device=device,
+    )
+
+    if batch_idx is None:
+        num_atoms_per_system_local = wp.array(
+            [num_atoms], dtype=wp.int32, device=device
+        )
+    else:
+        num_atoms_per_system_local = num_atoms_per_system
+
+    # 1. Barostat half-step
+    nph_barostat_half_step(
+        cell_velocities,
+        pressure_tensors,
+        target_pressure,
+        volumes,
+        cell_masses,
+        kinetic_energy,
+        num_atoms_per_system_local,
+        dt,
+        device=device,
+    )
+
+    # 2. Velocity half-step
+    nph_velocity_half_step(
+        velocities,
+        masses,
+        forces,
+        cell_velocities,
+        volumes,
+        num_atoms,
+        dt,
+        batch_idx=batch_idx,
+        num_atoms_per_system=num_atoms_per_system,
+        device=device,
+    )
+
+    # 3. Position update
+    cells_inv = compute_cell_inverse(cells, device=device)
+    nph_position_update(
+        positions,
+        velocities,
+        cells,
+        cell_velocities,
+        dt,
+        cells_inv=cells_inv,
+        batch_idx=batch_idx,
+        device=device,
+    )
+
+    # 4. Cell update
+    nph_cell_update(cells, cell_velocities, dt, device=device)
+
+    # 5. Recompute forces
+    if compute_forces_fn is not None:
+        compute_forces_fn(positions, cells, forces, virial_tensors)
+
+    # Recompute pressure and volumes
+    volumes = compute_cell_volume(cells, device=device)
+    kinetic_energy = compute_kinetic_energy(
+        velocities, masses, batch_idx=batch_idx, device=device
+    )
+    pressure_tensors = compute_pressure_tensor(
+        velocities,
+        masses,
+        virial_tensors,
+        cells,
+        pressure_tensors=pressure_tensors,
+        batch_idx=batch_idx,
+        volumes=volumes,
+        device=device,
+    )
+
+    # 6. Velocity half-step
+    nph_velocity_half_step(
+        velocities,
+        masses,
+        forces,
+        cell_velocities,
+        volumes,
+        num_atoms,
+        dt,
+        batch_idx=batch_idx,
+        num_atoms_per_system=num_atoms_per_system,
+        device=device,
+    )
+
+    # 7. Barostat half-step
+    nph_barostat_half_step(
+        cell_velocities,
+        pressure_tensors,
+        target_pressure,
+        volumes,
+        cell_masses,
+        kinetic_energy,
+        num_atoms_per_system_local,
+        dt,
+        device=device,
+    )
