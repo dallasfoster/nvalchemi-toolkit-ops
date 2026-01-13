@@ -27,20 +27,19 @@ Tests cover:
 - Float32 and float64 support
 """
 
-import pytest
 import numpy as np
+import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.optimizers import (
     fire_compute_diagnostics,
-    fire_velocity_mix,
     fire_md_step,
-    fire_reset_velocities,
-    fire_velocity_mix_out,
     fire_md_step_out,
+    fire_reset_velocities,
     fire_reset_velocities_out,
+    fire_velocity_mix,
+    fire_velocity_mix_out,
 )
-
 
 # ==============================================================================
 # Test Configuration
@@ -103,7 +102,7 @@ def compute_harmonic_forces(positions: wp.array, forces: wp.array, k: float):
 
 def compute_harmonic_energy(positions: np.ndarray, k: float) -> float:
     """Compute harmonic potential energy E = 0.5 * k * |r|^2."""
-    r_sq = np.sum(positions ** 2)
+    r_sq = np.sum(positions**2)
     return 0.5 * k * r_sq
 
 
@@ -120,7 +119,7 @@ def compute_morse_forces_and_energy(
     forces = np.zeros_like(positions)
     r_vec = positions[1] - positions[0]
     r = np.linalg.norm(r_vec)
-    
+
     if r > 1e-10:
         r_hat = r_vec / r
         exp_term = np.exp(-a * (r - r_e))
@@ -130,7 +129,7 @@ def compute_morse_forces_and_energy(
         energy = D_e * (1 - exp_term) ** 2
     else:
         energy = 0.0
-    
+
     return forces, float(energy)
 
 
@@ -159,37 +158,53 @@ def run_fire_optimization(
 ):
     """Run FIRE optimization loop."""
     num_atoms = positions.shape[0]
-    
+
     compute_forces_fn()
-    
+
     for step in range(max_steps):
         power, force_norm_sq, velocity_norm_sq = fire_compute_diagnostics(
-            velocities, forces, batch_idx=batch_idx, num_systems=num_systems, device=device
+            velocities,
+            forces,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
         )
-        
+
         wp.synchronize_device(device)
         power_val = power.numpy()[0]
         force_norm_sq_val = force_norm_sq.numpy()[0]
         velocity_norm_sq_val = velocity_norm_sq.numpy()[0]
         max_force = np.sqrt(force_norm_sq_val / num_atoms)
-        
+
         if max_force < force_tol:
             return step, max_force
-        
+
         # Compute norms for velocity mixing
-        force_norm = wp.array([np.sqrt(force_norm_sq_val)], dtype=dtype_scalar, device=device)
-        velocity_norm = wp.array([np.sqrt(velocity_norm_sq_val)], dtype=dtype_scalar, device=device)
-        
-        fire_velocity_mix(velocities, forces, alpha, force_norm, velocity_norm, batch_idx=batch_idx, device=device)
-        
+        force_norm = wp.array(
+            [np.sqrt(force_norm_sq_val)], dtype=dtype_scalar, device=device
+        )
+        velocity_norm = wp.array(
+            [np.sqrt(velocity_norm_sq_val)], dtype=dtype_scalar, device=device
+        )
+
+        fire_velocity_mix(
+            velocities,
+            forces,
+            alpha,
+            force_norm,
+            velocity_norm,
+            batch_idx=batch_idx,
+            device=device,
+        )
+
         if power_val > 0:
             wp.synchronize_device(device)
             current_n_positive = n_positive.numpy()[0]
             current_dt = dt.numpy()[0]
             current_alpha = alpha.numpy()[0]
-            
+
             n_positive_new = current_n_positive + 1
-            
+
             if n_positive_new > n_min:
                 new_dt = min(current_dt * f_inc, dt_max)
                 new_alpha = current_alpha * f_alpha
@@ -197,24 +212,42 @@ def run_fire_optimization(
                 alpha_np = np.array([new_alpha], dtype=np_dtype)
                 dt = wp.array(dt_np, dtype=dtype_scalar, device=device)
                 alpha = wp.array(alpha_np, dtype=dtype_scalar, device=device)
-            
+
             n_positive = wp.array(
-                np.array([n_positive_new], dtype=np.int32), dtype=wp.int32, device=device
+                np.array([n_positive_new], dtype=np.int32),
+                dtype=wp.int32,
+                device=device,
             )
         else:
             fire_reset_velocities(velocities, batch_idx=batch_idx, device=device)
-            
+
             wp.synchronize_device(device)
             current_dt = dt.numpy()[0]
             new_dt = current_dt * f_dec
-            
-            dt = wp.array(np.array([new_dt], dtype=np_dtype), dtype=dtype_scalar, device=device)
-            alpha = wp.array(np.array([alpha_start], dtype=np_dtype), dtype=dtype_scalar, device=device)
-            n_positive = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-        
-        fire_md_step(positions, velocities, forces, masses, dt, batch_idx=batch_idx, device=device)
+
+            dt = wp.array(
+                np.array([new_dt], dtype=np_dtype), dtype=dtype_scalar, device=device
+            )
+            alpha = wp.array(
+                np.array([alpha_start], dtype=np_dtype),
+                dtype=dtype_scalar,
+                device=device,
+            )
+            n_positive = wp.array(
+                np.array([0], dtype=np.int32), dtype=wp.int32, device=device
+            )
+
+        fire_md_step(
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            batch_idx=batch_idx,
+            device=device,
+        )
         compute_forces_fn()
-    
+
     wp.synchronize_device(device)
     _, force_norm_sq, _ = fire_compute_diagnostics(
         velocities, forces, batch_idx=batch_idx, num_systems=num_systems, device=device
@@ -222,7 +255,7 @@ def run_fire_optimization(
     wp.synchronize_device(device)
     force_norm_sq_val = force_norm_sq.numpy()[0]
     max_force = np.sqrt(force_norm_sq_val / num_atoms)
-    
+
     return max_steps, max_force
 
 
@@ -263,7 +296,9 @@ class TestFIREAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_compute_diagnostics_with_preallocated_arrays(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_compute_diagnostics_with_preallocated_arrays(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test fire_compute_diagnostics with pre-allocated output arrays."""
         num_atoms = 20
 
@@ -284,9 +319,13 @@ class TestFIREAPI:
         velocity_norm_sq = wp.zeros(1, dtype=wp.float64, device=device)
 
         p, fn, vn = fire_compute_diagnostics(
-            velocities, forces, num_systems=1,
-            power=power, force_norm_sq=force_norm_sq, velocity_norm_sq=velocity_norm_sq,
-            device=device
+            velocities,
+            forces,
+            num_systems=1,
+            power=power,
+            force_norm_sq=force_norm_sq,
+            velocity_norm_sq=velocity_norm_sq,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -320,7 +359,9 @@ class TestFIREAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_mix_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_mix_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating velocity mix preserves input."""
         num_atoms = 20
 
@@ -415,7 +456,9 @@ class TestFIREAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_md_step_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_md_step_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that non-mutating fire_md_step_out preserves input."""
         num_atoms = 10
         np.random.seed(42)
@@ -473,7 +516,9 @@ class TestFIREAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_reset_velocities_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_reset_velocities_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating velocity reset preserves input."""
         num_atoms = 20
 
@@ -501,7 +546,9 @@ class TestFIREBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_compute_diagnostics_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_compute_diagnostics_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched fire_compute_diagnostics executes correctly."""
         num_systems = 3
         atoms_per_system = 5
@@ -518,7 +565,7 @@ class TestFIREBatched:
             dtype=dtype_vec,
             device=device,
         )
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
@@ -532,7 +579,7 @@ class TestFIREBatched:
 
         force_norm_sq_np = force_norm_sq.numpy()
         velocity_norm_sq_np = velocity_norm_sq.numpy()
-        
+
         for sys_id in range(num_systems):
             assert force_norm_sq_np[sys_id] > 0.0
             assert velocity_norm_sq_np[sys_id] > 0.0
@@ -559,14 +606,16 @@ class TestFIREBatched:
         alpha = wp.array([0.1, 0.2, 0.3], dtype=dtype_scalar, device=device)
         force_norm = wp.array([1.0, 1.0, 1.0], dtype=dtype_scalar, device=device)
         velocity_norm = wp.array([1.0, 1.0, 1.0], dtype=dtype_scalar, device=device)
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
             device=device,
         )
 
-        fire_velocity_mix(velocities, forces, alpha, force_norm, velocity_norm, batch_idx=batch_idx)
+        fire_velocity_mix(
+            velocities, forces, alpha, force_norm, velocity_norm, batch_idx=batch_idx
+        )
         wp.synchronize_device(device)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -595,8 +644,13 @@ class TestFIREBatched:
         velocity_norm = wp.array([1.0, 1.0], dtype=dtype_scalar, device=device)
 
         vel_out = fire_velocity_mix_out(
-            velocities, forces, alpha, force_norm, velocity_norm,
-            batch_idx=batch_idx, device=device
+            velocities,
+            forces,
+            alpha,
+            force_norm,
+            velocity_norm,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert vel_out.shape[0] == num_atoms
@@ -631,7 +685,7 @@ class TestFIREBatched:
             device=device,
         )
         dt = wp.array([0.01, 0.02, 0.03], dtype=dtype_scalar, device=device)
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
@@ -675,8 +729,13 @@ class TestFIREBatched:
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
         pos_out, vel_out = fire_md_step_out(
-            positions, velocities, forces, masses, dt,
-            batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert pos_out.shape[0] == num_atoms
@@ -684,10 +743,10 @@ class TestFIREBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_uses_per_system_dt(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_uses_per_system_dt(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched version uses per-system timesteps correctly."""
-        num_systems = 2
-        
         pos = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype)
         vel = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np_dtype)
         force = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype)
@@ -706,9 +765,11 @@ class TestFIREBatched:
 
         result_pos = positions.numpy()
         result_vel = velocities.numpy()
-        
-        assert result_vel[1, 0] > result_vel[0, 0], "System with larger dt should have higher velocity"
-        
+
+        assert result_vel[1, 0] > result_vel[0, 0], (
+            "System with larger dt should have higher velocity"
+        )
+
         displacement_0 = result_pos[0, 0] - 1.0
         displacement_1 = result_pos[1, 0] - 1.0
         assert displacement_1 > displacement_0
@@ -730,14 +791,18 @@ class TestFIREBatched:
             device=device,
         )
 
-        fire_reset_velocities(velocities, batch_idx=batch_idx, num_systems=2, device=device)
+        fire_reset_velocities(
+            velocities, batch_idx=batch_idx, num_systems=2, device=device
+        )
 
         vel_np = velocities.numpy()
         assert np.allclose(vel_np, 0.0)
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_reset_velocities_out(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_reset_velocities_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating velocity reset for batched systems."""
         num_atoms = 40
 
@@ -760,7 +825,9 @@ class TestFIREBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_independent_convergence(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_independent_convergence(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched systems converge independently."""
         num_systems = 2
         atoms_per_system = 5
@@ -768,48 +835,61 @@ class TestFIREBatched:
         spring_k = 1.0
 
         np.random.seed(42)
-        
+
         pos_sys0 = np.random.randn(atoms_per_system, 3).astype(np_dtype) * 0.5
         pos_sys1 = np.random.randn(atoms_per_system, 3).astype(np_dtype) * 3.0
         initial_pos = np.vstack([pos_sys0, pos_sys1])
-        
+
         positions = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
         velocities = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
         forces = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
-        masses = wp.array(np.ones(total_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device)
-        
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
         dt = wp.array([0.01, 0.01], dtype=dtype_scalar, device=device)
         alpha = wp.array([0.1, 0.1], dtype=dtype_scalar, device=device)
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
             device=device,
         )
-        
+
         def compute_forces():
             compute_harmonic_forces(positions, forces, spring_k)
-        
+
         compute_forces()
-        
+
         for step in range(500):
             power, force_norm_sq, velocity_norm_sq = fire_compute_diagnostics(
                 velocities, forces, batch_idx=batch_idx, num_systems=num_systems
             )
             wp.synchronize_device(device)
-            
+
             force_norm_np = np.sqrt(force_norm_sq.numpy())
             velocity_norm_np = np.sqrt(velocity_norm_sq.numpy())
-            force_norm = wp.array(force_norm_np.astype(np_dtype), dtype=dtype_scalar, device=device)
-            velocity_norm = wp.array(velocity_norm_np.astype(np_dtype), dtype=dtype_scalar, device=device)
-            
-            fire_velocity_mix(velocities, forces, alpha, force_norm, velocity_norm, batch_idx=batch_idx)
+            force_norm = wp.array(
+                force_norm_np.astype(np_dtype), dtype=dtype_scalar, device=device
+            )
+            velocity_norm = wp.array(
+                velocity_norm_np.astype(np_dtype), dtype=dtype_scalar, device=device
+            )
+
+            fire_velocity_mix(
+                velocities,
+                forces,
+                alpha,
+                force_norm,
+                velocity_norm,
+                batch_idx=batch_idx,
+            )
             fire_md_step(positions, velocities, forces, masses, dt, batch_idx=batch_idx)
             compute_forces()
-        
+
         wp.synchronize_device(device)
         final_pos = positions.numpy()
-        
+
         for sys_id in range(num_systems):
             start = sys_id * atoms_per_system
             end = (sys_id + 1) * atoms_per_system
@@ -829,88 +909,120 @@ class TestFIREPhysics:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_harmonic_converges_to_origin(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_harmonic_converges_to_origin(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that FIRE converges to minimum of harmonic potential (origin)."""
         num_atoms = 10
         spring_k = 1.0
         force_tol = 1e-4
 
         np.random.seed(42)
-        
+
         initial_pos = np.random.randn(num_atoms, 3).astype(np_dtype) * 2.0
-        
+
         initial_max_pos = np.max(np.abs(initial_pos))
-        assert initial_max_pos > 0.5, f"Initial positions should be far from origin"
-        
+        assert initial_max_pos > 0.5, "Initial positions should be far from origin"
+
         positions = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
         velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device)
-        
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
         dt = wp.array([0.01], dtype=dtype_scalar, device=device)
         alpha = wp.array([0.1], dtype=dtype_scalar, device=device)
         n_positive = wp.array([0], dtype=wp.int32, device=device)
-        
+
         def compute_forces():
             compute_harmonic_forces(positions, forces, spring_k)
-        
+
         steps, final_force = run_fire_optimization(
-            positions, velocities, forces, masses, dt, alpha, n_positive,
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            alpha,
+            n_positive,
             compute_forces,
-            max_steps=2000, force_tol=force_tol, device=device,
-            dtype_scalar=dtype_scalar, np_dtype=np_dtype,
+            max_steps=2000,
+            force_tol=force_tol,
+            device=device,
+            dtype_scalar=dtype_scalar,
+            np_dtype=np_dtype,
         )
-        
+
         wp.synchronize_device(device)
         final_pos = positions.numpy()
-        
+
         max_displacement = np.max(np.abs(final_pos))
-        assert max_displacement < 0.01, f"Should converge to origin, max displacement: {max_displacement}"
+        assert max_displacement < 0.01, (
+            f"Should converge to origin, max displacement: {max_displacement}"
+        )
         assert steps < 2000, f"Should converge within max steps, took {steps}"
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_energy_decreases_during_optimization(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_energy_decreases_during_optimization(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that potential energy decreases during FIRE optimization."""
         num_atoms = 20
         spring_k = 1.0
 
         np.random.seed(42)
-        
+
         initial_pos = np.random.randn(num_atoms, 3).astype(np_dtype) * 2.0
-        
+
         positions = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
         velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device)
-        
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
         dt = wp.array([0.01], dtype=dtype_scalar, device=device)
         alpha = wp.array([0.1], dtype=dtype_scalar, device=device)
         n_positive = wp.array([0], dtype=wp.int32, device=device)
-        
+
         initial_energy = compute_harmonic_energy(initial_pos, spring_k)
-        assert initial_energy > 1.0, f"Initial energy should be significant: {initial_energy}"
-        
+        assert initial_energy > 1.0, (
+            f"Initial energy should be significant: {initial_energy}"
+        )
+
         def compute_forces():
             compute_harmonic_forces(positions, forces, spring_k)
-        
+
         run_fire_optimization(
-            positions, velocities, forces, masses, dt, alpha, n_positive,
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            alpha,
+            n_positive,
             compute_forces,
-            max_steps=500, force_tol=1e-4, device=device,
-            dtype_scalar=dtype_scalar, np_dtype=np_dtype,
+            max_steps=500,
+            force_tol=1e-4,
+            device=device,
+            dtype_scalar=dtype_scalar,
+            np_dtype=np_dtype,
         )
-        
+
         wp.synchronize_device(device)
         final_pos = positions.numpy()
         final_energy = compute_harmonic_energy(final_pos, spring_k)
-        
+
         assert final_energy < initial_energy, (
             f"Energy should decrease: {initial_energy} -> {final_energy}"
         )
-        
+
         energy_reduction = (initial_energy - final_energy) / initial_energy
-        assert energy_reduction > 0.99, f"Energy should decrease substantially: {energy_reduction}"
+        assert energy_reduction > 0.99, (
+            f"Energy should decrease substantially: {energy_reduction}"
+        )
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
@@ -921,39 +1033,56 @@ class TestFIREPhysics:
         force_tol = 1e-4
 
         np.random.seed(42)
-        
+
         initial_pos = np.random.randn(num_atoms, 3).astype(np_dtype) * 2.0
-        
+
         positions = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
         velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device)
-        
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
         dt = wp.array([0.01], dtype=dtype_scalar, device=device)
         alpha = wp.array([0.1], dtype=dtype_scalar, device=device)
         n_positive = wp.array([0], dtype=wp.int32, device=device)
-        
+
         compute_harmonic_forces(positions, forces, spring_k)
         wp.synchronize_device(device)
         initial_forces = forces.numpy()
         initial_max_force = compute_max_force(initial_forces)
-        
-        assert initial_max_force > 0.1, f"Initial forces should be significant: {initial_max_force}"
-        
+
+        assert initial_max_force > 0.1, (
+            f"Initial forces should be significant: {initial_max_force}"
+        )
+
         def compute_forces():
             compute_harmonic_forces(positions, forces, spring_k)
-        
+
         steps, final_max_force = run_fire_optimization(
-            positions, velocities, forces, masses, dt, alpha, n_positive,
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            alpha,
+            n_positive,
             compute_forces,
-            max_steps=2000, force_tol=force_tol, device=device,
-            dtype_scalar=dtype_scalar, np_dtype=np_dtype,
+            max_steps=2000,
+            force_tol=force_tol,
+            device=device,
+            dtype_scalar=dtype_scalar,
+            np_dtype=np_dtype,
         )
-        
-        assert final_max_force < force_tol * 10, f"Final max force should be small: {final_max_force}"
-        
+
+        assert final_max_force < force_tol * 10, (
+            f"Final max force should be small: {final_max_force}"
+        )
+
         force_reduction = initial_max_force / max(final_max_force, 1e-10)
-        assert force_reduction > 1000, f"Forces should decrease by > 1000x: {force_reduction}"
+        assert force_reduction > 1000, (
+            f"Forces should decrease by > 1000x: {force_reduction}"
+        )
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_morse_dimer_optimization(self, device):
@@ -961,84 +1090,109 @@ class TestFIREPhysics:
         D_e = 1.0
         a = 2.0
         r_e = 1.5
-        
+
         num_atoms = 2
         force_tol = 1e-4
-        
+
         initial_r = 2.5
-        initial_pos = np.array([
-            [0.0, 0.0, 0.0],
-            [initial_r, 0.0, 0.0],
-        ], dtype=np.float32)
-        
+        initial_pos = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [initial_r, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
         masses_np = np.array([1.0, 1.0], dtype=np.float32)
-        
+
         positions = wp.array(initial_pos.copy(), dtype=wp.vec3f, device=device)
         velocities = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
         forces = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
         masses = wp.array(masses_np, dtype=wp.float32, device=device)
-        
+
         dt = wp.array([0.01], dtype=wp.float32, device=device)
         alpha = wp.array([0.1], dtype=wp.float32, device=device)
         n_positive = wp.array([0], dtype=wp.int32, device=device)
-        
+
         def compute_morse():
             wp.synchronize_device(device)
             pos_np = positions.numpy()
             forces_np, _ = compute_morse_forces_and_energy(pos_np, D_e, a, r_e)
-            forces_wp = wp.array(forces_np.astype(np.float32), dtype=wp.vec3f, device=device)
+            forces_wp = wp.array(
+                forces_np.astype(np.float32), dtype=wp.vec3f, device=device
+            )
             wp.copy(forces, forces_wp)
-        
+
         compute_morse()
         wp.synchronize_device(device)
         initial_forces = forces.numpy()
         initial_max_force = compute_max_force(initial_forces)
-        
-        assert initial_max_force > 0.1, f"Initial forces should be significant: {initial_max_force}"
-        
-        steps, final_max_force = run_fire_optimization(
-            positions, velocities, forces, masses, dt, alpha, n_positive,
-            compute_morse,
-            max_steps=2000, force_tol=force_tol, device=device,
+
+        assert initial_max_force > 0.1, (
+            f"Initial forces should be significant: {initial_max_force}"
         )
-        
+
+        steps, final_max_force = run_fire_optimization(
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            alpha,
+            n_positive,
+            compute_morse,
+            max_steps=2000,
+            force_tol=force_tol,
+            device=device,
+        )
+
         wp.synchronize_device(device)
         final_pos = positions.numpy()
         final_r = np.linalg.norm(final_pos[1] - final_pos[0])
-        
-        np.testing.assert_allclose(final_r, r_e, rtol=0.01, 
-            err_msg=f"Bond length {final_r} should converge to r_e={r_e}")
-        
-        assert final_max_force < force_tol * 10, f"Final max force should be small: {final_max_force}"
+
+        np.testing.assert_allclose(
+            final_r,
+            r_e,
+            rtol=0.01,
+            err_msg=f"Bond length {final_r} should converge to r_e={r_e}",
+        )
+
+        assert final_max_force < force_tol * 10, (
+            f"Final max force should be small: {final_max_force}"
+        )
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_power_calculation_positive(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_power_calculation_positive(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test power calculation when v·F > 0 (moving downhill)."""
         velocities = wp.array([[1.0, 0.0, 0.0]], dtype=dtype_vec, device=device)
         forces = wp.array([[2.0, 0.0, 0.0]], dtype=dtype_vec, device=device)
-        
+
         power, force_norm_sq, velocity_norm_sq = fire_compute_diagnostics(
             velocities, forces, device=device
         )
         wp.synchronize_device(device)
-        
+
         power_val = power.numpy()[0]
         assert power_val > 0, f"Power should be positive: {power_val}"
         np.testing.assert_allclose(power_val, 2.0, rtol=1e-5)
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_power_calculation_negative(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_power_calculation_negative(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test power calculation when v·F < 0 (moving uphill)."""
         velocities = wp.array([[1.0, 0.0, 0.0]], dtype=dtype_vec, device=device)
         forces = wp.array([[-2.0, 0.0, 0.0]], dtype=dtype_vec, device=device)
-        
+
         power, force_norm_sq, velocity_norm_sq = fire_compute_diagnostics(
             velocities, forces, device=device
         )
         wp.synchronize_device(device)
-        
+
         power_val = power.numpy()[0]
         assert power_val < 0, f"Power should be negative: {power_val}"
         np.testing.assert_allclose(power_val, -2.0, rtol=1e-5)
@@ -1048,15 +1202,17 @@ class TestFIREPhysics:
     def test_force_norm_calculation(self, device, dtype_vec, dtype_scalar, np_dtype):
         """Test force norm squared calculation."""
         num_atoms = 2
-        
-        forces = wp.array([[3.0, 0.0, 0.0], [0.0, 4.0, 0.0]], dtype=dtype_vec, device=device)
+
+        forces = wp.array(
+            [[3.0, 0.0, 0.0], [0.0, 4.0, 0.0]], dtype=dtype_vec, device=device
+        )
         velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-        
+
         power, force_norm_sq, velocity_norm_sq = fire_compute_diagnostics(
             velocities, forces, device=device
         )
         wp.synchronize_device(device)
-        
+
         expected_force_norm_sq = 25.0
         np.testing.assert_allclose(
             force_norm_sq.numpy()[0], expected_force_norm_sq, rtol=1e-5
@@ -1064,19 +1220,21 @@ class TestFIREPhysics:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_aligns_with_force(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_aligns_with_force(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that velocity_mix aligns velocity toward force direction."""
         velocities = wp.array([[1.0, 0.0, 0.0]], dtype=dtype_vec, device=device)
         forces = wp.array([[0.0, 1.0, 0.0]], dtype=dtype_vec, device=device)
         alpha = wp.array([0.5], dtype=dtype_scalar, device=device)
         force_norm = wp.array([1.0], dtype=dtype_scalar, device=device)
         velocity_norm = wp.array([1.0], dtype=dtype_scalar, device=device)
-        
+
         fire_velocity_mix(velocities, forces, alpha, force_norm, velocity_norm)
         wp.synchronize_device(device)
-        
+
         result = velocities.numpy()[0]
-        
+
         assert result[1] > 0, "Velocity should have component in force direction"
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -1089,10 +1247,10 @@ class TestFIREPhysics:
         alpha = wp.array([0.0], dtype=dtype_scalar, device=device)
         force_norm = wp.array([1.0], dtype=dtype_scalar, device=device)
         velocity_norm = wp.array([1.0], dtype=dtype_scalar, device=device)
-        
+
         fire_velocity_mix(velocities, forces, alpha, force_norm, velocity_norm)
         wp.synchronize_device(device)
-        
+
         result = velocities.numpy()
         np.testing.assert_allclose(result, initial_vel, rtol=1e-5)
 

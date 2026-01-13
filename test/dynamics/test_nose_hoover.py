@@ -24,21 +24,20 @@ Tests cover:
 - Float32 and float64 support
 """
 
-import pytest
 import numpy as np
+import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.integrators import (
-    nhc_thermostat_chain_update,
-    nhc_velocity_half_step,
-    nhc_position_update,
     nhc_compute_chain_energy,
-    nhc_thermostat_chain_update_out,
-    nhc_velocity_half_step_out,
-    nhc_position_update_out,
     nhc_compute_masses,
+    nhc_position_update,
+    nhc_position_update_out,
+    nhc_thermostat_chain_update,
+    nhc_thermostat_chain_update_out,
+    nhc_velocity_half_step,
+    nhc_velocity_half_step_out,
 )
-
 
 # ==============================================================================
 # Test Configuration
@@ -101,13 +100,13 @@ def compute_harmonic_forces(positions: wp.array, forces: wp.array, k: float):
 
 def compute_harmonic_energy(positions: np.ndarray, k: float) -> float:
     """Compute harmonic potential energy E = 0.5 * k * |r|^2."""
-    r_sq = np.sum(positions ** 2)
+    r_sq = np.sum(positions**2)
     return 0.5 * k * r_sq
 
 
 def compute_kinetic_energy_np(velocities: np.ndarray, masses: np.ndarray) -> float:
     """Compute kinetic energy KE = 0.5 * sum(m * v^2)."""
-    v_sq = np.sum(velocities ** 2, axis=1)
+    v_sq = np.sum(velocities**2, axis=1)
     return 0.5 * np.sum(masses * v_sq)
 
 
@@ -136,16 +135,32 @@ def run_nhc_nvt_step(
 ):
     """Run one complete NVT integration step with Nosé-Hoover chain."""
     nhc_thermostat_chain_update(
-        velocities, masses, eta, eta_dot, eta_mass,
-        target_temp, dt, ndof, nloops=nloops, device=device
+        velocities,
+        masses,
+        eta,
+        eta_dot,
+        eta_mass,
+        target_temp,
+        dt,
+        ndof,
+        nloops=nloops,
+        device=device,
     )
     nhc_velocity_half_step(velocities, forces, masses, dt, device=device)
     nhc_position_update(positions, velocities, dt, device=device)
     compute_forces_fn()
     nhc_velocity_half_step(velocities, forces, masses, dt, device=device)
     nhc_thermostat_chain_update(
-        velocities, masses, eta, eta_dot, eta_mass,
-        target_temp, dt, ndof, nloops=nloops, device=device
+        velocities,
+        masses,
+        eta,
+        eta_dot,
+        eta_mass,
+        target_temp,
+        dt,
+        ndof,
+        nloops=nloops,
+        device=device,
     )
 
 
@@ -164,13 +179,13 @@ class TestNHCMassComputation:
         target_temp = 1.0
         tau = 0.1
         chain_length = 3
-        
+
         masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
-        
+
         assert len(masses) == chain_length
         expected_q0 = ndof * target_temp * tau * tau
         np.testing.assert_allclose(masses.numpy()[0], expected_q0, rtol=1e-10)
-        
+
         expected_qk = target_temp * tau * tau
         for k in range(1, chain_length):
             np.testing.assert_allclose(masses.numpy()[k], expected_qk, rtol=1e-10)
@@ -181,9 +196,11 @@ class TestNHCMassComputation:
         ndof = 100
         target_temp = 2.0
         tau = 0.05
-        
+
         for chain_length in [1, 3, 5]:
-            masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+            masses = nhc_compute_masses(
+                ndof, target_temp, tau, chain_length, device=device
+            )
             assert len(masses) == chain_length
 
 
@@ -224,7 +241,9 @@ class TestNHCAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_half_step_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_half_step_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that nhc_velocity_half_step_out preserves input arrays."""
         num_atoms = 10
         np.random.seed(42)
@@ -273,7 +292,9 @@ class TestNHCAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_position_update_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_position_update_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that nhc_position_update_out preserves input arrays."""
         num_atoms = 10
         np.random.seed(42)
@@ -295,7 +316,9 @@ class TestNHCAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_thermostat_chain_update_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_thermostat_chain_update_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that nhc_thermostat_chain_update executes without error."""
         num_atoms = 10
         chain_length = 3
@@ -313,10 +336,12 @@ class TestNHCAPI:
             dtype=dtype_scalar,
             device=device,
         )
-        
+
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
-        
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
+
         eta = wp.zeros(chain_length, dtype=dtype_scalar, device=device)
         eta_dot = wp.zeros(chain_length, dtype=dtype_scalar, device=device)
         eta_mass = wp.array(chain_masses, dtype=dtype_scalar, device=device)
@@ -325,14 +350,23 @@ class TestNHCAPI:
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
         nhc_thermostat_chain_update(
-            velocities, masses, eta, eta_dot, eta_mass,
-            target_temp_arr, dt, ndof_arr, device=device
+            velocities,
+            masses,
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            dt,
+            ndof_arr,
+            device=device,
         )
         wp.synchronize_device(device)
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_thermostat_chain_update_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_thermostat_chain_update_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that nhc_thermostat_chain_update_out preserves input arrays."""
         num_atoms = 10
         chain_length = 3
@@ -347,10 +381,12 @@ class TestNHCAPI:
             dtype=dtype_scalar,
             device=device,
         )
-        
+
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
-        
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
+
         eta_np = np.zeros(chain_length)
         eta_dot_np = np.zeros(chain_length)
         eta = wp.array(eta_np, dtype=dtype_scalar, device=device)
@@ -361,8 +397,15 @@ class TestNHCAPI:
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
         vel_out, eta_out, eta_dot_out = nhc_thermostat_chain_update_out(
-            velocities, masses, eta, eta_dot, eta_mass,
-            target_temp_arr, dt, ndof_arr, device=device
+            velocities,
+            masses,
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            dt,
+            ndof_arr,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -379,8 +422,14 @@ class TestNHCAPI:
         ndof = 297
 
         eta = wp.array(np.zeros(chain_length), dtype=dtype_scalar, device=device)
-        eta_dot = wp.array(np.random.randn(chain_length) * 0.1, dtype=dtype_scalar, device=device)
-        eta_mass = wp.array([ndof * target_temp * 0.01, target_temp * 0.01, target_temp * 0.01], dtype=dtype_scalar, device=device)
+        eta_dot = wp.array(
+            np.random.randn(chain_length) * 0.1, dtype=dtype_scalar, device=device
+        )
+        eta_mass = wp.array(
+            [ndof * target_temp * 0.01, target_temp * 0.01, target_temp * 0.01],
+            dtype=dtype_scalar,
+            device=device,
+        )
         target_temp_arr = wp.array([target_temp], dtype=dtype_scalar, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
@@ -403,7 +452,9 @@ class TestNHCAPI:
         dt_val = 0.01
 
         masses_np = np.ones(num_atoms, dtype=np_dtype)
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype) * 0.1,
@@ -421,8 +472,15 @@ class TestNHCAPI:
 
         # Call without explicit device (should infer from velocities)
         nhc_thermostat_chain_update(
-            velocities, masses, eta, eta_dot, eta_mass,
-            target_temp_arr, dt, ndof_arr, nloops=1
+            velocities,
+            masses,
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            dt,
+            ndof_arr,
+            nloops=1,
         )
 
         wp.synchronize_device(device)
@@ -430,7 +488,9 @@ class TestNHCAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_out_with_preallocated_arrays(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_out_with_preallocated_arrays(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test _out functions with pre-allocated output arrays."""
         num_atoms = 20
 
@@ -451,20 +511,13 @@ class TestNHCAPI:
         velocities_out = wp.empty_like(velocities)
 
         nhc_position_update_out(
-            positions, velocities, dt,
-            positions_out=positions_out,
-            device=device
+            positions, velocities, dt, positions_out=positions_out, device=device
         )
 
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.ones(num_atoms, dtype=dtype_scalar, device=device)
         nhc_velocity_half_step_out(
-            velocities,
-            forces,
-            masses,
-            dt,
-            velocities_out=velocities_out,
-            device=device
+            velocities, forces, masses, dt, velocities_out=velocities_out, device=device
         )
 
         wp.synchronize_device(device)
@@ -482,7 +535,9 @@ class TestNHCBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_velocity_half_step_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_velocity_half_step_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched nhc_velocity_half_step executes correctly."""
         num_systems = 3
         atoms_per_system = 5
@@ -516,10 +571,11 @@ class TestNHCBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_velocity_half_step_out(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_velocity_half_step_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test nhc_velocity_half_step_out with batched mode."""
         num_atoms = 20
-        num_systems = 2
 
         np.random.seed(42)
         velocities = wp.array(
@@ -533,8 +589,7 @@ class TestNHCBatched:
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt,
-            batch_idx=batch_idx, device=device
+            velocities, forces, masses, dt, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -542,7 +597,9 @@ class TestNHCBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_position_update_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_position_update_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched nhc_position_update executes correctly."""
         num_systems = 3
         atoms_per_system = 5
@@ -571,10 +628,11 @@ class TestNHCBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_position_update_out(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_position_update_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test nhc_position_update_out with batched mode."""
         num_atoms = 20
-        num_systems = 2
 
         np.random.seed(42)
         positions = wp.array(
@@ -591,8 +649,7 @@ class TestNHCBatched:
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
         pos_out = nhc_position_update_out(
-            positions, velocities, dt,
-            batch_idx=batch_idx, device=device
+            positions, velocities, dt, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -602,7 +659,6 @@ class TestNHCBatched:
     def test_compute_chain_energy_batched_2d(self, device):
         """Test nhc_compute_chain_energy with batched 2D arrays."""
         num_systems = 2
-        chain_length = 3
 
         eta = wp.array(
             [[0.1, 0.05, 0.02], [0.2, 0.1, 0.05]],
@@ -623,8 +679,7 @@ class TestNHCBatched:
         ndof = wp.array([27.0, 27.0], dtype=wp.float64, device=device)
 
         ke_chain, pe_chain = nhc_compute_chain_energy(
-            eta, eta_dot, eta_mass, target_temp, ndof,
-            num_systems=num_systems
+            eta, eta_dot, eta_mass, target_temp, ndof, num_systems=num_systems
         )
 
         wp.synchronize_device(device)
@@ -642,7 +697,9 @@ class TestNHCPhysics:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_half_step_formula(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_half_step_formula(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test velocity half-step follows: v += 0.5 * F/m * dt."""
         dt_val = 0.01
 
@@ -691,7 +748,9 @@ class TestNHCPhysics:
         ndof = 297
 
         eta_dot_vals = np.array([0.1, 0.2, 0.3])
-        eta_mass_vals = np.array([ndof * target_temp * 0.01, target_temp * 0.01, target_temp * 0.01])
+        eta_mass_vals = np.array(
+            [ndof * target_temp * 0.01, target_temp * 0.01, target_temp * 0.01]
+        )
 
         eta = wp.zeros(chain_length, dtype=wp.float64, device=device)
         eta_dot = wp.array(eta_dot_vals, dtype=wp.float64, device=device)
@@ -704,7 +763,7 @@ class TestNHCPhysics:
         )
         wp.synchronize_device(device)
 
-        expected_ke = 0.5 * np.sum(eta_mass_vals * eta_dot_vals ** 2)
+        expected_ke = 0.5 * np.sum(eta_mass_vals * eta_dot_vals**2)
         np.testing.assert_allclose(ke_chain.numpy()[0], expected_ke, rtol=1e-10)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -727,7 +786,9 @@ class TestNHCPhysics:
         )
         wp.synchronize_device(device)
 
-        expected_pe = ndof * target_temp * eta_vals[0] + target_temp * np.sum(eta_vals[1:])
+        expected_pe = ndof * target_temp * eta_vals[0] + target_temp * np.sum(
+            eta_vals[1:]
+        )
         np.testing.assert_allclose(pe_chain.numpy()[0], expected_pe, rtol=1e-10)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -745,7 +806,9 @@ class TestNHCPhysics:
         np.random.seed(42)
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
         initial_pos = np.random.randn(num_atoms, 3).astype(np.float32) * 0.5
@@ -771,9 +834,19 @@ class TestNHCPhysics:
         temps = []
         for step in range(num_steps):
             run_nhc_nvt_step(
-                positions, velocities, forces, masses,
-                eta, eta_dot, eta_mass, target_temp_arr, dt, ndof_arr,
-                compute_forces_fn, nloops=3, device=device
+                positions,
+                velocities,
+                forces,
+                masses,
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp_arr,
+                dt,
+                ndof_arr,
+                compute_forces_fn,
+                nloops=3,
+                device=device,
             )
 
             if step >= equilibration_steps and step % 50 == 0:
@@ -809,11 +882,15 @@ class TestNHCPhysics:
         np.random.seed(42)
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
         initial_pos = np.random.randn(num_atoms, 3).astype(np.float32) * 0.3
-        initial_vel = np.random.randn(num_atoms, 3).astype(np.float32) * np.sqrt(target_temp)
+        initial_vel = np.random.randn(num_atoms, 3).astype(np.float32) * np.sqrt(
+            target_temp
+        )
 
         positions = wp.array(initial_pos.copy(), dtype=wp.vec3f, device=device)
         velocities = wp.array(initial_vel.copy(), dtype=wp.vec3f, device=device)
@@ -845,16 +922,28 @@ class TestNHCPhysics:
             )
             wp.synchronize_device(device)
 
-            return ke_particles + pe_particles + ke_chain.numpy()[0] + pe_chain.numpy()[0]
+            return (
+                ke_particles + pe_particles + ke_chain.numpy()[0] + pe_chain.numpy()[0]
+            )
 
         initial_H = compute_extended_hamiltonian()
         energies = [initial_H]
 
         for step in range(num_steps):
             run_nhc_nvt_step(
-                positions, velocities, forces, masses,
-                eta, eta_dot, eta_mass, target_temp_arr, dt, ndof_arr,
-                compute_forces_fn, nloops=3, device=device
+                positions,
+                velocities,
+                forces,
+                masses,
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp_arr,
+                dt,
+                ndof_arr,
+                compute_forces_fn,
+                nloops=3,
+                device=device,
             )
 
             if step % 50 == 0:
@@ -866,10 +955,14 @@ class TestNHCPhysics:
         max_H = np.max(energies)
         min_H = np.min(energies)
         mean_H = np.mean(energies)
-        
-        assert max_H < 5 * abs(initial_H), f"Energy exploded: max={max_H}, initial={initial_H}"
-        assert min_H > -5 * abs(initial_H), f"Energy collapsed: min={min_H}, initial={initial_H}"
-        
+
+        assert max_H < 5 * abs(initial_H), (
+            f"Energy exploded: max={max_H}, initial={initial_H}"
+        )
+        assert min_H > -5 * abs(initial_H), (
+            f"Energy collapsed: min={min_H}, initial={initial_H}"
+        )
+
         H_range = (max_H - min_H) / abs(mean_H)
         assert H_range < 1.0, f"Energy fluctuation range too large: {H_range}"
 
@@ -890,7 +983,9 @@ class TestNHCPhysics:
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
         def measure_temperature(target_temp):
-            chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+            chain_masses = nhc_compute_masses(
+                ndof, target_temp, tau, chain_length, device=device
+            )
             initial_pos = np.random.randn(num_atoms, 3).astype(np.float32) * 0.5
             initial_vel = np.random.randn(num_atoms, 3).astype(np.float32) * 0.1
 
@@ -914,9 +1009,19 @@ class TestNHCPhysics:
             temps = []
             for step in range(num_steps):
                 run_nhc_nvt_step(
-                    positions, velocities, forces, masses,
-                    eta, eta_dot, eta_mass, target_temp_arr, dt, ndof_arr,
-                    compute_forces_fn, nloops=3, device=device
+                    positions,
+                    velocities,
+                    forces,
+                    masses,
+                    eta,
+                    eta_dot,
+                    eta_mass,
+                    target_temp_arr,
+                    dt,
+                    ndof_arr,
+                    compute_forces_fn,
+                    nloops=3,
+                    device=device,
                 )
 
                 if step >= equilibration_steps and step % 50 == 0:
@@ -951,7 +1056,9 @@ class TestNHCPhysics:
 
         np.random.seed(42)
         masses_np = np.ones(num_atoms, dtype=np.float32)
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
 
         positions = wp.array(
             np.random.randn(num_atoms, 3).astype(np.float32) * 0.5,
@@ -975,8 +1082,16 @@ class TestNHCPhysics:
 
         for _ in range(10):
             nhc_thermostat_chain_update(
-                velocities, masses, eta, eta_dot, eta_mass,
-                target_temp_arr, dt, ndof_arr, nloops=1, device=device
+                velocities,
+                masses,
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp_arr,
+                dt,
+                ndof_arr,
+                nloops=1,
+                device=device,
             )
             nhc_velocity_half_step(velocities, forces, masses, dt, device=device)
             nhc_position_update(positions, velocities, dt, device=device)
@@ -997,7 +1112,9 @@ class TestNHCPhysics:
 
         np.random.seed(42)
         masses_np = np.ones(num_atoms, dtype=np.float32)
-        chain_masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        chain_masses = nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, device=device
+        )
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np.float32) * 0.1,
@@ -1014,8 +1131,16 @@ class TestNHCPhysics:
         ndof_arr = wp.array([float(ndof)], dtype=wp.float32, device=device)
 
         nhc_thermostat_chain_update(
-            velocities, masses, eta, eta_dot, eta_mass,
-            target_temp_arr, dt, ndof_arr, nloops=nloops, device=device
+            velocities,
+            masses,
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            dt,
+            ndof_arr,
+            nloops=nloops,
+            device=device,
         )
 
         wp.synchronize_device(device)

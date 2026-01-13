@@ -46,78 +46,78 @@ API Patterns
 - Non-mutating APIs: Return new arrays (e.g., `velocity_verlet_position_update_out`)
 """
 
-from .velocity_verlet import (
-    # Mutating
-    velocity_verlet_position_update,
-    velocity_verlet_velocity_finalize,
-    # Non-mutating
-    velocity_verlet_position_update_out,
-    velocity_verlet_velocity_finalize_out,
-)
 from .langevin import (
+    langevin_baoab_finalize,
+    langevin_baoab_finalize_out,
     # Mutating
     langevin_baoab_half_step,
-    langevin_baoab_finalize,
     # Non-mutating
     langevin_baoab_half_step_out,
-    langevin_baoab_finalize_out,
+)
+from .nose_hoover import (
+    nhc_compute_chain_energy,
+    # Utilities
+    nhc_compute_masses,
+    nhc_position_update,
+    nhc_position_update_out,
+    # Mutating
+    nhc_thermostat_chain_update,
+    # Non-mutating
+    nhc_thermostat_chain_update_out,
+    nhc_velocity_half_step,
+    nhc_velocity_half_step_out,
+)
+from .npt import (
+    # Barostat utilities
+    compute_barostat_mass,
+    compute_barostat_potential_energy,
+    compute_cell_kinetic_energy,
+    # Pressure calculations
+    compute_pressure_tensor,
+    compute_scalar_pressure,
+    # NPH integration - Mutating
+    nph_barostat_half_step,  # Unified: auto-dispatches based on target_pressures dtype
+    nph_cell_update,
+    nph_position_update,
+    nph_position_update_out,
+    nph_velocity_half_step,  # Unified: mode="isotropic"|"anisotropic"
+    # NPH integration - Non-mutating
+    nph_velocity_half_step_out,
+    npt_barostat_half_step,  # Unified: auto-dispatches based on target_pressures dtype
+    npt_cell_update,
+    npt_cell_update_out,
+    npt_position_update,
+    npt_position_update_out,
+    # NPT integration - Mutating
+    npt_thermostat_half_step,
+    npt_velocity_half_step,  # Unified: mode="isotropic"|"anisotropic"
+    # NPT integration - Non-mutating
+    npt_velocity_half_step_out,
+    # High-level NPH
+    run_nph_step,
+    # High-level NPT
+    run_npt_step,
+    vec3d,
+    vec3f,
+    vec9d,
+    # Tensor types for pressure/virial
+    vec9f,
 )
 from .velocity_rescaling import (
+    # Utility
+    compute_rescale_factor,
     # Mutating
     velocity_rescale,
     # Non-mutating
     velocity_rescale_out,
-    # Utility
-    compute_rescale_factor,
 )
-from .nose_hoover import (
+from .velocity_verlet import (
     # Mutating
-    nhc_thermostat_chain_update,
-    nhc_velocity_half_step,
-    nhc_position_update,
-    nhc_compute_chain_energy,
+    velocity_verlet_position_update,
     # Non-mutating
-    nhc_thermostat_chain_update_out,
-    nhc_velocity_half_step_out,
-    nhc_position_update_out,
-    # Utilities
-    nhc_compute_masses,
-)
-from .npt import (
-    # Tensor types for pressure/virial
-    vec9f,
-    vec9d,
-    vec3f,
-    vec3d,
-    # Pressure calculations
-    compute_pressure_tensor,
-    compute_scalar_pressure,
-    # Barostat utilities
-    compute_barostat_mass,
-    compute_cell_kinetic_energy,
-    compute_barostat_potential_energy,
-    # NPT integration - Mutating
-    npt_thermostat_half_step,
-    npt_barostat_half_step,  # Unified: auto-dispatches based on target_pressures dtype
-    npt_velocity_half_step,  # Unified: mode="isotropic"|"anisotropic"
-    npt_position_update,
-    npt_cell_update,
-    # NPT integration - Non-mutating
-    npt_velocity_half_step_out,
-    npt_position_update_out,
-    npt_cell_update_out,
-    # High-level NPT
-    run_npt_step,
-    # NPH integration - Mutating
-    nph_barostat_half_step,  # Unified: auto-dispatches based on target_pressures dtype
-    nph_velocity_half_step,  # Unified: mode="isotropic"|"anisotropic"
-    nph_position_update,
-    nph_cell_update,
-    # NPH integration - Non-mutating
-    nph_velocity_half_step_out,
-    nph_position_update_out,
-    # High-level NPH
-    run_nph_step,
+    velocity_verlet_position_update_out,
+    velocity_verlet_velocity_finalize,
+    velocity_verlet_velocity_finalize_out,
 )
 
 __all__ = [

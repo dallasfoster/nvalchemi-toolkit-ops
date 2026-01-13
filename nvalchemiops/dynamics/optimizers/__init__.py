@@ -28,22 +28,22 @@ API Patterns
 """
 
 from .fire import (
-    # Diagnostics (shared by FIRE and FIRE2)
-    fire_compute_diagnostics,
-    # FIRE - Mutating
-    fire_velocity_mix,
-    fire_md_step,
-    fire_reset_velocities,
-    # FIRE - Non-mutating
-    fire_velocity_mix_out,
-    fire_md_step_out,
-    fire_reset_velocities_out,
+    fire2_md_step,
+    fire2_md_step_out,
     # FIRE2 - Mutating
     fire2_velocity_update,
-    fire2_md_step,
     # FIRE2 - Non-mutating
     fire2_velocity_update_out,
-    fire2_md_step_out,
+    # Diagnostics (shared by FIRE and FIRE2)
+    fire_compute_diagnostics,
+    fire_md_step,
+    fire_md_step_out,
+    fire_reset_velocities,
+    fire_reset_velocities_out,
+    # FIRE - Mutating
+    fire_velocity_mix,
+    # FIRE - Non-mutating
+    fire_velocity_mix_out,
 )
 
 __all__ = [

@@ -24,17 +24,16 @@ Tests cover:
 - Float32 and float64 support
 """
 
-import pytest
 import numpy as np
+import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.integrators import (
     velocity_verlet_position_update,
-    velocity_verlet_velocity_finalize,
     velocity_verlet_position_update_out,
+    velocity_verlet_velocity_finalize,
     velocity_verlet_velocity_finalize_out,
 )
-
 
 # ==============================================================================
 # Test Configuration
@@ -97,13 +96,13 @@ def compute_harmonic_forces(positions: wp.array, forces: wp.array, k: float):
 
 def compute_harmonic_energy(positions: np.ndarray, k: float) -> float:
     """Compute harmonic potential energy E = 0.5 * k * |r|^2."""
-    r_sq = np.sum(positions ** 2)
+    r_sq = np.sum(positions**2)
     return 0.5 * k * r_sq
 
 
 def compute_kinetic_energy_np(velocities: np.ndarray, masses: np.ndarray) -> float:
     """Compute kinetic energy KE = 0.5 * sum(m * v^2)."""
-    v_sq = np.sum(velocities ** 2, axis=1)
+    v_sq = np.sum(velocities**2, axis=1)
     return 0.5 * np.sum(masses * v_sq)
 
 
@@ -114,7 +113,7 @@ def compute_morse_forces_and_energy(
     forces = np.zeros_like(positions)
     r_vec = positions[1] - positions[0]
     r = np.linalg.norm(r_vec)
-    
+
     if r > 1e-10:
         r_hat = r_vec / r
         exp_term = np.exp(-a * (r - r_e))
@@ -124,7 +123,7 @@ def compute_morse_forces_and_energy(
         energy = D_e * (1 - exp_term) ** 2
     else:
         energy = 0.0
-    
+
     return forces, float(energy)
 
 
@@ -170,7 +169,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_position_update_device_inference(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_position_update_device_inference(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that device is inferred from positions."""
         num_atoms = 20
 
@@ -204,7 +205,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_position_update_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_position_update_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that non-mutating velocity_verlet_position_update_out preserves input."""
         num_atoms = 10
         np.random.seed(42)
@@ -245,7 +248,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_position_update_out_with_preallocated(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_position_update_out_with_preallocated(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test position_update_out with pre-allocated outputs."""
         num_atoms = 20
 
@@ -275,10 +280,14 @@ class TestVelocityVerletAPI:
         velocities_out = wp.empty_like(velocities)
 
         pos_out, vel_out = velocity_verlet_position_update_out(
-            positions, velocities, forces, masses, dt,
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
             positions_out=positions_out,
             velocities_out=velocities_out,
-            device=device
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -314,7 +323,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_finalize_device_inference(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_finalize_device_inference(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that device is inferred from velocities."""
         num_atoms = 20
 
@@ -342,7 +353,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_finalize_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_finalize_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating velocity finalize preserves input."""
         num_atoms = 20
 
@@ -374,7 +387,9 @@ class TestVelocityVerletAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_velocity_finalize_out_with_preallocated(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_velocity_finalize_out_with_preallocated(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test velocity_finalize_out with pre-allocated output."""
         num_atoms = 20
 
@@ -398,9 +413,12 @@ class TestVelocityVerletAPI:
         velocities_out = wp.empty_like(velocities)
 
         vel_out = velocity_verlet_velocity_finalize_out(
-            velocities, forces_new, masses, dt,
+            velocities,
+            forces_new,
+            masses,
+            dt,
             velocities_out=velocities_out,
-            device=device
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -417,7 +435,9 @@ class TestVelocityVerletBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_position_update_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_position_update_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched velocity_verlet_position_update executes correctly."""
         num_systems = 3
         atoms_per_system = 5
@@ -445,7 +465,7 @@ class TestVelocityVerletBatched:
             device=device,
         )
         dt = wp.array([0.001, 0.002, 0.003], dtype=dtype_scalar, device=device)
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
@@ -459,7 +479,9 @@ class TestVelocityVerletBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_position_update_out(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_position_update_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating position update for batched systems."""
         num_atoms = 40
 
@@ -491,8 +513,13 @@ class TestVelocityVerletBatched:
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
         pos_out, vel_out = velocity_verlet_position_update_out(
-            positions, velocities, forces, masses, dt,
-            batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert pos_out.shape[0] == num_atoms
@@ -500,7 +527,9 @@ class TestVelocityVerletBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_velocity_finalize_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_velocity_finalize_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched velocity_verlet_velocity_finalize executes correctly."""
         num_systems = 3
         atoms_per_system = 5
@@ -536,7 +565,9 @@ class TestVelocityVerletBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_velocity_finalize_out(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_velocity_finalize_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating velocity finalize for batched systems."""
         num_atoms = 40
 
@@ -563,15 +594,16 @@ class TestVelocityVerletBatched:
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
         vel_out = velocity_verlet_velocity_finalize_out(
-            velocities, forces_new, masses, dt,
-            batch_idx=batch_idx, device=device
+            velocities, forces_new, masses, dt, batch_idx=batch_idx, device=device
         )
 
         assert vel_out.shape[0] == num_atoms
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_uses_per_system_dt(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_uses_per_system_dt(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched version uses per-system timesteps correctly."""
         pos = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype)
         vel = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np_dtype)
@@ -592,16 +624,18 @@ class TestVelocityVerletBatched:
         wp.synchronize_device(device)
 
         result_pos = positions.numpy()
-        
+
         displacement_0 = result_pos[0, 0] - 1.0
         displacement_1 = result_pos[1, 0] - 1.0
-        
+
         ratio = displacement_1 / displacement_0
         np.testing.assert_allclose(ratio, 4.0, rtol=0.01)
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_energy_conservation(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_energy_conservation(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test energy conservation for multiple independent systems."""
         num_systems = 3
         atoms_per_system = 20
@@ -632,7 +666,7 @@ class TestVelocityVerletBatched:
         wp.synchronize_device(device)
         pos_np = positions.numpy()
         vel_np = velocities.numpy()
-        
+
         initial_energies = []
         for sys_id in range(num_systems):
             start = sys_id * atoms_per_system
@@ -653,15 +687,17 @@ class TestVelocityVerletBatched:
         wp.synchronize_device(device)
         pos_np = positions.numpy()
         vel_np = velocities.numpy()
-        
+
         for sys_id in range(num_systems):
             start = sys_id * atoms_per_system
             end = (sys_id + 1) * atoms_per_system
             ke = compute_kinetic_energy_np(vel_np[start:end], masses_np[start:end])
             pe = compute_harmonic_energy(pos_np[start:end], spring_k)
             final_energy = ke + pe
-            
-            drift = abs(final_energy - initial_energies[sys_id]) / initial_energies[sys_id]
+
+            drift = (
+                abs(final_energy - initial_energies[sys_id]) / initial_energies[sys_id]
+            )
             assert drift < 0.02, f"System {sys_id} energy drift too large: {drift}"
 
 
@@ -727,7 +763,9 @@ class TestVelocityVerletPhysics:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_harmonic_oscillator_energy_conservation(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_harmonic_oscillator_energy_conservation(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test energy conservation for a harmonic oscillator system."""
         num_atoms = 100
         spring_k = 1.0
@@ -774,12 +812,13 @@ class TestVelocityVerletPhysics:
         energy_fluctuation = np.std(energies) / np.mean(energies)
 
         assert abs(energy_drift) < 0.01, f"Energy drift too large: {energy_drift}"
-        assert energy_fluctuation < 0.01, f"Energy fluctuation too large: {energy_fluctuation}"
+        assert energy_fluctuation < 0.01, (
+            f"Energy fluctuation too large: {energy_fluctuation}"
+        )
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_free_particle_linear_motion(self, device):
         """Test that free particle moves in straight line with constant velocity."""
-        num_atoms = 1
         dt_val = 0.01
         num_steps = 100
 
@@ -845,54 +884,64 @@ class TestVelocityVerletPhysics:
         D_e = 1.0
         a = 2.0
         r_e = 1.5
-        
+
         dt_val = 0.001
         num_steps = 5000
-        
+
         initial_r = 1.8
-        initial_pos = np.array([
-            [0.0, 0.0, 0.0],
-            [initial_r, 0.0, 0.0],
-        ], dtype=np.float32)
-        
-        initial_vel = np.array([
-            [-0.3, 0.0, 0.0],
-            [0.3, 0.0, 0.0],
-        ], dtype=np.float32)
-        
+        initial_pos = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [initial_r, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        initial_vel = np.array(
+            [
+                [-0.3, 0.0, 0.0],
+                [0.3, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
         masses_np = np.array([1.0, 1.0], dtype=np.float32)
         num_atoms = 2
-        
+
         positions = wp.array(initial_pos.copy(), dtype=wp.vec3f, device=device)
         velocities = wp.array(initial_vel.copy(), dtype=wp.vec3f, device=device)
         forces = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
         masses = wp.array(masses_np, dtype=wp.float32, device=device)
         dt = wp.array([dt_val], dtype=wp.float32, device=device)
-        
+
         wp.synchronize_device(device)
         pos_np = positions.numpy()
         forces_np, pe = compute_morse_forces_and_energy(pos_np, D_e, a, r_e)
         forces = wp.array(forces_np.astype(np.float32), dtype=wp.vec3f, device=device)
-        
+
         vel_np = velocities.numpy()
         initial_ke = compute_kinetic_energy_np(vel_np, masses_np)
         initial_total = initial_ke + pe
-        
-        assert initial_total > 0.01, f"Initial energy should be significant: {initial_total}"
-        
+
+        assert initial_total > 0.01, (
+            f"Initial energy should be significant: {initial_total}"
+        )
+
         energies = []
         bond_lengths = []
-        
+
         for step in range(num_steps):
             velocity_verlet_position_update(positions, velocities, forces, masses, dt)
-            
+
             wp.synchronize_device(device)
             pos_np = positions.numpy()
             forces_np, pe = compute_morse_forces_and_energy(pos_np, D_e, a, r_e)
-            forces = wp.array(forces_np.astype(np.float32), dtype=wp.vec3f, device=device)
-            
+            forces = wp.array(
+                forces_np.astype(np.float32), dtype=wp.vec3f, device=device
+            )
+
             velocity_verlet_velocity_finalize(velocities, forces, masses, dt)
-            
+
             if step % 100 == 0:
                 wp.synchronize_device(device)
                 pos_np = positions.numpy()
@@ -900,18 +949,20 @@ class TestVelocityVerletPhysics:
                 ke = compute_kinetic_energy_np(vel_np, masses_np)
                 _, pe = compute_morse_forces_and_energy(pos_np, D_e, a, r_e)
                 energies.append(ke + pe)
-                
+
                 r = np.linalg.norm(pos_np[1] - pos_np[0])
                 bond_lengths.append(r)
-        
+
         energies = np.array(energies)
         bond_lengths = np.array(bond_lengths)
-        
+
         energy_drift = (energies[-1] - initial_total) / initial_total
         energy_fluctuation = np.std(energies) / np.mean(energies)
-        
+
         assert abs(energy_drift) < 0.01, f"Energy drift too large: {energy_drift}"
-        assert energy_fluctuation < 0.02, f"Energy fluctuation too large: {energy_fluctuation}"
+        assert energy_fluctuation < 0.02, (
+            f"Energy fluctuation too large: {energy_fluctuation}"
+        )
         assert bond_lengths.min() < r_e
         assert bond_lengths.max() > r_e
 

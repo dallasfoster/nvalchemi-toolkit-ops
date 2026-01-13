@@ -53,19 +53,19 @@ SHAKE is applied after position updates but before force calculation:
 
     # Position update (unconstrained)
     velocity_verlet_position_update(positions, velocities, forces, masses, dt)
-    
+
     # Apply SHAKE to fix bond lengths
     shake_converged = shake_constraints(
-        positions, positions_old, masses, 
+        positions, positions_old, masses,
         bond_pairs, bond_lengths, tolerance=1e-6, max_iter=100
     )
-    
+
     # Compute forces at constrained positions
     forces = compute_forces(positions)
-    
+
     # Velocity update
     velocity_verlet_velocity_finalize(velocities, forces, masses, dt)
-    
+
     # Apply RATTLE to fix velocity constraints
     rattle_constraints(positions, velocities, masses, bond_pairs, bond_lengths)
 
@@ -142,7 +142,7 @@ def _shake_iteration_kernel(
     Notes
     -----
     This kernel uses atomic operations on positions, which may cause
-    race conditions when atoms participate in multiple bonds. 
+    race conditions when atoms participate in multiple bonds.
     """
     bond_idx = wp.tid()
 
@@ -406,7 +406,7 @@ def _rattle_iteration_out_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 _shake_iteration_kernel_overload = {}
 _shake_iteration_out_kernel_overload = {}
@@ -416,27 +416,51 @@ _rattle_iteration_out_kernel_overload = {}
 for t, v in zip(_T, _V):
     _shake_iteration_kernel_overload[v] = wp.overload(
         _shake_iteration_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=wp.int32), wp.array(dtype=t),
-         wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+        ],
     )
     _shake_iteration_out_kernel_overload[v] = wp.overload(
         _shake_iteration_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=wp.int32), wp.array(dtype=t),
-         wp.array(dtype=v), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.float64),
+        ],
     )
     _rattle_iteration_kernel_overload[v] = wp.overload(
         _rattle_iteration_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=wp.int32),
-         wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.float64),
+        ],
     )
     _rattle_iteration_out_kernel_overload[v] = wp.overload(
         _rattle_iteration_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=wp.int32),
-         wp.array(dtype=v), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.float64),
+        ],
     )
 
 
@@ -496,8 +520,15 @@ def shake_iteration(
     wp.launch(
         _shake_iteration_kernel_overload[vec_dtype],
         dim=num_bonds,
-        inputs=[positions, positions_old, masses, bond_atom_i, bond_atom_j,
-                bond_lengths_sq, max_error],
+        inputs=[
+            positions,
+            positions_old,
+            masses,
+            bond_atom_i,
+            bond_atom_j,
+            bond_lengths_sq,
+            max_error,
+        ],
         device=device,
     )
 
@@ -563,9 +594,14 @@ def shake_constraints(
     for _ in range(num_iter):
         max_error.zero_()
         max_error = shake_iteration(
-            positions, positions_old, masses,
-            bond_atom_i, bond_atom_j, bond_lengths_sq,
-            max_error, device
+            positions,
+            positions_old,
+            masses,
+            bond_atom_i,
+            bond_atom_j,
+            bond_lengths_sq,
+            max_error,
+            device,
         )
 
     return max_error
@@ -632,8 +668,16 @@ def shake_iteration_out(
     wp.launch(
         _shake_iteration_out_kernel_overload[vec_dtype],
         dim=num_bonds,
-        inputs=[positions, positions_old, masses, bond_atom_i, bond_atom_j,
-                bond_lengths_sq, position_corrections, max_error],
+        inputs=[
+            positions,
+            positions_old,
+            masses,
+            bond_atom_i,
+            bond_atom_j,
+            bond_lengths_sq,
+            position_corrections,
+            max_error,
+        ],
         device=device,
     )
 
@@ -690,9 +734,14 @@ def shake_constraints_out(
         wp.copy(positions_out, positions)
 
     error = shake_constraints(
-        positions_out, positions_old, masses,
-        bond_atom_i, bond_atom_j, bond_lengths_sq,
-        num_iter, device
+        positions_out,
+        positions_old,
+        masses,
+        bond_atom_i,
+        bond_atom_j,
+        bond_lengths_sq,
+        num_iter,
+        device,
     )
 
     return positions_out, error
@@ -804,8 +853,7 @@ def rattle_constraints(
     for _ in range(num_iter):
         max_error.zero_()
         max_error = rattle_iteration(
-            positions, velocities, masses,
-            bond_atom_i, bond_atom_j, max_error, device
+            positions, velocities, masses, bond_atom_i, bond_atom_j, max_error, device
         )
 
     return max_error
@@ -856,7 +904,9 @@ def rattle_iteration_out(
     num_bonds = bond_atom_i.shape[0]
 
     if velocity_corrections is None:
-        velocity_corrections = wp.zeros(num_atoms, dtype=velocities.dtype, device=device)
+        velocity_corrections = wp.zeros(
+            num_atoms, dtype=velocities.dtype, device=device
+        )
     else:
         velocity_corrections.zero_()
 
@@ -869,8 +919,15 @@ def rattle_iteration_out(
     wp.launch(
         _rattle_iteration_out_kernel_overload[vec_dtype],
         dim=num_bonds,
-        inputs=[positions, velocities, masses, bond_atom_i, bond_atom_j,
-                velocity_corrections, max_error],
+        inputs=[
+            positions,
+            velocities,
+            masses,
+            bond_atom_i,
+            bond_atom_j,
+            velocity_corrections,
+            max_error,
+        ],
         device=device,
     )
 
@@ -924,10 +981,7 @@ def rattle_constraints_out(
         wp.copy(velocities_out, velocities)
 
     error = rattle_constraints(
-        positions, velocities_out, masses,
-        bond_atom_i, bond_atom_j,
-        num_iter, device
+        positions, velocities_out, masses, bond_atom_i, bond_atom_j, num_iter, device
     )
 
     return velocities_out, error
-

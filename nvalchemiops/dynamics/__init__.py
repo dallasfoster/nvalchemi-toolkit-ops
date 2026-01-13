@@ -45,9 +45,7 @@ Example
 ... )
 """
 
-from . import integrators
-from . import optimizers
-from . import utils
+from . import integrators, optimizers, utils
 
 __all__ = [
     # Submodules

@@ -470,7 +470,7 @@ def _batch_velocity_verlet_velocity_finalize_out_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Position update kernel overloads
 _velocity_verlet_position_update_kernel_overload = {}
@@ -488,22 +488,49 @@ for t, v in zip(_T, _V):
     # Position update kernels
     _velocity_verlet_position_update_kernel_overload[v] = wp.overload(
         _velocity_verlet_position_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+        ],
     )
     _batch_velocity_verlet_position_update_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_position_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
     _velocity_verlet_position_update_out_kernel_overload[v] = wp.overload(
         _velocity_verlet_position_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t),
-         wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
     _batch_velocity_verlet_position_update_out_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_position_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
 
     # Velocity finalize kernels
@@ -513,15 +540,34 @@ for t, v in zip(_T, _V):
     )
     _batch_velocity_verlet_velocity_finalize_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_velocity_finalize_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
     _velocity_verlet_velocity_finalize_out_kernel_overload[v] = wp.overload(
         _velocity_verlet_velocity_finalize_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
     _batch_velocity_verlet_velocity_finalize_out_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_velocity_finalize_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -700,16 +746,31 @@ def velocity_verlet_position_update_out(
         wp.launch(
             _batch_velocity_verlet_position_update_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, batch_idx, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                batch_idx,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _velocity_verlet_position_update_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
 
@@ -1025,24 +1086,53 @@ _batch_velocity_verlet_step_fused_out_kernel_overload = {}
 for t, v in zip(_T, _V):
     _velocity_verlet_step_fused_kernel_overload[v] = wp.overload(
         _velocity_verlet_step_fused_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v),
-         wp.array(dtype=t), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+        ],
     )
     _velocity_verlet_step_fused_out_kernel_overload[v] = wp.overload(
         _velocity_verlet_step_fused_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v),
-         wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
     _batch_velocity_verlet_step_fused_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_step_fused_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v),
-         wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
     _batch_velocity_verlet_step_fused_out_kernel_overload[v] = wp.overload(
         _batch_velocity_verlet_step_fused_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v),
-         wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t),
-         wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -1113,7 +1203,15 @@ def velocity_verlet_step_fused(
         wp.launch(
             _batch_velocity_verlet_step_fused_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces_old, forces_new, masses, batch_idx, dt],
+            inputs=[
+                positions,
+                velocities,
+                forces_old,
+                forces_new,
+                masses,
+                batch_idx,
+                dt,
+            ],
             device=device,
         )
     else:
@@ -1184,16 +1282,33 @@ def velocity_verlet_step_fused_out(
         wp.launch(
             _batch_velocity_verlet_step_fused_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces_old, forces_new, masses, batch_idx, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces_old,
+                forces_new,
+                masses,
+                batch_idx,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _velocity_verlet_step_fused_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces_old, forces_new, masses, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces_old,
+                forces_new,
+                masses,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
 

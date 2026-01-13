@@ -133,6 +133,7 @@ def _batch_compute_2ke_kernel(
 
     wp.atomic_add(ke2, system_id, type(ke2[system_id])(m * v_sq))
 
+
 @wp.kernel
 def _nhc_compute_masses_kernel(
     ndof: Any,
@@ -406,7 +407,7 @@ def _nhc_chain_propagate_single_kernel(
         Number of thermostats in the chain.
     vel_scale : wp.array(dtype=Any)
         Output velocity scale factors, shape (1,). MODIFIED.
-    
+
     Launch Grid
     -----------
     dim = [1]
@@ -429,7 +430,7 @@ def _nhc_chain_propagate_single_kernel(
         eta_local[k] = eta[k]
         eta_dot_local[k] = eta_dot[k]
         eta_mass_local[k] = eta_mass[k]
-        
+
     # ========== Step 1: Half-step position update ==========
     for k in range(chain_length):
         eta_local[k] = eta_local[k] + half_dt * eta_dot_local[k]
@@ -464,7 +465,7 @@ def _nhc_chain_propagate_single_kernel(
         eta_dot_local[0] = eta_dot_local[0] * scale
     else:
         eta_dot_local[0] = eta_dot_local[0] + quarter_dt * G_0
-    
+
     # ========== Step 3: Compute velocity scale factor ==========
     vel_scale_factor = wp.exp(-half_dt * eta_dot_local[0])
     vel_scale[0] = vel_scale_factor
@@ -505,6 +506,7 @@ def _nhc_chain_propagate_single_kernel(
     for k in range(chain_length):
         eta[k] = eta_local[k]
         eta_dot[k] = eta_dot_local[k]
+
 
 # ==============================================================================
 # Chain Energy Kernels
@@ -613,7 +615,13 @@ def _batch_nhc_compute_chain_energy_kernel(
     pe = type(kT)(0.0)
 
     for k in range(chain_length):
-        ke = ke + type(kT)(0.5) * eta_mass[sys_id, k] * eta_dot[sys_id, k] * eta_dot[sys_id, k]
+        ke = (
+            ke
+            + type(kT)(0.5)
+            * eta_mass[sys_id, k]
+            * eta_dot[sys_id, k]
+            * eta_dot[sys_id, k]
+        )
         if k == 0:
             pe = pe + ndof_sys * kT * eta[sys_id, k]
         else:
@@ -1069,7 +1077,6 @@ for v in _V:
         )
 
 for t, v in zip(_T, _V):
-
     # Velocity half-step kernels (keyed by vector type)
     _nhc_velocity_half_step_kernel_overload[v] = wp.overload(
         _nhc_velocity_half_step_kernel,
@@ -1149,7 +1156,7 @@ for t in _T:
             wp.array(dtype=t),  # target_temp
             wp.array(dtype=t),  # ndof
             wp.array(dtype=t),  # dt_chain
-            wp.int32,           # chain_length
+            wp.int32,  # chain_length
             wp.array(dtype=t),  # vel_scale
         ],
     )
@@ -1166,7 +1173,7 @@ for t in _T:
             wp.array(dtype=t),  # eta_mass
             wp.array(dtype=t),  # target_temp
             wp.array(dtype=t),  # ndof
-            wp.int32,           # chain_length
+            wp.int32,  # chain_length
             wp.array(dtype=t),  # ke_chain
             wp.array(dtype=t),  # pe_chain
         ],
@@ -1177,11 +1184,11 @@ for t in _T:
             wp.array2d(dtype=t),  # eta
             wp.array2d(dtype=t),  # eta_dot
             wp.array2d(dtype=t),  # eta_mass
-            wp.array(dtype=t),    # target_temp
-            wp.array(dtype=t),    # ndof
-            wp.int32,             # chain_length
-            wp.array(dtype=t),    # ke_chain
-            wp.array(dtype=t),    # pe_chain
+            wp.array(dtype=t),  # target_temp
+            wp.array(dtype=t),  # ndof
+            wp.int32,  # chain_length
+            wp.array(dtype=t),  # ke_chain
+            wp.array(dtype=t),  # pe_chain
         ],
     )
 
@@ -1189,6 +1196,7 @@ for t in _T:
 # ==============================================================================
 # Functional Interfaces
 # ==============================================================================
+
 
 def nhc_compute_masses(
     ndof: int,
@@ -1245,7 +1253,7 @@ def nhc_compute_masses(
 
     # Select overload based on dtype
     scalar_type = dtype
-    
+
     if is_batched:
         masses = wp.zeros((num_systems, chain_length), dtype=dtype, device=device)
         wp.launch(
@@ -1264,7 +1272,8 @@ def nhc_compute_masses(
         )
 
     return masses
-    
+
+
 def nhc_thermostat_chain_update(
     velocities: wp.array,
     masses: wp.array,
@@ -1461,7 +1470,9 @@ def _compute_weighted_dt_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    dt_chain[sys_id] = type(dt_chain[sys_id])(dt[sys_id]) * type(dt_chain[sys_id])(weight)
+    dt_chain[sys_id] = type(dt_chain[sys_id])(dt[sys_id]) * type(dt_chain[sys_id])(
+        weight
+    )
 
 
 # Overloads for _compute_weighted_dt_kernel - support all combinations of dt and dt_chain dtypes
@@ -1470,7 +1481,11 @@ for t_in in _T:
     for t_out in _T:
         _compute_weighted_dt_kernel_overload[(t_in, t_out)] = wp.overload(
             _compute_weighted_dt_kernel,
-            [wp.array(dtype=t_in), wp.array(dtype=t_out), t_out],  # weight uses output type
+            [
+                wp.array(dtype=t_in),
+                wp.array(dtype=t_out),
+                t_out,
+            ],  # weight uses output type
         )
 
 
@@ -1873,14 +1888,32 @@ def nhc_compute_chain_energy(
         wp.launch(
             _batch_nhc_compute_chain_energy_kernel_overload[chain_dtype],
             dim=num_systems,
-            inputs=[eta, eta_dot, eta_mass, target_temp, ndof, chain_length, ke_chain, pe_chain],
+            inputs=[
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp,
+                ndof,
+                chain_length,
+                ke_chain,
+                pe_chain,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _nhc_compute_chain_energy_kernel_overload[chain_dtype],
             dim=1,
-            inputs=[eta, eta_dot, eta_mass, target_temp, ndof, chain_length, ke_chain, pe_chain],
+            inputs=[
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp,
+                ndof,
+                chain_length,
+                ke_chain,
+                pe_chain,
+            ],
             device=device,
         )
 

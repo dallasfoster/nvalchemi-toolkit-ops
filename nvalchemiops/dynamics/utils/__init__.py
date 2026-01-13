@@ -61,49 +61,47 @@ fractional_to_cartesian
     Convert fractional to Cartesian coordinates.
 """
 
+from .cell_utils import (
+    apply_strain_to_cell,
+    # Coordinate transformations
+    cartesian_to_fractional,
+    compute_cell_inverse,
+    # Cell properties
+    compute_cell_volume,
+    # Strain operations
+    compute_strain_tensor,
+    fractional_to_cartesian,
+    # Position operations (mutating)
+    scale_positions_with_cell,
+    # Position operations (non-mutating)
+    scale_positions_with_cell_out,
+    wrap_positions_to_cell,
+    wrap_positions_to_cell_out,
+)
+from .constraints import (
+    # RATTLE - Mutating
+    rattle_constraints,
+    # RATTLE - Non-mutating
+    rattle_constraints_out,
+    rattle_iteration,
+    rattle_iteration_out,
+    # SHAKE - Mutating
+    shake_constraints,
+    # SHAKE - Non-mutating
+    shake_constraints_out,
+    shake_iteration,
+    shake_iteration_out,
+)
 from .thermostat_utils import (
     # Non-mutating (compute only)
     compute_kinetic_energy,
     compute_temperature,
     # Mutating
     initialize_velocities,
-    remove_com_motion,
     # Non-mutating
     initialize_velocities_out,
+    remove_com_motion,
     remove_com_motion_out,
-)
-
-from .cell_utils import (
-    # Cell properties
-    compute_cell_volume,
-    compute_cell_inverse,
-    # Strain operations
-    compute_strain_tensor,
-    apply_strain_to_cell,
-    # Position operations (mutating)
-    scale_positions_with_cell,
-    wrap_positions_to_cell,
-    # Position operations (non-mutating)
-    scale_positions_with_cell_out,
-    wrap_positions_to_cell_out,
-    # Coordinate transformations
-    cartesian_to_fractional,
-    fractional_to_cartesian,
-)
-
-from .constraints import (
-    # SHAKE - Mutating
-    shake_constraints,
-    shake_iteration,
-    # SHAKE - Non-mutating
-    shake_constraints_out,
-    shake_iteration_out,
-    # RATTLE - Mutating
-    rattle_constraints,
-    rattle_iteration,
-    # RATTLE - Non-mutating
-    rattle_constraints_out,
-    rattle_iteration_out,
 )
 
 __all__ = [

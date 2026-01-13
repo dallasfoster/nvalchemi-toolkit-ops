@@ -22,7 +22,7 @@ in molecular dynamics simulations with variable cell volume/shape (NPT, NPH ense
 The cell is represented as a (B, 3, 3) array of matrices where each matrix contains
 lattice vectors as columns:
     cell[b] = [a, b, c]  (column vectors for system b)
-    
+
 Even single-system simulations use shape (1, 3, 3).
 
 Fractional coordinates s relate to Cartesian coordinates r by:
@@ -55,13 +55,11 @@ __all__ = [
     "apply_strain_to_cell",
     # Position operations
     "scale_positions_with_cell",
-    "remap_positions_to_cell",
     "wrap_positions_to_cell",
     "cartesian_to_fractional",
     "fractional_to_cartesian",
     # Non-mutating variants
     "scale_positions_with_cell_out",
-    "remap_positions_to_cell_out",
     "wrap_positions_to_cell_out",
 ]
 
@@ -104,11 +102,7 @@ def _compute_cell_volume_kernel(
     c2 = cell[2, 2]
 
     # det = a · (b × c)
-    det = (
-        a0 * (b1 * c2 - b2 * c1)
-        - a1 * (b0 * c2 - b2 * c0)
-        + a2 * (b0 * c1 - b1 * c0)
-    )
+    det = a0 * (b1 * c2 - b2 * c1) - a1 * (b0 * c2 - b2 * c0) + a2 * (b0 * c1 - b1 * c0)
 
     volumes[sys_id] = wp.abs(det)
 
@@ -166,9 +160,7 @@ def _compute_cell_inverse_kernel(
     inv22 = (a00 * a11 - a01 * a10) * inv_det
 
     cells_inv[sys_id] = type(cell)(
-        inv00, inv01, inv02,
-        inv10, inv11, inv12,
-        inv20, inv21, inv22
+        inv00, inv01, inv02, inv10, inv11, inv12, inv20, inv21, inv22
     )
 
 
@@ -336,9 +328,7 @@ def _wrap_positions_single_kernel(
 
     # Wrap to [0, 1) using floor
     s_wrapped = type(s)(
-        s[0] - wp.floor(s[0]),
-        s[1] - wp.floor(s[1]),
-        s[2] - wp.floor(s[2])
+        s[0] - wp.floor(s[0]), s[1] - wp.floor(s[1]), s[2] - wp.floor(s[2])
     )
 
     # Convert back to Cartesian: r_new = cell @ s_wrapped
@@ -369,9 +359,7 @@ def _wrap_positions_kernel(
 
     # Wrap to [0, 1) using floor
     s_wrapped = type(s)(
-        s[0] - wp.floor(s[0]),
-        s[1] - wp.floor(s[1]),
-        s[2] - wp.floor(s[2])
+        s[0] - wp.floor(s[0]), s[1] - wp.floor(s[1]), s[2] - wp.floor(s[2])
     )
 
     # Convert back to Cartesian: r_new = cell @ s_wrapped
@@ -398,9 +386,7 @@ def _wrap_positions_out_single_kernel(
 
     s = wp.mul(ci, r)
     s_wrapped = type(s)(
-        s[0] - wp.floor(s[0]),
-        s[1] - wp.floor(s[1]),
-        s[2] - wp.floor(s[2])
+        s[0] - wp.floor(s[0]), s[1] - wp.floor(s[1]), s[2] - wp.floor(s[2])
     )
     positions_out[atom_idx] = wp.mul(c, s_wrapped)
 
@@ -430,9 +416,7 @@ def _wrap_positions_out_kernel(
 
     # Wrap to [0, 1) using floor
     s_wrapped = type(s)(
-        s[0] - wp.floor(s[0]),
-        s[1] - wp.floor(s[1]),
-        s[2] - wp.floor(s[2])
+        s[0] - wp.floor(s[0]), s[1] - wp.floor(s[1]), s[2] - wp.floor(s[2])
     )
 
     # Convert back to Cartesian: r_new = cell @ s_wrapped
@@ -533,8 +517,8 @@ def _fractional_to_cartesian_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
-_M = [wp.mat33f, wp.mat33d]    # Matrix types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
+_M = [wp.mat33f, wp.mat33d]  # Matrix types
 
 # Cell property kernel overloads
 _compute_cell_volume_kernel_overload = {}
@@ -586,7 +570,12 @@ for t, v, m in zip(_T, _V, _M):
     )
     _scale_positions_kernel_overload[v] = wp.overload(
         _scale_positions_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=m)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+        ],
     )
     _scale_positions_out_single_kernel_overload[v] = wp.overload(
         _scale_positions_out_single_kernel,
@@ -594,7 +583,13 @@ for t, v, m in zip(_T, _V, _M):
     )
     _scale_positions_out_kernel_overload[v] = wp.overload(
         _scale_positions_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=m), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+            wp.array(dtype=v),
+        ],
     )
 
     # Wrapping kernels
@@ -604,7 +599,12 @@ for t, v, m in zip(_T, _V, _M):
     )
     _wrap_positions_kernel_overload[v] = wp.overload(
         _wrap_positions_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=m)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+        ],
     )
     _wrap_positions_out_single_kernel_overload[v] = wp.overload(
         _wrap_positions_out_single_kernel,
@@ -612,7 +612,13 @@ for t, v, m in zip(_T, _V, _M):
     )
     _wrap_positions_out_kernel_overload[v] = wp.overload(
         _wrap_positions_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=m), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+            wp.array(dtype=v),
+        ],
     )
 
     # Coordinate conversion kernels
@@ -622,7 +628,12 @@ for t, v, m in zip(_T, _V, _M):
     )
     _cartesian_to_fractional_kernel_overload[v] = wp.overload(
         _cartesian_to_fractional_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=v),
+        ],
     )
     _fractional_to_cartesian_single_kernel_overload[v] = wp.overload(
         _fractional_to_cartesian_single_kernel,
@@ -630,7 +641,12 @@ for t, v, m in zip(_T, _V, _M):
     )
     _fractional_to_cartesian_kernel_overload[v] = wp.overload(
         _fractional_to_cartesian_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=m), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -956,6 +972,7 @@ def scale_positions_with_cell_out(
         )
 
     return positions_out
+
 
 def wrap_positions_to_cell(
     positions: wp.array,

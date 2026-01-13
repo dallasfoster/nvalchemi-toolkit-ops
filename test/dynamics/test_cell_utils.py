@@ -21,18 +21,17 @@ import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.utils import (
-    compute_cell_volume,
-    compute_cell_inverse,
-    compute_strain_tensor,
     apply_strain_to_cell,
+    cartesian_to_fractional,
+    compute_cell_inverse,
+    compute_cell_volume,
+    compute_strain_tensor,
+    fractional_to_cartesian,
     scale_positions_with_cell,
     scale_positions_with_cell_out,
     wrap_positions_to_cell,
     wrap_positions_to_cell_out,
-    cartesian_to_fractional,
-    fractional_to_cartesian,
 )
-
 
 # ==============================================================================
 # Test Configuration
@@ -51,9 +50,15 @@ def make_cell(cell_np, dtype, device):
     mat_dtype = wp.mat33f if dtype == "float32" else wp.mat33d
     # Warp mat33 is constructed row-major
     mat = mat_dtype(
-        cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-        cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-        cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+        cell_np[0, 0],
+        cell_np[0, 1],
+        cell_np[0, 2],
+        cell_np[1, 0],
+        cell_np[1, 1],
+        cell_np[1, 2],
+        cell_np[2, 0],
+        cell_np[2, 1],
+        cell_np[2, 2],
     )
     return wp.array([mat], dtype=mat_dtype, device=device)
 
@@ -65,11 +70,19 @@ def make_cells_batch(cells_np, dtype, device):
     mats = []
     for i in range(num_systems):
         c = cells_np[i]
-        mats.append(mat_dtype(
-            c[0, 0], c[0, 1], c[0, 2],
-            c[1, 0], c[1, 1], c[1, 2],
-            c[2, 0], c[2, 1], c[2, 2]
-        ))
+        mats.append(
+            mat_dtype(
+                c[0, 0],
+                c[0, 1],
+                c[0, 2],
+                c[1, 0],
+                c[1, 1],
+                c[1, 2],
+                c[2, 0],
+                c[2, 1],
+                c[2, 2],
+            )
+        )
     return wp.array(mats, dtype=mat_dtype, device=device)
 
 
@@ -95,11 +108,9 @@ class TestCellVolume:
         """Test volume of cubic cell."""
         tol = 1e-4 if cell_dtype == "float32" else 1e-10
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [0.0, 10.0, 0.0],
-            [0.0, 0.0, 10.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np.float64
+        )
         cells = make_cell(cell_np, cell_dtype, device)
 
         volumes = compute_cell_volume(cells, device=device)
@@ -111,11 +122,9 @@ class TestCellVolume:
         """Test volume of orthorhombic cell."""
         tol = 1e-4 if cell_dtype == "float32" else 1e-10
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [0.0, 20.0, 0.0],
-            [0.0, 0.0, 30.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 20.0, 0.0], [0.0, 0.0, 30.0]], dtype=np.float64
+        )
         cells = make_cell(cell_np, cell_dtype, device)
 
         volumes = compute_cell_volume(cells, device=device)
@@ -127,11 +136,9 @@ class TestCellVolume:
         """Test volume of triclinic cell."""
         tol = 1e-3 if cell_dtype == "float32" else 1e-10
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [2.0, 9.0, 0.0],
-            [1.0, 2.0, 8.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np.float64
+        )
         cells = make_cell(cell_np, cell_dtype, device)
 
         volumes = compute_cell_volume(cells, device=device)
@@ -186,11 +193,9 @@ class TestCellInverse:
         """Test inverse of triclinic cell."""
         rtol = 1e-4 if cell_dtype == "float32" else 1e-10
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [2.0, 9.0, 0.0],
-            [1.0, 2.0, 8.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np.float64
+        )
         cells = make_cell(cell_np, cell_dtype, device)
 
         cells_inv = compute_cell_inverse(cells, device=device)
@@ -204,11 +209,9 @@ class TestCellInverse:
         """Test that cell @ cell_inv = I."""
         atol = 1e-4 if cell_dtype == "float32" else 1e-10
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [2.0, 9.0, 0.0],
-            [1.0, 2.0, 8.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np.float64
+        )
         cells = make_cell(cell_np, cell_dtype, device)
 
         cells_inv = compute_cell_inverse(cells, device=device)
@@ -262,11 +265,9 @@ class TestStrainTensor:
         rtol = 1e-4 if dtype == "float32" else 1e-10
         np_dtype = np.float32 if dtype == "float32" else np.float64
         cell_ref_np = np.diag([10.0, 10.0, 10.0])
-        cell_new_np = np.array([
-            [11.0, 0.5, 0.0],
-            [0.0, 10.5, 0.2],
-            [0.0, 0.0, 10.0]
-        ], dtype=np_dtype)
+        cell_new_np = np.array(
+            [[11.0, 0.5, 0.0], [0.0, 10.5, 0.2], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
 
         cells_ref = make_cell(cell_ref_np, dtype, device)
         cells_new = make_cell(cell_new_np, dtype, device)
@@ -296,7 +297,9 @@ class TestStrainTensor:
         wp.synchronize_device(device)
 
         # Use pre-computed inverse
-        strains = compute_strain_tensor(cells_new, cells_ref, cells_ref_inv=cells_ref_inv, device=device)
+        strains = compute_strain_tensor(
+            cells_new, cells_ref, cells_ref_inv=cells_ref_inv, device=device
+        )
         wp.synchronize_device(device)
 
         result = cell_to_numpy(strains, 0)
@@ -338,7 +341,9 @@ class TestPositionScaling:
         positions = wp.array(positions_np, dtype=vec_dtype, device=device)
 
         # Test single-system version (no batch_idx)
-        scale_positions_with_cell(positions, cells_new=cells_new, cells_old=cells_old, device=device)
+        scale_positions_with_cell(
+            positions, cells_new=cells_new, cells_old=cells_old, device=device
+        )
         wp.synchronize_device(device)
 
         positions_scaled = positions.numpy()
@@ -354,14 +359,16 @@ class TestPositionScaling:
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
-        num_atoms = 5
-        positions_np = np.array([
-            [1.0, 2.0, 3.0],
-            [4.0, 5.0, 6.0],
-            [7.0, 8.0, 9.0],
-            [2.0, 2.0, 2.0],
-            [5.0, 5.0, 5.0]
-        ], dtype=scalar_dtype)
+        positions_np = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+                [2.0, 2.0, 2.0],
+                [5.0, 5.0, 5.0],
+            ],
+            dtype=scalar_dtype,
+        )
 
         cell_old_np = np.diag([10.0, 10.0, 10.0])
         cell_new_np = np.diag([20.0, 20.0, 20.0])
@@ -402,7 +409,9 @@ class TestPositionScaling:
         positions = wp.array(positions_np.copy(), dtype=vec_dtype, device=device)
 
         # Use pre-computed inverse (single-system, no batch_idx)
-        scale_positions_with_cell(positions, cells_new=cells_new, cells_old_inv=cells_old_inv, device=device)
+        scale_positions_with_cell(
+            positions, cells_new=cells_new, cells_old_inv=cells_old_inv, device=device
+        )
         wp.synchronize_device(device)
 
         # Should be scaled 2x
@@ -426,7 +435,9 @@ class TestPositionScalingBatched:
         np.random.seed(42)
 
         # Create batch index
-        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32)
+        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(
+            np.int32
+        )
 
         # Different cells for each system
         cells_old_np = np.zeros((num_systems, 3, 3), dtype=np.float64)
@@ -451,7 +462,11 @@ class TestPositionScalingBatched:
 
         # Test batched version with batch_idx keyword
         scale_positions_with_cell(
-            positions, cells_new=cells_new, cells_old=cells_old, batch_idx=batch_idx, device=device
+            positions,
+            cells_new=cells_new,
+            cells_old=cells_old,
+            batch_idx=batch_idx,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -486,11 +501,14 @@ class TestPositionWrapping:
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
         # Positions outside cell
-        positions_np = np.array([
-            [15.0, 5.0, 5.0],    # x > L
-            [-3.0, 5.0, 5.0],   # x < 0
-            [25.0, -8.0, 12.0], # Multiple wraps needed
-        ], dtype=scalar_dtype)
+        positions_np = np.array(
+            [
+                [15.0, 5.0, 5.0],  # x > L
+                [-3.0, 5.0, 5.0],  # x < 0
+                [25.0, -8.0, 12.0],  # Multiple wraps needed
+            ],
+            dtype=scalar_dtype,
+        )
 
         cell_np = np.diag([10.0, 10.0, 10.0])
 
@@ -517,16 +535,17 @@ class TestPositionWrapping:
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [2.0, 9.0, 0.0],
-            [1.0, 2.0, 8.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np.float64
+        )
 
         # Position outside cell
-        positions_np = np.array([
-            [15.0, 15.0, 15.0],
-        ], dtype=scalar_dtype)
+        positions_np = np.array(
+            [
+                [15.0, 15.0, 15.0],
+            ],
+            dtype=scalar_dtype,
+        )
 
         cells = make_cell(cell_np, dtype, device)
         positions = wp.array(positions_np.copy(), dtype=vec_dtype, device=device)
@@ -579,7 +598,9 @@ class TestPositionWrapping:
         positions = wp.array(positions_np.copy(), dtype=vec_dtype, device=device)
 
         # Use pre-computed inverse (single-system, no batch_idx)
-        wrap_positions_to_cell(positions, cells=cells, cells_inv=cells_inv, device=device)
+        wrap_positions_to_cell(
+            positions, cells=cells, cells_inv=cells_inv, device=device
+        )
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(positions.numpy()[0], [5.0, 5.0, 5.0], atol=1e-4)
@@ -601,11 +622,14 @@ class TestCoordinateTransformations:
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
         cell_np = np.diag([10.0, 10.0, 10.0])
-        positions_np = np.array([
-            [5.0, 5.0, 5.0],
-            [0.0, 0.0, 0.0],
-            [10.0, 10.0, 10.0],
-        ], dtype=scalar_dtype)
+        positions_np = np.array(
+            [
+                [5.0, 5.0, 5.0],
+                [0.0, 0.0, 0.0],
+                [10.0, 10.0, 10.0],
+            ],
+            dtype=scalar_dtype,
+        )
 
         cells = make_cell(cell_np, dtype, device)
         positions = wp.array(positions_np, dtype=vec_dtype, device=device)
@@ -614,11 +638,13 @@ class TestCoordinateTransformations:
         fractional = cartesian_to_fractional(positions, cells=cells, device=device)
         wp.synchronize_device(device)
 
-        expected = np.array([
-            [0.5, 0.5, 0.5],
-            [0.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0],
-        ])
+        expected = np.array(
+            [
+                [0.5, 0.5, 0.5],
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
 
         np.testing.assert_allclose(fractional.numpy(), expected, rtol=1e-4)
 
@@ -628,11 +654,14 @@ class TestCoordinateTransformations:
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
         cell_np = np.diag([10.0, 10.0, 10.0])
-        fractional_np = np.array([
-            [0.5, 0.5, 0.5],
-            [0.0, 0.0, 0.0],
-            [0.25, 0.75, 0.1],
-        ], dtype=scalar_dtype)
+        fractional_np = np.array(
+            [
+                [0.5, 0.5, 0.5],
+                [0.0, 0.0, 0.0],
+                [0.25, 0.75, 0.1],
+            ],
+            dtype=scalar_dtype,
+        )
 
         cells = make_cell(cell_np, dtype, device)
         fractional = wp.array(fractional_np, dtype=vec_dtype, device=device)
@@ -641,11 +670,13 @@ class TestCoordinateTransformations:
         positions = fractional_to_cartesian(fractional, cells=cells, device=device)
         wp.synchronize_device(device)
 
-        expected = np.array([
-            [5.0, 5.0, 5.0],
-            [0.0, 0.0, 0.0],
-            [2.5, 7.5, 1.0],
-        ])
+        expected = np.array(
+            [
+                [5.0, 5.0, 5.0],
+                [0.0, 0.0, 0.0],
+                [2.5, 7.5, 1.0],
+            ]
+        )
 
         np.testing.assert_allclose(positions.numpy(), expected, rtol=1e-4)
 
@@ -654,16 +685,17 @@ class TestCoordinateTransformations:
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
         scalar_dtype = np.float32 if dtype == "float32" else np.float64
 
-        cell_np = np.array([
-            [10.0, 0.0, 0.0],
-            [2.0, 9.0, 0.0],
-            [1.0, 2.0, 8.0]
-        ], dtype=np.float64)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np.float64
+        )
 
-        positions_np = np.array([
-            [5.0, 3.0, 2.0],
-            [8.0, 7.0, 6.0],
-        ], dtype=scalar_dtype)
+        positions_np = np.array(
+            [
+                [5.0, 3.0, 2.0],
+                [8.0, 7.0, 6.0],
+            ],
+            dtype=scalar_dtype,
+        )
 
         cells = make_cell(cell_np, dtype, device)
         positions = wp.array(positions_np, dtype=vec_dtype, device=device)
@@ -675,7 +707,6 @@ class TestCoordinateTransformations:
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(positions_back.numpy(), positions_np, rtol=1e-4)
-
 
 
 # ==============================================================================
@@ -692,7 +723,6 @@ class TestCellUtilsSingleSystemCoverage:
         """Test position scaling for single system without batch_idx."""
         num_atoms = 20
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
-        mat_dtype = wp.mat33f if dtype == "float32" else wp.mat33d
         np_dtype = np.float32 if dtype == "float32" else np.float64
 
         positions = wp.array(
@@ -700,13 +730,19 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
-        cell_new_np = np.array([[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
+        cell_new_np = np.array(
+            [[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
         cells_new = make_cell(cell_new_np, dtype, device)
 
-        scale_positions_with_cell(positions, cells_new=cells_new, cells_old=cells, device=device)
+        scale_positions_with_cell(
+            positions, cells_new=cells_new, cells_old=cells, device=device
+        )
 
         assert positions.shape[0] == num_atoms
 
@@ -721,15 +757,21 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
-        cell_new_np = np.array([[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
+        cell_new_np = np.array(
+            [[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
         cells_new = make_cell(cell_new_np, dtype, device)
 
         pos_orig = positions.numpy().copy()
 
-        pos_out = scale_positions_with_cell_out(positions, cells_new=cells_new, cells_old=cells, device=device)
+        pos_out = scale_positions_with_cell_out(
+            positions, cells_new=cells_new, cells_old=cells, device=device
+        )
 
         np.testing.assert_array_equal(positions.numpy(), pos_orig)
         assert pos_out.shape[0] == num_atoms
@@ -745,7 +787,9 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
 
@@ -764,7 +808,9 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
 
@@ -786,7 +832,9 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
 
@@ -806,7 +854,9 @@ class TestCellUtilsSingleSystemCoverage:
             dtype=vec_dtype,
             device=device,
         )
-        cell_np = np.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
 
         cells = make_cell(cell_np, dtype, device)
 
@@ -865,7 +915,9 @@ class TestCellUtilsCoverageExtras:
         pos_orig = positions.numpy().copy()
 
         # Call without cells_old_inv - should auto-compute
-        scale_positions_with_cell(positions, cells_new=cells_new, cells_old=cells, device=device)
+        scale_positions_with_cell(
+            positions, cells_new=cells_new, cells_old=cells, device=device
+        )
 
         wp.synchronize_device(device)
         # Positions should have changed
@@ -907,11 +959,12 @@ class TestCellUtilsCoverageExtras:
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell_inv_np = np.linalg.inv(cell_np).astype(np_dtype)
 
-        cells = make_cell(cell_np, dtype, device)
         cells_inv = make_cell(cell_inv_np, dtype, device)
 
         # Call with pre-computed cells_inv
-        fractional = cartesian_to_fractional(positions, cells_inv=cells_inv, device=device)
+        fractional = cartesian_to_fractional(
+            positions, cells_inv=cells_inv, device=device
+        )
 
         wp.synchronize_device(device)
         assert fractional.shape[0] == num_atoms
@@ -950,7 +1003,6 @@ class TestCellUtilsBatchedCoverage:
         np.random.seed(42)
         np_dtype = np.float32 if dtype == "float32" else np.float64
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
-        mat_dtype = wp.mat33f if dtype == "float32" else wp.mat33d
 
         positions = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype) * 20.0,
@@ -962,7 +1014,9 @@ class TestCellUtilsBatchedCoverage:
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cells = make_cells_batch(np.stack([cell_np] * num_systems), dtype, device)
 
-        wrap_positions_to_cell(positions, cells=cells, batch_idx=batch_idx, device=device)
+        wrap_positions_to_cell(
+            positions, cells=cells, batch_idx=batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         # Positions should be wrapped into cell
@@ -990,7 +1044,9 @@ class TestCellUtilsBatchedCoverage:
         cells = make_cells_batch(np.stack([cell_np] * num_systems), dtype, device)
 
         pos_orig = positions.numpy().copy()
-        result = wrap_positions_to_cell_out(positions, cells=cells, batch_idx=batch_idx, device=device)
+        result = wrap_positions_to_cell_out(
+            positions, cells=cells, batch_idx=batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         # Original positions preserved
@@ -1016,7 +1072,9 @@ class TestCellUtilsBatchedCoverage:
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cells = make_cells_batch(np.stack([cell_np] * num_systems), dtype, device)
 
-        result = cartesian_to_fractional(positions, cells=cells, batch_idx=batch_idx, device=device)
+        result = cartesian_to_fractional(
+            positions, cells=cells, batch_idx=batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         # For cubic cell, fractional = cartesian / L
@@ -1042,7 +1100,9 @@ class TestCellUtilsBatchedCoverage:
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cells = make_cells_batch(np.stack([cell_np] * num_systems), dtype, device)
 
-        result = fractional_to_cartesian(fractional, cells=cells, batch_idx=batch_idx, device=device)
+        result = fractional_to_cartesian(
+            fractional, cells=cells, batch_idx=batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         # For cubic cell, cartesian = fractional * L
@@ -1068,11 +1128,21 @@ class TestCellUtilsBatchedCoverage:
         cell_old_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell_new_np = np.diag([12.0, 12.0, 12.0]).astype(np_dtype)
 
-        cells_old = make_cells_batch(np.stack([cell_old_np] * num_systems), dtype, device)
-        cells_new = make_cells_batch(np.stack([cell_new_np] * num_systems), dtype, device)
+        cells_old = make_cells_batch(
+            np.stack([cell_old_np] * num_systems), dtype, device
+        )
+        cells_new = make_cells_batch(
+            np.stack([cell_new_np] * num_systems), dtype, device
+        )
 
         pos_orig = positions.numpy().copy()
-        scale_positions_with_cell(positions, cells_new=cells_new, cells_old=cells_old, batch_idx=batch_idx, device=device)
+        scale_positions_with_cell(
+            positions,
+            cells_new=cells_new,
+            cells_old=cells_old,
+            batch_idx=batch_idx,
+            device=device,
+        )
 
         wp.synchronize_device(device)
         # Positions should scale by 12/10 = 1.2
@@ -1096,12 +1166,20 @@ class TestCellUtilsBatchedCoverage:
         cell_old_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell_new_np = np.diag([12.0, 12.0, 12.0]).astype(np_dtype)
 
-        cells_old = make_cells_batch(np.stack([cell_old_np] * num_systems), dtype, device)
-        cells_new = make_cells_batch(np.stack([cell_new_np] * num_systems), dtype, device)
+        cells_old = make_cells_batch(
+            np.stack([cell_old_np] * num_systems), dtype, device
+        )
+        cells_new = make_cells_batch(
+            np.stack([cell_new_np] * num_systems), dtype, device
+        )
 
         pos_orig = positions.numpy().copy()
         result = scale_positions_with_cell_out(
-            positions, cells_new=cells_new, cells_old=cells_old, batch_idx=batch_idx, device=device
+            positions,
+            cells_new=cells_new,
+            cells_old=cells_old,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1157,11 +1235,15 @@ class TestCellUtilsPreallocatedOutputs:
         # Pre-allocate output
         fractional = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
-        result = cartesian_to_fractional(positions, fractional=fractional, cells=cells, device=device)
+        result = cartesian_to_fractional(
+            positions, fractional=fractional, cells=cells, device=device
+        )
 
         wp.synchronize_device(device)
         assert result is fractional
-        np.testing.assert_allclose(fractional.numpy(), positions.numpy() / 10.0, rtol=1e-5)
+        np.testing.assert_allclose(
+            fractional.numpy(), positions.numpy() / 10.0, rtol=1e-5
+        )
 
     def test_fractional_to_cartesian_preallocated(self, dtype, device):
         """Test fractional_to_cartesian with pre-allocated output."""
@@ -1181,11 +1263,15 @@ class TestCellUtilsPreallocatedOutputs:
         # Pre-allocate output
         positions = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
-        result = fractional_to_cartesian(fractional, cells=cells, positions=positions, device=device)
+        result = fractional_to_cartesian(
+            fractional, cells=cells, positions=positions, device=device
+        )
 
         wp.synchronize_device(device)
         assert result is positions
-        np.testing.assert_allclose(positions.numpy(), fractional.numpy() * 10.0, rtol=1e-5)
+        np.testing.assert_allclose(
+            positions.numpy(), fractional.numpy() * 10.0, rtol=1e-5
+        )
 
     def test_wrap_positions_out_preallocated(self, dtype, device):
         """Test wrap_positions_to_cell_out with pre-allocated output."""
@@ -1233,7 +1319,11 @@ class TestCellUtilsPreallocatedOutputs:
         positions_out = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
         result = scale_positions_with_cell_out(
-            positions, cells_new=cells_new, positions_out=positions_out, cells_old=cells_old, device=device
+            positions,
+            cells_new=cells_new,
+            positions_out=positions_out,
+            cells_old=cells_old,
+            device=device,
         )
 
         wp.synchronize_device(device)

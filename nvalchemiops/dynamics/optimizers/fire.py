@@ -579,7 +579,7 @@ def _batch_fire_reset_velocities_out_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Diagnostic kernel overloads
 _fire_compute_diagnostics_kernel_overload = {}
@@ -607,58 +607,122 @@ for t, v in zip(_T, _V):
     # Diagnostic kernels (5 args: velocities, forces, power, force_norm_sq, velocity_norm_sq)
     _fire_compute_diagnostics_kernel_overload[v] = wp.overload(
         _fire_compute_diagnostics_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v),
-         wp.array(dtype=wp.float64), wp.array(dtype=wp.float64), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+        ],
     )
     # Batch diagnostic (6 args: velocities, forces, batch_idx, power, force_norm_sq, velocity_norm_sq)
     _batch_fire_compute_diagnostics_kernel_overload[v] = wp.overload(
         _batch_fire_compute_diagnostics_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=wp.int32),
-         wp.array(dtype=wp.float64), wp.array(dtype=wp.float64), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+        ],
     )
 
     # Velocity mix kernels (5 args: velocities, forces, alpha, force_norm, velocity_norm)
     _fire_velocity_mix_kernel_overload[v] = wp.overload(
         _fire_velocity_mix_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+        ],
     )
     # Batch velocity mix (6 args: velocities, forces, batch_idx, alpha, force_norm, velocity_norm)
     _batch_fire_velocity_mix_kernel_overload[v] = wp.overload(
         _batch_fire_velocity_mix_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=wp.int32),
-         wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+        ],
     )
     # Velocity mix out (6 args: velocities, forces, alpha, force_norm, velocity_norm, velocities_out)
     _fire_velocity_mix_out_kernel_overload[v] = wp.overload(
         _fire_velocity_mix_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
     # Batch velocity mix out (7 args)
     _batch_fire_velocity_mix_out_kernel_overload[v] = wp.overload(
         _batch_fire_velocity_mix_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=wp.int32),
-         wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
 
     # MD step kernels
     _fire_md_step_kernel_overload[v] = wp.overload(
         _fire_md_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+        ],
     )
     _batch_fire_md_step_kernel_overload[v] = wp.overload(
         _batch_fire_md_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
     _fire_md_step_out_kernel_overload[v] = wp.overload(
         _fire_md_step_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t),
-         wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
     _batch_fire_md_step_out_kernel_overload[v] = wp.overload(
         _batch_fire_md_step_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
 
     # Reset velocities kernels
@@ -676,7 +740,12 @@ for t, v in zip(_T, _V):
     )
     _batch_fire_reset_velocities_out_kernel_overload[v] = wp.overload(
         _batch_fire_reset_velocities_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=wp.int32), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -747,7 +816,14 @@ def fire_compute_diagnostics(
         wp.launch(
             _batch_fire_compute_diagnostics_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, forces, batch_idx, power, force_norm_sq, velocity_norm_sq],
+            inputs=[
+                velocities,
+                forces,
+                batch_idx,
+                power,
+                force_norm_sq,
+                velocity_norm_sq,
+            ],
             device=device,
         )
     else:
@@ -978,15 +1054,29 @@ def fire_velocity_mix_out(
         wp.launch(
             _batch_fire_velocity_mix_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, forces, batch_idx, alpha, force_norm, velocity_norm,
-                    velocities_out],
+            inputs=[
+                velocities,
+                forces,
+                batch_idx,
+                alpha,
+                force_norm,
+                velocity_norm,
+                velocities_out,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _fire_velocity_mix_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, forces, alpha, force_norm, velocity_norm, velocities_out],
+            inputs=[
+                velocities,
+                forces,
+                alpha,
+                force_norm,
+                velocity_norm,
+                velocities_out,
+            ],
             device=device,
         )
 
@@ -1048,16 +1138,31 @@ def fire_md_step_out(
         wp.launch(
             _batch_fire_md_step_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, batch_idx, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                batch_idx,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _fire_md_step_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, dt,
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                dt,
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
 
@@ -1201,9 +1306,18 @@ def _fire2_velocity_update_kernel(
         one_minus_alpha = wp.float64(1.0) - wp.float64(a)
 
         # v = (1-α) * proj_v + α * (|v|/|F|) * F
-        new_vx = type(v[0])(one_minus_alpha * proj_scale * wp.float64(f[0]) + mix_scale * wp.float64(f[0]))
-        new_vy = type(v[1])(one_minus_alpha * proj_scale * wp.float64(f[1]) + mix_scale * wp.float64(f[1]))
-        new_vz = type(v[2])(one_minus_alpha * proj_scale * wp.float64(f[2]) + mix_scale * wp.float64(f[2]))
+        new_vx = type(v[0])(
+            one_minus_alpha * proj_scale * wp.float64(f[0])
+            + mix_scale * wp.float64(f[0])
+        )
+        new_vy = type(v[1])(
+            one_minus_alpha * proj_scale * wp.float64(f[1])
+            + mix_scale * wp.float64(f[1])
+        )
+        new_vz = type(v[2])(
+            one_minus_alpha * proj_scale * wp.float64(f[2])
+            + mix_scale * wp.float64(f[2])
+        )
 
         velocities[atom_idx] = type(v)(new_vx, new_vy, new_vz)
     else:
@@ -1247,9 +1361,18 @@ def _fire2_velocity_update_out_kernel(
         mix_scale = wp.float64(a) * v_norm / f_norm
         one_minus_alpha = wp.float64(1.0) - wp.float64(a)
 
-        new_vx = type(v[0])(one_minus_alpha * proj_scale * wp.float64(f[0]) + mix_scale * wp.float64(f[0]))
-        new_vy = type(v[1])(one_minus_alpha * proj_scale * wp.float64(f[1]) + mix_scale * wp.float64(f[1]))
-        new_vz = type(v[2])(one_minus_alpha * proj_scale * wp.float64(f[2]) + mix_scale * wp.float64(f[2]))
+        new_vx = type(v[0])(
+            one_minus_alpha * proj_scale * wp.float64(f[0])
+            + mix_scale * wp.float64(f[0])
+        )
+        new_vy = type(v[1])(
+            one_minus_alpha * proj_scale * wp.float64(f[1])
+            + mix_scale * wp.float64(f[1])
+        )
+        new_vz = type(v[2])(
+            one_minus_alpha * proj_scale * wp.float64(f[2])
+            + mix_scale * wp.float64(f[2])
+        )
 
         velocities_out[atom_idx] = type(v)(new_vx, new_vy, new_vz)
     else:
@@ -1293,9 +1416,18 @@ def _batch_fire2_velocity_update_kernel(
         mix_scale = wp.float64(a) * v_norm / f_norm
         one_minus_alpha = wp.float64(1.0) - wp.float64(a)
 
-        new_vx = type(v[0])(one_minus_alpha * proj_scale * wp.float64(f[0]) + mix_scale * wp.float64(f[0]))
-        new_vy = type(v[1])(one_minus_alpha * proj_scale * wp.float64(f[1]) + mix_scale * wp.float64(f[1]))
-        new_vz = type(v[2])(one_minus_alpha * proj_scale * wp.float64(f[2]) + mix_scale * wp.float64(f[2]))
+        new_vx = type(v[0])(
+            one_minus_alpha * proj_scale * wp.float64(f[0])
+            + mix_scale * wp.float64(f[0])
+        )
+        new_vy = type(v[1])(
+            one_minus_alpha * proj_scale * wp.float64(f[1])
+            + mix_scale * wp.float64(f[1])
+        )
+        new_vz = type(v[2])(
+            one_minus_alpha * proj_scale * wp.float64(f[2])
+            + mix_scale * wp.float64(f[2])
+        )
 
         velocities[atom_idx] = type(v)(new_vx, new_vy, new_vz)
     else:
@@ -1340,9 +1472,18 @@ def _batch_fire2_velocity_update_out_kernel(
         mix_scale = wp.float64(a) * v_norm / f_norm
         one_minus_alpha = wp.float64(1.0) - wp.float64(a)
 
-        new_vx = type(v[0])(one_minus_alpha * proj_scale * wp.float64(f[0]) + mix_scale * wp.float64(f[0]))
-        new_vy = type(v[1])(one_minus_alpha * proj_scale * wp.float64(f[1]) + mix_scale * wp.float64(f[1]))
-        new_vz = type(v[2])(one_minus_alpha * proj_scale * wp.float64(f[2]) + mix_scale * wp.float64(f[2]))
+        new_vx = type(v[0])(
+            one_minus_alpha * proj_scale * wp.float64(f[0])
+            + mix_scale * wp.float64(f[0])
+        )
+        new_vy = type(v[1])(
+            one_minus_alpha * proj_scale * wp.float64(f[1])
+            + mix_scale * wp.float64(f[1])
+        )
+        new_vz = type(v[2])(
+            one_minus_alpha * proj_scale * wp.float64(f[2])
+            + mix_scale * wp.float64(f[2])
+        )
 
         velocities_out[atom_idx] = type(v)(new_vx, new_vy, new_vz)
     else:
@@ -1361,24 +1502,47 @@ _batch_fire2_velocity_update_out_kernel_overload = {}
 for t, v in zip(_T, _V):
     _fire2_velocity_update_kernel_overload[v] = wp.overload(
         _fire2_velocity_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.float64), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+        ],
     )
     _fire2_velocity_update_out_kernel_overload[v] = wp.overload(
         _fire2_velocity_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.float64), wp.array(dtype=wp.float64), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=v),
+        ],
     )
     _batch_fire2_velocity_update_kernel_overload[v] = wp.overload(
         _batch_fire2_velocity_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=wp.int32),
-         wp.array(dtype=t), wp.array(dtype=wp.float64), wp.array(dtype=wp.float64)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+        ],
     )
     _batch_fire2_velocity_update_out_kernel_overload[v] = wp.overload(
         _batch_fire2_velocity_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=wp.int32),
-         wp.array(dtype=t), wp.array(dtype=wp.float64), wp.array(dtype=wp.float64),
-         wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=wp.float64),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -1506,8 +1670,15 @@ def fire2_velocity_update_out(
         wp.launch(
             _batch_fire2_velocity_update_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, forces, batch_idx, alpha, force_norm_sq, power,
-                    velocities_out],
+            inputs=[
+                velocities,
+                forces,
+                batch_idx,
+                alpha,
+                force_norm_sq,
+                power,
+                velocities_out,
+            ],
             device=device,
         )
     else:
@@ -1600,6 +1771,13 @@ def fire2_md_step_out(
     """
     # FIRE2 uses the same MD step as FIRE
     return fire_md_step_out(
-        positions, velocities, forces, masses, dt,
-        positions_out, velocities_out, batch_idx, device
+        positions,
+        velocities,
+        forces,
+        masses,
+        dt,
+        positions_out,
+        velocities_out,
+        batch_idx,
+        device,
     )

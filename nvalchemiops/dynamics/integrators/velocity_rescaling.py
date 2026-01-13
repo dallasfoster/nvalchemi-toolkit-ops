@@ -171,7 +171,7 @@ def _batch_velocity_rescale_out_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 _velocity_rescale_kernel_overload = {}
 _velocity_rescale_out_kernel_overload = {}
@@ -193,7 +193,12 @@ for t, v in zip(_T, _V):
     )
     _batch_velocity_rescale_out_kernel_overload[v] = wp.overload(
         _batch_velocity_rescale_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -226,6 +231,7 @@ def compute_rescale_factor(
     Returns 1.0 if current_temperature <= 0 to avoid division by zero.
     """
     import math
+
     if current_temperature <= 0.0:
         return 1.0
     return math.sqrt(target_temperature / current_temperature)
@@ -343,4 +349,3 @@ def velocity_rescale_out(
         )
 
     return velocities_out
-

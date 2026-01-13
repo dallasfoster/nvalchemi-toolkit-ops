@@ -23,17 +23,16 @@ Tests cover:
 - Float32 and float64 support
 """
 
-import pytest
 import numpy as np
+import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.integrators import (
-    langevin_baoab_half_step,
     langevin_baoab_finalize,
-    langevin_baoab_half_step_out,
     langevin_baoab_finalize_out,
+    langevin_baoab_half_step,
+    langevin_baoab_half_step_out,
 )
-
 
 # ==============================================================================
 # Test Configuration
@@ -96,7 +95,7 @@ def compute_harmonic_forces(positions: wp.array, forces: wp.array, k: float):
 
 def compute_kinetic_energy_np(velocities: np.ndarray, masses: np.ndarray) -> float:
     """Compute kinetic energy KE = 0.5 * sum(m * v^2)."""
-    v_sq = np.sum(velocities ** 2, axis=1)
+    v_sq = np.sum(velocities**2, axis=1)
     return 0.5 * np.sum(masses * v_sq)
 
 
@@ -117,14 +116,14 @@ def compute_morse_forces(
     forces = np.zeros_like(positions)
     r_vec = positions[1] - positions[0]
     r = np.linalg.norm(r_vec)
-    
+
     if r > 1e-10:
         r_hat = r_vec / r
         exp_term = np.exp(-a * (r - r_e))
         dVdr = 2 * D_e * a * (1 - exp_term) * exp_term
         forces[1] = -dVdr * r_hat
         forces[0] = dVdr * r_hat
-    
+
     return forces
 
 
@@ -182,7 +181,9 @@ class TestLangevinAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_half_step_device_inference(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_half_step_device_inference(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that device is inferred from positions."""
         num_atoms = 20
 
@@ -208,8 +209,14 @@ class TestLangevinAPI:
 
         # Call without explicit device
         langevin_baoab_half_step(
-            positions, velocities, forces, masses,
-            dt, temperature, friction, random_seed=42
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            temperature,
+            friction,
+            random_seed=42,
         )
 
         wp.synchronize_device(device)
@@ -217,7 +224,9 @@ class TestLangevinAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_half_step_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_half_step_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that non-mutating langevin_baoab_half_step_out preserves input."""
         num_atoms = 10
         np.random.seed(42)
@@ -267,7 +276,9 @@ class TestLangevinAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_half_step_out_with_preallocated(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_half_step_out_with_preallocated(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test half_step_out with pre-allocated output arrays."""
         num_atoms = 20
 
@@ -295,11 +306,17 @@ class TestLangevinAPI:
         velocities_out = wp.empty_like(velocities)
 
         pos_out, vel_out = langevin_baoab_half_step_out(
-            positions, velocities, forces, masses,
-            dt, temperature, friction, random_seed=42,
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            temperature,
+            friction,
+            random_seed=42,
             positions_out=positions_out,
             velocities_out=velocities_out,
-            device=device
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -335,7 +352,9 @@ class TestLangevinAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_finalize_out_preserves_input(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_finalize_out_preserves_input(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test non-mutating finalize for single system preserves input."""
         num_atoms = 20
 
@@ -367,7 +386,9 @@ class TestLangevinAPI:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_finalize_out_device_inference(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_finalize_out_device_inference(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test langevin_baoab_finalize_out with device inference."""
         num_atoms = 20
 
@@ -381,9 +402,7 @@ class TestLangevinAPI:
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
         # Call without explicit device
-        vel_out = langevin_baoab_finalize_out(
-            velocities, forces_new, masses, dt
-        )
+        vel_out = langevin_baoab_finalize_out(velocities, forces_new, masses, dt)
 
         wp.synchronize_device(device)
         assert vel_out.shape[0] == num_atoms
@@ -430,7 +449,7 @@ class TestLangevinBatched:
         temperature = wp.array([1.0, 2.0, 3.0], dtype=dtype_scalar, device=device)
         friction = wp.array([1.0, 1.0, 1.0], dtype=dtype_scalar, device=device)
         random_seed = 12345
-        
+
         batch_idx = wp.array(
             np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
             dtype=wp.int32,
@@ -455,7 +474,6 @@ class TestLangevinBatched:
     def test_batched_half_step_out(self, device, dtype_vec, dtype_scalar, np_dtype):
         """Test langevin_baoab_half_step_out with batched mode."""
         num_atoms = 20
-        num_systems = 2
 
         positions = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
@@ -475,9 +493,16 @@ class TestLangevinBatched:
         friction = wp.array([0.01, 0.01], dtype=dtype_scalar, device=device)
 
         pos_out, vel_out = langevin_baoab_half_step_out(
-            positions, velocities, forces, masses,
-            dt, temperature, friction, random_seed=42,
-            batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            temperature,
+            friction,
+            random_seed=42,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -515,9 +540,7 @@ class TestLangevinBatched:
             device=device,
         )
 
-        langevin_baoab_finalize(
-            velocities, new_forces, masses, dt, batch_idx=batch_idx
-        )
+        langevin_baoab_finalize(velocities, new_forces, masses, dt, batch_idx=batch_idx)
         wp.synchronize_device(device)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -525,7 +548,6 @@ class TestLangevinBatched:
     def test_batched_finalize_out(self, device, dtype_vec, dtype_scalar, np_dtype):
         """Test non-mutating finalize for batched systems."""
         num_atoms = 40
-        num_systems = 2
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
@@ -557,7 +579,9 @@ class TestLangevinBatched:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_uses_per_system_temperature(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_uses_per_system_temperature(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that batched version uses per-system temperatures correctly."""
         num_systems = 2
         atoms_per_system = 50
@@ -565,11 +589,11 @@ class TestLangevinBatched:
         dt_val = 0.01
         friction_val = 10.0
         num_steps = 2000
-        
+
         target_temps = [0.5, 2.0]
 
         np.random.seed(42)
-        
+
         initial_pos = np.zeros((total_atoms, 3), dtype=np_dtype)
         initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1
         masses_np = np.ones(total_atoms, dtype=np_dtype)
@@ -580,9 +604,13 @@ class TestLangevinBatched:
         masses = wp.array(masses_np, dtype=dtype_scalar, device=device)
         dt = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
         temperature = wp.array(target_temps, dtype=dtype_scalar, device=device)
-        friction = wp.array([friction_val] * num_systems, dtype=dtype_scalar, device=device)
-        
-        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32)
+        friction = wp.array(
+            [friction_val] * num_systems, dtype=dtype_scalar, device=device
+        )
+
+        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(
+            np.int32
+        )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
         for step in range(num_steps):
@@ -601,7 +629,7 @@ class TestLangevinBatched:
 
         wp.synchronize_device(device)
         vel_np = velocities.numpy()
-        
+
         measured_temps = []
         for sys_id in range(num_systems):
             start = sys_id * atoms_per_system
@@ -610,14 +638,16 @@ class TestLangevinBatched:
                 vel_np[start:end], masses_np[start:end], atoms_per_system
             )
             measured_temps.append(temp)
-        
+
         assert measured_temps[1] > measured_temps[0], (
             f"Higher temp system should be hotter: {measured_temps}"
         )
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batched_temperature_equilibration(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_batched_temperature_equilibration(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that multiple systems equilibrate to their target temperatures."""
         num_systems = 3
         atoms_per_system = 50
@@ -630,7 +660,7 @@ class TestLangevinBatched:
         target_temps = [0.5, 1.0, 2.0]
 
         np.random.seed(42)
-        
+
         initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1
         masses_np = np.ones(total_atoms, dtype=np_dtype)
 
@@ -640,13 +670,17 @@ class TestLangevinBatched:
         masses = wp.array(masses_np, dtype=dtype_scalar, device=device)
         dt = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
         temperature = wp.array(target_temps, dtype=dtype_scalar, device=device)
-        friction = wp.array([friction_val] * num_systems, dtype=dtype_scalar, device=device)
-        
-        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32)
+        friction = wp.array(
+            [friction_val] * num_systems, dtype=dtype_scalar, device=device
+        )
+
+        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(
+            np.int32
+        )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
         temps_history = [[] for _ in range(num_systems)]
-        
+
         for step in range(num_steps):
             langevin_baoab_half_step(
                 positions,
@@ -664,7 +698,7 @@ class TestLangevinBatched:
             if step >= equilibration_steps and step % 50 == 0:
                 wp.synchronize_device(device)
                 vel_np = velocities.numpy()
-                
+
                 for sys_id in range(num_systems):
                     start = sys_id * atoms_per_system
                     end = (sys_id + 1) * atoms_per_system
@@ -691,7 +725,9 @@ class TestLangevinPhysics:
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_temperature_equilibration_harmonic(self, device, dtype_vec, dtype_scalar, np_dtype):
+    def test_temperature_equilibration_harmonic(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
         """Test that system equilibrates to target temperature in harmonic potential."""
         num_atoms = 100
         spring_k = 1.0
@@ -747,7 +783,9 @@ class TestLangevinPhysics:
         )
 
         expected_std = target_temp * np.sqrt(2.0 / (3 * num_atoms))
-        assert std_temp < 3 * expected_std, f"Temperature fluctuation too large: {std_temp:.3f}"
+        assert std_temp < 3 * expected_std, (
+            f"Temperature fluctuation too large: {std_temp:.3f}"
+        )
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_high_friction_quick_equilibration(self, device):
@@ -763,9 +801,7 @@ class TestLangevinPhysics:
 
         def run_with_friction(friction_val, n_steps=500):
             positions = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
-            velocities = wp.array(
-                initial_vel.copy(), dtype=wp.vec3f, device=device
-            )
+            velocities = wp.array(initial_vel.copy(), dtype=wp.vec3f, device=device)
             forces = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
             masses = wp.array(masses_np, dtype=wp.float32, device=device)
             dt = wp.array([dt_val], dtype=wp.float32, device=device)
@@ -775,7 +811,14 @@ class TestLangevinPhysics:
             temps = []
             for step in range(n_steps):
                 langevin_baoab_half_step(
-                    positions, velocities, forces, masses, dt, temperature, friction, step
+                    positions,
+                    velocities,
+                    forces,
+                    masses,
+                    dt,
+                    temperature,
+                    friction,
+                    step,
                 )
                 langevin_baoab_finalize(velocities, forces, masses, dt)
 
@@ -822,7 +865,14 @@ class TestLangevinPhysics:
             temps = []
             for step in range(num_steps):
                 langevin_baoab_half_step(
-                    positions, velocities, forces, masses, dt, temperature, friction, step
+                    positions,
+                    velocities,
+                    forces,
+                    masses,
+                    dt,
+                    temperature,
+                    friction,
+                    step,
                 )
                 langevin_baoab_finalize(velocities, forces, masses, dt)
 
@@ -853,22 +903,25 @@ class TestLangevinPhysics:
         a = 2.0
         r_e = 1.5
         target_temp = 0.1
-        
+
         dt_val = 0.001
         friction_val = 5.0
         num_steps = 10000
         equilibration_steps = 5000
-        
+
         num_atoms = 2
         masses_np = np.array([1.0, 1.0], dtype=np.float32)
-        
-        initial_pos = np.array([
-            [0.0, 0.0, 0.0],
-            [r_e, 0.0, 0.0],
-        ], dtype=np.float32)
-        
+
+        initial_pos = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [r_e, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
         initial_vel = np.zeros((num_atoms, 3), dtype=np.float32)
-        
+
         positions = wp.array(initial_pos.copy(), dtype=wp.vec3f, device=device)
         velocities = wp.array(initial_vel.copy(), dtype=wp.vec3f, device=device)
         forces = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
@@ -876,15 +929,15 @@ class TestLangevinPhysics:
         dt = wp.array([dt_val], dtype=wp.float32, device=device)
         temperature = wp.array([target_temp], dtype=wp.float32, device=device)
         friction = wp.array([friction_val], dtype=wp.float32, device=device)
-        
+
         wp.synchronize_device(device)
         pos_np = positions.numpy()
         forces_np = compute_morse_forces(pos_np, D_e, a, r_e)
         forces = wp.array(forces_np.astype(np.float32), dtype=wp.vec3f, device=device)
-        
+
         bond_lengths = []
         temps = []
-        
+
         for step in range(num_steps):
             langevin_baoab_half_step(
                 positions,
@@ -896,38 +949,44 @@ class TestLangevinPhysics:
                 friction,
                 step,
             )
-            
+
             wp.synchronize_device(device)
             pos_np = positions.numpy()
             forces_np = compute_morse_forces(pos_np, D_e, a, r_e)
-            forces = wp.array(forces_np.astype(np.float32), dtype=wp.vec3f, device=device)
-            
+            forces = wp.array(
+                forces_np.astype(np.float32), dtype=wp.vec3f, device=device
+            )
+
             langevin_baoab_finalize(velocities, forces, masses, dt)
-            
+
             if step >= equilibration_steps and step % 100 == 0:
                 wp.synchronize_device(device)
                 pos_np = positions.numpy()
                 vel_np = velocities.numpy()
-                
+
                 r = np.linalg.norm(pos_np[1] - pos_np[0])
                 bond_lengths.append(r)
-                
+
                 temp = compute_temperature_np(vel_np, masses_np, num_atoms)
                 temps.append(temp)
-        
+
         bond_lengths = np.array(bond_lengths)
         temps = np.array(temps)
-        
+
         mean_bond_length = np.mean(bond_lengths)
         std_bond_length = np.std(bond_lengths)
-        
+
         assert mean_bond_length < r_e + 0.5, (
             f"Mean bond length {mean_bond_length:.3f} too far from equilibrium {r_e}"
         )
-        assert std_bond_length < 0.3, f"Bond length fluctuation too large: {std_bond_length:.3f}"
-        
+        assert std_bond_length < 0.3, (
+            f"Bond length fluctuation too large: {std_bond_length:.3f}"
+        )
+
         max_bond_length = np.max(bond_lengths)
-        assert max_bond_length < 3.0 * r_e, f"Dimer dissociated: max bond length = {max_bond_length:.3f}"
+        assert max_bond_length < 3.0 * r_e, (
+            f"Dimer dissociated: max bond length = {max_bond_length:.3f}"
+        )
 
 
 if __name__ == "__main__":

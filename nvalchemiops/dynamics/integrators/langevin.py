@@ -96,7 +96,7 @@ def _langevin_baoab_half_step_kernel(
     A: r += (dt/2)*v
     O: v = c1*v + c2*xi (thermostat)
     A: r += (dt/2)*v
-    
+
     Parameters
     ----------
     positions : wp.array(dtype=wp.vec3f or wp.vec3d)
@@ -150,9 +150,9 @@ def _langevin_baoab_half_step_kernel(
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
     xi = type(vel)(
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state))
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
     )
     vel_step = c1 * vel_step + c2 * xi
 
@@ -290,9 +290,9 @@ def _langevin_baoab_half_step_out_kernel(
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
     xi = type(vel)(
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state))
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
     )
     vel_step = c1 * vel_step + c2 * xi
 
@@ -427,13 +427,12 @@ def _batch_langevin_baoab_half_step_kernel(
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
     xi = type(vel)(
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state))
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
     )
     vel_step = c1 * vel_step + c2 * xi
 
-    
     # A step
     pos_step2 = pos_step + half_dt * vel_step
 
@@ -466,7 +465,7 @@ def _batch_langevin_baoab_finalize_kernel(
         System index for each atom. Shape (N,).
     dt : wp.array(dtype=wp.float32 or wp.float64)
         Timestep(s). Shape (1,) for single, (B,) for batched.
-    
+
     Launch Grid
     -----------
     dim = [num_atoms_total]
@@ -572,9 +571,9 @@ def _batch_langevin_baoab_half_step_out_kernel(
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
     xi = type(vel)(
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state)), 
-        type(kT)(wp.randn(rng_state))
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
+        type(kT)(wp.randn(rng_state)),
     )
     vel_step = c1 * vel_step + c2 * xi
 
@@ -635,7 +634,7 @@ def _batch_langevin_baoab_finalize_out_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Half-step kernel overloads
 _langevin_baoab_half_step_kernel_overload = {}
@@ -653,25 +652,61 @@ for t, v in zip(_T, _V):
     # Half-step kernels
     _langevin_baoab_half_step_kernel_overload[v] = wp.overload(
         _langevin_baoab_half_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.uint64],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+        ],
     )
     _batch_langevin_baoab_half_step_kernel_overload[v] = wp.overload(
         _batch_langevin_baoab_half_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.uint64],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+        ],
     )
     _langevin_baoab_half_step_out_kernel_overload[v] = wp.overload(
         _langevin_baoab_half_step_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.uint64,
-         wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
     _batch_langevin_baoab_half_step_out_kernel_overload[v] = wp.overload(
         _batch_langevin_baoab_half_step_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t), wp.uint64,
-         wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
 
     # Finalize kernels
@@ -681,15 +716,34 @@ for t, v in zip(_T, _V):
     )
     _batch_langevin_baoab_finalize_kernel_overload[v] = wp.overload(
         _batch_langevin_baoab_finalize_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
     _langevin_baoab_finalize_out_kernel_overload[v] = wp.overload(
         _langevin_baoab_finalize_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
     _batch_langevin_baoab_finalize_out_kernel_overload[v] = wp.overload(
         _batch_langevin_baoab_finalize_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+        ],
     )
 
 
@@ -752,16 +806,33 @@ def langevin_baoab_half_step(
         wp.launch(
             _batch_langevin_baoab_half_step_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, batch_idx,
-                    dt, temperature, friction, wp.uint64(random_seed)],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                batch_idx,
+                dt,
+                temperature,
+                friction,
+                wp.uint64(random_seed),
+            ],
             device=device,
         )
     else:
         wp.launch(
             _langevin_baoab_half_step_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses,
-                    dt, temperature, friction, wp.uint64(random_seed)],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                dt,
+                temperature,
+                friction,
+                wp.uint64(random_seed),
+            ],
             device=device,
         )
 
@@ -889,18 +960,37 @@ def langevin_baoab_half_step_out(
         wp.launch(
             _batch_langevin_baoab_half_step_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses, batch_idx,
-                    dt, temperature, friction, wp.uint64(random_seed),
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                batch_idx,
+                dt,
+                temperature,
+                friction,
+                wp.uint64(random_seed),
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
     else:
         wp.launch(
             _langevin_baoab_half_step_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[positions, velocities, forces, masses,
-                    dt, temperature, friction, wp.uint64(random_seed),
-                    positions_out, velocities_out],
+            inputs=[
+                positions,
+                velocities,
+                forces,
+                masses,
+                dt,
+                temperature,
+                friction,
+                wp.uint64(random_seed),
+                positions_out,
+                velocities_out,
+            ],
             device=device,
         )
 

@@ -80,7 +80,7 @@ def _compute_kinetic_energy_kernel(
     masses : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
         Atomic masses. Shape (num_atoms,).
     kinetic_energy : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Pre-allocated output array. 
+        Pre-allocated output array.
         Shape (1,) for single system
 
     Launch Grid
@@ -116,7 +116,7 @@ def _batch_compute_kinetic_energy_kernel(
     batch_idx : wp.array(dtype=wp.int32)
         System index for each atom. Shape (num_atoms,).
     kinetic_energies : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Pre-allocated output array. 
+        Pre-allocated output array.
         Shape (num_systems,).
 
     Launch Grid
@@ -174,6 +174,7 @@ def _compute_com_velocity_kernel(
     mom = mass * vel
     wp.atomic_add(total_momentum, 0, mom)
     wp.atomic_add(total_mass, 0, mass)
+
 
 @wp.kernel
 def _batch_compute_com_velocity_kernel(
@@ -239,6 +240,7 @@ def _remove_com_motion_kernel(
 
     velocities[atom_idx] = vel - com_velocity[0]
 
+
 @wp.kernel
 def _batch_remove_com_motion_kernel(
     velocities: wp.array(dtype=Any),
@@ -294,12 +296,13 @@ def _remove_com_motion_out_kernel(
 
     velocities_out[atom_idx] = vel - com_velocity[0]
 
+
 @wp.kernel
 def _batch_remove_com_motion_out_kernel(
     velocities: wp.array(dtype=Any),
     batch_idx: wp.array(dtype=wp.int32),
     com_velocity: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any), 
+    velocities_out: wp.array(dtype=Any),
 ):
     """Remove center of mass velocity from all atoms (non-mutating).
 
@@ -375,6 +378,7 @@ def _initialize_velocities_kernel(
 
     vel = velocities[atom_idx]
     velocities[atom_idx] = type(vel)(vx, vy, vz)
+
 
 @wp.kernel
 def _batch_initialize_velocities_kernel(
@@ -642,7 +646,7 @@ def _fill_constant_f64_kernel(
 # ==============================================================================
 
 _T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]      # Vector types
+_V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Kinetic energy kernel overloads
 _compute_kinetic_energy_kernel_overload = {}
@@ -676,7 +680,12 @@ for t, v in zip(_T, _V):
     )
     _batch_compute_kinetic_energy_kernel_overload[v] = wp.overload(
         _batch_compute_kinetic_energy_kernel,
-        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
     )
 
     # Temperature kernels (keyed by scalar type)
@@ -696,8 +705,13 @@ for t, v in zip(_T, _V):
     )
     _batch_compute_com_velocity_kernel_overload[v] = wp.overload(
         _batch_compute_com_velocity_kernel,
-        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=t),
-         wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+        ],
     )
 
     # Remove COM motion kernels (now using 1D vector arrays for com_velocity)
@@ -715,7 +729,12 @@ for t, v in zip(_T, _V):
     )
     _batch_remove_com_motion_out_kernel_overload[v] = wp.overload(
         _batch_remove_com_motion_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=v), wp.array(dtype=v)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+        ],
     )
 
     # Initialize velocities kernels (batch_idx moved to end)
@@ -725,7 +744,13 @@ for t, v in zip(_T, _V):
     )
     _batch_initialize_velocities_kernel_overload[v] = wp.overload(
         _batch_initialize_velocities_kernel,
-        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t), wp.uint64, wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+            wp.array(dtype=wp.int32),
+        ],
     )
     _initialize_velocities_out_kernel_overload[v] = wp.overload(
         _initialize_velocities_out_kernel,
@@ -733,7 +758,13 @@ for t, v in zip(_T, _V):
     )
     _batch_initialize_velocities_out_kernel_overload[v] = wp.overload(
         _batch_initialize_velocities_out_kernel,
-        [wp.array(dtype=t), wp.array(dtype=t), wp.uint64, wp.array(dtype=v), wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=t),
+            wp.array(dtype=t),
+            wp.uint64,
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+        ],
     )
 
 
@@ -858,7 +889,11 @@ def compute_temperature(
     # Compute kinetic energy if not provided
     if kinetic_energy is None:
         kinetic_energy = compute_kinetic_energy(
-            velocities, masses, batch_idx=batch_idx, num_systems=num_systems, device=device
+            velocities,
+            masses,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
         )
 
     # Determine DOF
@@ -935,12 +970,6 @@ def initialize_velocities(
     is_batched = batch_idx is not None
     vec_dtype = velocities.dtype
 
-    # Determine scalar dtype from vector dtype
-    if vec_dtype == wp.vec3d:
-        scalar_dtype = wp.float64
-    else:
-        scalar_dtype = wp.float32
-
     if is_batched:
         wp.launch(
             _batch_initialize_velocities_kernel_overload[vec_dtype],
@@ -957,7 +986,13 @@ def initialize_velocities(
         )
 
     if remove_com:
-        remove_com_motion(velocities, masses, batch_idx=batch_idx, num_systems=num_systems, device=device)
+        remove_com_motion(
+            velocities,
+            masses,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
 
 
 def initialize_velocities_out(
@@ -1018,7 +1053,13 @@ def initialize_velocities_out(
         wp.launch(
             _batch_initialize_velocities_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[masses, temperature, wp.uint64(random_seed), velocities_out, batch_idx],
+            inputs=[
+                masses,
+                temperature,
+                wp.uint64(random_seed),
+                velocities_out,
+                batch_idx,
+            ],
             device=device,
         )
     else:
@@ -1031,7 +1072,11 @@ def initialize_velocities_out(
 
     if remove_com:
         velocities_out = remove_com_motion_out(
-            velocities_out, masses, batch_idx=batch_idx, num_systems=num_systems, device=device
+            velocities_out,
+            masses,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
         )
 
     return velocities_out

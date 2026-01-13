@@ -13,33 +13,31 @@ import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.integrators.npt import (
-    vec9f,
-    vec9d,
-    vec3f,
-    vec3d,
+    compute_barostat_mass,
+    compute_barostat_potential_energy,
+    compute_cell_kinetic_energy,
     compute_pressure_tensor,
     compute_scalar_pressure,
-    compute_barostat_mass,
-    compute_cell_kinetic_energy,
-    compute_barostat_potential_energy,
-    npt_thermostat_half_step,
-    npt_barostat_half_step,
-    npt_velocity_half_step,
-    npt_position_update,
-    npt_cell_update,
-    npt_velocity_half_step_out,
-    npt_position_update_out,
-    npt_cell_update_out,
-    run_npt_step,
     nph_barostat_half_step,
-    nph_velocity_half_step,
     nph_position_update,
-    nph_velocity_half_step_out,
     nph_position_update_out,
+    nph_velocity_half_step,
+    nph_velocity_half_step_out,
+    npt_barostat_half_step,
+    npt_cell_update,
+    npt_cell_update_out,
+    npt_position_update,
+    npt_position_update_out,
+    npt_velocity_half_step,
+    npt_velocity_half_step_out,
     run_nph_step,
+    run_npt_step,
+    vec3d,
+    vec3f,
+    vec9d,
+    vec9f,
 )
 from nvalchemiops.dynamics.utils.cell_utils import compute_cell_volume
-
 
 # ==============================================================================
 # Test Configuration
@@ -59,9 +57,15 @@ def make_cell(cell_np, dtype, device):
     np_dtype = np.float32 if dtype == "float32" else np.float64
     cell_np = cell_np.astype(np_dtype)
     mat = mat_dtype(
-        cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-        cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-        cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+        cell_np[0, 0],
+        cell_np[0, 1],
+        cell_np[0, 2],
+        cell_np[1, 0],
+        cell_np[1, 1],
+        cell_np[1, 2],
+        cell_np[2, 0],
+        cell_np[2, 1],
+        cell_np[2, 2],
     )
     return wp.array([mat], dtype=mat_dtype, device=device)
 
@@ -74,11 +78,19 @@ def make_cells_batch(cells_np, dtype, device):
     mats = []
     for i in range(num_systems):
         c = cells_np[i].astype(np_dtype)
-        mats.append(mat_dtype(
-            c[0, 0], c[0, 1], c[0, 2],
-            c[1, 0], c[1, 1], c[1, 2],
-            c[2, 0], c[2, 1], c[2, 2]
-        ))
+        mats.append(
+            mat_dtype(
+                c[0, 0],
+                c[0, 1],
+                c[0, 2],
+                c[1, 0],
+                c[1, 1],
+                c[1, 2],
+                c[2, 0],
+                c[2, 1],
+                c[2, 2],
+            )
+        )
     return wp.array(mats, dtype=mat_dtype, device=device)
 
 
@@ -94,27 +106,43 @@ def setup_npt_system(num_atoms, dtype, device, seed=42, chain_length=3):
 
     positions = wp.array(
         np.random.rand(num_atoms, 3).astype(np_dtype) * 8.0 + 1.0,
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
     velocities = wp.array(
         np.random.randn(num_atoms, 3).astype(np_dtype) * 0.3,
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
     forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
-    masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+    masses = wp.array(
+        np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
     h_dot_np = np.zeros((3, 3), dtype=np_dtype)
 
     cell_mat = mat_dtype(
-        cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-        cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-        cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+        cell_np[0, 0],
+        cell_np[0, 1],
+        cell_np[0, 2],
+        cell_np[1, 0],
+        cell_np[1, 1],
+        cell_np[1, 2],
+        cell_np[2, 0],
+        cell_np[2, 1],
+        cell_np[2, 2],
     )
     h_dot_mat = mat_dtype(
-        h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-        h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-        h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2]
+        h_dot_np[0, 0],
+        h_dot_np[0, 1],
+        h_dot_np[0, 2],
+        h_dot_np[1, 0],
+        h_dot_np[1, 1],
+        h_dot_np[1, 2],
+        h_dot_np[2, 0],
+        h_dot_np[2, 1],
+        h_dot_np[2, 2],
     )
 
     cells = wp.array([cell_mat], dtype=mat_dtype, device=device)
@@ -125,7 +153,8 @@ def setup_npt_system(num_atoms, dtype, device, seed=42, chain_length=3):
     eta_dot = wp.zeros((1, chain_length), dtype=scalar_dtype, device=device)
     thermostat_masses = wp.array(
         np.ones((1, chain_length), dtype=np_dtype) * 20.0,
-        dtype=scalar_dtype, device=device
+        dtype=scalar_dtype,
+        device=device,
     )
 
     cell_masses = wp.array([200.0], dtype=scalar_dtype, device=device)
@@ -163,27 +192,43 @@ def setup_nph_system(num_atoms, dtype, device, seed=42):
 
     positions = wp.array(
         np.random.rand(num_atoms, 3).astype(np_dtype) * 8.0 + 1.0,
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
     velocities = wp.array(
         np.random.randn(num_atoms, 3).astype(np_dtype) * 0.3,
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
     forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
-    masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+    masses = wp.array(
+        np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
     h_dot_np = np.zeros((3, 3), dtype=np_dtype)
 
     cell_mat = mat_dtype(
-        cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-        cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-        cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+        cell_np[0, 0],
+        cell_np[0, 1],
+        cell_np[0, 2],
+        cell_np[1, 0],
+        cell_np[1, 1],
+        cell_np[1, 2],
+        cell_np[2, 0],
+        cell_np[2, 1],
+        cell_np[2, 2],
     )
     h_dot_mat = mat_dtype(
-        h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-        h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-        h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2]
+        h_dot_np[0, 0],
+        h_dot_np[0, 1],
+        h_dot_np[0, 2],
+        h_dot_np[1, 0],
+        h_dot_np[1, 1],
+        h_dot_np[1, 2],
+        h_dot_np[2, 0],
+        h_dot_np[2, 1],
+        h_dot_np[2, 2],
     )
 
     cells = wp.array([cell_mat], dtype=mat_dtype, device=device)
@@ -229,9 +274,12 @@ class TestPressureTensorAPI:
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
-            dtype=vec_dtype, device=device
+            dtype=vec_dtype,
+            device=device,
         )
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+        )
         virial_tensors = wp.zeros(1, dtype=tensor_dtype, device=device)
 
         cell_np = np.diag([10.0, 10.0, 10.0])
@@ -298,9 +346,15 @@ class TestBarostatUtilitiesAPI:
 
         h_dot_np = np.array([[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.1]], dtype=np_dtype)
         h_dot_mat = mat_dtype(
-            h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-            h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-            h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2]
+            h_dot_np[0, 0],
+            h_dot_np[0, 1],
+            h_dot_np[0, 2],
+            h_dot_np[1, 0],
+            h_dot_np[1, 1],
+            h_dot_np[1, 2],
+            h_dot_np[2, 0],
+            h_dot_np[2, 1],
+            h_dot_np[2, 2],
         )
         cell_velocities = wp.array([h_dot_mat], dtype=mat_dtype, device=device)
         cell_masses = wp.array([100.0], dtype=scalar_dtype, device=device)
@@ -345,9 +399,15 @@ class TestNPTIntegrationAPI:
         volumes = compute_cell_volume(system["cells"], device=device)
 
         npt_velocity_half_step(
-            system["velocities"], system["masses"], system["forces"],
-            system["cell_velocities"], volumes, system["eta_dot"],
-            system["num_atoms"], dt=0.001, device=device
+            system["velocities"],
+            system["masses"],
+            system["forces"],
+            system["cell_velocities"],
+            volumes,
+            system["eta_dot"],
+            system["num_atoms"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -356,8 +416,12 @@ class TestNPTIntegrationAPI:
         system = setup_npt_system(10, dtype, device)
 
         npt_position_update(
-            system["positions"], system["velocities"],
-            system["cells"], system["cell_velocities"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["cells"],
+            system["cell_velocities"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -365,7 +429,9 @@ class TestNPTIntegrationAPI:
         """Test that npt_cell_update runs without errors."""
         system = setup_npt_system(10, dtype, device)
 
-        npt_cell_update(system["cells"], system["cell_velocities"], dt=0.001, device=device)
+        npt_cell_update(
+            system["cells"], system["cell_velocities"], dt=0.001, device=device
+        )
         wp.synchronize_device(device)
 
     def test_run_npt_step_runs(self, dtype, device):
@@ -373,11 +439,23 @@ class TestNPTIntegrationAPI:
         system = setup_npt_system(10, dtype, device)
 
         run_npt_step(
-            system["positions"], system["velocities"], system["forces"], system["masses"],
-            system["cells"], system["cell_velocities"], system["virial_tensors"],
-            system["eta"], system["eta_dot"], system["thermostat_masses"],
-            system["cell_masses"], system["target_temperature"], system["target_pressure"],
-            system["num_atoms"], system["chain_length"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["forces"],
+            system["masses"],
+            system["cells"],
+            system["cell_velocities"],
+            system["virial_tensors"],
+            system["eta"],
+            system["eta_dot"],
+            system["thermostat_masses"],
+            system["cell_masses"],
+            system["target_temperature"],
+            system["target_pressure"],
+            system["num_atoms"],
+            system["chain_length"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -399,9 +477,14 @@ class TestNPHIntegrationAPI:
         volumes = compute_cell_volume(system["cells"], device=device)
 
         nph_velocity_half_step(
-            system["velocities"], system["masses"], system["forces"],
-            system["cell_velocities"], volumes,
-            system["num_atoms"], dt=0.001, device=device
+            system["velocities"],
+            system["masses"],
+            system["forces"],
+            system["cell_velocities"],
+            volumes,
+            system["num_atoms"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -410,8 +493,12 @@ class TestNPHIntegrationAPI:
         system = setup_nph_system(10, dtype, device)
 
         nph_position_update(
-            system["positions"], system["velocities"],
-            system["cells"], system["cell_velocities"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["cells"],
+            system["cell_velocities"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -420,10 +507,18 @@ class TestNPHIntegrationAPI:
         system = setup_nph_system(10, dtype, device)
 
         run_nph_step(
-            system["positions"], system["velocities"], system["forces"], system["masses"],
-            system["cells"], system["cell_velocities"], system["virial_tensors"],
-            system["cell_masses"], system["target_pressure"],
-            system["num_atoms"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["forces"],
+            system["masses"],
+            system["cells"],
+            system["cell_velocities"],
+            system["virial_tensors"],
+            system["cell_masses"],
+            system["target_pressure"],
+            system["num_atoms"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -444,9 +539,15 @@ class TestNonMutatingAPIs:
         volumes = compute_cell_volume(system["cells"], device=device)
 
         velocities_out = npt_velocity_half_step_out(
-            system["velocities"], system["masses"], system["forces"],
-            system["cell_velocities"], volumes, system["eta_dot"],
-            system["num_atoms"], dt=0.001, device=device
+            system["velocities"],
+            system["masses"],
+            system["forces"],
+            system["cell_velocities"],
+            volumes,
+            system["eta_dot"],
+            system["num_atoms"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -457,8 +558,12 @@ class TestNonMutatingAPIs:
         system = setup_npt_system(10, dtype, device)
 
         positions_out = npt_position_update_out(
-            system["positions"], system["velocities"],
-            system["cells"], system["cell_velocities"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["cells"],
+            system["cell_velocities"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -481,9 +586,14 @@ class TestNonMutatingAPIs:
         volumes = compute_cell_volume(system["cells"], device=device)
 
         velocities_out = nph_velocity_half_step_out(
-            system["velocities"], system["masses"], system["forces"],
-            system["cell_velocities"], volumes,
-            system["num_atoms"], dt=0.001, device=device
+            system["velocities"],
+            system["masses"],
+            system["forces"],
+            system["cell_velocities"],
+            volumes,
+            system["num_atoms"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -494,8 +604,12 @@ class TestNonMutatingAPIs:
         system = setup_nph_system(10, dtype, device)
 
         positions_out = nph_position_update_out(
-            system["positions"], system["velocities"],
-            system["cells"], system["cell_velocities"], dt=0.001, device=device
+            system["positions"],
+            system["velocities"],
+            system["cells"],
+            system["cell_velocities"],
+            dt=0.001,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -521,14 +635,22 @@ class TestMutatingNonMutatingConsistency:
 
         # Mutating
         npt_position_update(
-            system1["positions"], system1["velocities"],
-            system1["cells"], system1["cell_velocities"], dt, device=device
+            system1["positions"],
+            system1["velocities"],
+            system1["cells"],
+            system1["cell_velocities"],
+            dt,
+            device=device,
         )
 
         # Non-mutating
         positions_out = npt_position_update_out(
-            system2["positions"], system2["velocities"],
-            system2["cells"], system2["cell_velocities"], dt, device=device
+            system2["positions"],
+            system2["velocities"],
+            system2["cells"],
+            system2["cell_velocities"],
+            dt,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -547,16 +669,28 @@ class TestMutatingNonMutatingConsistency:
 
         # Mutating
         npt_velocity_half_step(
-            system1["velocities"], system1["masses"], system1["forces"],
-            system1["cell_velocities"], volumes, system1["eta_dot"],
-            system1["num_atoms"], dt, device=device
+            system1["velocities"],
+            system1["masses"],
+            system1["forces"],
+            system1["cell_velocities"],
+            volumes,
+            system1["eta_dot"],
+            system1["num_atoms"],
+            dt,
+            device=device,
         )
 
         # Non-mutating
         velocities_out = npt_velocity_half_step_out(
-            system2["velocities"], system2["masses"], system2["forces"],
-            system2["cell_velocities"], volumes, system2["eta_dot"],
-            system2["num_atoms"], dt, device=device
+            system2["velocities"],
+            system2["masses"],
+            system2["forces"],
+            system2["cell_velocities"],
+            volumes,
+            system2["eta_dot"],
+            system2["num_atoms"],
+            dt,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -587,7 +721,8 @@ class TestNPTPhysics:
 
         system["velocities"] = wp.array(
             np.random.randn(20, 3).astype(np_dtype) * 2.0,  # High velocities
-            dtype=vec_dtype, device=device
+            dtype=vec_dtype,
+            device=device,
         )
 
         initial_volume = compute_cell_volume(system["cells"], device=device).numpy()[0]
@@ -595,11 +730,23 @@ class TestNPTPhysics:
         # Run many steps
         for _ in range(100):
             run_npt_step(
-                system["positions"], system["velocities"], system["forces"], system["masses"],
-                system["cells"], system["cell_velocities"], system["virial_tensors"],
-                system["eta"], system["eta_dot"], system["thermostat_masses"],
-                system["cell_masses"], system["target_temperature"], system["target_pressure"],
-                system["num_atoms"], system["chain_length"], dt=0.001, device=device
+                system["positions"],
+                system["velocities"],
+                system["forces"],
+                system["masses"],
+                system["cells"],
+                system["cell_velocities"],
+                system["virial_tensors"],
+                system["eta"],
+                system["eta_dot"],
+                system["thermostat_masses"],
+                system["cell_masses"],
+                system["target_temperature"],
+                system["target_pressure"],
+                system["num_atoms"],
+                system["chain_length"],
+                dt=0.001,
+                device=device,
             )
 
         wp.synchronize_device(device)
@@ -616,24 +763,44 @@ class TestNPTPhysics:
 
         from nvalchemiops.dynamics.utils.thermostat_utils import compute_kinetic_energy
 
-        initial_ke = compute_kinetic_energy(
-            system["velocities"], system["masses"], device=device
-        ).numpy().sum()
+        initial_ke = (
+            compute_kinetic_energy(
+                system["velocities"], system["masses"], device=device
+            )
+            .numpy()
+            .sum()
+        )
 
         for _ in range(50):
             run_npt_step(
-                system["positions"], system["velocities"], system["forces"], system["masses"],
-                system["cells"], system["cell_velocities"], system["virial_tensors"],
-                system["eta"], system["eta_dot"], system["thermostat_masses"],
-                system["cell_masses"], system["target_temperature"], system["target_pressure"],
-                system["num_atoms"], system["chain_length"], dt=0.001, device=device
+                system["positions"],
+                system["velocities"],
+                system["forces"],
+                system["masses"],
+                system["cells"],
+                system["cell_velocities"],
+                system["virial_tensors"],
+                system["eta"],
+                system["eta_dot"],
+                system["thermostat_masses"],
+                system["cell_masses"],
+                system["target_temperature"],
+                system["target_pressure"],
+                system["num_atoms"],
+                system["chain_length"],
+                dt=0.001,
+                device=device,
             )
 
         wp.synchronize_device(device)
 
-        final_ke = compute_kinetic_energy(
-            system["velocities"], system["masses"], device=device
-        ).numpy().sum()
+        final_ke = (
+            compute_kinetic_energy(
+                system["velocities"], system["masses"], device=device
+            )
+            .numpy()
+            .sum()
+        )
 
         # Thermostat should change KE towards target
         assert initial_ke != final_ke
@@ -660,17 +827,26 @@ class TestNPHPhysics:
 
         system["velocities"] = wp.array(
             np.random.randn(20, 3).astype(np_dtype) * 2.0,
-            dtype=vec_dtype, device=device
+            dtype=vec_dtype,
+            device=device,
         )
 
         initial_volume = compute_cell_volume(system["cells"], device=device).numpy()[0]
 
         for _ in range(100):
             run_nph_step(
-                system["positions"], system["velocities"], system["forces"], system["masses"],
-                system["cells"], system["cell_velocities"], system["virial_tensors"],
-                system["cell_masses"], system["target_pressure"],
-                system["num_atoms"], dt=0.001, device=device
+                system["positions"],
+                system["velocities"],
+                system["forces"],
+                system["masses"],
+                system["cells"],
+                system["cell_velocities"],
+                system["virial_tensors"],
+                system["cell_masses"],
+                system["target_pressure"],
+                system["num_atoms"],
+                dt=0.001,
+                device=device,
             )
 
         wp.synchronize_device(device)
@@ -682,56 +858,76 @@ class TestNPHPhysics:
 
     def test_nph_no_thermostat_coupling(self, dtype, device):
         """Test that NPH differs from NPT due to lack of thermostat.
-        
+
         NPT has thermostat coupling in velocity update: drag = (coupling * eps_dot + eta_dot_1) * v
         NPH has no thermostat coupling: drag = coupling * eps_dot * v
-        
+
         We verify this by checking that the eta_dot (thermostat velocity) changes in NPT
         but NPH has no thermostat state at all.
         """
         # Set up NPT system with non-equilibrium initial conditions
         npt_system = setup_npt_system(10, dtype, device, seed=123)
-        
+
         # Record initial thermostat state
         initial_eta_dot = npt_system["eta_dot"].numpy().copy()
-        
+
         dt = 0.001
-        
+
         # Run NPT - the thermostat chain should evolve
         for _ in range(100):
             run_npt_step(
-                npt_system["positions"], npt_system["velocities"], npt_system["forces"],
-                npt_system["masses"], npt_system["cells"], npt_system["cell_velocities"],
-                npt_system["virial_tensors"], npt_system["eta"], npt_system["eta_dot"],
-                npt_system["thermostat_masses"], npt_system["cell_masses"],
-                npt_system["target_temperature"], npt_system["target_pressure"],
-                npt_system["num_atoms"], npt_system["chain_length"], dt=dt, device=device
+                npt_system["positions"],
+                npt_system["velocities"],
+                npt_system["forces"],
+                npt_system["masses"],
+                npt_system["cells"],
+                npt_system["cell_velocities"],
+                npt_system["virial_tensors"],
+                npt_system["eta"],
+                npt_system["eta_dot"],
+                npt_system["thermostat_masses"],
+                npt_system["cell_masses"],
+                npt_system["target_temperature"],
+                npt_system["target_pressure"],
+                npt_system["num_atoms"],
+                npt_system["chain_length"],
+                dt=dt,
+                device=device,
             )
-        
+
         wp.synchronize_device(device)
-        
+
         # NPT thermostat state should have changed
         final_eta_dot = npt_system["eta_dot"].numpy()
-        
+
         # The thermostat velocities should have evolved from their initial values
         # This confirms the thermostat is active in NPT
-        assert not np.allclose(initial_eta_dot, final_eta_dot, atol=1e-10), \
+        assert not np.allclose(initial_eta_dot, final_eta_dot, atol=1e-10), (
             "NPT thermostat chain should evolve (eta_dot should change)"
-        
+        )
+
         # NPH doesn't have thermostat state - that's the key difference
         # We verify NPH runs without thermostat by checking it doesn't require eta/eta_dot
         nph_system = setup_nph_system(10, dtype, device, seed=123)
-        
+
         for _ in range(100):
             run_nph_step(
-                nph_system["positions"], nph_system["velocities"], nph_system["forces"],
-                nph_system["masses"], nph_system["cells"], nph_system["cell_velocities"],
-                nph_system["virial_tensors"], nph_system["cell_masses"],
-                nph_system["target_pressure"], nph_system["num_atoms"], dt=dt, device=device
+                nph_system["positions"],
+                nph_system["velocities"],
+                nph_system["forces"],
+                nph_system["masses"],
+                nph_system["cells"],
+                nph_system["cell_velocities"],
+                nph_system["virial_tensors"],
+                nph_system["cell_masses"],
+                nph_system["target_pressure"],
+                nph_system["num_atoms"],
+                dt=dt,
+                device=device,
             )
-        
+
         wp.synchronize_device(device)
-        
+
         # NPH should complete without any thermostat - this is the fundamental difference
         # The test passing means NPH doesn't need/use thermostat state
 
@@ -760,36 +956,57 @@ class TestBatchedIntegration:
 
         np.random.seed(42)
 
-        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32)
+        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(
+            np.int32
+        )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
-            dtype=vec_dtype, device=device
+            dtype=vec_dtype,
+            device=device,
         )
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+        )
 
         # Create cells
         cell1_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell2_np = np.diag([12.0, 12.0, 12.0]).astype(np_dtype)
 
         cell1_mat = mat_dtype(
-            cell1_np[0, 0], cell1_np[0, 1], cell1_np[0, 2],
-            cell1_np[1, 0], cell1_np[1, 1], cell1_np[1, 2],
-            cell1_np[2, 0], cell1_np[2, 1], cell1_np[2, 2]
+            cell1_np[0, 0],
+            cell1_np[0, 1],
+            cell1_np[0, 2],
+            cell1_np[1, 0],
+            cell1_np[1, 1],
+            cell1_np[1, 2],
+            cell1_np[2, 0],
+            cell1_np[2, 1],
+            cell1_np[2, 2],
         )
         cell2_mat = mat_dtype(
-            cell2_np[0, 0], cell2_np[0, 1], cell2_np[0, 2],
-            cell2_np[1, 0], cell2_np[1, 1], cell2_np[1, 2],
-            cell2_np[2, 0], cell2_np[2, 1], cell2_np[2, 2]
+            cell2_np[0, 0],
+            cell2_np[0, 1],
+            cell2_np[0, 2],
+            cell2_np[1, 0],
+            cell2_np[1, 1],
+            cell2_np[1, 2],
+            cell2_np[2, 0],
+            cell2_np[2, 1],
+            cell2_np[2, 2],
         )
         cells = wp.array([cell1_mat, cell2_mat], dtype=mat_dtype, device=device)
 
         virial_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
 
         pressure_tensors = compute_pressure_tensor(
-            velocities, masses, virial_tensors, cells,
-            batch_idx=batch_idx, device=device
+            velocities,
+            masses,
+            virial_tensors,
+            cells,
+            batch_idx=batch_idx,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -808,39 +1025,67 @@ class TestBatchedIntegration:
 
         np.random.seed(42)
 
-        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32)
+        batch_idx_np = np.repeat(np.arange(num_systems), atoms_per_system).astype(
+            np.int32
+        )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
-        num_atoms_per_system = wp.array([atoms_per_system, atoms_per_system], dtype=wp.int32, device=device)
+        num_atoms_per_system = wp.array(
+            [atoms_per_system, atoms_per_system], dtype=wp.int32, device=device
+        )
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype) * 0.3,
-            dtype=vec_dtype, device=device
+            dtype=vec_dtype,
+            device=device,
         )
-        masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+        )
         forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         h_dot_np = np.zeros((3, 3), dtype=np_dtype)
 
         cell_mat = mat_dtype(
-            cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-            cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-            cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+            cell_np[0, 0],
+            cell_np[0, 1],
+            cell_np[0, 2],
+            cell_np[1, 0],
+            cell_np[1, 1],
+            cell_np[1, 2],
+            cell_np[2, 0],
+            cell_np[2, 1],
+            cell_np[2, 2],
         )
         h_dot_mat = mat_dtype(
-            h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-            h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-            h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2]
+            h_dot_np[0, 0],
+            h_dot_np[0, 1],
+            h_dot_np[0, 2],
+            h_dot_np[1, 0],
+            h_dot_np[1, 1],
+            h_dot_np[1, 2],
+            h_dot_np[2, 0],
+            h_dot_np[2, 1],
+            h_dot_np[2, 2],
         )
         cells = wp.array([cell_mat, cell_mat], dtype=mat_dtype, device=device)
-        cell_velocities = wp.array([h_dot_mat, h_dot_mat], dtype=mat_dtype, device=device)
+        cell_velocities = wp.array(
+            [h_dot_mat, h_dot_mat], dtype=mat_dtype, device=device
+        )
 
         volumes = compute_cell_volume(cells, device=device)
 
         nph_velocity_half_step(
-            velocities, masses, forces, cell_velocities, volumes,
-            num_atoms, dt=0.001, batch_idx=batch_idx,
-            num_atoms_per_system=num_atoms_per_system, device=device
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
+            num_atoms,
+            dt=0.001,
+            batch_idx=batch_idx,
+            num_atoms_per_system=num_atoms_per_system,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -866,30 +1111,46 @@ def setup_aniso_system(num_atoms, dtype, device, seed=42):
     # Positions and velocities
     positions = wp.array(
         np.random.uniform(0, 10, (num_atoms, 3)).astype(np_dtype),
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
     velocities = wp.array(
         np.random.randn(num_atoms, 3).astype(np_dtype) * 0.5,
-        dtype=vec_dtype, device=device
+        dtype=vec_dtype,
+        device=device,
     )
-    masses = wp.array(np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device)
+    masses = wp.array(
+        np.ones(num_atoms, dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
     forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
     # Cell (orthorhombic for anisotropic tests)
     cell_np = np.diag([10.0, 12.0, 8.0]).astype(np_dtype)  # Different box lengths
     cell_mat = mat_dtype(
-        cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-        cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-        cell_np[2, 0], cell_np[2, 1], cell_np[2, 2]
+        cell_np[0, 0],
+        cell_np[0, 1],
+        cell_np[0, 2],
+        cell_np[1, 0],
+        cell_np[1, 1],
+        cell_np[1, 2],
+        cell_np[2, 0],
+        cell_np[2, 1],
+        cell_np[2, 2],
     )
     cells = wp.array([cell_mat], dtype=mat_dtype, device=device)
 
     # Cell velocity
     h_dot_np = np.zeros((3, 3), dtype=np_dtype)
     h_dot_mat = mat_dtype(
-        h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-        h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-        h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2]
+        h_dot_np[0, 0],
+        h_dot_np[0, 1],
+        h_dot_np[0, 2],
+        h_dot_np[1, 0],
+        h_dot_np[1, 1],
+        h_dot_np[1, 2],
+        h_dot_np[2, 0],
+        h_dot_np[2, 1],
+        h_dot_np[2, 2],
     )
     cell_velocities = wp.array([h_dot_mat], dtype=mat_dtype, device=device)
 
@@ -900,32 +1161,44 @@ def setup_aniso_system(num_atoms, dtype, device, seed=42):
     chain_length = 3
     eta = wp.zeros((1, chain_length), dtype=scalar_dtype, device=device)
     eta_dot = wp.zeros((1, chain_length), dtype=scalar_dtype, device=device)
-    thermostat_masses = wp.array(np.ones((1, chain_length), dtype=np_dtype), dtype=scalar_dtype, device=device)
+    thermostat_masses = wp.array(
+        np.ones((1, chain_length), dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     # Cell mass
-    cell_masses = wp.array(np.array([100.0], dtype=np_dtype), dtype=scalar_dtype, device=device)
+    cell_masses = wp.array(
+        np.array([100.0], dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     # Virial tensor (isotropic pressure)
-    virial_np = np.array([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]], dtype=np_dtype)
+    virial_np = np.array(
+        [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]], dtype=np_dtype
+    )
     virial_tensors = wp.array(virial_np, dtype=vec9_dtype, device=device)
 
     # Anisotropic target pressure (vec3)
     target_pressure_aniso = wp.array(
         np.array([[1.0, 2.0, 0.5]], dtype=np_dtype),  # Different pressures for x, y, z
-        dtype=vec3_dtype, device=device
+        dtype=vec3_dtype,
+        device=device,
     )
 
     # Triclinic target pressure (vec9)
     target_pressure_tri = wp.array(
         np.array([[1.0, 0.1, 0.2, 0.1, 2.0, 0.15, 0.2, 0.15, 0.5]], dtype=np_dtype),
-        dtype=vec9_dtype, device=device
+        dtype=vec9_dtype,
+        device=device,
     )
 
     # Scalar target pressure
-    target_pressure_scalar = wp.array(np.array([1.0], dtype=np_dtype), dtype=scalar_dtype, device=device)
+    target_pressure_scalar = wp.array(
+        np.array([1.0], dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     # Kinetic energy
-    kinetic_energy = wp.array(np.array([5.0], dtype=np_dtype), dtype=scalar_dtype, device=device)
+    kinetic_energy = wp.array(
+        np.array([5.0], dtype=np_dtype), dtype=scalar_dtype, device=device
+    )
 
     # Number of atoms
     num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
@@ -957,7 +1230,7 @@ def setup_aniso_system(num_atoms, dtype, device, seed=42):
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 class TestAnisotropicBarostat:
     """Tests for anisotropic barostat functionality.
-    
+
     These tests verify the unified API dispatches correctly based on
     target_pressures dtype:
     - scalar (float32/float64) -> isotropic
@@ -980,7 +1253,7 @@ class TestAnisotropicBarostat:
             system["num_atoms_per_system"],
             system["eta_dot"],
             dt=0.001,
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1002,7 +1275,7 @@ class TestAnisotropicBarostat:
             system["kinetic_energy"],
             system["num_atoms_per_system"],
             dt=0.001,
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1024,7 +1297,7 @@ class TestAnisotropicBarostat:
             system["num_atoms_per_system"],
             system["eta_dot"],
             dt=0.001,
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1045,7 +1318,7 @@ class TestAnisotropicBarostat:
             system["kinetic_energy"],
             system["num_atoms_per_system"],
             dt=0.001,
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1066,7 +1339,7 @@ class TestAnisotropicBarostat:
             system["kinetic_energy"],
             system["num_atoms_per_system"],
             dt=0.01,  # Larger dt to see effect
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1095,12 +1368,12 @@ class TestAnisotropicBarostat:
             system["kinetic_energy"],
             system["num_atoms_per_system"],
             dt=0.01,
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
         h_dot = system["cell_velocities"].numpy()[0]
-        
+
         # All components should be updated (not necessarily non-zero, but should have run)
         assert h_dot.shape == (3, 3)
 
@@ -1109,7 +1382,7 @@ class TestAnisotropicBarostat:
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 class TestAnisotropicVelocityUpdate:
     """Tests for anisotropic velocity update functionality.
-    
+
     These tests use the unified API with mode="anisotropic" parameter.
     """
 
@@ -1127,7 +1400,7 @@ class TestAnisotropicVelocityUpdate:
             system["num_atoms"],
             dt=0.001,
             mode="anisotropic",  # Use unified API with mode
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1146,7 +1419,7 @@ class TestAnisotropicVelocityUpdate:
             system["num_atoms"],
             dt=0.001,
             mode="anisotropic",  # Use unified API with mode
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1166,7 +1439,7 @@ class TestAnisotropicVelocityUpdate:
             system["num_atoms"],
             dt=0.001,
             mode="anisotropic",  # Use mode parameter
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1186,7 +1459,7 @@ class TestAnisotropicVelocityUpdate:
             system["num_atoms"],
             dt=0.001,
             mode="anisotropic",  # Use mode parameter
-            device=device
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -1199,7 +1472,9 @@ class TestAnisotropicVelocityUpdate:
 class TestAnisotropicPhysics:
     """Physics tests for anisotropic pressure control using unified API."""
 
-    def test_aniso_different_pressures_cause_different_cell_evolution(self, dtype, device):
+    def test_aniso_different_pressures_cause_different_cell_evolution(
+        self, dtype, device
+    ):
         """Test that different target pressures cause different cell evolutions."""
         np_dtype = np.float32 if dtype == "float32" else np.float64
         vec3_dtype = vec3f if dtype == "float32" else vec3d
@@ -1210,9 +1485,13 @@ class TestAnisotropicPhysics:
 
         # Different target pressures (vec3 -> anisotropic dispatch)
         # System 1: High x pressure, low y, z
-        target1 = wp.array(np.array([[5.0, 0.1, 0.1]], dtype=np_dtype), dtype=vec3_dtype, device=device)
+        target1 = wp.array(
+            np.array([[5.0, 0.1, 0.1]], dtype=np_dtype), dtype=vec3_dtype, device=device
+        )
         # System 2: Low x pressure, high y, z
-        target2 = wp.array(np.array([[0.1, 5.0, 5.0]], dtype=np_dtype), dtype=vec3_dtype, device=device)
+        target2 = wp.array(
+            np.array([[0.1, 5.0, 5.0]], dtype=np_dtype), dtype=vec3_dtype, device=device
+        )
 
         for _ in range(10):
             # Unified API dispatches to aniso kernel based on vec3 dtype
@@ -1225,7 +1504,7 @@ class TestAnisotropicPhysics:
                 system1["kinetic_energy"],
                 system1["num_atoms_per_system"],
                 dt=0.01,
-                device=device
+                device=device,
             )
             nph_barostat_half_step(
                 system2["cell_velocities"],
@@ -1236,7 +1515,7 @@ class TestAnisotropicPhysics:
                 system2["kinetic_energy"],
                 system2["num_atoms_per_system"],
                 dt=0.01,
-                device=device
+                device=device,
             )
 
         wp.synchronize_device(device)
@@ -1245,8 +1524,9 @@ class TestAnisotropicPhysics:
         h_dot2 = system2["cell_velocities"].numpy()[0]
 
         # Cell velocities should evolve differently based on target pressures
-        assert not np.allclose(h_dot1, h_dot2, atol=1e-10), \
+        assert not np.allclose(h_dot1, h_dot2, atol=1e-10), (
             "Different target pressures should cause different cell velocity evolution"
+        )
 
     def test_isotropic_vs_anisotropic_with_uniform_pressure(self, dtype, device):
         """Test that isotropic and anisotropic give similar results with uniform pressure."""
@@ -1261,9 +1541,13 @@ class TestAnisotropicPhysics:
         # Same pressure for all axes (uniform)
         P = 1.0
         # scalar dtype -> isotropic dispatch
-        target_iso = wp.array(np.array([P], dtype=np_dtype), dtype=scalar_dtype, device=device)
+        target_iso = wp.array(
+            np.array([P], dtype=np_dtype), dtype=scalar_dtype, device=device
+        )
         # vec3 dtype -> anisotropic dispatch
-        target_aniso = wp.array(np.array([[P, P, P]], dtype=np_dtype), dtype=vec3_dtype, device=device)
+        target_aniso = wp.array(
+            np.array([[P, P, P]], dtype=np_dtype), dtype=vec3_dtype, device=device
+        )
 
         # Run isotropic (auto-dispatched based on scalar dtype)
         nph_barostat_half_step(
@@ -1275,7 +1559,7 @@ class TestAnisotropicPhysics:
             system_iso["kinetic_energy"],
             system_iso["num_atoms_per_system"],
             dt=0.001,
-            device=device
+            device=device,
         )
 
         # Run anisotropic (auto-dispatched based on vec3 dtype)
@@ -1288,7 +1572,7 @@ class TestAnisotropicPhysics:
             system_aniso["kinetic_energy"],
             system_aniso["num_atoms_per_system"],
             dt=0.001,
-            device=device
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1337,27 +1621,37 @@ class TestTriclinicVelocityCoupling:
         )
 
         # Triclinic cell
-        cell_np = np.array([[10.0, 0.5, 0.2], [0.0, 10.0, 0.3], [0.0, 0.0, 10.0]], dtype=np_dtype)
-        cell_mat = mat_dtype(
-            cell_np[0, 0], cell_np[0, 1], cell_np[0, 2],
-            cell_np[1, 0], cell_np[1, 1], cell_np[1, 2],
-            cell_np[2, 0], cell_np[2, 1], cell_np[2, 2],
+        cell_np = np.array(
+            [[10.0, 0.5, 0.2], [0.0, 10.0, 0.3], [0.0, 0.0, 10.0]], dtype=np_dtype
         )
-        cells = wp.array([cell_mat], dtype=mat_dtype, device=device)
 
         cell_inv_np = np.linalg.inv(cell_np).astype(np_dtype)
         cell_inv_mat = mat_dtype(
-            cell_inv_np[0, 0], cell_inv_np[0, 1], cell_inv_np[0, 2],
-            cell_inv_np[1, 0], cell_inv_np[1, 1], cell_inv_np[1, 2],
-            cell_inv_np[2, 0], cell_inv_np[2, 1], cell_inv_np[2, 2],
+            cell_inv_np[0, 0],
+            cell_inv_np[0, 1],
+            cell_inv_np[0, 2],
+            cell_inv_np[1, 0],
+            cell_inv_np[1, 1],
+            cell_inv_np[1, 2],
+            cell_inv_np[2, 0],
+            cell_inv_np[2, 1],
+            cell_inv_np[2, 2],
         )
         cells_inv = wp.array([cell_inv_mat], dtype=mat_dtype, device=device)
 
-        h_dot_np = np.array([[0.01, 0.001, 0.0], [0.0, 0.01, 0.001], [0.0, 0.0, 0.01]], dtype=np_dtype)
+        h_dot_np = np.array(
+            [[0.01, 0.001, 0.0], [0.0, 0.01, 0.001], [0.0, 0.0, 0.01]], dtype=np_dtype
+        )
         h_dot_mat = mat_dtype(
-            h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-            h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-            h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2],
+            h_dot_np[0, 0],
+            h_dot_np[0, 1],
+            h_dot_np[0, 2],
+            h_dot_np[1, 0],
+            h_dot_np[1, 1],
+            h_dot_np[1, 2],
+            h_dot_np[2, 0],
+            h_dot_np[2, 1],
+            h_dot_np[2, 2],
         )
         cell_velocities = wp.array([h_dot_mat], dtype=mat_dtype, device=device)
 
@@ -1489,24 +1783,48 @@ class TestTriclinicVelocityCoupling:
         num_atoms_per_system = wp.array([20, 20], dtype=wp.int32, device=device)
 
         # Create cells for batch
-        cell_np = np.array([[10.0, 0.5, 0.2], [0.0, 10.0, 0.3], [0.0, 0.0, 10.0]], dtype=np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.5, 0.2], [0.0, 10.0, 0.3], [0.0, 0.0, 10.0]], dtype=np_dtype
+        )
         cell_inv_np = np.linalg.inv(cell_np).astype(np_dtype)
-        h_dot_np = np.array([[0.01, 0.001, 0.0], [0.0, 0.01, 0.001], [0.0, 0.0, 0.01]], dtype=np_dtype)
+        h_dot_np = np.array(
+            [[0.01, 0.001, 0.0], [0.0, 0.01, 0.001], [0.0, 0.0, 0.01]], dtype=np_dtype
+        )
 
         cell_inv_mat = mat_dtype(
-            cell_inv_np[0, 0], cell_inv_np[0, 1], cell_inv_np[0, 2],
-            cell_inv_np[1, 0], cell_inv_np[1, 1], cell_inv_np[1, 2],
-            cell_inv_np[2, 0], cell_inv_np[2, 1], cell_inv_np[2, 2],
+            cell_inv_np[0, 0],
+            cell_inv_np[0, 1],
+            cell_inv_np[0, 2],
+            cell_inv_np[1, 0],
+            cell_inv_np[1, 1],
+            cell_inv_np[1, 2],
+            cell_inv_np[2, 0],
+            cell_inv_np[2, 1],
+            cell_inv_np[2, 2],
         )
         h_dot_mat = mat_dtype(
-            h_dot_np[0, 0], h_dot_np[0, 1], h_dot_np[0, 2],
-            h_dot_np[1, 0], h_dot_np[1, 1], h_dot_np[1, 2],
-            h_dot_np[2, 0], h_dot_np[2, 1], h_dot_np[2, 2],
+            h_dot_np[0, 0],
+            h_dot_np[0, 1],
+            h_dot_np[0, 2],
+            h_dot_np[1, 0],
+            h_dot_np[1, 1],
+            h_dot_np[1, 2],
+            h_dot_np[2, 0],
+            h_dot_np[2, 1],
+            h_dot_np[2, 2],
         )
 
-        cell_velocities = wp.array([h_dot_mat, h_dot_mat], dtype=mat_dtype, device=device)
-        cells_inv = wp.array([cell_inv_mat, cell_inv_mat], dtype=mat_dtype, device=device)
-        volumes = wp.array([np.linalg.det(cell_np), np.linalg.det(cell_np)], dtype=scalar_dtype, device=device)
+        cell_velocities = wp.array(
+            [h_dot_mat, h_dot_mat], dtype=mat_dtype, device=device
+        )
+        cells_inv = wp.array(
+            [cell_inv_mat, cell_inv_mat], dtype=mat_dtype, device=device
+        )
+        volumes = wp.array(
+            [np.linalg.det(cell_np), np.linalg.det(cell_np)],
+            dtype=scalar_dtype,
+            device=device,
+        )
         eta_dots = wp.zeros((num_systems, 3), dtype=scalar_dtype, device=device)
 
         npt_velocity_half_step(
@@ -1546,7 +1864,9 @@ class TestBarostatMassCoverage:
         tau_p = wp.array([1.0, 0.5, 2.0], dtype=scalar_dtype, device=device)
         num_atoms = wp.array([100, 200, 150], dtype=wp.int32, device=device)
 
-        W = compute_barostat_mass(temps, tau_p, num_atoms, dtype=scalar_dtype, device=device)
+        W = compute_barostat_mass(
+            temps, tau_p, num_atoms, dtype=scalar_dtype, device=device
+        )
 
         assert W.shape[0] == 3
         # Verify formula: W = (3N + 3) * T * τ²
@@ -1629,7 +1949,9 @@ class TestExplicitBarostatFunctions:
         volumes = wp.array([1000.0, 1000.0], dtype=scalar_dtype, device=device)
         cell_masses = wp.array([100.0, 100.0], dtype=scalar_dtype, device=device)
         kinetic_energy = wp.array([10.0, 10.0], dtype=scalar_dtype, device=device)
-        num_atoms_per_system = wp.array([num_atoms, num_atoms], dtype=wp.int32, device=device)
+        num_atoms_per_system = wp.array(
+            [num_atoms, num_atoms], dtype=wp.int32, device=device
+        )
         eta_dots = wp.zeros((num_systems, 3), dtype=scalar_dtype, device=device)
 
         npt_barostat_half_step_aniso(
@@ -1650,7 +1972,9 @@ class TestExplicitBarostatFunctions:
 
     def test_npt_barostat_half_step_triclinic(self, dtype, device):
         """Test explicit NPT triclinic barostat."""
-        from nvalchemiops.dynamics.integrators.npt import npt_barostat_half_step_triclinic
+        from nvalchemiops.dynamics.integrators.npt import (
+            npt_barostat_half_step_triclinic,
+        )
 
         num_systems = 2
         num_atoms = 20
@@ -1672,7 +1996,9 @@ class TestExplicitBarostatFunctions:
         volumes = wp.array([1000.0, 1000.0], dtype=scalar_dtype, device=device)
         cell_masses = wp.array([100.0, 100.0], dtype=scalar_dtype, device=device)
         kinetic_energy = wp.array([10.0, 10.0], dtype=scalar_dtype, device=device)
-        num_atoms_per_system = wp.array([num_atoms, num_atoms], dtype=wp.int32, device=device)
+        num_atoms_per_system = wp.array(
+            [num_atoms, num_atoms], dtype=wp.int32, device=device
+        )
         eta_dots = wp.zeros((num_systems, 3), dtype=scalar_dtype, device=device)
 
         npt_barostat_half_step_triclinic(
@@ -1716,7 +2042,9 @@ class TestExplicitBarostatFunctions:
         volumes = wp.array([1000.0, 1000.0], dtype=scalar_dtype, device=device)
         cell_masses = wp.array([100.0, 100.0], dtype=scalar_dtype, device=device)
         kinetic_energy = wp.array([10.0, 10.0], dtype=scalar_dtype, device=device)
-        num_atoms_per_system = wp.array([num_atoms, num_atoms], dtype=wp.int32, device=device)
+        num_atoms_per_system = wp.array(
+            [num_atoms, num_atoms], dtype=wp.int32, device=device
+        )
 
         nph_barostat_half_step_aniso(
             cell_velocities,
@@ -1735,7 +2063,9 @@ class TestExplicitBarostatFunctions:
 
     def test_nph_barostat_half_step_triclinic(self, dtype, device):
         """Test explicit NPH triclinic barostat."""
-        from nvalchemiops.dynamics.integrators.npt import nph_barostat_half_step_triclinic
+        from nvalchemiops.dynamics.integrators.npt import (
+            nph_barostat_half_step_triclinic,
+        )
 
         num_systems = 2
         num_atoms = 20
@@ -1757,7 +2087,9 @@ class TestExplicitBarostatFunctions:
         volumes = wp.array([1000.0, 1000.0], dtype=scalar_dtype, device=device)
         cell_masses = wp.array([100.0, 100.0], dtype=scalar_dtype, device=device)
         kinetic_energy = wp.array([10.0, 10.0], dtype=scalar_dtype, device=device)
-        num_atoms_per_system = wp.array([num_atoms, num_atoms], dtype=wp.int32, device=device)
+        num_atoms_per_system = wp.array(
+            [num_atoms, num_atoms], dtype=wp.int32, device=device
+        )
 
         nph_barostat_half_step_triclinic(
             cell_velocities,
@@ -1892,8 +2224,13 @@ class TestNPTDeviceInference:
         cell_velocities = wp.zeros(num_systems, dtype=mat_dtype, device=device)
 
         npt_position_update(
-            positions, velocities, cells, cell_velocities,
-            dt=0.001, batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            cells,
+            cell_velocities,
+            dt=0.001,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1924,7 +2261,6 @@ class TestNPTDeviceInference:
 
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell_inv_np = np.linalg.inv(cell_np).astype(np_dtype)
-        cells_np = np.stack([cell_np, cell_np])
         cells_inv_np_batch = np.stack([cell_inv_np, cell_inv_np])
         cells_inv = make_cells_batch(cells_inv_np_batch, dtype, device)
         cell_velocities = wp.zeros(num_systems, dtype=mat_dtype, device=device)
@@ -1933,7 +2269,12 @@ class TestNPTDeviceInference:
         num_atoms_per_system = wp.array([10, 10], dtype=wp.int32, device=device)
 
         result = npt_velocity_half_step_out(
-            velocities, masses, forces, cell_velocities, volumes, eta_dots,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
+            eta_dots,
             num_atoms=10,
             dt=0.001,
             batch_idx=batch_idx,
@@ -1978,7 +2319,11 @@ class TestNPTDeviceInference:
         num_atoms_per_system = wp.array([10, 10], dtype=wp.int32, device=device)
 
         result = nph_velocity_half_step_out(
-            velocities, masses, forces, cell_velocities, volumes,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
             num_atoms=10,
             dt=0.001,
             batch_idx=batch_idx,
@@ -2055,13 +2400,21 @@ class TestNPTCoverageExtras:
         kinetic_energy = wp.array([10.0], dtype=wp.float32, device=device)
         num_atoms_per_system = wp.array([100], dtype=wp.int32, device=device)
         # eta_dots must be 2D: (B, chain_length)
-        eta_dots = wp.zeros((num_systems, chain_length), dtype=wp.float32, device=device)
+        eta_dots = wp.zeros(
+            (num_systems, chain_length), dtype=wp.float32, device=device
+        )
 
         # Don't pass device
         npt_barostat_half_step(
-            cell_velocities, pressure_tensors, target_pressures, volumes,
-            cell_masses, kinetic_energy, num_atoms_per_system, eta_dots,
-            dt=0.001
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt=0.001,
         )
 
         wp.synchronize_device(device)
@@ -2092,7 +2445,11 @@ class TestNPTCoverageExtras:
 
         # Mutating batched triclinic
         nph_velocity_half_step(
-            velocities, masses, forces, cell_velocities, volumes,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
             num_atoms=10,
             dt=0.001,
             batch_idx=batch_idx,
@@ -2128,12 +2485,19 @@ class TestNPTCoverageExtras:
         cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
         volumes = wp.array([1000.0] * num_systems, dtype=wp.float32, device=device)
         # eta_dots must be 2D: (B, chain_length)
-        eta_dots = wp.zeros((num_systems, chain_length), dtype=wp.float32, device=device)
+        eta_dots = wp.zeros(
+            (num_systems, chain_length), dtype=wp.float32, device=device
+        )
         num_atoms_per_system = wp.array([10, 10], dtype=wp.int32, device=device)
 
         # Mutating batched triclinic
         npt_velocity_half_step(
-            velocities, masses, forces, cell_velocities, volumes, eta_dots,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
+            eta_dots,
             num_atoms=10,
             dt=0.001,
             batch_idx=batch_idx,
@@ -2149,10 +2513,10 @@ class TestNPTCoverageExtras:
     def test_explicit_aniso_barostat_functions(self, device):
         """Test explicit aniso barostat half step functions."""
         from nvalchemiops.dynamics.integrators.npt import (
-            npt_barostat_half_step_aniso,
-            npt_barostat_half_step_triclinic,
             nph_barostat_half_step_aniso,
             nph_barostat_half_step_triclinic,
+            npt_barostat_half_step_aniso,
+            npt_barostat_half_step_triclinic,
         )
 
         num_systems = 1
@@ -2165,36 +2529,66 @@ class TestNPTCoverageExtras:
         kinetic_energy = wp.array([10.0], dtype=wp.float32, device=device)
         num_atoms_per_system = wp.array([100], dtype=wp.int32, device=device)
         # eta_dots must be 2D: (B, chain_length)
-        eta_dots = wp.zeros((num_systems, chain_length), dtype=wp.float32, device=device)
+        eta_dots = wp.zeros(
+            (num_systems, chain_length), dtype=wp.float32, device=device
+        )
 
         # Test NPT aniso
-        target_pressures_aniso = wp.array([wp.vec3f(0.1, 0.1, 0.1)], dtype=wp.vec3f, device=device)
+        target_pressures_aniso = wp.array(
+            [wp.vec3f(0.1, 0.1, 0.1)], dtype=wp.vec3f, device=device
+        )
         npt_barostat_half_step_aniso(
-            cell_velocities, pressure_tensors, target_pressures_aniso, volumes,
-            cell_masses, kinetic_energy, num_atoms_per_system, eta_dots,
-            dt=0.001, device=device
+            cell_velocities,
+            pressure_tensors,
+            target_pressures_aniso,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt=0.001,
+            device=device,
         )
 
         # Test NPT triclinic
         target_pressures_tri = wp.zeros(num_systems, dtype=vec9f, device=device)
         npt_barostat_half_step_triclinic(
-            cell_velocities, pressure_tensors, target_pressures_tri, volumes,
-            cell_masses, kinetic_energy, num_atoms_per_system, eta_dots,
-            dt=0.001, device=device
+            cell_velocities,
+            pressure_tensors,
+            target_pressures_tri,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt=0.001,
+            device=device,
         )
 
         # Test NPH aniso
         nph_barostat_half_step_aniso(
-            cell_velocities, pressure_tensors, target_pressures_aniso, volumes,
-            cell_masses, kinetic_energy, num_atoms_per_system,
-            dt=0.001, device=device
+            cell_velocities,
+            pressure_tensors,
+            target_pressures_aniso,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt=0.001,
+            device=device,
         )
 
         # Test NPH triclinic
         nph_barostat_half_step_triclinic(
-            cell_velocities, pressure_tensors, target_pressures_tri, volumes,
-            cell_masses, kinetic_energy, num_atoms_per_system,
-            dt=0.001, device=device
+            cell_velocities,
+            pressure_tensors,
+            target_pressures_tri,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt=0.001,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -2225,8 +2619,13 @@ class TestNPTCoverageExtras:
 
         # Don't pre-allocate output
         result = npt_position_update_out(
-            positions, velocities, cells, cell_velocities,
-            dt=0.001, batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            cells,
+            cell_velocities,
+            dt=0.001,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -2257,8 +2656,13 @@ class TestNPTCoverageExtras:
 
         # Don't pre-allocate output
         result = nph_position_update_out(
-            positions, velocities, cells, cell_velocities,
-            dt=0.001, batch_idx=batch_idx, device=device
+            positions,
+            velocities,
+            cells,
+            cell_velocities,
+            dt=0.001,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
