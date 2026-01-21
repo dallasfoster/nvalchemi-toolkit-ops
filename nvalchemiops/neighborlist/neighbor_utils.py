@@ -451,25 +451,38 @@ def _prepare_batch_idx_ptr(
     """
     Utility function to prepare batch index and pointer tensors.
 
+    Converts between batch_idx and batch_ptr (atom_ptr) representations,
+    creating whichever one is missing from the other.
+
     Parameters
     ----------
-    batch_idx: torch.Tensor | None
-        Tensor indicating the batch index for each atom.
-    batch_ptr: torch.Tensor | None
+    batch_idx : torch.Tensor | None
+        Tensor indicating the batch index for each atom. Shape (num_atoms,).
+    batch_ptr : torch.Tensor | None
         Tensor indicating the start index of each batch in the atom list.
-    num_atoms: int
+        Shape (num_systems + 1,). Also known as atom_ptr in CSR format.
+    num_atoms : int
         Total number of atoms.
-    num_systems: int | None
-        Total number of systems.
-    device: torch.device
+    device : torch.device
         Device on which to create tensors if needed.
 
     Returns
     -------
-    batch_idx: torch.Tensor
-        Prepared batch index tensor.
-    batch_ptr: torch.Tensor
-        Prepared batch pointer tensor.
+    batch_idx : torch.Tensor
+        Prepared batch index tensor. Shape (num_atoms,).
+    batch_ptr : torch.Tensor
+        Prepared batch pointer tensor. Shape (num_systems + 1,).
+
+    Raises
+    ------
+    ValueError
+        If neither batch_idx nor batch_ptr is provided.
+
+    See Also
+    --------
+    nvalchemiops.batch_utils : GPU-accelerated Warp utilities for batch operations.
+        For pure Warp workflows, use `create_batch_idx`, `create_atom_ptr`,
+        `batch_idx_to_atom_ptr`, and `atom_ptr_to_batch_idx` from batch_utils.
     """
     if batch_idx is None and batch_ptr is None:
         raise ValueError("Either batch_idx or batch_ptr must be provided.")

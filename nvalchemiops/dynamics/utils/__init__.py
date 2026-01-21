@@ -59,8 +59,48 @@ cartesian_to_fractional
 
 fractional_to_cartesian
     Convert fractional to Cartesian coordinates.
+
+Cell Filter Utilities (Variable-Cell Optimization)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+align_cell
+    Align cell to upper-triangular form for stable optimization.
+
+extend_batch_idx / extend_atom_ptr
+    Extend batch_idx/atom_ptr arrays for cell DOFs.
+
+pack_positions_with_cell / unpack_positions_with_cell
+    Pack/unpack atomic positions and cell into extended arrays.
+
+pack_velocities_with_cell / unpack_velocities_with_cell
+    Pack/unpack atomic velocities and cell velocity into extended arrays.
+
+pack_forces_with_cell
+    Pack atomic forces and cell force into extended arrays.
+
+pack_masses_with_cell
+    Pack atomic masses and cell mass into extended arrays.
+
+stress_to_cell_force
+    Convert stress tensor to cell force for optimization.
 """
 
+from .cell_filter import (
+    # Cell alignment
+    align_cell,
+    # Batch index extension
+    extend_atom_ptr,
+    extend_batch_idx,
+    # Pack utilities
+    pack_forces_with_cell,
+    pack_masses_with_cell,
+    pack_positions_with_cell,
+    pack_velocities_with_cell,
+    # Stress conversion
+    stress_to_cell_force,
+    # Unpack utilities
+    unpack_positions_with_cell,
+    unpack_velocities_with_cell,
+)
 from .cell_utils import (
     apply_strain_to_cell,
     # Coordinate transformations
@@ -123,6 +163,17 @@ __all__ = [
     "wrap_positions_to_cell_out",
     "cartesian_to_fractional",
     "fractional_to_cartesian",
+    # Cell filter utilities (variable-cell optimization)
+    "align_cell",
+    "extend_batch_idx",
+    "extend_atom_ptr",
+    "pack_positions_with_cell",
+    "pack_velocities_with_cell",
+    "pack_forces_with_cell",
+    "pack_masses_with_cell",
+    "unpack_positions_with_cell",
+    "unpack_velocities_with_cell",
+    "stress_to_cell_force",
     # Constraint utilities (SHAKE/RATTLE)
     "shake_constraints",
     "shake_iteration",

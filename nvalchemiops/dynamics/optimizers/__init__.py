@@ -12,55 +12,65 @@
 Geometry Optimizers
 ===================
 
-GPU-accelerated geometry optimization algorithms with both mutating and
-non-mutating APIs for gradient tracking compatibility.
+GPU-accelerated geometry optimization algorithms.
 
 Available Optimizers
 --------------------
-fire
-    FIRE (Fast Inertial Relaxation Engine) optimizer.
+FIRE (Fast Inertial Relaxation Engine)
     MD-based optimization with adaptive timestep and velocity mixing.
 
-API Patterns
-------------
-- Mutating APIs: Modify arrays in-place (e.g., `fire_md_step`)
-- Non-mutating APIs: Return new arrays (e.g., `fire_md_step_out`)
+Main API Functions
+------------------
+fire_step
+    Full FIRE step with MD integration. Supports single system,
+    batch_idx, and atom_ptr batching modes, with optional downhill check.
+
+fire_update
+    FIRE velocity mixing and parameter update WITHOUT MD integration.
+    Use for variable-cell optimization with packed extended arrays.
+
+Kernel Selection
+----------------
+- Neither batch_idx nor atom_ptr: single system kernel
+- batch_idx provided: batch_idx kernel (one thread per atom)
+- atom_ptr provided: ptr/CSR kernel (one thread per system)
+- Downhill arrays provided: downhill variant with energy check
 """
 
 from .fire import (
-    fire2_md_step,
-    fire2_md_step_out,
-    # FIRE2 - Mutating
-    fire2_velocity_update,
-    # FIRE2 - Non-mutating
-    fire2_velocity_update_out,
-    # Diagnostics (shared by FIRE and FIRE2)
-    fire_compute_diagnostics,
-    fire_md_step,
-    fire_md_step_out,
-    fire_reset_velocities,
-    fire_reset_velocities_out,
-    # FIRE - Mutating
-    fire_velocity_mix,
-    # FIRE - Non-mutating
-    fire_velocity_mix_out,
+    _fire_step_downhill_batch_idx_kernel,
+    _fire_step_downhill_kernel,
+    _fire_step_downhill_ptr_kernel,
+    _fire_step_no_downhill_batch_idx_kernel,
+    # Low-level kernels (for advanced use)
+    _fire_step_no_downhill_kernel,
+    _fire_step_no_downhill_ptr_kernel,
+    _fire_update_params_downhill_batch_idx_kernel,
+    _fire_update_params_downhill_kernel,
+    _fire_update_params_downhill_ptr_kernel,
+    _fire_update_params_no_downhill_batch_idx_kernel,
+    _fire_update_params_no_downhill_kernel,
+    _fire_update_params_no_downhill_ptr_kernel,
+    # Unified API (recommended)
+    fire_step,
+    fire_update,
 )
 
 __all__ = [
-    # Diagnostics (shared by FIRE and FIRE2)
-    "fire_compute_diagnostics",
-    # FIRE - Mutating
-    "fire_velocity_mix",
-    "fire_md_step",
-    "fire_reset_velocities",
-    # FIRE - Non-mutating
-    "fire_velocity_mix_out",
-    "fire_md_step_out",
-    "fire_reset_velocities_out",
-    # FIRE2 - Mutating
-    "fire2_velocity_update",
-    "fire2_md_step",
-    # FIRE2 - Non-mutating
-    "fire2_velocity_update_out",
-    "fire2_md_step_out",
+    # Unified API (recommended)
+    "fire_step",
+    "fire_update",
+    # Low-level kernels (for advanced use)
+    "_fire_step_no_downhill_kernel",
+    "_fire_step_no_downhill_batch_idx_kernel",
+    "_fire_step_no_downhill_ptr_kernel",
+    "_fire_step_downhill_kernel",
+    "_fire_step_downhill_batch_idx_kernel",
+    "_fire_step_downhill_ptr_kernel",
+    "_fire_update_params_no_downhill_kernel",
+    "_fire_update_params_no_downhill_batch_idx_kernel",
+    "_fire_update_params_no_downhill_ptr_kernel",
+    "_fire_update_params_downhill_kernel",
+    "_fire_update_params_downhill_batch_idx_kernel",
+    "_fire_update_params_downhill_ptr_kernel",
 ]
