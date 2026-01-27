@@ -965,5 +965,539 @@ class TestCOMMotionRemoval:
         np.testing.assert_allclose(final_momentum, 0.0, atol=1e-5)
 
 
+# ==============================================================================
+# Atom Pointer (CSR) Batch Mode Tests
+# ==============================================================================
+
+
+class TestKineticEnergyAtomPtr:
+    """Test atom_ptr batch mode for kinetic energy computation."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_compute_kinetic_energy_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that compute_kinetic_energy executes with atom_ptr."""
+        atom_counts = [10, 25, 15]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+
+        ke = compute_kinetic_energy(
+            velocities,
+            masses,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        assert ke.shape[0] == num_systems
+        ke_vals = ke.numpy()
+        for i in range(num_systems):
+            assert ke_vals[i] > 0
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_vs_batch_idx_equivalence_ke(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr and batch_idx produce identical KE for same-sized systems."""
+        num_systems = 3
+        atoms_per_system = 20
+        total_atoms = num_systems * atoms_per_system
+
+        np.random.seed(42)
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype)
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        # Setup for batch_idx mode
+        velocities_batch = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_batch = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        # Setup for atom_ptr mode
+        velocities_ptr = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_ptr = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
+
+        # Execute with batch_idx
+        ke_batch = compute_kinetic_energy(
+            velocities_batch,
+            masses_batch,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        # Execute with atom_ptr
+        ke_ptr = compute_kinetic_energy(
+            velocities_ptr,
+            masses_ptr,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+        # Results should be identical
+        np.testing.assert_allclose(ke_batch.numpy(), ke_ptr.numpy(), rtol=1e-6)
+
+
+class TestTemperatureAtomPtr:
+    """Test atom_ptr batch mode for temperature computation."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_compute_temperature_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that compute_temperature executes with atom_ptr."""
+        atom_counts = [50, 50, 50]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        dof_per_system = 3 * 50
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+
+        temp = compute_temperature(
+            velocities,
+            masses,
+            num_atoms=50,
+            dof=dof_per_system,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        assert temp.shape[0] == num_systems
+        temp_vals = temp.numpy()
+        for i in range(num_systems):
+            assert temp_vals[i] > 0
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_vs_batch_idx_equivalence_temp(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr and batch_idx produce identical temperature for same-sized systems."""
+        num_systems = 3
+        atoms_per_system = 20
+        total_atoms = num_systems * atoms_per_system
+        dof_per_system = 3 * atoms_per_system
+
+        np.random.seed(42)
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype)
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        # Setup for batch_idx mode
+        velocities_batch = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_batch = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        # Setup for atom_ptr mode
+        velocities_ptr = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_ptr = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
+
+        # Execute with batch_idx
+        temp_batch = compute_temperature(
+            velocities_batch,
+            masses_batch,
+            num_atoms=atoms_per_system,
+            dof=dof_per_system,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        # Execute with atom_ptr
+        temp_ptr = compute_temperature(
+            velocities_ptr,
+            masses_ptr,
+            num_atoms=atoms_per_system,
+            dof=dof_per_system,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+        # Results should be identical
+        np.testing.assert_allclose(temp_batch.numpy(), temp_ptr.numpy(), rtol=1e-6)
+
+
+class TestInitializeVelocitiesAtomPtr:
+    """Test atom_ptr batch mode for velocity initialization."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_initialize_velocities_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that initialize_velocities executes with atom_ptr."""
+        atom_counts = [50, 50, 50]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        temperatures = wp.array([0.5, 1.0, 2.0], dtype=dtype_scalar, device=device)
+
+        initialize_velocities(
+            velocities,
+            masses,
+            temperatures,
+            random_seed=42,
+            atom_ptr=atom_ptr,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        vel_np = velocities.numpy()
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            assert not np.allclose(vel_np[offset : offset + n], 0.0)
+            offset += n
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_initialize_velocities_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating initialize_velocities_out with atom_ptr."""
+        atom_counts = [30, 30, 40]
+        total_atoms = sum(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        temperatures = wp.array([1.0, 1.5, 0.5], dtype=dtype_scalar, device=device)
+
+        velocities = initialize_velocities_out(
+            masses,
+            temperatures,
+            random_seed=42,
+            atom_ptr=atom_ptr,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+        assert velocities.shape[0] == total_atoms
+        vel_np = velocities.numpy()
+        assert not np.allclose(vel_np, 0.0)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_variable_system_sizes_init(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test velocity initialization with highly variable system sizes using atom_ptr."""
+        atom_counts = [5, 50, 10, 35]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+
+        np.random.seed(43)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        temperatures = wp.array([1.0, 2.0, 1.5, 0.8], dtype=dtype_scalar, device=device)
+
+        initialize_velocities(
+            velocities,
+            masses,
+            temperatures,
+            random_seed=42,
+            atom_ptr=atom_ptr,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        vel_np = velocities.numpy()
+
+        # Verify all systems have non-zero velocities
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_vel = vel_np[offset : offset + n]
+            assert not np.allclose(sys_vel, 0.0), (
+                f"System {sys_id} (size={n}) velocities not initialized"
+            )
+            offset += n
+
+
+class TestRemoveCOMMotionAtomPtr:
+    """Test atom_ptr batch mode for COM motion removal."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_remove_com_motion_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that remove_com_motion executes with atom_ptr."""
+        atom_counts = [50, 50, 50]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+
+        remove_com_motion(
+            velocities,
+            masses,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        vel_result = velocities.numpy()
+        mass_result = masses.numpy()
+
+        # Check COM is zero for each system
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_vel = vel_result[offset : offset + n]
+            sys_mass = mass_result[offset : offset + n]
+            sys_com = np.sum(sys_mass[:, np.newaxis] * sys_vel, axis=0) / np.sum(
+                sys_mass
+            )
+            np.testing.assert_allclose(sys_com, 0.0, atol=1e-5)
+            offset += n
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_remove_com_motion_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating remove_com_motion_out with atom_ptr."""
+        atom_counts = [30, 30, 40]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+
+        vel_orig = velocities.numpy().copy()
+
+        vel_out = remove_com_motion_out(
+            velocities,
+            masses,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+        # Check input preserved
+        np.testing.assert_array_equal(velocities.numpy(), vel_orig)
+
+        # Check output has zero COM for each system
+        vel_result = vel_out.numpy()
+        mass_result = masses.numpy()
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_vel = vel_result[offset : offset + n]
+            sys_mass = mass_result[offset : offset + n]
+            sys_com = np.sum(sys_mass[:, np.newaxis] * sys_vel, axis=0) / np.sum(
+                sys_mass
+            )
+            np.testing.assert_allclose(sys_com, 0.0, atol=1e-5)
+            offset += n
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_vs_batch_idx_equivalence_com(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr and batch_idx produce identical COM removal for same-sized systems."""
+        num_systems = 3
+        atoms_per_system = 20
+        total_atoms = num_systems * atoms_per_system
+
+        np.random.seed(42)
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype)
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        # Setup for batch_idx mode
+        velocities_batch = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_batch = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        # Setup for atom_ptr mode
+        velocities_ptr = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        masses_ptr = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
+
+        # Execute with batch_idx
+        remove_com_motion(
+            velocities_batch,
+            masses_batch,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        # Execute with atom_ptr
+        remove_com_motion(
+            velocities_ptr,
+            masses_ptr,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+        # Results should be identical
+        np.testing.assert_allclose(
+            velocities_batch.numpy(), velocities_ptr.numpy(), rtol=1e-6
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_variable_system_sizes_com(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test COM removal with highly variable system sizes using atom_ptr."""
+        atom_counts = [5, 50, 10, 35]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+
+        np.random.seed(43)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+
+        remove_com_motion(
+            velocities,
+            masses,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        vel_result = velocities.numpy()
+        mass_result = masses.numpy()
+
+        # Verify COM is zero for each system
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_vel = vel_result[offset : offset + n]
+            sys_mass = mass_result[offset : offset + n]
+            sys_com = np.sum(sys_mass[:, np.newaxis] * sys_vel, axis=0) / np.sum(
+                sys_mass
+            )
+            np.testing.assert_allclose(
+                sys_com,
+                0.0,
+                atol=1e-5,
+                err_msg=(f"System {sys_id} (size={n}) COM not zero"),
+            )
+            offset += n
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

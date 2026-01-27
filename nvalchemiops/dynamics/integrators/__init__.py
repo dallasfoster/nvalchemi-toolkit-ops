@@ -44,6 +44,86 @@ API Patterns
 ------------
 - Mutating APIs: Modify arrays in-place (e.g., `velocity_verlet_position_update`)
 - Non-mutating APIs: Return new arrays (e.g., `velocity_verlet_position_update_out`)
+
+Usage Examples
+--------------
+
+**Basic NVE Simulation with Velocity Verlet**::
+
+    import warp as wp
+    import numpy as np
+    from nvalchemiops.dynamics.integrators import (
+        velocity_verlet_position_update,
+        velocity_verlet_velocity_finalize
+    )
+
+    # Setup
+    positions = wp.array(np.random.randn(100, 3), dtype=wp.vec3d, device="cuda:0")
+    velocities = wp.array(np.random.randn(100, 3), dtype=wp.vec3d, device="cuda:0")
+    forces = wp.zeros_like(positions)
+    masses = wp.ones(100, dtype=wp.float64, device="cuda:0")
+    dt = wp.array([0.001], dtype=wp.float64, device="cuda:0")
+
+    # MD loop
+    for step in range(num_steps):
+        # Update positions and half-step velocities
+        velocity_verlet_position_update(positions, velocities, forces, masses, dt)
+
+        # Recalculate forces at new positions
+        forces = compute_forces(positions)  # User-defined
+
+        # Finalize velocity update
+        velocity_verlet_velocity_finalize(velocities, forces, masses, dt)
+
+**NVT Simulation with Langevin Dynamics**::
+
+    from nvalchemiops.dynamics.integrators import (
+        langevin_baoab_half_step,
+        langevin_baoab_finalize
+    )
+
+    # Setup NVT parameters
+    temperature = wp.array([1.0], dtype=wp.float64, device="cuda:0")
+    friction = wp.array([1.0], dtype=wp.float64, device="cuda:0")
+
+    # MD loop
+    for step in range(num_steps):
+        # BAOAB half-step (B-A-O-A)
+        langevin_baoab_half_step(
+            positions, velocities, forces, masses, dt,
+            temperature, friction, random_seed=step
+        )
+
+        # Recalculate forces
+        forces = compute_forces(positions)
+
+        # Final B step
+        langevin_baoab_finalize(velocities, forces, masses, dt)
+
+**Batch Mode: Multiple Systems Simultaneously**::
+
+    # Simulate 3 systems: 30, 40, and 30 atoms
+    batch_idx = wp.array([0]*30 + [1]*40 + [2]*30, dtype=wp.int32, device="cuda:0")
+
+    # Per-system timesteps
+    dt_batch = wp.array([0.001, 0.002, 0.0015], dtype=wp.float64, device="cuda:0")
+
+    # MD loop - all systems evolve in parallel
+    for step in range(num_steps):
+        velocity_verlet_position_update(
+            positions, velocities, forces, masses, dt_batch,
+            batch_idx=batch_idx
+        )
+
+        # Compute forces for all systems
+        forces = compute_forces(positions)
+
+        velocity_verlet_velocity_finalize(
+            velocities, forces, masses, dt_batch,
+            batch_idx=batch_idx
+        )
+
+For detailed documentation and mathematical formulations, see the :ref:`dynamics_userguide`.
 """
 
 from .langevin import (

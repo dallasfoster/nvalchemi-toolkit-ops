@@ -1328,3 +1328,209 @@ class TestCellUtilsPreallocatedOutputs:
 
         wp.synchronize_device(device)
         assert result is positions_out
+
+
+# ==============================================================================
+# Device Inference Tests
+# ==============================================================================
+
+
+class TestDeviceInference:
+    """Test device inference when device=None is passed."""
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_cell_volume_device_inference(self, dtype, device):
+        """Test compute_cell_volume infers device from cells."""
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cells = make_cell(cell_np, dtype, device)
+
+        # Don't pass device
+        volumes = compute_cell_volume(cells)
+
+        wp.synchronize_device(device)
+        assert volumes.device == device
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_cell_inverse_device_inference(self, dtype, device):
+        """Test compute_cell_inverse infers device from cells."""
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cells = make_cell(cell_np, dtype, device)
+
+        # Don't pass device
+        cells_inv = compute_cell_inverse(cells)
+
+        wp.synchronize_device(device)
+        assert cells_inv.device == device
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_strain_tensor_device_inference(self, dtype, device):
+        """Test compute_strain_tensor infers device from cells."""
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cell_ref_np = np.diag([9.0, 9.0, 9.0]).astype(np_dtype)
+        cells = make_cell(cell_np, dtype, device)
+        cells_ref = make_cell(cell_ref_np, dtype, device)
+
+        # Don't pass device
+        strains = compute_strain_tensor(cells, cells_ref=cells_ref)
+
+        wp.synchronize_device(device)
+        assert strains.device == device
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_apply_strain_to_cell_device_inference(self, dtype, device):
+        """Test apply_strain_to_cell infers device from cells."""
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        mat_dtype = wp.mat33f if dtype == "float32" else wp.mat33d
+
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        strain_np = np.eye(3, dtype=np_dtype) * 0.01
+        cells = make_cell(cell_np, dtype, device)
+        strains = wp.array(
+            [mat_dtype(*strain_np.flatten())], dtype=mat_dtype, device=device
+        )
+
+        # Don't pass device
+        cells_out = apply_strain_to_cell(cells, strains)
+
+        wp.synchronize_device(device)
+        assert cells_out.device == device
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_scale_positions_device_inference(self, dtype, device):
+        """Test scale_positions_with_cell infers device from positions."""
+        num_atoms = 5
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=vec_dtype,
+            device=device,
+        )
+        cell_old_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cell_new_np = np.diag([11.0, 11.0, 11.0]).astype(np_dtype)
+        cells_old = make_cell(cell_old_np, dtype, device)
+        cells_new = make_cell(cell_new_np, dtype, device)
+
+        # Don't pass device
+        scale_positions_with_cell(positions, cells_new, cells_old=cells_old)
+
+        wp.synchronize_device(device)
+        # Just check it ran without error
+
+    @pytest.mark.parametrize("dtype", ["float32", "float64"])
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_wrap_positions_device_inference(self, dtype, device):
+        """Test wrap_positions_to_cell infers device from positions."""
+        num_atoms = 5
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+        vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype) * 20.0,
+            dtype=vec_dtype,
+            device=device,
+        )
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cells = make_cell(cell_np, dtype, device)
+
+        # Don't pass device
+        wrap_positions_to_cell(positions, cells=cells)
+
+        wp.synchronize_device(device)
+        # Just check it ran without error
+
+
+# ==============================================================================
+# Error Case Tests
+# ==============================================================================
+
+
+class TestErrorCases:
+    """Test error handling in cell utilities."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_strain_missing_ref_error(self, device):
+        """Test compute_strain_tensor raises error without reference cell."""
+        np_dtype = np.float64
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cells = make_cell(cell_np, "float64", device)
+
+        with pytest.raises(ValueError, match="Either cells_ref or cells_ref_inv"):
+            compute_strain_tensor(cells, device=device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_scale_positions_missing_old_cell_error(self, device):
+        """Test scale_positions_with_cell raises error without old cell."""
+        num_atoms = 5
+        np_dtype = np.float64
+        vec_dtype = wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=vec_dtype,
+            device=device,
+        )
+        cell_new_np = np.diag([11.0, 11.0, 11.0]).astype(np_dtype)
+        cells_new = make_cell(cell_new_np, "float64", device)
+
+        with pytest.raises(ValueError, match="Either cells_old or cells_old_inv"):
+            scale_positions_with_cell(positions, cells_new, device=device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_wrap_positions_missing_cells_error(self, device):
+        """Test wrap_positions_to_cell raises error without cell info."""
+        num_atoms = 5
+        np_dtype = np.float64
+        vec_dtype = wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=vec_dtype,
+            device=device,
+        )
+
+        with pytest.raises(ValueError, match="Either cells or cells_inv"):
+            wrap_positions_to_cell(positions, device=device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_wrap_positions_out_missing_cells_error(self, device):
+        """Test wrap_positions_to_cell_out raises error without cell info."""
+        num_atoms = 5
+        np_dtype = np.float64
+        vec_dtype = wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=vec_dtype,
+            device=device,
+        )
+
+        with pytest.raises(ValueError, match="Either cells or cells_inv"):
+            wrap_positions_to_cell_out(positions, device=device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_scale_positions_out_missing_old_cell_error(self, device):
+        """Test scale_positions_with_cell_out raises error without old cell."""
+        num_atoms = 5
+        np_dtype = np.float64
+        vec_dtype = wp.vec3d
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=vec_dtype,
+            device=device,
+        )
+        cell_new_np = np.diag([11.0, 11.0, 11.0]).astype(np_dtype)
+        cells_new = make_cell(cell_new_np, "float64", device)
+
+        with pytest.raises(ValueError, match="Either cells_old or cells_old_inv"):
+            scale_positions_with_cell_out(positions, cells_new=cells_new, device=device)

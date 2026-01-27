@@ -2667,3 +2667,217 @@ class TestNPTCoverageExtras:
 
         wp.synchronize_device(device)
         assert result.shape[0] == num_atoms
+
+
+# ==============================================================================
+# Additional Coverage Tests
+# ==============================================================================
+
+
+class TestAdditionalCoverage:
+    """Additional tests to improve coverage for edge cases and device inference."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_barostat_mass_N_broadcast(self, device):
+        """Test compute_barostat_mass broadcasting N_arr for multiple systems."""
+        # Provide scalar num_atoms but multiple systems from temperature array
+        T_arr = wp.array([1.0, 1.5], dtype=wp.float32, device=device)
+        tau_arr = wp.array([1.0, 1.0], dtype=wp.float32, device=device)
+
+        W = compute_barostat_mass(
+            target_temperature=T_arr,
+            tau_p=tau_arr,
+            num_atoms=100,  # scalar, should broadcast to 2 systems
+            dtype=wp.float32,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+        assert W.shape[0] == 2
+        # W = (3N + 3) * T * τ² = 303 * T
+        np.testing.assert_allclose(W.numpy()[0], 303.0, rtol=1e-5)
+        np.testing.assert_allclose(W.numpy()[1], 454.5, rtol=1e-5)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_barostat_potential_device_inference(self, device):
+        """Test compute_barostat_potential_energy with device inference."""
+        target_pressures = wp.array([0.1], dtype=wp.float32, device=device)
+        volumes = wp.array([1000.0], dtype=wp.float32, device=device)
+
+        # Don't pass device
+        result = compute_barostat_potential_energy(target_pressures, volumes)
+
+        wp.synchronize_device(device)
+        assert result.shape[0] == 1
+        # PE = P * V = 0.1 * 1000 = 100.0
+        np.testing.assert_allclose(result.numpy()[0], 100.0, rtol=1e-5)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_barostat_potential_output_allocation(self, device):
+        """Test compute_barostat_potential_energy allocates output internally."""
+        target_pressures = wp.array([0.1, 0.2], dtype=wp.float32, device=device)
+        volumes = wp.array([1000.0, 500.0], dtype=wp.float32, device=device)
+
+        # Don't pass potential_energy output array
+        result = compute_barostat_potential_energy(
+            target_pressures, volumes, device=device
+        )
+
+        wp.synchronize_device(device)
+        assert result.shape[0] == 2
+        np.testing.assert_allclose(result.numpy()[0], 100.0, rtol=1e-5)
+        np.testing.assert_allclose(result.numpy()[1], 100.0, rtol=1e-5)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_compute_cell_kinetic_energy_preallocated(self, device):
+        """Test compute_cell_kinetic_energy with pre-allocated output."""
+        num_systems = 2
+        cell_vel_np = np.diag([0.1, 0.1, 0.1]).astype(np.float32)
+        cell_velocities = wp.array(
+            [wp.mat33f(*cell_vel_np.flatten())] * num_systems,
+            dtype=wp.mat33f,
+            device=device,
+        )
+        cell_masses = wp.array([100.0, 100.0], dtype=wp.float32, device=device)
+        kinetic_energy = wp.zeros(num_systems, dtype=wp.float32, device=device)
+
+        result = compute_cell_kinetic_energy(
+            cell_velocities, cell_masses, kinetic_energy=kinetic_energy, device=device
+        )
+
+        wp.synchronize_device(device)
+        assert result is kinetic_energy
+        # KE = 0.5 * W * ||ḣ||²_F = 0.5 * 100 * (3 * 0.01) = 1.5
+        np.testing.assert_allclose(result.numpy()[0], 1.5, rtol=1e-4)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_npt_thermostat_half_step_device_inference(self, device):
+        """Test npt_thermostat_half_step with device inference."""
+        from nvalchemiops.dynamics.integrators.npt import npt_thermostat_half_step
+
+        num_systems = 1
+        chain_length = 3
+
+        eta = wp.zeros((num_systems, chain_length), dtype=wp.float64, device=device)
+        eta_dot = wp.zeros((num_systems, chain_length), dtype=wp.float64, device=device)
+        kinetic_energy = wp.array([10.0], dtype=wp.float64, device=device)
+        target_temperature = wp.array([1.0], dtype=wp.float64, device=device)
+        thermostat_masses = wp.ones(
+            (num_systems, chain_length), dtype=wp.float64, device=device
+        )
+        num_atoms_per_system = wp.array([100], dtype=wp.int32, device=device)
+
+        # Don't pass device
+        npt_thermostat_half_step(
+            eta,
+            eta_dot,
+            kinetic_energy,
+            target_temperature,
+            thermostat_masses,
+            num_atoms_per_system,
+            chain_length=chain_length,
+            dt=0.0005,
+        )
+
+        wp.synchronize_device(device)
+        # Just check it ran without error
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_nph_barostat_half_step_device_inference(self, device):
+        """Test nph_barostat_half_step with device inference."""
+        num_systems = 1
+
+        cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
+        pressure_tensors = wp.zeros(num_systems, dtype=vec9f, device=device)
+        target_pressures = wp.array([0.1], dtype=wp.float32, device=device)
+        volumes = wp.array([1000.0], dtype=wp.float32, device=device)
+        cell_masses = wp.array([100.0], dtype=wp.float32, device=device)
+        kinetic_energy = wp.array([10.0], dtype=wp.float32, device=device)
+        num_atoms_per_system = wp.array([100], dtype=wp.int32, device=device)
+
+        # Don't pass device
+        nph_barostat_half_step(
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt=0.001,
+        )
+
+        wp.synchronize_device(device)
+        # Just check it ran without error
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_npt_cell_update_device_inference(self, device):
+        """Test npt_cell_update with device inference."""
+        num_systems = 1
+
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np.float32)
+        cells_np = np.stack([cell_np])
+        cells = make_cells_batch(cells_np, "float32", device)
+        cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
+
+        # Don't pass device
+        npt_cell_update(cells, cell_velocities, dt=0.001)
+
+        wp.synchronize_device(device)
+        # Just check it ran without error
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_npt_cell_update_out_device_inference(self, device):
+        """Test npt_cell_update_out with device inference."""
+        num_systems = 1
+
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np.float32)
+        cells_np = np.stack([cell_np])
+        cells = make_cells_batch(cells_np, "float32", device)
+        cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
+
+        # Don't pass device
+        result = npt_cell_update_out(cells, cell_velocities, dt=0.001)
+
+        wp.synchronize_device(device)
+        assert result.shape[0] == num_systems
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_npt_velocity_half_step_device_inference(self, device):
+        """Test npt_velocity_half_step with device inference."""
+        num_atoms = 10
+        num_systems = 1
+        np.random.seed(42)
+
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np.float32) * 0.1,
+            dtype=wp.vec3f,
+            device=device,
+        )
+        masses = wp.ones(num_atoms, dtype=wp.float32, device=device)
+        forces = wp.zeros(num_atoms, dtype=wp.vec3f, device=device)
+
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np.float32)
+        cell_inv_np = np.linalg.inv(cell_np).astype(np.float32)
+        cells_inv = wp.array(
+            [wp.mat33f(*cell_inv_np.flatten())], dtype=wp.mat33f, device=device
+        )
+        cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
+        volumes = wp.array([1000.0], dtype=wp.float32, device=device)
+        eta_dot_0 = wp.zeros((num_systems, 1), dtype=wp.float32, device=device)
+
+        # Don't pass device
+        npt_velocity_half_step(
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            volumes,
+            eta_dot_0,
+            num_atoms,
+            dt=0.001,
+            cells_inv=cells_inv,
+        )
+
+        wp.synchronize_device(device)
+        # Just check it ran without error

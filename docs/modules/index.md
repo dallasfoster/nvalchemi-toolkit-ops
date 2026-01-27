@@ -10,5 +10,6 @@ alone may not provide sufficient information.
 neighborlist.rst
 dispersion.rst
 electrostatics.rst
+dynamics.rst
 utilities.rst
 ```

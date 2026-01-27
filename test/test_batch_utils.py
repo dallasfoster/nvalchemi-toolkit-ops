@@ -810,5 +810,399 @@ class TestSyncFreePatterns:
         np.testing.assert_allclose(result.numpy(), expected, rtol=1e-10)
 
 
+# =============================================================================
+# Additional Coverage Tests
+# =============================================================================
+
+
+class TestDeviceInference:
+    """Tests for device inference (when device is not passed)."""
+
+    def test_create_batch_idx_device_inference(self, device, simple_batch_data):
+        """Test create_batch_idx infers device from atom_counts."""
+        atom_counts = wp.array(
+            simple_batch_data["atom_counts"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        # Don't pass device
+        batch_idx = create_batch_idx(atom_counts, total_atoms=total_atoms)
+
+        wp.synchronize_device(device)
+        assert batch_idx.device == device
+
+    def test_create_atom_ptr_device_inference(self, device, simple_batch_data):
+        """Test create_atom_ptr infers device from atom_counts."""
+        atom_counts = wp.array(
+            simple_batch_data["atom_counts"], dtype=wp.int32, device=device
+        )
+
+        # Don't pass device
+        atom_ptr = create_atom_ptr(atom_counts)
+
+        wp.synchronize_device(device)
+        assert atom_ptr.device == device
+
+    def test_atom_ptr_to_batch_idx_device_inference(self, device, simple_batch_data):
+        """Test atom_ptr_to_batch_idx infers device from atom_ptr."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        # Don't pass device
+        batch_idx = atom_ptr_to_batch_idx(atom_ptr, total_atoms=total_atoms)
+
+        wp.synchronize_device(device)
+        assert batch_idx.device == device
+
+    def test_sum_per_system_device_inference(self, device, simple_batch_data):
+        """Test sum_per_system infers device from values."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        values = wp.array(
+            np.random.randn(simple_batch_data["total_atoms"]),
+            dtype=wp.float64,
+            device=device,
+        )
+
+        # Don't pass device
+        result = sum_per_system(values, atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+    def test_max_per_system_device_inference(self, device, simple_batch_data):
+        """Test max_per_system infers device from values."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        values = wp.array(
+            np.random.randn(simple_batch_data["total_atoms"]),
+            dtype=wp.float64,
+            device=device,
+        )
+
+        # Don't pass device
+        result = max_per_system(values, atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+    def test_min_per_system_device_inference(self, device, simple_batch_data):
+        """Test min_per_system infers device from values."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        values = wp.array(
+            np.random.randn(simple_batch_data["total_atoms"]),
+            dtype=wp.float64,
+            device=device,
+        )
+
+        # Don't pass device
+        result = min_per_system(values, atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+    def test_mean_per_system_device_inference(self, device, simple_batch_data):
+        """Test mean_per_system infers device from values."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        values = wp.array(
+            np.random.randn(simple_batch_data["total_atoms"]),
+            dtype=wp.float64,
+            device=device,
+        )
+
+        # Don't pass device
+        result = mean_per_system(values, atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+
+class TestBatchIdxModeReductions:
+    """Tests for reduction functions using batch_idx mode."""
+
+    def test_sum_per_system_batch_idx_mode(self, device, simple_batch_data):
+        """Test sum_per_system with batch_idx."""
+        batch_idx = wp.array(
+            simple_batch_data["expected_batch_idx"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(200)
+        values_np = np.random.randn(total_atoms)
+        values = wp.array(values_np, dtype=wp.float64, device=device)
+
+        result = sum_per_system(
+            values, batch_idx=batch_idx, num_systems=num_systems, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        # Compute expected
+        atom_counts = simple_batch_data["atom_counts"]
+        expected = np.zeros(num_systems)
+        offset = 0
+        for s, count in enumerate(atom_counts):
+            expected[s] = values_np[offset : offset + count].sum()
+            offset += count
+
+        np.testing.assert_allclose(result.numpy(), expected, rtol=1e-10)
+
+
+class TestAtomsPerSystemEdgeCases:
+    """Tests for atoms_per_system edge cases."""
+
+    def test_atoms_per_system_from_batch_idx(self, device, simple_batch_data):
+        """Test atoms_per_system from batch_idx."""
+        batch_idx = wp.array(
+            simple_batch_data["expected_batch_idx"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+
+        result = atoms_per_system(
+            batch_idx=batch_idx, num_systems=num_systems, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        expected = np.array(simple_batch_data["atom_counts"], dtype=np.int32)
+        np.testing.assert_array_equal(result.numpy(), expected)
+
+    def test_atoms_per_system_from_atom_ptr(self, device, simple_batch_data):
+        """Test atoms_per_system from atom_ptr."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+
+        result = atoms_per_system(atom_ptr=atom_ptr, device=device)
+
+        wp.synchronize_device(device)
+
+        expected = np.array(simple_batch_data["atom_counts"], dtype=np.int32)
+        np.testing.assert_array_equal(result.numpy(), expected)
+
+    def test_atoms_per_system_device_inference_batch_idx(
+        self, device, simple_batch_data
+    ):
+        """Test atoms_per_system device inference from batch_idx."""
+        batch_idx = wp.array(
+            simple_batch_data["expected_batch_idx"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+
+        # Don't pass device
+        result = atoms_per_system(batch_idx=batch_idx, num_systems=num_systems)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+    def test_atoms_per_system_device_inference_atom_ptr(
+        self, device, simple_batch_data
+    ):
+        """Test atoms_per_system device inference from atom_ptr."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+
+        # Don't pass device
+        result = atoms_per_system(atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+        assert result.device == device
+
+    def test_atoms_per_system_missing_input_error(self, device):
+        """Test atoms_per_system raises error when no input provided."""
+        with pytest.raises(ValueError, match="Either batch_idx or atom_ptr"):
+            atoms_per_system(device=device)
+
+    def test_atoms_per_system_batch_idx_missing_num_systems_error(self, device):
+        """Test atoms_per_system raises error when num_systems missing."""
+        batch_idx = wp.array([0, 0, 1, 1, 1], dtype=wp.int32, device=device)
+        with pytest.raises(ValueError, match="num_systems required"):
+            atoms_per_system(batch_idx=batch_idx, device=device)
+
+
+class TestAtomPtrToBatchIdxPreallocated:
+    """Tests for atom_ptr_to_batch_idx with pre-allocated output."""
+
+    def test_atom_ptr_to_batch_idx_preallocated(self, device, simple_batch_data):
+        """Test atom_ptr_to_batch_idx with pre-allocated batch_idx."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        # Pre-allocate batch_idx
+        batch_idx = wp.zeros(total_atoms, dtype=wp.int32, device=device)
+
+        result = atom_ptr_to_batch_idx(atom_ptr, batch_idx=batch_idx, device=device)
+
+        wp.synchronize_device(device)
+
+        assert result is batch_idx
+        expected = np.array(simple_batch_data["expected_batch_idx"], dtype=np.int32)
+        np.testing.assert_array_equal(result.numpy(), expected)
+
+
+class TestPreallocatedResults:
+    """Tests for functions with pre-allocated result arrays."""
+
+    def test_max_per_system_preallocated(self, device, simple_batch_data):
+        """Test max_per_system with pre-allocated result."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(201)
+        values_np = np.random.randn(total_atoms)
+        values = wp.array(values_np, dtype=wp.float64, device=device)
+
+        # Pre-allocate result
+        result = wp.zeros(num_systems, dtype=wp.float64, device=device)
+
+        returned = max_per_system(
+            values, atom_ptr=atom_ptr, result=result, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        assert returned is result
+
+    def test_min_per_system_preallocated(self, device, simple_batch_data):
+        """Test min_per_system with pre-allocated result."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(202)
+        values_np = np.random.randn(total_atoms)
+        values = wp.array(values_np, dtype=wp.float64, device=device)
+
+        # Pre-allocate result
+        result = wp.zeros(num_systems, dtype=wp.float64, device=device)
+
+        returned = min_per_system(
+            values, atom_ptr=atom_ptr, result=result, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        assert returned is result
+
+    def test_mean_per_system_preallocated(self, device, simple_batch_data):
+        """Test mean_per_system with pre-allocated result."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        num_systems = simple_batch_data["num_systems"]
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(203)
+        values_np = np.random.randn(total_atoms)
+        values = wp.array(values_np, dtype=wp.float64, device=device)
+
+        # Pre-allocate result
+        result = wp.zeros(num_systems, dtype=wp.float64, device=device)
+
+        returned = mean_per_system(
+            values, atom_ptr=atom_ptr, result=result, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        assert returned is result
+
+
+class TestFloat32Precision:
+    """Tests for float32 precision variants."""
+
+    def test_sum_per_system_float32(self, device, simple_batch_data):
+        """Test sum_per_system with float32."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(204)
+        values_np = np.random.randn(total_atoms).astype(np.float32)
+        values = wp.array(values_np, dtype=wp.float32, device=device)
+
+        result = sum_per_system(values, atom_ptr=atom_ptr, device=device)
+
+        wp.synchronize_device(device)
+
+        # Compute expected
+        atom_counts = simple_batch_data["atom_counts"]
+        expected = np.zeros(simple_batch_data["num_systems"], dtype=np.float32)
+        offset = 0
+        for s, count in enumerate(atom_counts):
+            expected[s] = values_np[offset : offset + count].sum()
+            offset += count
+
+        np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
+
+    def test_max_per_system_float32(self, device, simple_batch_data):
+        """Test max_per_system with float32."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(205)
+        values_np = np.random.randn(total_atoms).astype(np.float32)
+        values = wp.array(values_np, dtype=wp.float32, device=device)
+
+        result = max_per_system(values, atom_ptr=atom_ptr, device=device)
+
+        wp.synchronize_device(device)
+
+        # Compute expected
+        atom_counts = simple_batch_data["atom_counts"]
+        expected = np.zeros(simple_batch_data["num_systems"], dtype=np.float32)
+        offset = 0
+        for s, count in enumerate(atom_counts):
+            expected[s] = values_np[offset : offset + count].max()
+            offset += count
+
+        np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
+
+    def test_min_per_system_float32(self, device, simple_batch_data):
+        """Test min_per_system with float32."""
+        atom_ptr = wp.array(
+            simple_batch_data["expected_atom_ptr"], dtype=wp.int32, device=device
+        )
+        total_atoms = simple_batch_data["total_atoms"]
+
+        np.random.seed(206)
+        values_np = np.random.randn(total_atoms).astype(np.float32)
+        values = wp.array(values_np, dtype=wp.float32, device=device)
+
+        result = min_per_system(values, atom_ptr=atom_ptr, device=device)
+
+        wp.synchronize_device(device)
+
+        # Compute expected
+        atom_counts = simple_batch_data["atom_counts"]
+        expected = np.zeros(simple_batch_data["num_systems"], dtype=np.float32)
+        offset = 0
+        for s, count in enumerate(atom_counts):
+            expected[s] = values_np[offset : offset + count].min()
+            offset += count
+
+        np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

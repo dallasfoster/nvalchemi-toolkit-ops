@@ -1,0 +1,216 @@
+# Dynamics Benchmark Configuration
+# =================================
+#
+# This configuration file controls the restructured benchmark suite with
+# 4 separate benchmark types:
+#   - md_single: Single-system MD benchmarks (nvalchemiops vs ASE)
+#   - opt_single: Single-system optimization benchmarks (nvalchemiops vs ASE)
+#   - md_batch: Batched MD benchmarks (nvalchemiops vs torch-sim)
+#   - opt_batch: Batched optimization benchmarks (nvalchemiops vs torch-sim)
+
+# Single-System MD Benchmarks
+# ---------------------------
+md_single:
+  enabled: true
+
+  # System sizes to benchmark
+  system_sizes: [256, 512, 1024, 2048, 4096]
+
+  # MD integrators to benchmark
+  integrators:
+    velocity_verlet:
+      enabled: true
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+
+    langevin:
+      enabled: true
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+      temperature: 300.0  # K
+      friction: 0.01  # 1/fs
+
+    nose_hoover:
+      enabled: false  # Enable when NHC implementation is complete
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+      temperature: 300.0  # K
+      chain_length: 3
+      tau: 100.0  # fs
+
+    npt:
+      enabled: false  # Enable when NPT implementation is complete
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+      temperature: 300.0  # K
+      pressure: 1.0  # bar
+      tau_t: 100.0  # fs
+      tau_p: 1000.0  # fs
+      bulk_modulus: 2.5  # GPa
+
+    nph:
+      enabled: false  # Enable when NPH implementation is complete
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+      pressure: 1.0  # bar
+      tau_p: 1000.0  # fs
+      bulk_modulus: 2.5  # GPa
+
+  # Logging interval
+  log_interval: 100
+
+# Single-System Optimization Benchmarks
+# -------------------------------------
+opt_single:
+  enabled: true
+
+  # System sizes to benchmark
+  system_sizes: [256, 512, 1024, 2048]
+
+  # Optimizers to benchmark
+  optimizers:
+    fire:
+      enabled: true
+      max_steps: 1000
+      force_tolerance: 0.01  # eV/Å
+      dt_start: 1.0  # fs
+      dt_max: 10.0  # fs
+      dt_min: 0.001  # fs
+      alpha_start: 0.1
+      n_min: 5
+      f_inc: 1.1
+      f_dec: 0.5
+      f_alpha: 0.99
+      maxstep: 0.2  # Å
+
+    bfgs:
+      enabled: true  # ASE only
+      max_steps: 1000
+      force_tolerance: 0.01  # eV/Å
+      maxstep: 0.2  # Å
+      use_line_search: true
+
+  # Logging interval
+  log_interval: 100
+
+# Batched MD Benchmarks
+# ---------------------
+md_batch:
+  enabled: true
+
+  # System sizes to benchmark (atoms per system)
+  system_sizes: [256, 512, 1024]
+
+  # Batch sizes to benchmark (number of independent systems)
+  batch_sizes: [1, 2, 4, 8, 16, 32]
+
+  # MD integrators to benchmark
+  integrators:
+    velocity_verlet:
+      enabled: true
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+
+    langevin:
+      enabled: true
+      steps: 10000
+      dt: 0.001  # fs
+      warmup_steps: 100
+      temperature: 300.0  # K
+      friction: 0.01  # 1/fs
+
+  # Logging interval
+  log_interval: 100
+
+# Batched Optimization Benchmarks
+# -------------------------------
+opt_batch:
+  enabled: true  # Enable after torch-sim integration
+
+  # System sizes to benchmark (atoms per system)
+  system_sizes: [32, 64, 128, 256, 512]
+
+  # Batch sizes to benchmark (number of independent systems)
+  batch_sizes: [2, 8, 32, 128, 512]
+
+  # Optimizers to benchmark
+  optimizers:
+    fire:
+      enabled: true
+      max_steps: 1000
+      force_tolerance: 0.01  # eV/Å
+      dt_start: 0.05  # fs
+      dt_max:  0.08 # fs
+      dt_min: 0.005  # fs
+      alpha_start: 0.090
+      n_min: 5
+      f_inc: 1.05
+      f_dec: 0.75
+      f_alpha: 0.985
+      maxstep: 0.1  # Å
+
+  # Logging interval
+  log_interval: 100
+
+# System Configuration (shared across all benchmarks)
+# ---------------------------------------------------
+system:
+  # Atom type for LJ parameters
+  atom_type: "Ar"  # Argon
+
+  # Crystal structure
+  structure: "fcc"
+
+  # Lattice parameter (Å)
+  # For argon: 5.26 Å gives density ~1.4 g/cm³
+  lattice_constant: 5.26
+
+  # Initial temperature (K) for velocity initialization
+  temperature: 300.0
+
+  # Periodic boundary conditions
+  pbc: [true, true, true]
+
+  # Data type
+  dtype: "float64"  # float64 recommended for stability
+
+# LJ Potential Parameters (shared across all benchmarks)
+# ------------------------------------------------------
+potential:
+  # Energy parameter (eV)
+  epsilon: 0.0104
+
+  # Length parameter (Å)
+  sigma: 3.40
+
+  # Cutoff distance (Å)
+  cutoff: 8.5
+
+  # Neighbor list skin (Å)
+  skin: 1.0
+
+  # Neighbor list rebuild interval (steps)
+  # 0 = displacement-based rebuilding
+  # >0 = fixed interval rebuilding (recommended for benchmarks)
+  neighbor_rebuild_interval: 10
+
+# Hardware Configuration
+# ----------------------
+hardware:
+  # GPU device index
+  gpu_device: 0
+
+# Output Configuration
+# --------------------
+output:
+  # Output directory for CSV results
+  results_dir: "../docs/benchmarks/benchmark_results"
+
+  # Whether to save detailed timing data
+  save_timing: true

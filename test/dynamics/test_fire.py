@@ -687,6 +687,287 @@ class TestFireUpdate:
         # Velocities should have changed (velocity mixing)
         assert not np.allclose(final_vel, initial_vel), "Velocities should be modified"
 
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_update_single_system(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_update in single system mode."""
+        num_atoms = 10
+        num_systems = 1
+
+        np.random.seed(42)
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+
+        params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        del params["maxstep"]
+        accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+
+        fire_update(
+            velocities=velocities,
+            forces=forces,
+            **params,
+            **accum,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_update_batch_idx(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_update with batch_idx mode."""
+        num_systems = 2
+        atoms_per_system = 10
+        total_atoms = num_systems * atoms_per_system
+
+        np.random.seed(42)
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        del params["maxstep"]
+        accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+
+        fire_update(
+            velocities=velocities,
+            forces=forces,
+            batch_idx=batch_idx,
+            **params,
+            **accum,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_update_ptr_downhill(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_update with downhill check enabled."""
+        num_systems = 1
+        num_atoms = 10
+
+        np.random.seed(42)
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        atom_ptr = wp.array(
+            np.array([0, num_atoms], dtype=np.int32), dtype=wp.int32, device=device
+        )
+
+        params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        del params["maxstep"]
+
+        # Create downhill arrays for fire_update
+        energy = wp.array([1.0], dtype=dtype_scalar, device=device)
+        energy_last = wp.array([2.0], dtype=dtype_scalar, device=device)
+        positions_last = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities_last = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+
+        fire_update(
+            velocities=velocities,
+            forces=forces,
+            atom_ptr=atom_ptr,
+            energy=energy,
+            energy_last=energy_last,
+            positions=positions,
+            positions_last=positions_last,
+            velocities_last=velocities_last,
+            **params,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_update_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_update device inference."""
+        num_atoms = 10
+
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        atom_ptr = wp.array(
+            np.array([0, num_atoms], dtype=np.int32), dtype=wp.int32, device=device
+        )
+
+        params = make_fire_params(1, dtype_scalar, device, np_dtype)
+        del params["maxstep"]
+
+        # Don't pass device - should be inferred
+        fire_update(
+            velocities=velocities,
+            forces=forces,
+            atom_ptr=atom_ptr,
+            **params,
+        )
+
+        wp.synchronize_device(device)
+
+
+class TestFireUpdateErrors:
+    """Test fire_update error cases."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_fire_update_both_batch_idx_and_atom_ptr_error(self, device):
+        """Test fire_update raises error when both batch_idx and atom_ptr are provided."""
+        num_atoms = 10
+        np_dtype = np.float64
+
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        atom_ptr = wp.array([0, num_atoms], dtype=wp.int32, device=device)
+        batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+        params = make_fire_params(1, wp.float64, device, np_dtype)
+        del params["maxstep"]
+
+        with pytest.raises(
+            ValueError, match="Cannot specify both batch_idx and atom_ptr"
+        ):
+            fire_update(
+                velocities=velocities,
+                forces=forces,
+                atom_ptr=atom_ptr,
+                batch_idx=batch_idx,
+                **params,
+                device=device,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_fire_update_partial_downhill_arrays_error(self, device):
+        """Test fire_update raises error with partial downhill arrays."""
+        num_atoms = 10
+        np_dtype = np.float64
+
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        atom_ptr = wp.array([0, num_atoms], dtype=wp.int32, device=device)
+
+        params = make_fire_params(1, wp.float64, device, np_dtype)
+        del params["maxstep"]
+
+        # Only provide energy, not the other required arrays
+        energy = wp.array([1.0], dtype=wp.float64, device=device)
+
+        with pytest.raises(ValueError, match="For downhill check, must provide ALL"):
+            fire_update(
+                velocities=velocities,
+                forces=forces,
+                atom_ptr=atom_ptr,
+                energy=energy,
+                **params,
+                device=device,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_fire_update_batch_idx_missing_accumulators_error(self, device):
+        """Test fire_update with batch_idx raises error without accumulators."""
+        num_systems = 2
+        atoms_per_system = 5
+        total_atoms = num_systems * atoms_per_system
+        np_dtype = np.float64
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params = make_fire_params(num_systems, wp.float64, device, np_dtype)
+        del params["maxstep"]
+
+        with pytest.raises(ValueError, match="vf, vv, ff accumulators required"):
+            fire_update(
+                velocities=velocities,
+                forces=forces,
+                batch_idx=batch_idx,
+                **params,
+                device=device,
+            )
+
 
 # ==============================================================================
 # Cell Filter Utilities Tests
@@ -1838,6 +2119,208 @@ class TestStressToCellForce:
 
 
 # ==============================================================================
+# Cell Filter Device Inference and Edge Cases
+# ==============================================================================
+
+
+class TestCellFilterDeviceInference:
+    """Test device inference for cell filter utilities."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_pack_positions_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test pack_positions_with_cell infers device from positions."""
+        num_atoms = 5
+        np.random.seed(42)
+
+        positions_np = np.random.randn(num_atoms, 3).astype(np_dtype)
+        cell_np = np.eye(3, dtype=np_dtype) * 10.0
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cell = make_cell(cell_np, dtype_mat, device)
+
+        # Don't pass device
+        extended = pack_positions_with_cell(positions, cell)
+
+        wp.synchronize_device(device)
+        assert extended.device == device
+        assert extended.shape[0] == num_atoms + 2
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_unpack_positions_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test unpack_positions_with_cell infers device from extended."""
+        num_atoms = 5
+
+        # Create extended array
+        extended_np = np.random.randn(num_atoms + 2, 3).astype(np_dtype)
+        extended = wp.array(extended_np, dtype=dtype_vec, device=device)
+
+        # Don't pass device
+        positions, cell = unpack_positions_with_cell(extended, num_atoms)
+
+        wp.synchronize_device(device)
+        assert positions.device == device
+        assert cell.device == device
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_align_cell_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test align_cell infers device from positions."""
+        num_atoms = 10
+
+        positions_np = np.random.randn(num_atoms, 3).astype(np_dtype)
+        cell_np = np.array(
+            [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]], dtype=np_dtype
+        )
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cell = make_cell(cell_np, dtype_mat, device)
+
+        # Don't pass device
+        pos_out, cell_out = align_cell(positions, cell)
+
+        wp.synchronize_device(device)
+        assert pos_out.device == device
+        assert cell_out.device == device
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_extend_batch_idx_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test extend_batch_idx infers device from batch_idx."""
+        num_atoms = 15
+        num_systems = 2
+
+        batch_idx_np = np.array([0] * 8 + [1] * 7, dtype=np.int32)
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        # Don't pass device
+        extended = extend_batch_idx(batch_idx, num_atoms, num_systems)
+
+        wp.synchronize_device(device)
+        assert extended.device == device
+        assert extended.shape[0] == num_atoms + 2 * num_systems
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_extend_atom_ptr_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test extend_atom_ptr infers device from atom_ptr."""
+        atom_ptr_np = np.array([0, 8, 15], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        # Don't pass device
+        extended = extend_atom_ptr(atom_ptr)
+
+        wp.synchronize_device(device)
+        assert extended.device == device
+
+
+class TestCellFilterBatchedModeEdgeCases:
+    """Test edge cases and additional batched mode scenarios."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_unpack_positions_batched_with_preallocated_outputs(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test batched unpack with pre-allocated outputs."""
+        num_systems = 2
+        atoms_per_system = [5, 8]
+        total_atoms = sum(atoms_per_system)
+        ext_size = total_atoms + 2 * num_systems
+
+        # Create extended array
+        np.random.seed(42)
+        extended_np = np.random.randn(ext_size, 3).astype(np_dtype)
+        extended = wp.array(extended_np, dtype=dtype_vec, device=device)
+
+        # Create atom_ptr
+        atom_ptr_np = np.array([0, atoms_per_system[0], total_atoms], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+
+        # Pre-allocate outputs
+        if dtype_mat == wp.mat33f:
+            mat_dtype = wp.mat33f
+        else:
+            mat_dtype = wp.mat33d
+
+        positions = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        cell = wp.zeros(num_systems, dtype=mat_dtype, device=device)
+
+        # Unpack with pre-allocated outputs
+        pos_out, cell_out = unpack_positions_with_cell(
+            extended,
+            num_atoms=total_atoms,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            positions=positions,
+            cell=cell,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+        assert pos_out is positions
+        assert cell_out is cell
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_align_cell_batched_with_batch_idx(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test align_cell with batched systems using batch_idx."""
+        num_atoms_per_system = 5
+        num_systems = 2
+        total_atoms = num_atoms_per_system * num_systems
+
+        np.random.seed(42)
+        positions_np = np.random.randn(total_atoms, 3).astype(np_dtype)
+
+        # Create cells that need alignment (off-diagonal elements)
+        cells_np = np.array(
+            [
+                [[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 2.0, 8.0]],
+                [[11.0, 0.0, 0.0], [1.5, 10.0, 0.0], [0.5, 1.5, 9.0]],
+            ],
+            dtype=np_dtype,
+        )
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cell = wp.array(cells_np, dtype=dtype_mat, device=device)
+
+        # Create batch_idx
+        batch_idx_np = np.repeat(np.arange(num_systems), num_atoms_per_system).astype(
+            np.int32
+        )
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        # Align
+        pos_out, cell_out = align_cell(
+            positions, cell, batch_idx=batch_idx, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        # Cell should be upper triangular
+        cell_result = cell_out.numpy()
+        for s in range(num_systems):
+            np.testing.assert_allclose(cell_result[s, 0, 1], 0.0, atol=1e-5)
+            np.testing.assert_allclose(cell_result[s, 0, 2], 0.0, atol=1e-5)
+            np.testing.assert_allclose(cell_result[s, 1, 2], 0.0, atol=1e-5)
+
+
+# ==============================================================================
 # Integration Tests - Variable Cell Optimization
 # ==============================================================================
 
@@ -2579,6 +3062,91 @@ class TestFireStepSingle:
 
         wp.synchronize_device(device)
 
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_step_single_downhill(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_step in single system mode with downhill check."""
+        num_atoms = 10
+        num_systems = 1
+
+        np.random.seed(42)
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
+        params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+        downhill = make_downhill_arrays(
+            num_atoms, num_systems, dtype_vec, dtype_scalar, device, np_dtype
+        )
+
+        # Initialize positions_last
+        wp.copy(downhill["positions_last"], positions)
+
+        fire_step(
+            positions=positions,
+            velocities=velocities,
+            forces=forces,
+            masses=masses,
+            **params,
+            **accum,
+            **downhill,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_step_single_device_inference(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_step in single system mode with device inference."""
+        num_atoms = 10
+
+        positions = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
+        params = make_fire_params(1, dtype_scalar, device, np_dtype)
+        accum = make_accumulators(1, dtype_scalar, device, np_dtype)
+
+        # Don't pass device - should be inferred from positions
+        fire_step(
+            positions=positions,
+            velocities=velocities,
+            forces=forces,
+            masses=masses,
+            **params,
+            **accum,
+        )
+
+        wp.synchronize_device(device)
+
 
 class TestFireStepBatchIdx:
     """Test fire_step with batch_idx mode."""
@@ -2628,6 +3196,102 @@ class TestFireStepBatchIdx:
         )
 
         wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_fire_step_batch_idx_downhill(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Test fire_step with batch_idx and downhill check."""
+        num_systems = 2
+        atoms_per_system = 10
+        total_atoms = num_systems * atoms_per_system
+
+        np.random.seed(42)
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+        downhill = make_downhill_arrays(
+            total_atoms, num_systems, dtype_vec, dtype_scalar, device, np_dtype
+        )
+
+        # Initialize positions_last
+        wp.copy(downhill["positions_last"], positions)
+
+        fire_step(
+            positions=positions,
+            velocities=velocities,
+            forces=forces,
+            masses=masses,
+            batch_idx=batch_idx,
+            **params,
+            **accum,
+            **downhill,
+            device=device,
+        )
+
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_fire_step_batch_idx_missing_accumulators(self, device):
+        """Test fire_step batch_idx mode raises error without accumulators."""
+        num_systems = 2
+        atoms_per_system = 5
+        total_atoms = num_systems * atoms_per_system
+        np_dtype = np.float64
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        velocities = wp.zeros(total_atoms, dtype=wp.vec3d, device=device)
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=wp.vec3d,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype), dtype=wp.float64, device=device
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params = make_fire_params(num_systems, wp.float64, device, np_dtype)
+
+        # Don't pass accumulators - should raise error
+        with pytest.raises(ValueError, match="vf, vv, ff accumulators required"):
+            fire_step(
+                positions=positions,
+                velocities=velocities,
+                forces=forces,
+                masses=masses,
+                batch_idx=batch_idx,
+                **params,
+                device=device,
+            )
 
 
 if __name__ == "__main__":

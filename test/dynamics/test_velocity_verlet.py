@@ -967,5 +967,508 @@ class TestVelocityVerletPhysics:
         assert bond_lengths.max() > r_e
 
 
+# ==============================================================================
+# Atom Pointer (CSR) Batch Mode Tests
+# ==============================================================================
+
+
+class TestVelocityVerletAtomPtr:
+    """Test atom_ptr batch mode functionality for velocity Verlet integrator."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_position_update_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that velocity_verlet_position_update executes with atom_ptr."""
+        # 3 systems with different sizes: 10, 25, 15 atoms
+        atom_counts = [10, 25, 15]
+        total_atoms = sum(atom_counts)
+        np.random.seed(42)
+
+        # Create CSR-style atom_ptr: [0, 10, 35, 50]
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        # Different timesteps per system
+        dt = wp.array([0.001, 0.002, 0.0015], dtype=dtype_scalar, device=device)
+
+        velocity_verlet_position_update(
+            positions, velocities, forces, masses, dt, atom_ptr=atom_ptr
+        )
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_velocity_finalize_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that velocity_verlet_velocity_finalize executes with atom_ptr."""
+        atom_counts = [10, 25, 15]
+        total_atoms = sum(atom_counts)
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.002, 0.0015], dtype=dtype_scalar, device=device)
+
+        velocity_verlet_velocity_finalize(
+            velocities, forces, masses, dt, atom_ptr=atom_ptr
+        )
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_position_update_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating position_update with atom_ptr."""
+        atom_counts = [10, 20, 10]
+        total_atoms = sum(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        pos_orig = positions.numpy().copy()
+        vel_orig = velocities.numpy().copy()
+
+        pos_out, vel_out = velocity_verlet_position_update_out(
+            positions, velocities, forces, masses, dt, atom_ptr=atom_ptr, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        # Check input preserved
+        np.testing.assert_array_equal(positions.numpy(), pos_orig)
+        np.testing.assert_array_equal(velocities.numpy(), vel_orig)
+
+        # Check output modified
+        assert pos_out.shape[0] == total_atoms
+        assert vel_out.shape[0] == total_atoms
+        assert not np.allclose(pos_out.numpy(), pos_orig)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_velocity_finalize_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating velocity_finalize with atom_ptr."""
+        atom_counts = [15, 15, 10]
+        total_atoms = sum(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces_new = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        vel_orig = velocities.numpy().copy()
+
+        vel_out = velocity_verlet_velocity_finalize_out(
+            velocities, forces_new, masses, dt, atom_ptr=atom_ptr, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        np.testing.assert_array_equal(velocities.numpy(), vel_orig)
+        assert vel_out.shape[0] == total_atoms
+        assert not np.allclose(vel_out.numpy(), vel_orig)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_uses_per_system_dt(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr mode uses per-system timesteps correctly."""
+        # 3 systems with 1 atom each for easy verification
+
+        atom_ptr_np = np.array([0, 1, 2, 3], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        # Same initial conditions, different timesteps
+        pos = np.array(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype
+        )
+        vel = np.array(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np_dtype
+        )
+        force = np.array(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype
+        )
+        mass = np.array([1.0, 1.0, 1.0], dtype=np_dtype)
+
+        # Different timesteps: dt[1] = 2*dt[0], dt[2] = 3*dt[0]
+        dt_vals = [0.01, 0.02, 0.03]
+
+        positions = wp.array(pos, dtype=dtype_vec, device=device)
+        velocities = wp.array(vel, dtype=dtype_vec, device=device)
+        forces = wp.array(force, dtype=dtype_vec, device=device)
+        masses = wp.array(mass, dtype=dtype_scalar, device=device)
+        dt = wp.array(dt_vals, dtype=dtype_scalar, device=device)
+
+        velocity_verlet_position_update(
+            positions, velocities, forces, masses, dt, atom_ptr=atom_ptr
+        )
+        wp.synchronize_device(device)
+
+        result_pos = positions.numpy()
+
+        # Displacement should be: 0.5 * a * dt^2 = 0.5 * 1.0 * dt^2
+        displacement_0 = result_pos[0, 0] - 1.0
+        displacement_1 = result_pos[1, 0] - 1.0
+        displacement_2 = result_pos[2, 0] - 1.0
+
+        # Check ratios: displacement ~ dt^2
+        ratio_1_0 = displacement_1 / displacement_0
+        ratio_2_0 = displacement_2 / displacement_0
+
+        np.testing.assert_allclose(ratio_1_0, 4.0, rtol=0.01)  # (0.02/0.01)^2 = 4
+        np.testing.assert_allclose(ratio_2_0, 9.0, rtol=0.01)  # (0.03/0.01)^2 = 9
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_vs_batch_idx_equivalence(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr and batch_idx produce identical results for same-sized systems."""
+        # 3 systems, all with 20 atoms (same size)
+        num_systems = 3
+        atoms_per_system = 20
+        total_atoms = num_systems * atoms_per_system
+        dt_val = 0.01
+
+        np.random.seed(42)
+        initial_pos = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.5
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1
+        initial_force = np.random.randn(total_atoms, 3).astype(np_dtype)
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        # Setup for batch_idx mode
+        positions_batch = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
+        velocities_batch = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        forces_batch = wp.array(initial_force.copy(), dtype=dtype_vec, device=device)
+        masses_batch = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        dt_batch = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        # Setup for atom_ptr mode
+        positions_ptr = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
+        velocities_ptr = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        forces_ptr = wp.array(initial_force.copy(), dtype=dtype_vec, device=device)
+        masses_ptr = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        dt_ptr = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+        atom_ptr_np = np.array([0, 20, 40, 60], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        # Execute with batch_idx
+        velocity_verlet_position_update(
+            positions_batch,
+            velocities_batch,
+            forces_batch,
+            masses_batch,
+            dt_batch,
+            batch_idx=batch_idx,
+        )
+
+        # Execute with atom_ptr
+        velocity_verlet_position_update(
+            positions_ptr,
+            velocities_ptr,
+            forces_ptr,
+            masses_ptr,
+            dt_ptr,
+            atom_ptr=atom_ptr,
+        )
+
+        wp.synchronize_device(device)
+
+        # Results should be identical
+        np.testing.assert_allclose(
+            positions_batch.numpy(), positions_ptr.numpy(), rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            velocities_batch.numpy(), velocities_ptr.numpy(), rtol=1e-6
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_energy_conservation(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test energy conservation for multiple systems with atom_ptr."""
+        # 3 systems with different sizes
+        atom_counts = [20, 30, 25]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        spring_k = 1.0
+        dt_val = 0.01
+        num_steps = 200
+
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        initial_pos = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.5
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        positions = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
+        velocities = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        forces = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        dt = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+
+        compute_harmonic_forces(positions, forces, spring_k)
+
+        wp.synchronize_device(device)
+        pos_np = positions.numpy()
+        vel_np = velocities.numpy()
+
+        # Compute initial energy for each system
+        initial_energies = []
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            ke = compute_kinetic_energy_np(
+                vel_np[offset : offset + n], masses_np[offset : offset + n]
+            )
+            pe = compute_harmonic_energy(pos_np[offset : offset + n], spring_k)
+            initial_energies.append(ke + pe)
+            offset += n
+
+        # Run MD
+        for step in range(num_steps):
+            velocity_verlet_position_update(
+                positions, velocities, forces, masses, dt, atom_ptr=atom_ptr
+            )
+            compute_harmonic_forces(positions, forces, spring_k)
+            velocity_verlet_velocity_finalize(
+                velocities, forces, masses, dt, atom_ptr=atom_ptr
+            )
+
+        wp.synchronize_device(device)
+        pos_np = positions.numpy()
+        vel_np = velocities.numpy()
+
+        # Check energy conservation for each system
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            ke = compute_kinetic_energy_np(
+                vel_np[offset : offset + n], masses_np[offset : offset + n]
+            )
+            pe = compute_harmonic_energy(pos_np[offset : offset + n], spring_k)
+            final_energy = ke + pe
+
+            drift = (
+                abs(final_energy - initial_energies[sys_id]) / initial_energies[sys_id]
+            )
+            assert drift < 0.02, (
+                f"System {sys_id} (size={n}) energy drift too large: {drift}"
+            )
+            offset += n
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_mutual_exclusivity_position_update(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that providing both batch_idx and atom_ptr raises ValueError for position_update."""
+        total_atoms = 20
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.ones(total_atoms, dtype=dtype_scalar, device=device)
+        dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
+        atom_ptr = wp.array([0, 10, 20], dtype=wp.int32, device=device)
+
+        # Should raise ValueError
+        with pytest.raises(ValueError, match="Provide batch_idx OR atom_ptr, not both"):
+            velocity_verlet_position_update(
+                positions,
+                velocities,
+                forces,
+                masses,
+                dt,
+                batch_idx=batch_idx,
+                atom_ptr=atom_ptr,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_mutual_exclusivity_velocity_finalize(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that providing both batch_idx and atom_ptr raises ValueError for velocity_finalize."""
+        total_atoms = 20
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.ones(total_atoms, dtype=dtype_scalar, device=device)
+        dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
+        atom_ptr = wp.array([0, 10, 20], dtype=wp.int32, device=device)
+
+        # Should raise ValueError
+        with pytest.raises(ValueError, match="Provide batch_idx OR atom_ptr, not both"):
+            velocity_verlet_velocity_finalize(
+                velocities, forces, masses, dt, batch_idx=batch_idx, atom_ptr=atom_ptr
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_variable_system_sizes(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test atom_ptr with highly variable system sizes."""
+        # Systems with very different sizes: 5, 50, 10, 35 atoms
+        atom_counts = [5, 50, 10, 35]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        dt_val = 0.01
+
+        np.random.seed(43)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+
+        pos_orig = positions.numpy().copy()
+
+        # Execute integration step
+        velocity_verlet_position_update(
+            positions, velocities, forces, masses, dt, atom_ptr=atom_ptr
+        )
+        wp.synchronize_device(device)
+
+        result_pos = positions.numpy()
+
+        # Verify all systems were updated
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_pos_orig = pos_orig[offset : offset + n]
+            sys_pos_result = result_pos[offset : offset + n]
+            # Each system should have moved
+            assert not np.allclose(sys_pos_orig, sys_pos_result), (
+                f"System {sys_id} (size={n}) was not updated"
+            )
+            offset += n
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

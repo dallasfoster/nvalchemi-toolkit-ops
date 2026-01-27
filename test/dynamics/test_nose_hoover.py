@@ -1147,5 +1147,398 @@ class TestNHCPhysics:
         assert velocities.shape[0] == num_atoms
 
 
+# ==============================================================================
+# Atom Pointer (CSR) Batch Mode Tests
+# ==============================================================================
+
+
+class TestNHCAtomPtr:
+    """Test atom_ptr batch mode functionality for Nosé-Hoover Chain integrator.
+
+    Note: nhc_thermostat_chain_update does not use atom_ptr because it operates
+    on per-system chain variables (eta, eta_dot). Only velocity_half_step and
+    position_update support atom_ptr batch mode.
+    """
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_velocity_half_step_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that nhc_velocity_half_step executes with atom_ptr."""
+        # 3 systems with different sizes: 10, 25, 15 atoms
+        atom_counts = [10, 25, 15]
+        total_atoms = sum(atom_counts)
+        np.random.seed(42)
+
+        # Create CSR-style atom_ptr
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.002, 0.0015], dtype=dtype_scalar, device=device)
+
+        nhc_velocity_half_step(velocities, forces, masses, dt, atom_ptr=atom_ptr)
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_position_update_runs(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that nhc_position_update executes with atom_ptr."""
+        atom_counts = [10, 25, 15]
+        total_atoms = sum(atom_counts)
+        np.random.seed(42)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.002, 0.0015], dtype=dtype_scalar, device=device)
+
+        nhc_position_update(positions, velocities, dt, atom_ptr=atom_ptr)
+        wp.synchronize_device(device)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_velocity_half_step_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating velocity_half_step with atom_ptr."""
+        atom_counts = [10, 20, 10]
+        total_atoms = sum(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        vel_orig = velocities.numpy().copy()
+
+        vel_out = nhc_velocity_half_step_out(
+            velocities, forces, masses, dt, atom_ptr=atom_ptr, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        # Check input preserved
+        np.testing.assert_array_equal(velocities.numpy(), vel_orig)
+
+        # Check output modified
+        assert vel_out.shape[0] == total_atoms
+        assert not np.allclose(vel_out.numpy(), vel_orig)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_position_update_out(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test non-mutating position_update with atom_ptr."""
+        atom_counts = [15, 15, 10]
+        total_atoms = sum(atom_counts)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        pos_orig = positions.numpy().copy()
+
+        pos_out = nhc_position_update_out(
+            positions, velocities, dt, atom_ptr=atom_ptr, device=device
+        )
+
+        wp.synchronize_device(device)
+
+        np.testing.assert_array_equal(positions.numpy(), pos_orig)
+        assert pos_out.shape[0] == total_atoms
+        assert not np.allclose(pos_out.numpy(), pos_orig)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_uses_per_system_dt(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr mode uses per-system timesteps correctly."""
+        # 3 systems with 1 atom each for easy verification
+
+        atom_ptr_np = np.array([0, 1, 2, 3], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        # Same initial conditions, different timesteps
+        pos = np.array(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np_dtype
+        )
+        vel = np.array(
+            [[0.1, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=np_dtype
+        )
+
+        positions = wp.array(pos, dtype=dtype_vec, device=device)
+        velocities = wp.array(vel, dtype=dtype_vec, device=device)
+
+        # Different timesteps: dt[1] = 2*dt[0], dt[2] = 3*dt[0]
+        dt_vals = [0.01, 0.02, 0.03]
+        dt = wp.array(dt_vals, dtype=dtype_scalar, device=device)
+
+        nhc_position_update(positions, velocities, dt, atom_ptr=atom_ptr)
+        wp.synchronize_device(device)
+
+        result_pos = positions.numpy()
+
+        # Displacement should be: v * dt
+        displacement_0 = result_pos[0, 0] - 1.0
+        displacement_1 = result_pos[1, 0] - 1.0
+        displacement_2 = result_pos[2, 0] - 1.0
+
+        # Check ratios: displacement ~ dt
+        ratio_1_0 = displacement_1 / displacement_0
+        ratio_2_0 = displacement_2 / displacement_0
+
+        np.testing.assert_allclose(ratio_1_0, 2.0, rtol=0.01)  # 0.02/0.01 = 2
+        np.testing.assert_allclose(ratio_2_0, 3.0, rtol=0.01)  # 0.03/0.01 = 3
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_vs_batch_idx_equivalence(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that atom_ptr and batch_idx produce identical results for same-sized systems."""
+        num_systems = 3
+        atoms_per_system = 20
+        total_atoms = num_systems * atoms_per_system
+        dt_val = 0.01
+
+        np.random.seed(42)
+        initial_pos = np.random.randn(total_atoms, 3).astype(np_dtype)
+        initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1
+        initial_force = np.random.randn(total_atoms, 3).astype(np_dtype)
+        masses_np = np.ones(total_atoms, dtype=np_dtype)
+
+        # Setup for batch_idx mode
+        positions_batch = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
+        velocities_batch = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        forces_batch = wp.array(initial_force.copy(), dtype=dtype_vec, device=device)
+        masses_batch = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        dt_batch = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        # Setup for atom_ptr mode
+        positions_ptr = wp.array(initial_pos.copy(), dtype=dtype_vec, device=device)
+        velocities_ptr = wp.array(initial_vel.copy(), dtype=dtype_vec, device=device)
+        forces_ptr = wp.array(initial_force.copy(), dtype=dtype_vec, device=device)
+        masses_ptr = wp.array(masses_np, dtype=dtype_scalar, device=device)
+        dt_ptr = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+        atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
+
+        # Execute with batch_idx
+        nhc_velocity_half_step(
+            velocities_batch, forces_batch, masses_batch, dt_batch, batch_idx=batch_idx
+        )
+        nhc_position_update(
+            positions_batch, velocities_batch, dt_batch, batch_idx=batch_idx
+        )
+
+        # Execute with atom_ptr
+        nhc_velocity_half_step(
+            velocities_ptr, forces_ptr, masses_ptr, dt_ptr, atom_ptr=atom_ptr
+        )
+        nhc_position_update(positions_ptr, velocities_ptr, dt_ptr, atom_ptr=atom_ptr)
+
+        wp.synchronize_device(device)
+
+        # Results should be identical
+        np.testing.assert_allclose(
+            positions_batch.numpy(), positions_ptr.numpy(), rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            velocities_batch.numpy(), velocities_ptr.numpy(), rtol=1e-6
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_mutual_exclusivity_velocity_half_step(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that providing both batch_idx and atom_ptr raises ValueError for velocity_half_step."""
+        total_atoms = 20
+
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        masses = wp.ones(total_atoms, dtype=dtype_scalar, device=device)
+        dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
+        atom_ptr = wp.array([0, 10, 20], dtype=wp.int32, device=device)
+
+        # Should raise ValueError
+        with pytest.raises(ValueError, match="Provide batch_idx OR atom_ptr, not both"):
+            nhc_velocity_half_step(
+                velocities,
+                forces,
+                masses,
+                dt,
+                batch_idx=batch_idx,
+                atom_ptr=atom_ptr,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_mutual_exclusivity_position_update(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test that providing both batch_idx and atom_ptr raises ValueError for position_update."""
+        total_atoms = 20
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
+
+        batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
+        atom_ptr = wp.array([0, 10, 20], dtype=wp.int32, device=device)
+
+        # Should raise ValueError
+        with pytest.raises(ValueError, match="Provide batch_idx OR atom_ptr, not both"):
+            nhc_position_update(
+                positions,
+                velocities,
+                dt,
+                batch_idx=batch_idx,
+                atom_ptr=atom_ptr,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_atom_ptr_variable_system_sizes(
+        self, device, dtype_vec, dtype_scalar, np_dtype
+    ):
+        """Test atom_ptr with highly variable system sizes."""
+        # Systems with very different sizes: 5, 50, 10, 35 atoms
+        atom_counts = [5, 50, 10, 35]
+        total_atoms = sum(atom_counts)
+        num_systems = len(atom_counts)
+        dt_val = 0.01
+
+        np.random.seed(43)
+
+        atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+
+        positions = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype) * 0.1,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        dt = wp.array([dt_val] * num_systems, dtype=dtype_scalar, device=device)
+
+        pos_orig = positions.numpy().copy()
+        vel_orig = velocities.numpy().copy()
+
+        # Execute integration steps
+        nhc_velocity_half_step(velocities, forces, masses, dt, atom_ptr=atom_ptr)
+        nhc_position_update(positions, velocities, dt, atom_ptr=atom_ptr)
+        wp.synchronize_device(device)
+
+        result_pos = positions.numpy()
+        result_vel = velocities.numpy()
+
+        # Verify all systems were updated
+        offset = 0
+        for sys_id in range(num_systems):
+            n = atom_counts[sys_id]
+            sys_pos_orig = pos_orig[offset : offset + n]
+            sys_pos_result = result_pos[offset : offset + n]
+            sys_vel_orig = vel_orig[offset : offset + n]
+            sys_vel_result = result_vel[offset : offset + n]
+
+            # Each system should have moved
+            assert not np.allclose(sys_pos_orig, sys_pos_result), (
+                f"System {sys_id} (size={n}) positions not updated"
+            )
+            assert not np.allclose(sys_vel_orig, sys_vel_result), (
+                f"System {sys_id} (size={n}) velocities not updated"
+            )
+            offset += n
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

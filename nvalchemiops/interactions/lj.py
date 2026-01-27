@@ -190,7 +190,7 @@ def _lj_energy_matrix_kernel(
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
     fill_value: wp.int32,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
 ):
     r"""Compute Lennard-Jones energies using neighbor matrix format.
 
@@ -229,12 +229,12 @@ def _lj_energy_matrix_kernel(
         True if the neighbor matrix contains each pair once; False if pairs are duplicated.
     fill_value : wp.int32
         Sentinel value used to pad `neighbor_matrix` rows.
-    atomic_energies : wp.array, shape (N,), dtype=wp.float64
-        OUTPUT: per-atom energies accumulated atomically in float64.
+    atomic_energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        OUTPUT: per-atom energies accumulated atomically (matches input precision).
 
     Notes
     -----
-    - Internal math is performed in float64 for stability; output energies are float64.
+    - Internal math is performed in float64 for stability; output is cast to match input dtype.
     - Pairs closer than ~1e-5 (r^2 < 1e-10) are skipped for safety.
     """
     atom_i = wp.tid()
@@ -293,9 +293,11 @@ def _lj_energy_matrix_kernel(
         # Energy accounting:
         # - If half neighbor list: each pair appears once; split 1/2 to i and 1/2 to j.
         # - If full neighbor list: each pair appears twice; add 1/2 to i only.
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
 
     # (energies accumulated per-pair)
 
@@ -313,7 +315,7 @@ def _lj_energy_forces_matrix_kernel(
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
     fill_value: wp.int32,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
 ):
     """Compute Lennard-Jones energies and forces using neighbor matrix format.
@@ -349,13 +351,14 @@ def _lj_energy_forces_matrix_kernel(
         True if each pair appears once; False if pairs appear twice.
     fill_value : wp.int32
         Sentinel value used to pad `neighbor_matrix`.
-    atomic_energies : wp.array, shape (N,), dtype=wp.float64
-        OUTPUT: per-atom energies (float64).
+    atomic_energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        OUTPUT: per-atom energies (matches input precision).
     atomic_forces : wp.array, shape (N,), dtype=wp.vec3f or wp.vec3d
         OUTPUT: per-atom forces accumulated atomically (matches positions dtype).
 
     Notes
     -----
+    - Internal math is performed in float64 for stability; output is cast to match input dtype.
     - The kernel accumulates force on i in registers and performs one atomic add at the end.
     - Pairs with r^2 >= cutoff^2 (or extremely small separation) are skipped.
     """
@@ -423,9 +426,11 @@ def _lj_energy_forces_matrix_kernel(
             force_mag_over_r = force_mag_over_r_raw
 
         # Energies: see note in _lj_energy_matrix_kernel
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
 
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
@@ -455,9 +460,9 @@ def _lj_energy_forces_virial_matrix_kernel(
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
     fill_value: wp.int32,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
-    virial: wp.array(dtype=wp.float64),
+    virial: wp.array(dtype=Any),
 ):
     r"""Compute Lennard-Jones energies, forces, and virial (neighbor matrix).
 
@@ -497,16 +502,16 @@ def _lj_energy_forces_virial_matrix_kernel(
         True for half neighbor list; False for full neighbor list.
     fill_value : wp.int32
         Sentinel value used to pad `neighbor_matrix`.
-    atomic_energies : wp.array, shape (N,), dtype=wp.float64
-        OUTPUT: per-atom energies.
+    atomic_energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        OUTPUT: per-atom energies (matches input precision).
     atomic_forces : wp.array, shape (N,), dtype=wp.vec3f or wp.vec3d
         OUTPUT: per-atom forces.
-    virial : wp.array, shape (9,), dtype=wp.float64
-        OUTPUT: global virial tensor (flattened 3x3).
+    virial : wp.array, shape (9,), dtype=wp.float32 or wp.float64
+        OUTPUT: global virial tensor (flattened 3x3, matches input precision).
 
     Notes
     -----
-    - Virial accumulation uses float64 registers and atomic updates to the 9-vector.
+    - Internal accumulation uses float64 registers; output is cast to match input dtype.
     - Uses the same C2 switching as the energy/forces kernels when `switch_width > 0`.
     """
     atom_i = wp.tid()
@@ -582,9 +587,11 @@ def _lj_energy_forces_virial_matrix_kernel(
             force_mag_over_r = force_mag_over_r_raw
 
         # Energies: see note in _lj_energy_matrix_kernel
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
 
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
@@ -620,15 +627,17 @@ def _lj_energy_forces_virial_matrix_kernel(
     wp.atomic_add(atomic_forces, atom_i, force_acc)
 
     # Accumulate virial (negative sign convention: W = -Σ r ⊗ F)
-    wp.atomic_sub(virial, 0, vir_xx)
-    wp.atomic_sub(virial, 1, vir_xy)
-    wp.atomic_sub(virial, 2, vir_xz)
-    wp.atomic_sub(virial, 3, vir_yx)
-    wp.atomic_sub(virial, 4, vir_yy)
-    wp.atomic_sub(virial, 5, vir_yz)
-    wp.atomic_sub(virial, 6, vir_zx)
-    wp.atomic_sub(virial, 7, vir_zy)
-    wp.atomic_sub(virial, 8, vir_zz)
+    # Cast from float64 accumulator back to output dtype
+
+    wp.atomic_sub(virial, 0, type(virial[0])(vir_xx))
+    wp.atomic_sub(virial, 1, type(virial[0])(vir_xy))
+    wp.atomic_sub(virial, 2, type(virial[0])(vir_xz))
+    wp.atomic_sub(virial, 3, type(virial[0])(vir_yx))
+    wp.atomic_sub(virial, 4, type(virial[0])(vir_yy))
+    wp.atomic_sub(virial, 5, type(virial[0])(vir_yz))
+    wp.atomic_sub(virial, 6, type(virial[0])(vir_zx))
+    wp.atomic_sub(virial, 7, type(virial[0])(vir_zy))
+    wp.atomic_sub(virial, 8, type(virial[0])(vir_zz))
 
 
 # ==============================================================================
@@ -648,7 +657,7 @@ def _lj_energy_list_kernel(
     cutoff: wp.array(dtype=Any),
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
 ):
     """Compute Lennard-Jones energies using neighbor list (CSR) format.
 
@@ -731,9 +740,11 @@ def _lj_energy_list_kernel(
             pair_energy = pair_energy_raw
 
         # Energies: same convention as matrix kernels
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
 
 
 @wp.kernel
@@ -748,7 +759,7 @@ def _lj_energy_forces_list_kernel(
     cutoff: wp.array(dtype=Any),
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
 ):
     """Compute Lennard-Jones energies and forces using neighbor list (CSR) format.
@@ -844,9 +855,11 @@ def _lj_energy_forces_list_kernel(
             pair_energy = pair_energy_raw
             force_mag_over_r = force_mag_over_r_raw
 
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
             type(ri[0])(force_mag_over_r) * r_ij[1],
@@ -871,9 +884,9 @@ def _lj_energy_forces_virial_list_kernel(
     cutoff: wp.array(dtype=Any),
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
-    virial: wp.array(dtype=wp.float64),
+    virial: wp.array(dtype=Any),
 ):
     r"""Compute Lennard-Jones energies, forces, and virial (CSR neighbor list).
 
@@ -981,9 +994,11 @@ def _lj_energy_forces_virial_list_kernel(
             pair_energy = pair_energy_raw
             force_mag_over_r = force_mag_over_r_raw
 
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
             type(ri[0])(force_mag_over_r) * r_ij[1],
@@ -1014,15 +1029,16 @@ def _lj_energy_forces_virial_list_kernel(
         vir_zz += vir_scale * (r_ij_2 * f_ij_2)
     wp.atomic_add(atomic_forces, atom_i, force_acc)
 
-    wp.atomic_sub(virial, 0, vir_xx)
-    wp.atomic_sub(virial, 1, vir_xy)
-    wp.atomic_sub(virial, 2, vir_xz)
-    wp.atomic_sub(virial, 3, vir_yx)
-    wp.atomic_sub(virial, 4, vir_yy)
-    wp.atomic_sub(virial, 5, vir_yz)
-    wp.atomic_sub(virial, 6, vir_zx)
-    wp.atomic_sub(virial, 7, vir_zy)
-    wp.atomic_sub(virial, 8, vir_zz)
+    # Cast from float64 accumulator back to output dtype
+    wp.atomic_sub(virial, 0, type(virial[0])(vir_xx))
+    wp.atomic_sub(virial, 1, type(virial[0])(vir_xy))
+    wp.atomic_sub(virial, 2, type(virial[0])(vir_xz))
+    wp.atomic_sub(virial, 3, type(virial[0])(vir_yx))
+    wp.atomic_sub(virial, 4, type(virial[0])(vir_yy))
+    wp.atomic_sub(virial, 5, type(virial[0])(vir_yz))
+    wp.atomic_sub(virial, 6, type(virial[0])(vir_zx))
+    wp.atomic_sub(virial, 7, type(virial[0])(vir_zy))
+    wp.atomic_sub(virial, 8, type(virial[0])(vir_zz))
 
 
 # ==============================================================================
@@ -1044,7 +1060,7 @@ def _batch_lj_energy_forces_matrix_kernel(
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
     fill_value: wp.int32,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
 ):
     """Compute Lennard-Jones energies and forces for batched systems (neighbor matrix).
@@ -1148,9 +1164,11 @@ def _batch_lj_energy_forces_matrix_kernel(
             pair_energy = pair_energy_raw
             force_mag_over_r = force_mag_over_r_raw
 
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
             type(ri[0])(force_mag_over_r) * r_ij[1],
@@ -1177,9 +1195,9 @@ def _batch_lj_energy_forces_virial_matrix_kernel(
     switch_width: wp.array(dtype=Any),
     half_neighbor_list: wp.bool,
     fill_value: wp.int32,
-    atomic_energies: wp.array(dtype=wp.float64),
+    atomic_energies: wp.array(dtype=Any),
     atomic_forces: wp.array(dtype=Any),
-    virial: wp.array2d(dtype=wp.float64),
+    virial: wp.array2d(dtype=Any),
 ):
     """Compute Lennard-Jones energies, forces, and virial for batched systems.
 
@@ -1291,9 +1309,11 @@ def _batch_lj_energy_forces_virial_matrix_kernel(
             pair_energy = pair_energy_raw
             force_mag_over_r = force_mag_over_r_raw
 
-        wp.atomic_add(atomic_energies, atom_i, wp.float64(0.5) * pair_energy)
+        # Cast from float64 accumulator back to output dtype
+        half_energy = wp.float64(0.5) * pair_energy
+        wp.atomic_add(atomic_energies, atom_i, type(atomic_energies[0])(half_energy))
         if half_neighbor_list:
-            wp.atomic_add(atomic_energies, j, wp.float64(0.5) * pair_energy)
+            wp.atomic_add(atomic_energies, j, type(atomic_energies[0])(half_energy))
         force_ij = type(ri)(
             type(ri[0])(force_mag_over_r) * r_ij[0],
             type(ri[0])(force_mag_over_r) * r_ij[1],
@@ -1323,15 +1343,16 @@ def _batch_lj_energy_forces_virial_matrix_kernel(
         vir_zz += vir_scale * (r_ij_2 * f_ij_2)
     wp.atomic_add(atomic_forces, atom_i, force_acc)
 
-    wp.atomic_sub(virial, system_id, 0, vir_xx)
-    wp.atomic_sub(virial, system_id, 1, vir_xy)
-    wp.atomic_sub(virial, system_id, 2, vir_xz)
-    wp.atomic_sub(virial, system_id, 3, vir_yx)
-    wp.atomic_sub(virial, system_id, 4, vir_yy)
-    wp.atomic_sub(virial, system_id, 5, vir_yz)
-    wp.atomic_sub(virial, system_id, 6, vir_zx)
-    wp.atomic_sub(virial, system_id, 7, vir_zy)
-    wp.atomic_sub(virial, system_id, 8, vir_zz)
+    # Cast from float64 accumulator back to output dtype
+    wp.atomic_sub(virial, system_id, 0, type(virial[0][0])(vir_xx))
+    wp.atomic_sub(virial, system_id, 1, type(virial[0][0])(vir_xy))
+    wp.atomic_sub(virial, system_id, 2, type(virial[0][0])(vir_xz))
+    wp.atomic_sub(virial, system_id, 3, type(virial[0][0])(vir_yx))
+    wp.atomic_sub(virial, system_id, 4, type(virial[0][0])(vir_yy))
+    wp.atomic_sub(virial, system_id, 5, type(virial[0][0])(vir_yz))
+    wp.atomic_sub(virial, system_id, 6, type(virial[0][0])(vir_zx))
+    wp.atomic_sub(virial, system_id, 7, type(virial[0][0])(vir_zy))
+    wp.atomic_sub(virial, system_id, 8, type(virial[0][0])(vir_zz))
 
 
 # ==============================================================================
@@ -1368,7 +1389,7 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
             wp.int32,  # fill_value
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
         ],
     )
 
@@ -1386,7 +1407,7 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
             wp.int32,  # fill_value
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
         ],
     )
@@ -1405,9 +1426,9 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
             wp.int32,  # fill_value
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
-            wp.array(dtype=wp.float64),  # virial
+            wp.array(dtype=t),  # virial (matches input dtype)
         ],
     )
 
@@ -1425,7 +1446,7 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # cutoff
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
         ],
     )
 
@@ -1442,7 +1463,7 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # cutoff
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
         ],
     )
@@ -1460,9 +1481,9 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # cutoff
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
-            wp.array(dtype=wp.float64),  # virial
+            wp.array(dtype=t),  # virial (matches input dtype)
         ],
     )
 
@@ -1482,7 +1503,7 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
             wp.int32,  # fill_value
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
         ],
     )
@@ -1502,9 +1523,9 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=t),  # switch_width
             wp.bool,  # half_neighbor_list
             wp.int32,  # fill_value
-            wp.array(dtype=wp.float64),  # atomic_energies
+            wp.array(dtype=t),  # atomic_energies (matches input dtype)
             wp.array(dtype=v),  # atomic_forces
-            wp.array2d(dtype=wp.float64),  # virial
+            wp.array2d(dtype=t),  # virial (matches input dtype)
         ],
     )
 
@@ -1564,8 +1585,8 @@ def lj_energy(
 
     Returns
     -------
-    energies : wp.array, shape (N,), dtype=wp.float64
-        Per-atom energies. Sum to get total energy.
+    energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        Per-atom energies (matches input positions dtype). Sum to get total energy.
     """
     if device is None:
         device = positions.device
@@ -1581,8 +1602,8 @@ def lj_energy(
     if not use_matrix and not use_list:
         raise ValueError("Must provide either neighbor_matrix or neighbor_list")
 
-    # Allocate output
-    energies = wp.zeros(num_atoms, dtype=wp.float64, device=device)
+    # Allocate output (matches input dtype for flexibility)
+    energies = wp.zeros(num_atoms, dtype=scalar_dtype, device=device)
 
     # Wrap scalar parameters as arrays
     wp_epsilon = wp.array([epsilon], dtype=scalar_dtype, device=device)
@@ -1743,8 +1764,8 @@ def lj_energy_forces(
 
     Returns
     -------
-    energies : wp.array, shape (N,), dtype=wp.float64
-        Per-atom energies.
+    energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        Per-atom energies (matches input positions dtype).
     forces : wp.array, shape (N,), dtype=wp.vec3f or wp.vec3d
         Forces on each atom.
     """
@@ -1763,8 +1784,8 @@ def lj_energy_forces(
     if not use_matrix and not use_list:
         raise ValueError("Must provide either neighbor_matrix or neighbor_list")
 
-    # Allocate outputs
-    energies = wp.zeros(num_atoms, dtype=wp.float64, device=device)
+    # Allocate outputs (matches input dtype for flexibility)
+    energies = wp.zeros(num_atoms, dtype=scalar_dtype, device=device)
     forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
     # Wrap scalar parameters
@@ -1909,12 +1930,12 @@ def lj_energy_forces_virial(
 
     Returns
     -------
-    energies : wp.array, shape (N,), dtype=wp.float64
-        Per-atom energies.
+    energies : wp.array, shape (N,), dtype=wp.float32 or wp.float64
+        Per-atom energies (matches input positions dtype).
     forces : wp.array, shape (N,), dtype=wp.vec3f or wp.vec3d
         Forces on each atom.
-    virial : wp.array, shape (9,) or (B, 9), dtype=wp.float64
-        Virial tensor [xx, xy, xz, yx, yy, yz, zx, zy, zz].
+    virial : wp.array, shape (9,) or (B, 9), dtype=wp.float32 or wp.float64
+        Virial tensor [xx, xy, xz, yx, yy, yz, zx, zy, zz] (matches input dtype).
         For batched, shape is (num_systems, 9).
     """
     if device is None:
@@ -1932,14 +1953,14 @@ def lj_energy_forces_virial(
     if not use_matrix and not use_list:
         raise ValueError("Must provide either neighbor_matrix or neighbor_list")
 
-    # Allocate outputs
-    energies = wp.zeros(num_atoms, dtype=wp.float64, device=device)
+    # Allocate outputs (matches input dtype for flexibility)
+    energies = wp.zeros(num_atoms, dtype=scalar_dtype, device=device)
     forces = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
     if is_batched:
-        virial = wp.zeros((num_systems, 9), dtype=wp.float64, device=device)
+        virial = wp.zeros((num_systems, 9), dtype=scalar_dtype, device=device)
     else:
-        virial = wp.zeros(9, dtype=wp.float64, device=device)
+        virial = wp.zeros(9, dtype=scalar_dtype, device=device)
 
     # Wrap scalar parameters
     wp_epsilon = wp.array([epsilon], dtype=scalar_dtype, device=device)
