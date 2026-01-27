@@ -42,6 +42,7 @@ from pathlib import Path
 import torch
 from shared_utils import (
     NvalchemiOpsBenchmark,
+    NvalchemiopsLJModel,
     create_lj_system,
     get_gpu_sku,
     load_config,
@@ -97,15 +98,24 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
 
         pbc = torch.tensor([True, True, True], device=positions.device)
 
+        # Create LJ model
+        lj_model = NvalchemiopsLJModel(
+            epsilon=epsilon,
+            sigma=sigma,
+            cutoff=cutoff,
+            cell=cell,
+            batch_idx=None,  # Single-system mode
+            device="cuda",
+            dtype=torch.float64,
+        )
+
         # Run nvalchemiops benchmarks
         nv_bench = NvalchemiOpsBenchmark(
             positions=positions,
             cell=cell,
             masses=masses,
             pbc=pbc,
-            epsilon=epsilon,
-            sigma=sigma,
-            cutoff=cutoff,
+            model=lj_model,
             skin=skin,
             neighbor_rebuild_interval=neighbor_rebuild_interval,
             velocities=velocities,

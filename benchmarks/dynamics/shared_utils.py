@@ -36,6 +36,8 @@ import torch
 import warp as wp
 import yaml
 
+from nvalchemiops.interactions.lj import lj_energy_forces, lj_energy_forces_virial
+
 wp.init()
 
 # ==============================================================================
@@ -72,7 +74,9 @@ class BenchmarkResult:
     name : str
         Benchmark name (e.g., 'velocity_verlet', 'fire').
     backend : str
-        Backend used ('nvalchemiops', 'ase', 'torchsim').
+        Backend used ('nvalchemiops').
+    model_type : str
+        Model type used ('native_lj', 'nvalchemiops_lj', 'mace', or None for default).
     ensemble : str
         Ensemble or method type (e.g., 'NVE', 'NVT', 'optimization').
     num_atoms : int
@@ -111,6 +115,7 @@ class BenchmarkResult:
     total_time: float
     step_times: list[float] = field(default_factory=list)
     batch_size: int | None = None
+    model_type: str | None = None
     energies: list[float] = field(default_factory=list)
     temperatures: list[float] = field(default_factory=list)
     final_ke: float | None = None
@@ -174,10 +179,11 @@ class BenchmarkResult:
             return float("nan")
 
         # For MD: calculate ns/day
+        num_systems = self.batch_size if self.is_batched else 1
         if self.total_time > 0:
             steps_per_second = self.throughput_steps_per_s
             # timestep (fs) * steps/s * seconds/day / 1e6 (fs to ns)
-            return (self.dt * steps_per_second * 86400 * self.batch_size) / 1e6
+            return (self.dt * steps_per_second * 86400 * num_systems) / 1e6
         return 0.0
 
     def to_csv_row(self) -> dict:
@@ -189,6 +195,7 @@ class BenchmarkResult:
         # Common columns for both single and batched
         row = {
             "backend": self.backend,
+            "model_type": self.model_type or "",
             "method": self.name,
             "num_atoms": self.num_atoms,
             "ensemble": self.ensemble,
@@ -266,9 +273,10 @@ def write_results_csv(
 
     # Define column order based on benchmark type
     if is_batched:
-        # Batched benchmark schema (15 columns)
+        # Batched benchmark schema (16 columns)
         fieldnames = [
             "backend",
+            "model_type",
             "method",
             "num_atoms",
             "ensemble",
@@ -285,9 +293,10 @@ def write_results_csv(
             "batch_throughput_system_steps_per_s",
         ]
     else:
-        # Single-system benchmark schema (12 columns)
+        # Single-system benchmark schema (13 columns)
         fieldnames = [
             "backend",
+            "model_type",
             "method",
             "num_atoms",
             "ensemble",
@@ -393,7 +402,7 @@ def print_batch_benchmark_header() -> None:
     """Print a formatted header for batched benchmark results table."""
     print("\n" + "=" * 120)
     print(
-        f"{'Method':<18} {'Atoms/sys':<12} {'Batch':<8} {'Total':<10} "
+        f"{'Backend':<18} {'Method':<18} {'Atoms/sys':<12} {'Batch':<8} {'Total':<10} "
         f"{'Steps':<10} {'Time (s)':<12} {'Atom-steps/s':<15} {'ns/day':<12}"
     )
     print("=" * 120)
@@ -417,14 +426,14 @@ def print_batch_benchmark_result(result: BenchmarkResult, is_md: bool = True) ->
         ns_day = result.ns_per_day
         ns_day_str = f"{ns_day:.2f}" if not np.isnan(ns_day) else "N/A"
         print(
-            f"{method_str:<18} {result.num_atoms:<12} {batch_size:<8} {total_atoms:<10} "
+            f"{result.backend:<18} {method_str:<18} {result.num_atoms:<12} {batch_size:<8} {total_atoms:<10} "
             f"{result.num_steps:<10} {result.total_time:<12.3f} "
             f"{result.throughput_atom_steps_per_s:<15.2e} {ns_day_str:<12}"
         )
     else:
         # For optimization
         print(
-            f"{method_str:<18} {result.num_atoms:<12} {batch_size:<8} {total_atoms:<10} "
+            f"{result.backend:<18} {method_str:<18} {result.num_atoms:<12} {batch_size:<8} {total_atoms:<10} "
             f"{result.num_steps:<10} {result.total_time:<12.3f} "
             f"{result.throughput_atom_steps_per_s:<15.2e}"
         )
@@ -688,6 +697,192 @@ def convert_flat_virial_to_vec9(
 
 
 # ==============================================================================
+# Model Interface for Benchmarking
+# ==============================================================================
+
+
+class NvalchemiopsModelInterface:
+    """Abstract interface for models used in nvalchemiops benchmarks.
+
+    This interface allows different force calculation methods (LJ, MACE, etc.)
+    to be used interchangeably in the benchmark infrastructure.
+    """
+
+    def compute_forces(
+        self,
+        wp_positions: wp.array,
+        neighbor_matrix: wp.array,
+        num_neighbors: wp.array,
+        neighbor_shifts: wp.array,
+    ) -> tuple[wp.array, wp.array]:
+        """Compute energies and forces.
+
+        Parameters
+        ----------
+        wp_positions : wp.array
+            Atomic positions (warp array)
+        neighbor_matrix : wp.array
+            Neighbor list matrix
+        num_neighbors : wp.array
+            Number of neighbors per atom
+        neighbor_shifts : wp.array
+            PBC shift vectors for neighbors
+
+        Returns
+        -------
+        wp_energies : wp.array
+            Atomic energies
+        wp_forces : wp.array
+            Atomic forces
+        """
+        raise NotImplementedError
+
+    def compute_virial(
+        self,
+        wp_positions: wp.array,
+        neighbor_matrix: wp.array,
+        num_neighbors: wp.array,
+        neighbor_shifts: wp.array,
+    ) -> tuple[wp.array, wp.array, wp.array]:
+        """Compute energies, forces, and virial.
+
+        Parameters
+        ----------
+        wp_positions : wp.array
+            Atomic positions (warp array)
+        neighbor_matrix : wp.array
+            Neighbor list matrix
+        num_neighbors : wp.array
+            Number of neighbors per atom
+        neighbor_shifts : wp.array
+            PBC shift vectors for neighbors
+
+        Returns
+        -------
+        wp_energies : wp.array
+            Atomic energies
+        wp_forces : wp.array
+            Atomic forces
+        wp_virial : wp.array
+            Virial tensor (9 components per system)
+        """
+        raise NotImplementedError
+
+
+class NvalchemiopsLJModel(NvalchemiopsModelInterface):
+    """Lennard-Jones model using nvalchemiops kernels.
+
+    Parameters
+    ----------
+    epsilon : float
+        LJ epsilon parameter (eV)
+    sigma : float
+        LJ sigma parameter (Å)
+    cutoff : float
+        LJ cutoff distance (Å)
+    cell : torch.Tensor
+        Unit cell matrix
+    batch_idx : torch.Tensor or None
+        Batch index for each atom (for batched mode)
+    device : str
+        Warp device string
+    dtype : torch.dtype
+        Data type
+    """
+
+    def __init__(
+        self,
+        epsilon: float,
+        sigma: float,
+        cutoff: float,
+        cell: torch.Tensor,
+        batch_idx: torch.Tensor | None,
+        device: str,
+        dtype: torch.dtype,
+    ):
+        self.epsilon = epsilon
+        self.sigma = sigma
+        self.cutoff = cutoff
+        self.device = device
+        self.dtype = dtype
+
+        # Import type helpers
+        from nvalchemiops.types import get_wp_mat_dtype
+
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+        self.wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
+
+        self.batch_idx = batch_idx
+        self.wp_batch_idx = (
+            None
+            if batch_idx is None
+            else wp.from_torch(batch_idx.to(torch.int32), dtype=wp.int32)
+        )
+        self.is_batched = batch_idx is not None
+
+    def compute_forces(
+        self,
+        wp_positions: wp.array,
+        neighbor_matrix: wp.array,
+        num_neighbors: wp.array,
+        neighbor_shifts: wp.array,
+    ) -> tuple[wp.array, wp.array]:
+        """Compute LJ energies and forces."""
+        # Determine fill_value (num_atoms)
+        if hasattr(neighbor_matrix, "shape"):
+            fill_value = neighbor_matrix.shape[0]
+        else:
+            # Fallback
+            fill_value = num_neighbors.shape[0]
+
+        wp_energies, wp_forces = lj_energy_forces(
+            positions=wp_positions,
+            cell=self.wp_cell,
+            epsilon=self.epsilon,
+            sigma=self.sigma,
+            cutoff=self.cutoff,
+            neighbor_matrix=neighbor_matrix,
+            neighbor_matrix_shifts=neighbor_shifts,
+            num_neighbors=num_neighbors,
+            fill_value=fill_value,
+            batch_idx=self.wp_batch_idx,
+            device=self.device,
+        )
+
+        return wp_energies, wp_forces
+
+    def compute_virial(
+        self,
+        wp_positions: wp.array,
+        neighbor_matrix: wp.array,
+        num_neighbors: wp.array,
+        neighbor_shifts: wp.array,
+    ) -> tuple[wp.array, wp.array, wp.array]:
+        """Compute LJ energies, forces, and virial."""
+        # Determine fill_value (num_atoms)
+        if hasattr(neighbor_matrix, "shape"):
+            fill_value = neighbor_matrix.shape[0]
+        else:
+            fill_value = num_neighbors.shape[0]
+
+        wp_energies, wp_forces, wp_virial = lj_energy_forces_virial(
+            positions=wp_positions,
+            cell=self.wp_cell,
+            epsilon=self.epsilon,
+            sigma=self.sigma,
+            cutoff=self.cutoff,
+            neighbor_matrix=neighbor_matrix,
+            neighbor_matrix_shifts=neighbor_shifts,
+            num_neighbors=num_neighbors,
+            fill_value=fill_value,
+            batch_idx=self.wp_batch_idx,
+            device=self.device,
+        )
+
+        return wp_energies, wp_forces, wp_virial
+
+
+# ==============================================================================
 # Unified Benchmark Class
 # ==============================================================================
 
@@ -709,16 +904,18 @@ class NvalchemiOpsBenchmark:
         Atomic masses. Shape (N,) for single-system or (total_atoms,) for batched.
     pbc : torch.Tensor
         Periodic boundary conditions, shape (3,).
-    epsilon : float
-        LJ epsilon parameter (eV).
-    sigma : float
-        LJ sigma parameter (Å).
-    cutoff : float
-        LJ cutoff distance (Å).
-    skin : float
-        Neighbor list skin distance (Å).
-    neighbor_rebuild_interval : int
-        Interval for rebuilding neighbor lists (0 = displacement-based).
+    model : NvalchemiopsModelInterface, optional
+        Model for force/energy computation. If None, uses LJ with epsilon/sigma/cutoff.
+    epsilon : float, optional
+        LJ epsilon parameter (eV). Used only if model is None.
+    sigma : float, optional
+        LJ sigma parameter (Å). Used only if model is None.
+    cutoff : float, optional
+        LJ cutoff distance (Å). Used only if model is None.
+    skin : float, optional
+        Neighbor list skin distance (Å). Default 1.0.
+    neighbor_rebuild_interval : int, optional
+        Interval for rebuilding neighbor lists (0 = displacement-based). Default 10.
     velocities : torch.Tensor, optional
         Initial velocities. Required for MD, optional for optimization.
     batch_idx : torch.Tensor, optional
@@ -732,6 +929,7 @@ class NvalchemiOpsBenchmark:
     - For batched mode, positions/velocities/masses should be concatenated across all systems.
     - Supports integrators: VelocityVerlet, Langevin, NoseHoover, NPT, NPH.
     - Supports optimizer: FIRE.
+    - If model is None, automatically creates NvalchemiopsLJModel with epsilon/sigma/cutoff.
     """
 
     def __init__(
@@ -740,10 +938,11 @@ class NvalchemiOpsBenchmark:
         cell: torch.Tensor,
         masses: torch.Tensor,
         pbc: torch.Tensor,
-        epsilon: float,
-        sigma: float,
-        cutoff: float,
-        skin: float,
+        model: NvalchemiopsModelInterface | None = None,
+        epsilon: float | None = None,
+        sigma: float | None = None,
+        cutoff: float | None = None,
+        skin: float = 1.0,
         neighbor_rebuild_interval: int = 10,
         velocities: torch.Tensor | None = None,
         batch_idx: torch.Tensor | None = None,
@@ -755,13 +954,6 @@ class NvalchemiOpsBenchmark:
         self.torch_masses = masses
         self.torch_velocities = velocities
         self.pbc = pbc
-
-        # LJ parameters
-        self.epsilon = epsilon
-        self.sigma = sigma
-        self.cutoff = cutoff
-        self.skin = skin
-        self.neighbor_rebuild_interval = neighbor_rebuild_interval
 
         # Batching parameters
         self.batch_idx = batch_idx
@@ -778,6 +970,43 @@ class NvalchemiOpsBenchmark:
         )
         self.is_batched = batch_idx is not None and atom_ptr is not None
 
+        # Device and dtype setup (needed for model creation)
+        self.device = positions.device
+        self.dtype = positions.dtype
+        self.wp_device = str(self.device)
+
+        # Model setup: use provided model or create LJ model from parameters
+        if model is not None:
+            self.model = model
+            # For neighbor list, we need cutoff
+            # Try to get it from model if available
+            if hasattr(model, "cutoff"):
+                cutoff = model.cutoff
+            elif cutoff is None:
+                raise ValueError(
+                    "cutoff must be provided when using external model without cutoff attribute"
+                )
+        else:
+            # Backward compatibility: create LJ model from parameters
+            if epsilon is None or sigma is None or cutoff is None:
+                raise ValueError(
+                    "Must provide either model or (epsilon, sigma, cutoff)"
+                )
+            self.model = NvalchemiopsLJModel(
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
+                cell=cell,
+                batch_idx=batch_idx,
+                device=self.wp_device,
+                dtype=self.dtype,
+            )
+
+        # Neighbor list parameters
+        self.cutoff = cutoff
+        self.skin = skin
+        self.neighbor_rebuild_interval = neighbor_rebuild_interval
+
         # System size
         if self.is_batched:
             self.total_atoms = positions.shape[0]
@@ -787,11 +1016,6 @@ class NvalchemiOpsBenchmark:
             self.num_atoms = positions.shape[0]
             self.total_atoms = self.num_atoms
             self.num_systems = 1
-
-        # Device and dtype setup
-        self.device = positions.device
-        self.dtype = positions.dtype
-        self.wp_device = str(self.device)
 
         # Import type helpers
         from nvalchemiops.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
@@ -872,7 +1096,7 @@ class NvalchemiOpsBenchmark:
     def _compute_forces(
         self, wp_positions: wp.array, compute_virial: bool = False
     ) -> tuple[wp.array, wp.array, wp.array | None]:
-        """Compute LJ energies, forces, and optionally virial.
+        """Compute energies, forces, and optionally virial using the model.
 
         Parameters
         ----------
@@ -890,16 +1114,6 @@ class NvalchemiOpsBenchmark:
         wp_virial : wp.array or None
             Virial tensor (9 components) if compute_virial=True, else None.
         """
-        # Import LJ kernels
-        import sys
-        from pathlib import Path
-
-        # Add benchmarks/dynamics to path for imports
-        benchmark_dir = Path(__file__).parent
-        if str(benchmark_dir) not in sys.path:
-            sys.path.insert(0, str(benchmark_dir))
-
-        from lj_calculator import lj_energy_forces, lj_energy_forces_virial
 
         # Check if rebuild needed (for displacement-based)
         if self.neighbor_rebuild_interval == 0:
@@ -909,50 +1123,22 @@ class NvalchemiOpsBenchmark:
                 self._rebuild_neighbors()
                 self._ref_positions = positions_torch.clone()
 
-        # Allocate output arrays
-        num_atoms = self.total_atoms if self.is_batched else self.num_atoms
-        wp_energies = wp.zeros(num_atoms, dtype=self.wp_dtype, device=self.wp_device)
-        wp_forces = wp.zeros(num_atoms, dtype=self.wp_vec_dtype, device=self.wp_device)
-
+        # Call model to compute forces/energies
         if compute_virial:
-            # Virial tensor: 9 components (3x3 flattened)
-            virial_size = self.num_systems if self.is_batched else 1
-            wp_virial = wp.zeros(
-                virial_size * 9, dtype=self.wp_dtype, device=self.wp_device
-            )
-            lj_energy_forces_virial(
-                positions=wp_positions,
-                cell=self.wp_cell,
+            wp_energies, wp_forces, wp_virial = self.model.compute_virial(
+                wp_positions=wp_positions,
                 neighbor_matrix=self._wp_neighbor_matrix,
-                neighbor_matrix_shifts=self._wp_neighbor_shifts,
                 num_neighbors=self._wp_num_neighbors,
-                epsilon=self.epsilon,
-                sigma=self.sigma,
-                cutoff=self.cutoff,
-                fill_value=num_atoms,
-                atomic_energies=wp_energies,
-                atomic_forces=wp_forces,
-                virial=wp_virial,
-                batch_idx=self.wp_batch_idx,
-                device=self.wp_device,
+                neighbor_shifts=self._wp_neighbor_shifts,
             )
         else:
-            wp_virial = None
-            lj_energy_forces(
-                positions=wp_positions,
-                cell=self.wp_cell,
+            wp_energies, wp_forces = self.model.compute_forces(
+                wp_positions=wp_positions,
                 neighbor_matrix=self._wp_neighbor_matrix,
-                neighbor_matrix_shifts=self._wp_neighbor_shifts,
                 num_neighbors=self._wp_num_neighbors,
-                epsilon=self.epsilon,
-                sigma=self.sigma,
-                cutoff=self.cutoff,
-                fill_value=num_atoms,
-                atomic_energies=wp_energies,
-                atomic_forces=wp_forces,
-                batch_idx=self.wp_batch_idx,
-                device=self.wp_device,
+                neighbor_shifts=self._wp_neighbor_shifts,
             )
+            wp_virial = None
 
         return wp_energies, wp_forces, wp_virial
 
