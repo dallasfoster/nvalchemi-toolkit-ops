@@ -167,7 +167,7 @@ class TestNeighborListAutoSelection:
         cutoff = 2.0
         positions = torch.cat([positions1, positions2], dim=0)
         cell = torch.stack([cell1.squeeze(0), cell2.squeeze(0)], dim=0)
-        pbc = torch.stack([pbc1, pbc2], dim=0)
+        pbc = torch.stack([pbc1.squeeze(0), pbc2.squeeze(0)], dim=0)
         batch_idx = torch.cat(
             [
                 torch.zeros(50, dtype=torch.int32, device=device),
@@ -254,7 +254,7 @@ class TestNeighborListAutoSelection:
 
         positions = torch.cat([positions1, positions2], dim=0)
         cell = torch.stack([cell1.squeeze(0), cell2.squeeze(0)], dim=0)
-        pbc = torch.stack([pbc1, pbc2], dim=0)
+        pbc = torch.stack([pbc1.squeeze(0), pbc2.squeeze(0)], dim=0)
         batch_idx = torch.cat(
             [
                 torch.zeros(50, dtype=torch.int32, device=device),
@@ -379,7 +379,7 @@ class TestNeighborListBatchProcessing:
         # Combine into batch
         positions = torch.cat([positions1, positions2], dim=0)
         cell = torch.stack([cell1.squeeze(0), cell2.squeeze(0)], dim=0)
-        pbc = torch.stack([pbc1, pbc2], dim=0)
+        pbc = torch.stack([pbc1.squeeze(0), pbc2.squeeze(0)], dim=0)
         batch_idx = torch.cat(
             [
                 torch.zeros(50, dtype=torch.int32, device=device),
@@ -434,7 +434,7 @@ class TestNeighborListBatchProcessing:
         # Combine into batch
         positions = torch.cat([positions1, positions2], dim=0)
         cell = torch.stack([cell1.squeeze(0), cell2.squeeze(0)], dim=0)
-        pbc = torch.stack([pbc1, pbc2], dim=0)
+        pbc = torch.stack([pbc1.squeeze(0), pbc2.squeeze(0)], dim=0)
         batch_idx = torch.cat(
             [
                 torch.zeros(200, dtype=torch.int32, device=device),
@@ -525,7 +525,7 @@ class TestNeighborListDualCutoff:
         # Combine into batch
         positions = torch.cat([positions1, positions2], dim=0)
         cell = torch.stack([cell1.squeeze(0), cell2.squeeze(0)], dim=0)
-        pbc = torch.stack([pbc1, pbc2], dim=0)
+        pbc = torch.stack([pbc1.squeeze(0), pbc2.squeeze(0)], dim=0)
         batch_idx = torch.cat(
             [
                 torch.zeros(50, dtype=torch.int32, device=device),

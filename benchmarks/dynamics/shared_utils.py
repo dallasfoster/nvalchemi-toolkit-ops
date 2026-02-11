@@ -2407,3 +2407,744 @@ class NvalchemiOpsBenchmark:
             step_times=step_times,
             batch_size=self.num_systems if self.is_batched else None,
         )
+
+    def run_fire2(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 0.045,
+        tmax: float = 0.10,
+        tmin: float = 0.005,
+        delaystep: int = 50,
+        dtgrow: float = 1.09,
+        dtshrink: float = 0.95,
+        alpha0: float = 0.20,
+        alphashrink: float = 0.985,
+        maxstep: float = 0.25,
+        warmup_steps: int = 0,
+        log_interval: int = 100,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Run FIRE2 geometry optimization (coordinate-only).
+
+        Parameters
+        ----------
+        max_steps : int, optional
+            Maximum number of optimization steps.
+        force_tolerance : float, optional
+            Convergence criterion for maximum force magnitude (eV/Å).
+        dt_start : float, optional
+            Initial timestep.
+        tmax : float, optional
+            Maximum timestep.
+        tmin : float, optional
+            Minimum timestep.
+        delaystep : int, optional
+            Minimum positive-power steps before dt growth.
+        dtgrow : float, optional
+            Timestep growth factor.
+        dtshrink : float, optional
+            Timestep shrink factor.
+        alpha0 : float, optional
+            Alpha reset value.
+        alphashrink : float, optional
+            Alpha decay factor.
+        maxstep : float, optional
+            Maximum position change per step (Å).
+        warmup_steps : int, optional
+            Number of warmup steps (usually 0 for optimization).
+        log_interval : int, optional
+            Logging interval.
+        check_interval : int, optional
+            Interval to check convergence.
+
+        Returns
+        -------
+        BenchmarkResult
+            Benchmark result with timing and metadata.
+
+        Notes
+        -----
+        - FIRE2 is a mass-free optimizer; no masses are required.
+        - Uses batch_idx batching (not atom_ptr).
+        - Convergence is checked based on maximum force magnitude.
+        - Supports both single-system and batched modes.
+        - Uses 3 fused kernel launches per step for minimal overhead.
+        """
+        from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
+        from nvalchemiops.dynamics.utils import (
+            compute_cell_inverse,
+            wrap_positions_to_cell,
+        )
+
+        # Initialize velocities to zero
+        velocities = torch.zeros_like(self.torch_positions)
+
+        # Convert to warp
+        wp_positions = wp.from_torch(
+            self.torch_positions.clone(), dtype=self.wp_vec_dtype
+        )
+        wp_velocities = wp.from_torch(velocities, dtype=self.wp_vec_dtype)
+
+        # Pre-compute cell inverse
+        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+
+        # batch_idx: use existing or create single-system index
+        if self.wp_batch_idx is not None:
+            wp_bidx = self.wp_batch_idx
+        else:
+            wp_bidx = wp.zeros(self.num_atoms, dtype=wp.int32, device=self.wp_device)
+
+        # FIRE2 per-system state
+        wp_alpha = wp.array(
+            [alpha0] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+        )
+        wp_dt = wp.array(
+            [dt_start] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+        )
+        wp_nsteps_inc = wp.zeros(
+            self.num_systems, dtype=wp.int32, device=self.wp_device
+        )
+
+        # Scratch buffers
+        wp_vf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_v_sumsq = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_f_sumsq = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_max_norm = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+
+        # Initial forces
+        _, wp_forces, _ = self._compute_forces(wp_positions)
+
+        # Warmup (usually not needed for optimization, but included for API consistency)
+        if warmup_steps > 0:
+
+            def warmup_step():
+                pass  # No warmup needed for FIRE2
+
+            self._run_warmup(warmup_step, warmup_steps, "FIRE2 warmup")
+
+        # Timed loop
+        import time
+
+        wp.synchronize()
+        start_time = time.perf_counter()
+
+        actual_steps = 0
+        for step in range(max_steps):
+            actual_steps += 1
+            # Check convergence periodically
+            if step % check_interval == 0:
+                forces_torch = wp.to_torch(wp_forces)
+                max_force = torch.abs(forces_torch).max().item()
+                if max_force < force_tolerance:
+                    break
+
+            # Zero scratch buffers
+            wp_vf.zero_()
+            wp_v_sumsq.zero_()
+            wp_f_sumsq.zero_()
+            wp_max_norm.zero_()
+
+            # FIRE2 step
+            fire2_step(
+                positions=wp_positions,
+                velocities=wp_velocities,
+                forces=wp_forces,
+                batch_idx=wp_bidx,
+                alpha=wp_alpha,
+                dt=wp_dt,
+                nsteps_inc=wp_nsteps_inc,
+                delaystep=delaystep,
+                dtgrow=dtgrow,
+                dtshrink=dtshrink,
+                alphashrink=alphashrink,
+                alpha0=alpha0,
+                tmax=tmax,
+                tmin=tmin,
+                maxstep=maxstep,
+                vf=wp_vf,
+                v_sumsq=wp_v_sumsq,
+                f_sumsq=wp_f_sumsq,
+                max_norm=wp_max_norm,
+            )
+
+            # Wrap positions back into cell
+            wrap_positions_to_cell(
+                wp_positions,
+                cells=self.wp_cell,
+                cells_inv=wp_cell_inv,
+                device=self.wp_device,
+            )
+
+            # Compute new forces
+            _, wp_forces, _ = self._compute_forces(wp_positions)
+
+            # Rebuild neighbors if needed
+            if self.neighbor_rebuild_interval > 0:
+                self._steps_since_rebuild += 1
+                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
+                    self.torch_positions = wp.to_torch(wp_positions)
+                    self._rebuild_neighbors()
+
+        wp.synchronize()
+        total_time = time.perf_counter() - start_time
+        step_times = [total_time / actual_steps] * actual_steps
+
+        actual_steps = len(step_times)
+
+        return BenchmarkResult(
+            name="fire2",
+            backend="nvalchemiops",
+            ensemble="optimization",
+            num_atoms=self.num_atoms,
+            num_steps=actual_steps,
+            dt=dt_start,
+            warmup_steps=warmup_steps,
+            total_time=total_time,
+            step_times=step_times,
+            batch_size=self.num_systems if self.is_batched else None,
+        )
+
+    def _virial_to_cell_force(self, wp_virial, cell_torch):
+        """Convert LJ virial (flat) to cell force via stress_to_cell_force.
+
+        Parameters
+        ----------
+        wp_virial : wp.array
+            Flat virial from LJ, shape (9,) or (B*9,) or array2d (B,9).
+        cell_torch : torch.Tensor
+            Cell matrices, shape (M, 3, 3).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            (cell_force, stress) -- cell_force shape (M, 3, 3),
+            stress shape (M, 3, 3) in eV/A^3.
+        """
+        from nvalchemiops.dynamics.utils.cell_filter import stress_to_cell_force
+
+        M = self.num_systems
+        virial_torch = wp.to_torch(wp_virial)
+        virial_mat = virial_torch.reshape(M, 3, 3)
+        volume = torch.det(cell_torch).to(self.dtype)
+        stress_torch = virial_mat / volume.reshape(-1, 1, 1)
+        stress_wp = wp.from_torch(stress_torch.contiguous(), dtype=self.wp_mat_dtype)
+        wp_cell_cur = wp.from_torch(cell_torch.contiguous(), dtype=self.wp_mat_dtype)
+        cell_force_wp = stress_to_cell_force(
+            stress_wp, wp_cell_cur, keep_aligned=True, device=self.wp_device,
+        )
+        return wp.to_torch(cell_force_wp).reshape(M, 3, 3), stress_torch
+
+    def run_fire_cell(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 1.0,
+        dt_max: float = 10.0,
+        dt_min: float = 0.001,
+        alpha_start: float = 0.1,
+        n_min: int = 5,
+        f_inc: float = 1.1,
+        f_dec: float = 0.5,
+        f_alpha: float = 0.99,
+        maxstep: float = 0.2,
+        cell_mass: float = 1.0,
+        pressure_tolerance: float = 0.3,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Run FIRE variable-cell geometry optimization using extended arrays.
+
+        Uses align_cell preprocessing, then packs atomic + cell DOFs into
+        extended arrays and runs fire_step on the extended system.
+
+        Parameters
+        ----------
+        max_steps : int, optional
+            Maximum number of optimization steps.
+        force_tolerance : float, optional
+            Convergence criterion for maximum force magnitude (eV/Å).
+        dt_start, dt_max, dt_min, alpha_start, n_min, f_inc, f_dec, f_alpha, maxstep
+            FIRE1 hyperparameters.
+        cell_mass : float, optional
+            Mass for cell DOFs (controls cell response speed).
+        pressure_tolerance : float, optional
+            Convergence criterion for maximum stress (kBar).
+        check_interval : int, optional
+            Interval to check convergence.
+
+        Returns
+        -------
+        BenchmarkResult
+            Benchmark result with timing and metadata.
+        """
+        from nvalchemiops.dynamics.optimizers.fire import fire_step
+        from nvalchemiops.dynamics.utils import (
+            compute_cell_inverse,
+            wrap_positions_to_cell,
+        )
+        from nvalchemiops.dynamics.utils.cell_filter import (
+            align_cell,
+            extend_batch_idx,
+            pack_forces_with_cell,
+            pack_positions_with_cell,
+            stress_to_cell_force,
+            unpack_positions_with_cell,
+        )
+
+        M = self.num_systems
+        N = self.total_atoms
+
+        # Clone state
+        wp_positions = wp.from_torch(
+            self.torch_positions.clone(), dtype=self.wp_vec_dtype,
+        )
+        wp_cell = wp.from_torch(
+            self.torch_cell.clone(), dtype=self.wp_mat_dtype,
+        )
+
+        # batch_idx
+        if self.wp_batch_idx is not None:
+            wp_bidx = self.wp_batch_idx
+        else:
+            wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
+
+        # Align cell (one-time preprocessing)
+        align_cell(wp_positions, wp_cell, wp_bidx, device=self.wp_device)
+        self.wp_cell = wp_cell
+        self.model.wp_cell = self.wp_cell
+        wp.synchronize()
+        self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
+        self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
+        self._rebuild_neighbors()
+
+        # Extended batch_idx: atoms + 2 extra DOFs per system
+        N_ext = N + 2 * M
+        ext_bidx = extend_batch_idx(
+            wp_bidx, N, M, device=self.wp_device,
+        )
+
+        # Pack initial positions into extended array
+        ext_positions = pack_positions_with_cell(
+            wp_positions, wp_cell, device=self.wp_device,
+        )
+        ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+
+        # Extended masses: atomic masses + cell_mass for cell DOFs
+        masses_np = wp.to_torch(self.wp_masses).cpu().numpy()
+        ext_masses_list = list(masses_np)
+        for _ in range(M):
+            ext_masses_list.extend([cell_mass, cell_mass])
+        ext_masses = wp.array(
+            ext_masses_list, dtype=self.wp_dtype, device=self.wp_device,
+        )
+
+        # FIRE1 per-system state (all as per-system arrays)
+        wp_alpha = wp.array(
+            [alpha_start] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_dt = wp.array(
+            [dt_start] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_alpha_start = wp.array(
+            [alpha_start] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_f_alpha = wp.array(
+            [f_alpha] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_dt_min = wp.array(
+            [dt_min] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_dt_max = wp.array(
+            [dt_max] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_maxstep = wp.array(
+            [maxstep] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_n_steps_positive = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
+        wp_n_min = wp.array(
+            [n_min] * M, dtype=wp.int32, device=self.wp_device,
+        )
+        wp_f_dec = wp.array(
+            [f_dec] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_f_inc = wp.array(
+            [f_inc] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+
+        # Accumulators
+        wp_vf = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_vv = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_ff = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+
+        # Initial forces + virial
+        _, wp_forces, wp_virial = self._compute_forces(
+            wp_positions, compute_virial=True,
+        )
+
+        # Cell force from virial
+        cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
+        cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
+        cell_force_wp = wp.from_torch(
+            cell_force.contiguous(), dtype=self.wp_mat_dtype,
+        )
+
+        # Pack forces into extended array
+        ext_forces = pack_forces_with_cell(
+            wp_forces, cell_force_wp, device=self.wp_device,
+        )
+
+        # Timed loop
+        import time
+
+        wp.synchronize()
+        start_time = time.perf_counter()
+
+        actual_steps = 0
+        for step_i in range(max_steps):
+            actual_steps += 1
+            # Check convergence on atomic forces + pressure
+            if step_i % check_interval == 0:
+                forces_torch = wp.to_torch(wp_forces)
+                max_force = torch.abs(forces_torch).max().item()
+                stress_kbar = stress * 1602.18
+                stress_kbar = 0.5 * (stress_kbar + stress_kbar.transpose(-1, -2))
+                p_max = torch.linalg.svdvals(stress_kbar).max().item()
+                if max_force < force_tolerance and p_max < pressure_tolerance:
+                    break
+
+            # Zero accumulators
+            wp_vf.zero_()
+            wp_vv.zero_()
+            wp_ff.zero_()
+
+            # FIRE step on extended arrays
+            fire_step(
+                positions=ext_positions,
+                velocities=ext_velocities,
+                forces=ext_forces,
+                masses=ext_masses,
+                alpha=wp_alpha,
+                dt=wp_dt,
+                alpha_start=wp_alpha_start,
+                f_alpha=wp_f_alpha,
+                dt_min=wp_dt_min,
+                dt_max=wp_dt_max,
+                maxstep=wp_maxstep,
+                n_steps_positive=wp_n_steps_positive,
+                n_min=wp_n_min,
+                f_dec=wp_f_dec,
+                f_inc=wp_f_inc,
+                vf=wp_vf,
+                vv=wp_vv,
+                ff=wp_ff,
+                batch_idx=ext_bidx,
+                device=self.wp_device,
+            )
+
+            # Unpack extended positions → atom positions + cell
+            wp_positions, wp_cell = unpack_positions_with_cell(
+                ext_positions, num_atoms=N, device=self.wp_device,
+            )
+            self.wp_cell = wp_cell
+            self.model.wp_cell = self.wp_cell
+
+            # Wrap positions
+            wp_cell_inv = compute_cell_inverse(wp_cell, device=self.wp_device)
+            wrap_positions_to_cell(
+                wp_positions, cells=wp_cell, cells_inv=wp_cell_inv,
+                device=self.wp_device,
+            )
+
+            # Repack wrapped positions into extended array
+            ext_positions = pack_positions_with_cell(
+                wp_positions, wp_cell, device=self.wp_device,
+            )
+
+            # Compute new forces + virial
+            self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
+            self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
+            _, wp_forces, wp_virial = self._compute_forces(
+                wp_positions, compute_virial=True,
+            )
+
+            # Cell force from virial
+            cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
+            cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
+            cell_force_wp = wp.from_torch(
+                cell_force.contiguous(), dtype=self.wp_mat_dtype,
+            )
+            ext_forces = pack_forces_with_cell(
+                wp_forces, cell_force_wp, device=self.wp_device,
+            )
+
+            # Rebuild neighbors if needed
+            if self.neighbor_rebuild_interval > 0:
+                self._steps_since_rebuild += 1
+                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
+                    self._rebuild_neighbors()
+
+        wp.synchronize()
+        total_time = time.perf_counter() - start_time
+        step_times = [total_time / actual_steps] * actual_steps
+        actual_steps = len(step_times)
+
+        return BenchmarkResult(
+            name="fire_cell",
+            backend="nvalchemiops",
+            ensemble="optimization",
+            num_atoms=self.num_atoms,
+            num_steps=actual_steps,
+            dt=dt_start,
+            warmup_steps=0,
+            total_time=total_time,
+            step_times=step_times,
+            batch_size=self.num_systems if self.is_batched else None,
+        )
+
+    def run_fire2_cell(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 0.045,
+        tmax: float = 0.10,
+        tmin: float = 0.005,
+        delaystep: int = 50,
+        dtgrow: float = 1.09,
+        dtshrink: float = 0.95,
+        alpha0: float = 0.20,
+        alphashrink: float = 0.985,
+        maxstep: float = 0.25,
+        pressure_tolerance: float = 0.3,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Run FIRE2 variable-cell geometry optimization using extended arrays.
+
+        Uses align_cell preprocessing, then packs atomic + cell DOFs into
+        extended arrays and runs fire2_step on the extended system.
+
+        FIRE2 is mass-free: no extended masses are required, unlike FIRE1.
+
+        Parameters
+        ----------
+        max_steps : int, optional
+            Maximum number of optimization steps.
+        force_tolerance : float, optional
+            Convergence criterion for maximum force magnitude (eV/Å).
+        dt_start : float, optional
+            Initial timestep.
+        tmax : float, optional
+            Maximum timestep.
+        tmin : float, optional
+            Minimum timestep.
+        delaystep : int, optional
+            Minimum positive-power steps before dt growth.
+        dtgrow : float, optional
+            Timestep growth factor.
+        dtshrink : float, optional
+            Timestep shrink factor.
+        alpha0 : float, optional
+            Alpha reset value.
+        alphashrink : float, optional
+            Alpha decay factor.
+        maxstep : float, optional
+            Maximum position change per step (Å).
+        pressure_tolerance : float, optional
+            Convergence criterion for maximum stress (kBar).
+        check_interval : int, optional
+            Interval to check convergence.
+
+        Returns
+        -------
+        BenchmarkResult
+            Benchmark result with timing and metadata.
+        """
+        from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
+        from nvalchemiops.dynamics.utils import (
+            compute_cell_inverse,
+            wrap_positions_to_cell,
+        )
+        from nvalchemiops.dynamics.utils.cell_filter import (
+            align_cell,
+            extend_batch_idx,
+            pack_forces_with_cell,
+            pack_positions_with_cell,
+            unpack_positions_with_cell,
+        )
+
+        M = self.num_systems
+        N = self.total_atoms
+
+        # Clone state
+        wp_positions = wp.from_torch(
+            self.torch_positions.clone(), dtype=self.wp_vec_dtype,
+        )
+        wp_cell = wp.from_torch(
+            self.torch_cell.clone(), dtype=self.wp_mat_dtype,
+        )
+
+        # batch_idx
+        if self.wp_batch_idx is not None:
+            wp_bidx = self.wp_batch_idx
+        else:
+            wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
+
+        # Align cell (one-time preprocessing)
+        align_cell(wp_positions, wp_cell, wp_bidx, device=self.wp_device)
+        self.wp_cell = wp_cell
+        self.model.wp_cell = self.wp_cell
+        wp.synchronize()
+        self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
+        self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
+        self._rebuild_neighbors()
+
+        # Extended batch_idx: atoms + 2 extra DOFs per system
+        N_ext = N + 2 * M
+        ext_bidx = extend_batch_idx(
+            wp_bidx, N, M, device=self.wp_device,
+        )
+
+        # Pack initial positions into extended array
+        ext_positions = pack_positions_with_cell(
+            wp_positions, wp_cell, device=self.wp_device,
+        )
+        ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+
+        # FIRE2 per-system state (mass-free)
+        wp_alpha = wp.array(
+            [alpha0] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_dt = wp.array(
+            [dt_start] * M, dtype=self.wp_dtype, device=self.wp_device,
+        )
+        wp_nsteps_inc = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
+
+        # Scratch buffers
+        wp_vf = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_v_sumsq = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_f_sumsq = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_max_norm = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+
+        # Initial forces + virial
+        _, wp_forces, wp_virial = self._compute_forces(
+            wp_positions, compute_virial=True,
+        )
+
+        # Cell force from virial
+        cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
+        cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
+        cell_force_wp = wp.from_torch(
+            cell_force.contiguous(), dtype=self.wp_mat_dtype,
+        )
+
+        # Pack forces into extended array
+        ext_forces = pack_forces_with_cell(
+            wp_forces, cell_force_wp, device=self.wp_device,
+        )
+
+        # Timed loop
+        import time
+
+        wp.synchronize()
+        start_time = time.perf_counter()
+
+        actual_steps = 0
+        for step_i in range(max_steps):
+            actual_steps += 1
+            # Check convergence on atomic forces + pressure
+            if step_i % check_interval == 0:
+                forces_torch = wp.to_torch(wp_forces)
+                max_force = torch.abs(forces_torch).max().item()
+                stress_kbar = stress * 1602.18
+                stress_kbar = 0.5 * (stress_kbar + stress_kbar.transpose(-1, -2))
+                p_max = torch.linalg.svdvals(stress_kbar).max().item()
+                if max_force < force_tolerance and p_max < pressure_tolerance:
+                    break
+
+            # Zero scratch buffers
+            wp_vf.zero_()
+            wp_v_sumsq.zero_()
+            wp_f_sumsq.zero_()
+            wp_max_norm.zero_()
+
+            # FIRE2 step on extended arrays (mass-free)
+            fire2_step(
+                positions=ext_positions,
+                velocities=ext_velocities,
+                forces=ext_forces,
+                batch_idx=ext_bidx,
+                alpha=wp_alpha,
+                dt=wp_dt,
+                nsteps_inc=wp_nsteps_inc,
+                delaystep=delaystep,
+                dtgrow=dtgrow,
+                dtshrink=dtshrink,
+                alphashrink=alphashrink,
+                alpha0=alpha0,
+                tmax=tmax,
+                tmin=tmin,
+                maxstep=maxstep,
+                vf=wp_vf,
+                v_sumsq=wp_v_sumsq,
+                f_sumsq=wp_f_sumsq,
+                max_norm=wp_max_norm,
+            )
+
+            # Unpack extended positions -> atom positions + cell
+            wp_positions, wp_cell = unpack_positions_with_cell(
+                ext_positions, num_atoms=N, device=self.wp_device,
+            )
+            self.wp_cell = wp_cell
+            self.model.wp_cell = self.wp_cell
+
+            # Wrap positions
+            wp_cell_inv = compute_cell_inverse(wp_cell, device=self.wp_device)
+            wrap_positions_to_cell(
+                wp_positions, cells=wp_cell, cells_inv=wp_cell_inv,
+                device=self.wp_device,
+            )
+
+            # Repack wrapped positions into extended array
+            ext_positions = pack_positions_with_cell(
+                wp_positions, wp_cell, device=self.wp_device,
+            )
+
+            # Compute new forces + virial
+            self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
+            self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
+            _, wp_forces, wp_virial = self._compute_forces(
+                wp_positions, compute_virial=True,
+            )
+
+            # Cell force from virial
+            cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
+            cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
+            cell_force_wp = wp.from_torch(
+                cell_force.contiguous(), dtype=self.wp_mat_dtype,
+            )
+            ext_forces = pack_forces_with_cell(
+                wp_forces, cell_force_wp, device=self.wp_device,
+            )
+
+            # Rebuild neighbors if needed
+            if self.neighbor_rebuild_interval > 0:
+                self._steps_since_rebuild += 1
+                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
+                    self._rebuild_neighbors()
+
+        wp.synchronize()
+        total_time = time.perf_counter() - start_time
+        step_times = [total_time / actual_steps] * actual_steps
+        actual_steps = len(step_times)
+
+        return BenchmarkResult(
+            name="fire2_cell",
+            backend="nvalchemiops",
+            ensemble="optimization",
+            num_atoms=self.num_atoms,
+            num_steps=actual_steps,
+            dt=dt_start,
+            warmup_steps=0,
+            total_time=total_time,
+            step_times=step_times,
+            batch_size=self.num_systems if self.is_batched else None,
+        )

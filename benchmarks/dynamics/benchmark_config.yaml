@@ -129,6 +129,93 @@ opt_batch:
   # Logging interval
   log_interval: 100
 
+# FIRE2 Kernel Performance Benchmark
+# -----------------------------------
+# Measures raw per-step GPU time using CUDA events.
+# Benchmarks FIRE2 vs FIRE1 vs PyTorch across N/M sweeps.
+fire2_perf:
+  enabled: true
+
+  # Total number of atoms to sweep
+  total_atoms: [1000, 10000, 100000, 1000000]
+
+  # Number of systems (batches) to sweep
+  num_systems: [1, 10, 100]
+
+  # Timing parameters
+  warmup: 10
+  runs: 50
+
+  # Data types to benchmark
+  dtypes: [float32, float64]
+
+  # Methods to benchmark (toggle on/off)
+  methods:
+    warp_fire2: true
+    warp_fire1: true
+    torch_adapter: true
+    torch_reference: true
+
+  # FIRE2 hyperparameters
+  hyperparameters:
+    delaystep: 5
+    dtgrow: 1.05
+    dtshrink: 0.75
+    alphashrink: 0.985
+    alpha0: 0.09
+    tmax: 0.08
+    tmin: 0.005
+    maxstep: 0.1
+
+# FIRE1 vs FIRE2 Accuracy Comparison
+# -----------------------------------
+# Full optimization runs comparing convergence and wall-clock time.
+fire_compare:
+  enabled: true
+
+  # System sizes (number of atoms)
+  system_sizes: [256, 512, 1024, 2048]
+
+  # Convergence criteria
+  force_tolerance: 0.005   # eV/Å
+  pressure_tolerance: 0.3  # kBar (variable-cell only)
+  max_steps: 2000
+  check_interval: 10
+
+  # Fixed-cell optimization (coordinate-only)
+  fixed_cell:
+    enabled: true
+    perturbation: 0.1  # Å
+
+  # Variable-cell optimization (extended arrays with cell DOFs)
+  variable_cell:
+    enabled: true
+    perturbation: 0.1  # Å
+
+  # FIRE1 hyperparameters
+  fire1:
+    dt_start: 1.0
+    dt_max: 10.0
+    dt_min: 0.001
+    alpha_start: 0.1
+    n_min: 5
+    f_inc: 1.1
+    f_dec: 0.5
+    f_alpha: 0.99
+    maxstep: 0.2
+
+  # FIRE2 hyperparameters
+  fire2:
+    dt_start: 0.045
+    tmax: 0.10
+    tmin: 0.005
+    delaystep: 50
+    dtgrow: 1.09
+    dtshrink: 0.95
+    alpha0: 0.20
+    alphashrink: 0.985
+    maxstep: 0.25
+
 # System Configuration (shared across all benchmarks)
 # ---------------------------------------------------
 system:

@@ -756,7 +756,11 @@ def _stress_to_cell_force_kernel(
     Parameters
     ----------
     stress : wp.array, shape (B,), dtype=wp.mat33*
-        Stress tensor (positive for compression, in energy/volume units).
+        Stress tensor in tension-positive (negative for compression)
+        convention, in energy/volume units.  For zero-pressure relaxation
+        this is typically ``virial / V`` where virial = −Σ r⊗F from the
+        LJ kernel.  For finite external pressure use
+        ``P_ext − P_internal`` (see ``virial_to_stress``).
     cell : wp.array, shape (B,), dtype=wp.mat33*
         Cell matrices (should be upper-triangular from align_cell).
     volume : wp.array, shape (B,), dtype=wp.float*
@@ -773,8 +777,12 @@ def _stress_to_cell_force_kernel(
 
     Notes
     -----
-    - The negative sign ensures that positive stress (compression) creates a
-      force that expands the cell, leading to pressure equilibration.
+    - The stress follows a tension-positive sign convention: negative values
+      indicate compression, positive values indicate tension / expansion.
+    - The negative prefactor in the formula ensures correct equilibration:
+      negative stress (compression) produces a positive cell force that
+      expands the cell, while positive stress (tension) produces a negative
+      cell force that contracts the cell.
     - When keep_aligned=True, the upper off-diagonal elements are zeroed to
       maintain the upper-triangular cell representation from align_cell().
       This is essential for stable variable-cell optimization.
