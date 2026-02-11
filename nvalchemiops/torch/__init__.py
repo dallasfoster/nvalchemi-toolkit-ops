@@ -27,6 +27,14 @@ fire2
     PyTorch adapter for the FIRE2 optimizer (coordinate-only).
 """
 
+import importlib
+
+if importlib.util.find_spec("torch") is None:
+    raise ImportError(
+        "PyTorch is required for `nvalchemiops.torch` namespace."
+        " Please install via `pip install 'nvalchemiops[torch]'`."
+    )
+
 from .fire2 import fire2_step_coord
 
 __all__ = ["fire2_step_coord"]
