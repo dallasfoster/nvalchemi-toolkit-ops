@@ -1228,12 +1228,6 @@ def segmented_sum(
     Performs a segmented reduction that sums all elements belonging to each
     segment: ``out[s] = sum(x[i] for i where idx[i] == s)``.
 
-    This function uses a run-length encoding (RLE) approach that minimizes
-    atomic operations by accumulating locally within runs of identical
-    segment indices, only emitting atomic adds at segment boundaries.
-    This provides O(M) atomic operations instead of O(N), typically
-    100-1000x fewer atomics than naive approaches.
-
     **IMPORTANT:** The caller must zero-initialize ``out`` before calling
     (e.g., ``out.zero_()`` or ``wp.zeros``). This avoids a redundant kernel
     launch when the caller already provides a fresh array.
@@ -1264,16 +1258,6 @@ def segmented_sum(
     >>> system_forces = wp.zeros(3, dtype=wp.float32)
     >>> segmented_sum(forces, batch_idx, system_forces)
     >>> print(system_forces.numpy())  # [6.0, 9.0, 21.0]
-
-    Notes
-    -----
-    - **Performance**: RLE approach provides ~100-1000x fewer atomic operations
-      compared to naive per-element atomics
-    - **Sorting**: Use ``wp.sort()`` or ensure data is pre-sorted by segment
-    - **Special case**: When M=1 (single segment) and N≥8192, uses optimized
-      tile-based reduction for maximum performance
-    - **Zero-init**: Caller is responsible for zeroing ``out``; this function
-      accumulates into the provided array
 
     See Also
     --------

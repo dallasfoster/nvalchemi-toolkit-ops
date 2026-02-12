@@ -92,6 +92,10 @@ from typing import Any
 
 import warp as wp
 
+from ..utils.kernel_functions import (
+    scale_vector_by_scalar,
+)
+
 __all__ = [
     # Mutating APIs
     "velocity_rescale",
@@ -129,7 +133,7 @@ def _velocity_rescale_kernel(
     v = velocities[atom_idx]
     s = scale_factor[0]
 
-    velocities[atom_idx] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+    velocities[atom_idx] = scale_vector_by_scalar(v, s)
 
 
 @wp.kernel
@@ -148,7 +152,7 @@ def _velocity_rescale_out_kernel(
     v = velocities[atom_idx]
     s = scale_factor[0]
 
-    velocities_out[atom_idx] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
 
 
 @wp.kernel
@@ -173,11 +177,10 @@ def _batch_velocity_rescale_kernel(
         Per-system scaling factors. Shape (B,).
     """
     atom_idx = wp.tid()
-    system_id = batch_idx[atom_idx]
     v = velocities[atom_idx]
-    s = scale_factors[system_id]
+    s = scale_factors[batch_idx[atom_idx]]
 
-    velocities[atom_idx] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+    velocities[atom_idx] = scale_vector_by_scalar(v, s)
 
 
 @wp.kernel
@@ -194,11 +197,10 @@ def _batch_velocity_rescale_out_kernel(
     dim = [num_atoms_total]
     """
     atom_idx = wp.tid()
-    system_id = batch_idx[atom_idx]
     v = velocities[atom_idx]
-    s = scale_factors[system_id]
+    s = scale_factors[batch_idx[atom_idx]]
 
-    velocities_out[atom_idx] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
 
 
 # ==============================================================================
@@ -231,13 +233,12 @@ def _velocity_rescale_ptr_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
     s = scale_factors[sys_id]
 
     for i in range(a0, a1):
         v = velocities[i]
-        velocities[i] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+        velocities[i] = scale_vector_by_scalar(v, s)
 
 
 @wp.kernel
@@ -267,13 +268,12 @@ def _velocity_rescale_ptr_out_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
     s = scale_factors[sys_id]
 
     for i in range(a0, a1):
         v = velocities[i]
-        velocities_out[i] = type(v)(v[0] * s, v[1] * s, v[2] * s)
+        velocities_out[i] = scale_vector_by_scalar(v, s)
 
 
 # ==============================================================================

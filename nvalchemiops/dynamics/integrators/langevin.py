@@ -102,6 +102,12 @@ from typing import Any
 
 import warp as wp
 
+from ..utils.kernel_functions import (
+    compute_acceleration_from_force,
+    position_update_from_velocity,
+    velocity_half_step_from_acceleration,
+)
+
 __all__ = [
     # Mutating (in-place) APIs
     "langevin_baoab_half_step",
@@ -110,6 +116,93 @@ __all__ = [
     "langevin_baoab_half_step_out",
     "langevin_baoab_finalize_out",
 ]
+
+# ------------------------------------------------------------------------------
+# Langevin Integrator Functions
+# ------------------------------------------------------------------------------
+
+
+@wp.func
+def langevin_noise_amplitude(
+    kT: Any,  # wp.float32 or wp.float64
+    c1: Any,  # wp.float32 or wp.float64
+    mass: Any,  # wp.float32 or wp.float64
+) -> Any:
+    """Compute Langevin thermostat noise amplitude coefficient.
+
+    Calculates the amplitude c₂ for Gaussian random noise in the BAOAB
+    or OVRVO Langevin integrators. This ensures the Ornstein-Uhlenbeck
+    process generates the correct equilibrium distribution.
+
+    The formula is: c₂ = √(kT(1 - c₁²)/m)
+
+    where c₁ = exp(-γΔt) is the velocity decay factor.
+
+    Parameters
+    ----------
+    kT : wp.float32 or wp.float64
+        Temperature in energy units (Boltzmann constant × temperature).
+        Units must be consistent with force units.
+    c1 : wp.float32 or wp.float64
+        Velocity decay factor c₁ = exp(-γΔt), where γ is friction
+        and Δt is timestep.
+    mass : wp.float32 or wp.float64
+        Particle mass.
+
+    Returns
+    -------
+    c2 : same type as kT
+        Noise amplitude coefficient.
+
+    Examples
+    --------
+    In a Langevin BAOAB kernel (O step)::
+
+        gamma = friction[system_id]
+        dt_val = dt[system_id]
+        kT_val = temperature[system_id]
+        mass_val = masses[atom_idx]
+
+        # Compute coefficients
+        gamma_dt = gamma * dt_val
+        c1 = wp.exp(-gamma_dt)
+        c2 = langevin_noise_amplitude(kT_val, c1, mass_val)
+
+        # Apply Ornstein-Uhlenbeck update
+        rng = wp.rand_init(seed, atom_idx)
+        noise_x = wp.randn(rng)
+        noise_y = wp.randn(rng)
+        noise_z = wp.randn(rng)
+
+        vel_new = c1 * vel + c2 * wp.vec3(noise_x, noise_y, noise_z)
+
+    Notes
+    -----
+    - **Statistical Mechanics**: The c₂ term ensures detailed balance
+      and canonical sampling at temperature T
+    - **Variance**: The noise has variance kT(1-c₁²)/m per component
+    - **Limits**:
+      - γΔt → 0: c₁ → 1, c₂ → √(γΔt·kT/m) (weak coupling)
+      - γΔt → ∞: c₁ → 0, c₂ → √(kT/m) (strong coupling)
+
+    Physical Interpretation:
+        The (1 - c₁²) factor represents the variance reduction from
+        exponential decay. The noise must compensate to maintain
+        thermal equilibrium at temperature T.
+
+    See Also
+    --------
+    velocity_half_step_from_acceleration : For B and A steps in BAOAB
+    position_update_from_velocity : For A steps in BAOAB
+    """
+    inv_mass = type(mass)(1.0) / mass
+    one = type(kT)(1.0)
+
+    # Variance of noise: kT(1 - c1²)/m
+    c2_squared = kT * (one - c1 * c1) * inv_mass
+
+    # Amplitude (standard deviation)
+    return wp.sqrt(c2_squared)
 
 
 # ==============================================================================
@@ -170,18 +263,19 @@ def _langevin_baoab_half_step_kernel(
     kT = temperature[0]
     gamma = friction[0]
 
-    inv_mass = type(mass)(1.0) / mass
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step: v += (dt/2m)*F
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
     # A step: r += (dt/2)*v
-    pos_step = pos + half_dt * vel_step
+    pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
     # O step: Ornstein-Uhlenbeck thermostat
     gamma_dt = gamma * dt_val
     c1 = wp.exp(-gamma_dt)
+    inv_mass = type(mass)(1.0) / mass
     c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
     c2 = wp.sqrt(c2_sq)
 
@@ -196,7 +290,7 @@ def _langevin_baoab_half_step_kernel(
     vel_step = c1 * vel_step + c2 * xi
 
     # A step: r += (dt/2)*v
-    pos_step2 = pos_step + half_dt * vel_step
+    pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
     positions[atom_idx] = pos_step2
     velocities[atom_idx] = vel_step
@@ -240,10 +334,8 @@ def _langevin_baoab_finalize_kernel(
     mass = masses[atom_idx]
     dt_val = dt[0]
 
-    inv_mass = type(mass)(1.0) / mass
-    half_dt = type(dt_val)(0.5) * dt_val
-
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
     velocities[atom_idx] = vel_step
 
 
@@ -312,18 +404,19 @@ def _langevin_baoab_half_step_out_kernel(
     kT = temperature[0]
     gamma = friction[0]
 
-    inv_mass = type(mass)(1.0) / mass
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
     # A step
-    pos_step = pos + half_dt * vel_step
+    pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
     # O step
     gamma_dt = gamma * dt_val
     c1 = wp.exp(-gamma_dt)
+    inv_mass = type(mass)(1.0) / mass
     c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
     c2 = wp.sqrt(c2_sq)
 
@@ -337,7 +430,7 @@ def _langevin_baoab_half_step_out_kernel(
     vel_step = c1 * vel_step + c2 * xi
 
     # A step
-    pos_step2 = pos_step + half_dt * vel_step
+    pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
     positions_out[atom_idx] = pos_step2
     velocities_out[atom_idx] = vel_step
@@ -380,10 +473,8 @@ def _langevin_baoab_finalize_out_kernel(
     mass = masses[atom_idx]
     dt_val = dt[0]
 
-    inv_mass = type(mass)(1.0) / mass
-    half_dt = type(dt_val)(0.5) * dt_val
-
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
     velocities_out[atom_idx] = vel_step
 
 
@@ -450,18 +541,19 @@ def _batch_langevin_baoab_half_step_kernel(
     kT = temperature[system_id]
     gamma = friction[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
     # A step
-    pos_step = pos + half_dt * vel_step
+    pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
     # O step
     gamma_dt = gamma * dt_val
     c1 = wp.exp(-gamma_dt)
+    inv_mass = type(mass)(1.0) / mass
     c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
     c2 = wp.sqrt(c2_sq)
 
@@ -475,7 +567,7 @@ def _batch_langevin_baoab_half_step_kernel(
     vel_step = c1 * vel_step + c2 * xi
 
     # A step
-    pos_step2 = pos_step + half_dt * vel_step
+    pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
     positions[atom_idx] = pos_step2
     velocities[atom_idx] = vel_step
@@ -519,10 +611,8 @@ def _batch_langevin_baoab_finalize_kernel(
     mass = masses[atom_idx]
     dt_val = dt[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
-    half_dt = type(dt_val)(0.5) * dt_val
-
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
     velocities[atom_idx] = vel_step
 
 
@@ -595,18 +685,19 @@ def _batch_langevin_baoab_half_step_out_kernel(
     kT = temperature[system_id]
     gamma = friction[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
     # A step
-    pos_step = pos + half_dt * vel_step
+    pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
     # O step
     gamma_dt = gamma * dt_val
     c1 = wp.exp(-gamma_dt)
+    inv_mass = type(mass)(1.0) / mass
     c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
     c2 = wp.sqrt(c2_sq)
 
@@ -619,7 +710,7 @@ def _batch_langevin_baoab_half_step_out_kernel(
     )
     vel_step = c1 * vel_step + c2 * xi
 
-    pos_step2 = pos_step + half_dt * vel_step
+    pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
     positions_out[atom_idx] = pos_step2
     velocities_out[atom_idx] = vel_step
@@ -664,10 +755,8 @@ def _batch_langevin_baoab_finalize_out_kernel(
     mass = masses[atom_idx]
     dt_val = dt[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
-    half_dt = type(dt_val)(0.5) * dt_val
-
-    vel_step = vel + half_dt * force * inv_mass
+    acc = compute_acceleration_from_force(force, mass)
+    vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
     velocities_out[atom_idx] = vel_step
 
 
@@ -718,8 +807,7 @@ def _langevin_baoab_half_step_ptr_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
 
     dt_val = dt[sys_id]
     kT = temperature[sys_id]
@@ -735,15 +823,15 @@ def _langevin_baoab_half_step_ptr_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
-
         # B step: v += (dt/2m)*F
-        vel_step = vel + half_dt * force * inv_mass
+        acc = compute_acceleration_from_force(force, mass)
+        vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
         # A step: r += (dt/2)*v
-        pos_step = pos + half_dt * vel_step
+        pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
         # O step: Ornstein-Uhlenbeck thermostat
+        inv_mass = type(mass)(1.0) / mass
         c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
         c2 = wp.sqrt(c2_sq)
 
@@ -757,7 +845,7 @@ def _langevin_baoab_half_step_ptr_kernel(
         vel_step = c1 * vel_step + c2 * xi
 
         # A step: r += (dt/2)*v
-        pos_step2 = pos_step + half_dt * vel_step
+        pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
         positions[i] = pos_step2
         velocities[i] = vel_step
@@ -793,19 +881,16 @@ def _langevin_baoab_finalize_ptr_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
     dt_val = dt[sys_id]
-
-    half_dt = type(dt_val)(0.5) * dt_val
 
     for i in range(a0, a1):
         vel = velocities[i]
         force = forces_new[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
-        vel_step = vel + half_dt * force * inv_mass
+        acc = compute_acceleration_from_force(force, mass)
+        vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
         velocities[i] = vel_step
 
 
@@ -862,8 +947,7 @@ def _langevin_baoab_half_step_ptr_out_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
 
     dt_val = dt[sys_id]
     kT = temperature[sys_id]
@@ -879,15 +963,15 @@ def _langevin_baoab_half_step_ptr_out_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
-
         # B step
-        vel_step = vel + half_dt * force * inv_mass
+        acc = compute_acceleration_from_force(force, mass)
+        vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
 
         # A step
-        pos_step = pos + half_dt * vel_step
+        pos_step = position_update_from_velocity(pos, vel_step, half_dt)
 
         # O step
+        inv_mass = type(mass)(1.0) / mass
         c2_sq = kT * (type(kT)(1.0) - c1 * c1) * inv_mass
         c2 = wp.sqrt(c2_sq)
 
@@ -900,7 +984,7 @@ def _langevin_baoab_half_step_ptr_out_kernel(
         vel_step = c1 * vel_step + c2 * xi
 
         # A step
-        pos_step2 = pos_step + half_dt * vel_step
+        pos_step2 = position_update_from_velocity(pos_step, vel_step, half_dt)
 
         positions_out[i] = pos_step2
         velocities_out[i] = vel_step
@@ -939,19 +1023,16 @@ def _langevin_baoab_finalize_ptr_out_kernel(
     dim = [num_systems]
     """
     sys_id = wp.tid()
-    a0 = atom_ptr[sys_id]
-    a1 = atom_ptr[sys_id + 1]
+    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
     dt_val = dt[sys_id]
-
-    half_dt = type(dt_val)(0.5) * dt_val
 
     for i in range(a0, a1):
         vel = velocities[i]
         force = forces_new[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
-        vel_step = vel + half_dt * force * inv_mass
+        acc = compute_acceleration_from_force(force, mass)
+        vel_step = velocity_half_step_from_acceleration(vel, acc, dt_val)
         velocities_out[i] = vel_step
 
 

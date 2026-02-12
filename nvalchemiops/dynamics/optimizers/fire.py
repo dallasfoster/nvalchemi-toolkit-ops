@@ -67,6 +67,12 @@ from typing import Any
 import warp as wp
 
 from ...segment_ops import _compute_ept
+from ..utils.kernel_functions import (
+    clamp_displacement,
+    compute_vf_vv_ff,
+    fire_velocity_mixing,
+    is_first_atom_of_system,
+)
 
 
 @wp.kernel
@@ -159,9 +165,10 @@ def _fire_step_no_downhill_kernel(
     """
     atom_idx = wp.tid()
 
-    vf[0] += wp.dot(forces[atom_idx], velocities[atom_idx])
-    vv[0] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[0] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[0] += vf_val
+    vv[0] += vv_val
+    ff[0] += ff_val
 
     vf_mask = vf[0] > type(dt[0])(0.0)
     n_steps_positive[0] = wp.where(vf_mask, n_steps_positive[0] + 1, 0)
@@ -197,8 +204,8 @@ def _fire_step_no_downhill_kernel(
     dr = dt[0] * velocities[atom_idx]
 
     # Scale displacement by maxstep
-    scale = wp.min(type(dt[0])(1.0), maxstep[0] / wp.length(dr))
-    positions[atom_idx] += scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[0])
+    positions[atom_idx] += dr_clamped
 
 
 @wp.kernel(enable_backward=False)
@@ -241,7 +248,7 @@ def _fire_uphill_check_kernel(
     is_uphill = energy[sys] > energy_last[sys]
 
     # Only first atom per system writes state
-    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+    if is_first_atom_of_system(atom_idx, batch_idx):
         if is_uphill:
             uphill_flag[sys] = 1
             energy[sys] = energy_last[sys]  # Revert energy
@@ -320,9 +327,7 @@ def _fire_revert_and_reduce_kernel(
         positions_last[start] = positions[start]
         velocities_last[start] = velocities[start]
 
-    acc_vf = wp.dot(velocities[start], forces[start])
-    acc_vv = wp.dot(velocities[start], velocities[start])
-    acc_ff = wp.dot(forces[start], forces[start])
+    acc_vf, acc_vv, acc_ff = compute_vf_vv_ff(velocities[start], forces[start])
 
     # Process remaining elements
     for i in range(start + 1, end):
@@ -351,9 +356,7 @@ def _fire_revert_and_reduce_kernel(
             velocities_last[i] = velocities[i]
 
         # Accumulate diagnostics
-        val_vf = wp.dot(velocities[i], forces[i])
-        val_vv = wp.dot(velocities[i], velocities[i])
-        val_ff = wp.dot(forces[i], forces[i])
+        val_vf, val_vv, val_ff = compute_vf_vv_ff(velocities[i], forces[i])
         acc_vf = acc_vf + val_vf
         acc_vv = acc_vv + val_vv
         acc_ff = acc_ff + val_ff
@@ -426,7 +429,6 @@ def _fire_update_downhill_batch_idx_kernel(
     # Snapshot dt before any thread modifies it
     local_dt = dt[sys]
     zero = type(local_dt)(0.0)
-    one = type(local_dt)(1.0)
 
     # Redundantly compute parameter updates
     _vf = vf[sys]
@@ -450,20 +452,15 @@ def _fire_update_downhill_batch_idx_kernel(
         new_alpha = alpha_start[sys]
 
     # First atom per segment writes
-    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+    if is_first_atom_of_system(atom_idx, batch_idx):
         dt[sys] = new_dt
         alpha[sys] = new_alpha
         n_steps_positive[sys] = _nsi
 
     # Velocity mixing with uphill masking
-    if _ff > zero:
-        ratio = wp.sqrt(_vv / _ff)
-    else:
-        ratio = zero
-
     if vf_mask:
-        velocities[atom_idx] = (one - new_alpha) * velocities[atom_idx] + (
-            new_alpha * forces[atom_idx] * ratio
+        velocities[atom_idx] = fire_velocity_mixing(
+            velocities[atom_idx], forces[atom_idx], new_alpha, _vv, _ff
         )
     else:
         velocities[atom_idx] = zero * velocities[atom_idx]
@@ -473,12 +470,8 @@ def _fire_update_downhill_batch_idx_kernel(
         velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
     )
     dr = local_dt * velocities[atom_idx]
-    dr_len = wp.length(dr)
-    if dr_len > zero:
-        scale = wp.min(one, maxstep[sys] / dr_len)
-    else:
-        scale = one
-    positions[atom_idx] = positions[atom_idx] + scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[sys])
+    positions[atom_idx] = positions[atom_idx] + dr_clamped
 
 
 @wp.kernel(enable_backward=False)
@@ -541,16 +534,12 @@ def _fire_reduce_batch_idx_rle_kernel(
 
     # First element
     s_cur = batch_idx[start]
-    acc_vf = wp.dot(velocities[start], forces[start])
-    acc_vv = wp.dot(velocities[start], velocities[start])
-    acc_ff = wp.dot(forces[start], forces[start])
+    acc_vf, acc_vv, acc_ff = compute_vf_vv_ff(velocities[start], forces[start])
 
     # Process remaining elements in chunk
     for i in range(start + 1, end):
         s = batch_idx[i]
-        val_vf = wp.dot(velocities[i], forces[i])
-        val_vv = wp.dot(velocities[i], velocities[i])
-        val_ff = wp.dot(forces[i], forces[i])
+        val_vf, val_vv, val_ff = compute_vf_vv_ff(velocities[i], forces[i])
         if s == s_cur:
             # Same segment: accumulate locally
             acc_vf = acc_vf + val_vf
@@ -640,7 +629,6 @@ def _fire_update_batch_idx_kernel(
     # Snapshot dt before any thread modifies it (race-condition guard)
     local_dt = dt[sys]
     zero = type(local_dt)(0.0)
-    one = type(local_dt)(1.0)
 
     # Redundantly compute per-system parameter updates from read-only inputs
     _vf = vf[sys]
@@ -663,21 +651,15 @@ def _fire_update_batch_idx_kernel(
         new_alpha = alpha_start[sys]
 
     # First atom per segment writes updated params
-    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+    if is_first_atom_of_system(atom_idx, batch_idx):
         dt[sys] = new_dt
         alpha[sys] = new_alpha
         n_steps_positive[sys] = _nsi
 
     # Velocity mixing (all atoms)
-    # Guard against division by zero when forces are zero
-    if _ff > zero:
-        ratio = wp.sqrt(_vv / _ff)
-    else:
-        ratio = zero
-
     if vf_mask:
-        velocities[atom_idx] = (one - new_alpha) * velocities[atom_idx] + (
-            new_alpha * forces[atom_idx] * ratio
+        velocities[atom_idx] = fire_velocity_mixing(
+            velocities[atom_idx], forces[atom_idx], new_alpha, _vv, _ff
         )
     else:
         velocities[atom_idx] = zero * velocities[atom_idx]
@@ -687,12 +669,8 @@ def _fire_update_batch_idx_kernel(
         velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
     )
     dr = local_dt * velocities[atom_idx]
-    dr_len = wp.length(dr)
-    if dr_len > zero:
-        scale = wp.min(one, maxstep[sys] / dr_len)
-    else:
-        scale = one
-    positions[atom_idx] = positions[atom_idx] + scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[sys])
+    positions[atom_idx] = positions[atom_idx] + dr_clamped
 
 
 @wp.kernel
@@ -766,9 +744,10 @@ def _fire_step_no_downhill_batch_idx_kernel(
     atom_idx = wp.tid()
     sys = batch_idx[atom_idx]
 
-    vf[sys] += wp.dot(forces[atom_idx], velocities[atom_idx])
-    vv[sys] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[sys] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[sys] += vf_val
+    vv[sys] += vv_val
+    ff[sys] += ff_val
 
     vf_mask = vf[sys] > type(dt[sys])(0.0)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -802,8 +781,8 @@ def _fire_step_no_downhill_batch_idx_kernel(
     # Update velocities with forces (mass-aware)
     velocities[atom_idx] += dt[sys] * forces[atom_idx] / masses[atom_idx]
     dr = dt[sys] * velocities[atom_idx]
-    scale = wp.min(type(dt[sys])(1.0), maxstep[sys] / wp.length(dr))
-    positions[atom_idx] += scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[sys])
+    positions[atom_idx] += dr_clamped
 
 
 @wp.kernel
@@ -873,9 +852,10 @@ def _fire_step_no_downhill_ptr_kernel(
     vv = type(dt[sys])(0.0)
     ff = type(dt[sys])(0.0)
     for i in range(a0, a1):
-        vf += wp.dot(forces[i], velocities[i])
-        vv += wp.dot(velocities[i], velocities[i])
-        ff += wp.dot(forces[i], forces[i])
+        vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[i], forces[i])
+        vf += vf_val
+        vv += vv_val
+        ff += ff_val
 
     vf_mask = vf > type(dt[sys])(0.0)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -916,8 +896,8 @@ def _fire_step_no_downhill_ptr_kernel(
     for i in range(a0, a1):
         velocities[i] += dt[sys] * forces[i] / masses[i]
         dr = dt[sys] * velocities[i]
-        scale = wp.min(type(dt[sys])(1.0), maxstep[sys] / wp.length(dr))
-        positions[i] += scale * dr
+        dr_clamped = clamp_displacement(dr, maxstep[sys])
+        positions[i] += dr_clamped
 
 
 @wp.kernel
@@ -1034,9 +1014,10 @@ def _fire_step_downhill_kernel(
         velocities_last[atom_idx] = velocities[atom_idx]
 
     # (3) Accumulate diagnostics
-    vf[0] += wp.dot(forces[atom_idx], velocities[atom_idx])
-    vv[0] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[0] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[0] += vf_val
+    vv[0] += vv_val
+    ff[0] += ff_val
 
     vf_mask = (vf[0] > type(dt[0])(0.0)) and (not is_uphill)
     n_steps_positive[0] = wp.where(vf_mask, n_steps_positive[0] + 1, 0)
@@ -1074,8 +1055,8 @@ def _fire_step_downhill_kernel(
     # (6) MD-like update + per-atom maxstep cap (same style as no-downhill)
     velocities[atom_idx] += dt[0] * forces[atom_idx] / masses[atom_idx]
     dr = dt[0] * velocities[atom_idx]
-    scale = wp.min(type(dt[0])(1.0), maxstep[0] / wp.length(dr))
-    positions[atom_idx] += scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[0])
+    positions[atom_idx] += dr_clamped
 
 
 @wp.kernel
@@ -1170,9 +1151,10 @@ def _fire_step_downhill_batch_idx_kernel(
         positions_last[atom_idx] = positions[atom_idx]
         velocities_last[atom_idx] = velocities[atom_idx]
 
-    vf[sys] += wp.dot(forces[atom_idx], velocities[atom_idx])
-    vv[sys] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[sys] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[sys] += vf_val
+    vv[sys] += vv_val
+    ff[sys] += ff_val
 
     vf_mask = (vf[sys] > type(dt[sys])(0.0)) and (not is_uphill)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -1206,8 +1188,8 @@ def _fire_step_downhill_batch_idx_kernel(
 
     velocities[atom_idx] += dt[sys] * forces[atom_idx] / masses[atom_idx]
     dr = dt[sys] * velocities[atom_idx]
-    scale = wp.min(type(dt[sys])(1.0), maxstep[sys] / wp.length(dr))
-    positions[atom_idx] += scale * dr
+    dr_clamped = clamp_displacement(dr, maxstep[sys])
+    positions[atom_idx] += dr_clamped
 
 
 @wp.kernel
@@ -1298,9 +1280,10 @@ def _fire_step_downhill_ptr_kernel(
     vv = type(dt[sys])(0.0)
     ff = type(dt[sys])(0.0)
     for i in range(a0, a1):
-        vf += wp.dot(forces[i], velocities[i])
-        vv += wp.dot(velocities[i], velocities[i])
-        ff += wp.dot(forces[i], forces[i])
+        vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[i], forces[i])
+        vf += vf_val
+        vv += vv_val
+        ff += ff_val
 
     vf_mask = (vf > type(dt[sys])(0.0)) and (not is_uphill)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -1343,8 +1326,8 @@ def _fire_step_downhill_ptr_kernel(
     for i in range(a0, a1):
         velocities[i] += dt[sys] * forces[i] / masses[i]
         dr = dt[sys] * velocities[i]
-        scale = wp.min(type(dt[sys])(1.0), maxstep[sys] / wp.length(dr))
-        positions[i] += scale * dr
+        dr_clamped = clamp_displacement(dr, maxstep[sys])
+        positions[i] += dr_clamped
 
 
 @wp.kernel
@@ -1420,9 +1403,10 @@ def _fire_update_params_no_downhill_kernel(
     atom_idx = wp.tid()
 
     # Accumulate diagnostics
-    vf[0] += wp.dot(velocities[atom_idx], forces[atom_idx])
-    vv[0] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[0] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[0] += vf_val
+    vv[0] += vv_val
+    ff[0] += ff_val
 
     vf_mask = vf[0] > type(dt[0])(0.0)
     n_steps_positive[0] = wp.where(vf_mask, n_steps_positive[0] + 1, 0)
@@ -1530,9 +1514,10 @@ def _fire_update_params_no_downhill_batch_idx_kernel(
     atom_idx = wp.tid()
     sys = batch_idx[atom_idx]
 
-    vf[sys] += wp.dot(velocities[atom_idx], forces[atom_idx])
-    vv[sys] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[sys] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[sys] += vf_val
+    vv[sys] += vv_val
+    ff[sys] += ff_val
 
     vf_mask = vf[sys] > type(dt[sys])(0.0)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -1635,9 +1620,10 @@ def _fire_update_params_no_downhill_ptr_kernel(
     ff = type(dt[sys])(0.0)
     vf = type(dt[sys])(0.0)
     for i in range(a0, a1):
-        vf += wp.dot(velocities[i], forces[i])
-        vv += wp.dot(velocities[i], velocities[i])
-        ff += wp.dot(forces[i], forces[i])
+        vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[i], forces[i])
+        vf += vf_val
+        vv += vv_val
+        ff += ff_val
 
     vf_mask = vf > type(dt[sys])(0.0)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
@@ -1776,9 +1762,10 @@ def _fire_update_params_downhill_kernel(
         positions_last[atom_idx] = positions[atom_idx]
         velocities_last[atom_idx] = velocities[atom_idx]
 
-    vf[0] += wp.dot(velocities[atom_idx], forces[atom_idx])
-    vv[0] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[0] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[0] += vf_val
+    vv[0] += vv_val
+    ff[0] += ff_val
 
     vf_mask = (vf[0] > type(dt[0])(0.0)) and (not is_uphill)
     n_steps_positive[0] = wp.where(vf_mask, n_steps_positive[0] + 1, 0)
@@ -1912,9 +1899,10 @@ def _fire_update_params_downhill_batch_idx_kernel(
         positions_last[atom_idx] = positions[atom_idx]
         velocities_last[atom_idx] = velocities[atom_idx]
 
-    vf[sys] += wp.dot(velocities[atom_idx], forces[atom_idx])
-    vv[sys] += wp.dot(velocities[atom_idx], velocities[atom_idx])
-    ff[sys] += wp.dot(forces[atom_idx], forces[atom_idx])
+    vf_val, vv_val, ff_val = compute_vf_vv_ff(velocities[atom_idx], forces[atom_idx])
+    vf[sys] += vf_val
+    vv[sys] += vv_val
+    ff[sys] += ff_val
 
     vf_mask = (vf[sys] > type(dt[sys])(0.0)) and (not is_uphill)
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)

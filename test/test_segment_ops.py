@@ -32,7 +32,6 @@ from nvalchemiops.segment_ops import (
     segmented_sum,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -84,10 +83,13 @@ def device():
 class TestScalarSegmentReduce:
     """Segmented sum for float16, float32 and float64."""
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-5),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_uniform_segments(self, device, wp_dtype, np_dtype, rtol):
         N, M = 1200, 12
         seg_len = N // M
@@ -101,16 +103,21 @@ class TestScalarSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-5),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_skewed_segments(self, device, wp_dtype, np_dtype, rtol):
         """Mix of large and tiny segments."""
         rng = np.random.default_rng(7)
         lengths = [500, 1, 3, 200, 2, 1, 50, 1, 1, 100]
         M = len(lengths)
-        idx_np = np.concatenate([np.full(l, s, dtype=np.int32) for s, l in enumerate(lengths)])
+        idx_np = np.concatenate(
+            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+        )
         N = len(idx_np)
         x_np = rng.standard_normal(N).astype(np_dtype)
 
@@ -147,10 +154,13 @@ class TestScalarSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=1e-6)
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-4),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-4),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_single_segment_large(self, device, wp_dtype, np_dtype, rtol):
         """Large M=1 case -- exercises the tile block-reduction path."""
         N, M = 10_000, 1
@@ -198,10 +208,13 @@ class TestScalarSegmentReduce:
 class TestVectorSegmentReduce:
     """Segmented sum for vec3h, vec3f and vec3d."""
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-4),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-4),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_uniform_segments(self, device, wp_dtype, np_dtype, rtol):
         N, M = 600, 6
         seg_len = N // M
@@ -218,10 +231,13 @@ class TestVectorSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-4),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-4),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_single_segment_vec(self, device, wp_dtype, np_dtype, rtol):
         N, M = 200, 1
         rng = np.random.default_rng(11)
@@ -237,10 +253,13 @@ class TestVectorSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-3),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_single_segment_large_vec(self, device, wp_dtype, np_dtype, rtol):
         """Large M=1 vec3 case -- exercises the tile block-reduction path."""
         N, M = 10_000, 1
@@ -264,11 +283,13 @@ class TestVectorSegmentReduce:
 
 
 class TestSegmentedComponentSum:
-
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-4),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-4),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_uniform(self, device, wp_vec, np_dtype, rtol):
         N, M = 600, 6
         rng = np.random.default_rng(10)
@@ -287,16 +308,20 @@ class TestSegmentedComponentSum:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-4),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-4),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_skewed(self, device, wp_vec, np_dtype, rtol):
         rng = np.random.default_rng(20)
         lengths = [300, 1, 50, 2, 100]
         M = len(lengths)
-        idx_np = np.concatenate([np.full(l, s, dtype=np.int32)
-                                 for s, l in enumerate(lengths)])
+        idx_np = np.concatenate(
+            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+        )
         N = len(idx_np)
         x_np = rng.standard_normal((N, 3)).astype(np_dtype)
 
@@ -319,11 +344,13 @@ class TestSegmentedComponentSum:
 
 
 class TestSegmentedDot:
-
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-4),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-4),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_scalar(self, device, wp_dtype, np_dtype, rtol):
         N, M = 1200, 12
         rng = np.random.default_rng(30)
@@ -343,10 +370,13 @@ class TestSegmentedDot:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-3),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_vec3(self, device, wp_vec, np_dtype, rtol):
         N, M = 600, 6
         rng = np.random.default_rng(31)
@@ -374,11 +404,13 @@ class TestSegmentedDot:
 
 
 class TestSegmentedMaxNorm:
-
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-5),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-5),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_uniform(self, device, wp_vec, np_dtype, rtol):
         N, M = 600, 6
         rng = np.random.default_rng(40)
@@ -405,8 +437,9 @@ class TestSegmentedMaxNorm:
         rng = np.random.default_rng(41)
         lengths = [200, 1, 3, 100, 50]
         M = len(lengths)
-        idx_np = np.concatenate([np.full(l, s, dtype=np.int32)
-                                 for s, l in enumerate(lengths)])
+        idx_np = np.concatenate(
+            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+        )
         N = len(idx_np)
         x_np = rng.standard_normal((N, 3)).astype(np.float32)
 
@@ -425,10 +458,13 @@ class TestSegmentedMaxNorm:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=1e-5)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-5),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-5),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_single_segment_large(self, device, wp_vec, np_dtype, rtol):
         """Large M=1 case -- exercises the total max-norm fast path."""
         N, M = 10_000, 1
@@ -454,11 +490,13 @@ class TestSegmentedMaxNorm:
 
 
 class TestSegmentedMul:
-
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-5),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_scalar_same_type(self, device, wp_dtype, np_dtype, rtol):
         N, M = 500, 5
         rng = np.random.default_rng(50)
@@ -477,10 +515,13 @@ class TestSegmentedMul:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,wp_scalar,np_dtype,rtol", [
-        (wp.vec3f, wp.float32, np.float32, 1e-5),
-        (wp.vec3d, wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-5),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_vec_scalar(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         """vec3 * scalar broadcast."""
         N, M = 500, 5
@@ -501,18 +542,19 @@ class TestSegmentedMul:
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
 
-
 # ---------------------------------------------------------------------------
 # segmented_add tests
 # ---------------------------------------------------------------------------
 
 
 class TestSegmentedAdd:
-
-    @pytest.mark.parametrize("wp_dtype,np_dtype,rtol", [
-        (wp.float32, np.float32, 1e-5),
-        (wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_scalar_same_type(self, device, wp_dtype, np_dtype, rtol):
         N, M = 500, 5
         rng = np.random.default_rng(60)
@@ -531,10 +573,13 @@ class TestSegmentedAdd:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-5),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-5),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_vec_same_type(self, device, wp_vec, np_dtype, rtol):
         """vec3 + vec3."""
         N, M = 500, 5
@@ -554,10 +599,13 @@ class TestSegmentedAdd:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-5),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-5),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_vec_scalar(self, device, wp_vec, np_dtype, rtol):
         """vec3 + scalar broadcast."""
         N, M = 500, 5
@@ -578,10 +626,13 @@ class TestSegmentedAdd:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,np_dtype,rtol", [
-        (wp.vec3f, np.float32, 1e-5),
-        (wp.vec3d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-5),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
     def test_scalar_vec(self, device, wp_vec, np_dtype, rtol):
         """scalar + vec3 broadcast."""
         N, M = 500, 5
@@ -609,11 +660,13 @@ class TestSegmentedAdd:
 
 
 class TestSegmentedMatvec:
-
-    @pytest.mark.parametrize("wp_vec,wp_mat,np_dtype,rtol", [
-        (wp.vec3f, wp.mat33f, np.float32, 1e-4),
-        (wp.vec3d, wp.mat33d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_mat,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.mat33f, np.float32, 1e-4),
+            (wp.vec3d, wp.mat33d, np.float64, 1e-12),
+        ],
+    )
     def test_basic(self, device, wp_vec, wp_mat, np_dtype, rtol):
         N, M = 500, 5
         rng = np.random.default_rng(70)
@@ -636,10 +689,13 @@ class TestSegmentedMatvec:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
-    @pytest.mark.parametrize("wp_vec,wp_mat,np_dtype,rtol", [
-        (wp.vec3f, wp.mat33f, np.float32, 1e-4),
-        (wp.vec3d, wp.mat33d, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_mat,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.mat33f, np.float32, 1e-4),
+            (wp.vec3d, wp.mat33d, np.float64, 1e-12),
+        ],
+    )
     def test_identity_matrices(self, device, wp_vec, wp_mat, np_dtype, rtol):
         """With identity matrices, output should equal input."""
         N, M = 200, 4
@@ -667,10 +723,13 @@ class TestSegmentedMatvec:
 class TestSegmentedAxpy:
     """Tests for segmented_axpy: y[i] += x[i] * a[idx[i]]."""
 
-    @pytest.mark.parametrize("wp_vec,wp_scalar,np_dtype,rtol", [
-        (wp.vec3f, wp.float32, np.float32, 1e-5),
-        (wp.vec3d, wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-5),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_basic(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         rng = np.random.default_rng(0)
         N, M = 100, 4
@@ -700,10 +759,13 @@ class TestSegmentedAxpy:
 class TestSegmentedInnerProducts:
     """Tests for segmented_inner_products: triple reduction."""
 
-    @pytest.mark.parametrize("wp_vec,wp_scalar,np_dtype,rtol", [
-        (wp.vec3f, wp.float32, np.float32, 1e-4),
-        (wp.vec3d, wp.float64, np.float64, 1e-10),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-4),
+            (wp.vec3d, wp.float64, np.float64, 1e-10),
+        ],
+    )
     def test_vec(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         rng = np.random.default_rng(1)
         N, M = 200, 3
@@ -773,10 +835,13 @@ class TestSegmentedInnerProducts:
 class TestSegmentedAxpby:
     """Tests for segmented_axpby: out = a[s]*x + b[s]*y."""
 
-    @pytest.mark.parametrize("wp_vec,wp_scalar,np_dtype,rtol", [
-        (wp.vec3f, wp.float32, np.float32, 1e-5),
-        (wp.vec3d, wp.float64, np.float64, 1e-12),
-    ])
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-5),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
     def test_basic(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         rng = np.random.default_rng(3)
         N, M = 120, 4
@@ -798,5 +863,7 @@ class TestSegmentedAxpby:
 
         expected = a_np[idx_np, None] * x_np + b_np[idx_np, None] * y_np
         np.testing.assert_allclose(
-            out.numpy(), expected, rtol=rtol,
+            out.numpy(),
+            expected,
+            rtol=rtol,
         )

@@ -82,6 +82,44 @@ pack_masses_with_cell
 
 stress_to_cell_force
     Convert stress tensor to cell force for optimization.
+
+Kernel Functions (Shared @wp.func for Integrators)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+compute_acceleration_from_force
+    Compute acceleration from force and mass (a = F/m).
+
+velocity_half_step_from_acceleration
+    Half-step velocity update (v_half = v + 0.5*a*dt).
+
+position_update_from_velocity
+    Position update from velocity (r_new = r + v*dt).
+
+velocity_verlet_position_step
+    Velocity Verlet position update (r(t+dt) = r + v*dt + 0.5*a*dt^2).
+
+scale_vector_by_scalar
+    Scale 3D vector by scalar (v_scaled = v * s).
+
+Algorithm-Specific Kernel Functions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+**FIRE Optimizer:**
+
+compute_vf_vv_ff
+    Compute triple dot product (v·f, v·v, f·f) for FIRE diagnostics.
+
+fire_velocity_mixing
+    FIRE velocity mixing formula with zero-safety.
+
+clamp_displacement
+    Clamp displacement vector to maximum step size.
+
+is_first_atom_of_system
+    Check if atom is first in batch_idx segment (race-free writes).
+
+**Langevin Integrator:**
+
+langevin_noise_amplitude
+    Compute Ornstein-Uhlenbeck noise amplitude coefficient.
 """
 
 from .cell_filter import (
@@ -131,6 +169,19 @@ from .constraints import (
     shake_constraints_out,
     shake_iteration,
     shake_iteration_out,
+)
+from .kernel_functions import (
+    # Physics functions
+    clamp_displacement,
+    compute_acceleration_from_force,
+    compute_vf_vv_ff,
+    fire_velocity_mixing,
+    is_first_atom_of_system,
+    position_update_from_velocity,
+    # Utility functions
+    scale_vector_by_scalar,
+    velocity_half_step_from_acceleration,
+    velocity_verlet_position_step,
 )
 from .thermostat_utils import (
     # Non-mutating (compute only)
@@ -183,4 +234,16 @@ __all__ = [
     "rattle_iteration",
     "rattle_constraints_out",
     "rattle_iteration_out",
+    # Kernel functions (shared @wp.func for integrators)
+    "compute_acceleration_from_force",
+    "velocity_half_step_from_acceleration",
+    "position_update_from_velocity",
+    "velocity_verlet_position_step",
+    "scale_vector_by_scalar",
+    # Algorithm-specific kernel functions
+    "compute_vf_vv_ff",
+    "fire_velocity_mixing",
+    "clamp_displacement",
+    "is_first_atom_of_system",
+    "langevin_noise_amplitude",
 ]

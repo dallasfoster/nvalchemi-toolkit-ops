@@ -74,6 +74,7 @@ from typing import Any
 import warp as wp
 
 from ...segment_ops import _compute_ept
+from ..utils.kernel_functions import compute_vf_vv_ff
 
 # =============================================================================
 # Kernel 1: Triple inner-product reduction (deferred half-step)
@@ -147,16 +148,12 @@ def _fire2_reduce_only_kernel(
     # First element -- compute v_upd in register, do NOT write back
     s_cur = batch_idx[start]
     v_upd = velocities[start] + forces[start] * dt[s_cur]
-    acc_vf = wp.dot(v_upd, forces[start])
-    acc_vv = wp.dot(v_upd, v_upd)
-    acc_ff = wp.dot(forces[start], forces[start])
+    acc_vf, acc_vv, acc_ff = compute_vf_vv_ff(v_upd, forces[start])
 
     for i in range(start + 1, end):
         s = batch_idx[i]
         v_upd = velocities[i] + forces[i] * dt[s]
-        val_vf = wp.dot(v_upd, forces[i])
-        val_vv = wp.dot(v_upd, v_upd)
-        val_ff = wp.dot(forces[i], forces[i])
+        val_vf, val_vv, val_ff = compute_vf_vv_ff(v_upd, forces[i])
         if s == s_cur:
             acc_vf = acc_vf + val_vf
             acc_vv = acc_vv + val_vv

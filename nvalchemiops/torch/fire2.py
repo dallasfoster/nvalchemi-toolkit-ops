@@ -141,13 +141,23 @@ def fire2_step_coord(
         max_norm.zero_()
 
     # Detach from autograd graph + convert to ctypes (no wp.array overhead)
-    positions_c = wp.from_torch(positions.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    velocities_c = wp.from_torch(velocities.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    forces_c = wp.from_torch(forces.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    batch_idx_c = wp.from_torch(batch_idx.detach().contiguous(), dtype=wp.int32, return_ctype=True)
+    positions_c = wp.from_torch(
+        positions.detach().contiguous(), dtype=vec_type, return_ctype=True
+    )
+    velocities_c = wp.from_torch(
+        velocities.detach().contiguous(), dtype=vec_type, return_ctype=True
+    )
+    forces_c = wp.from_torch(
+        forces.detach().contiguous(), dtype=vec_type, return_ctype=True
+    )
+    batch_idx_c = wp.from_torch(
+        batch_idx.detach().contiguous(), dtype=wp.int32, return_ctype=True
+    )
     alpha_c = wp.from_torch(alpha.detach().contiguous(), return_ctype=True)
     dt_c = wp.from_torch(dt.detach().contiguous(), return_ctype=True)
-    nsteps_inc_c = wp.from_torch(nsteps_inc.detach().contiguous(), dtype=wp.int32, return_ctype=True)
+    nsteps_inc_c = wp.from_torch(
+        nsteps_inc.detach().contiguous(), dtype=wp.int32, return_ctype=True
+    )
     vf_c = wp.from_torch(vf, return_ctype=True)
     v_sumsq_c = wp.from_torch(v_sumsq, return_ctype=True)
     f_sumsq_c = wp.from_torch(f_sumsq, return_ctype=True)
@@ -159,8 +169,17 @@ def fire2_step_coord(
     wp.launch(
         _fire2_reduce_only_overloads[vec_type],
         dim=dim1,
-        inputs=[velocities_c, forces_c, dt_c, batch_idx_c,
-                vf_c, v_sumsq_c, f_sumsq_c, N, ept1],
+        inputs=[
+            velocities_c,
+            forces_c,
+            dt_c,
+            batch_idx_c,
+            vf_c,
+            v_sumsq_c,
+            f_sumsq_c,
+            N,
+            ept1,
+        ],
         device=wp_device,
     )
 
@@ -170,11 +189,27 @@ def fire2_step_coord(
     wp.launch(
         _fire2_fused_mix_maxnorm_overloads[vec_type],
         dim=dim2,
-        inputs=[velocities_c, forces_c, dt_c, batch_idx_c,
-                vf_c, v_sumsq_c, f_sumsq_c, alpha_c, nsteps_inc_c,
-                max_norm_c, N, ept2,
-                delaystep, dtgrow, dtshrink, alphashrink,
-                alpha0, tmax, tmin],
+        inputs=[
+            velocities_c,
+            forces_c,
+            dt_c,
+            batch_idx_c,
+            vf_c,
+            v_sumsq_c,
+            f_sumsq_c,
+            alpha_c,
+            nsteps_inc_c,
+            max_norm_c,
+            N,
+            ept2,
+            delaystep,
+            dtgrow,
+            dtshrink,
+            alphashrink,
+            alpha0,
+            tmax,
+            tmin,
+        ],
         device=wp_device,
     )
 
@@ -182,8 +217,14 @@ def fire2_step_coord(
     wp.launch(
         _fire2_clamp_apply_recompute_overloads[vec_type],
         dim=N,
-        inputs=[positions_c, velocities_c, dt_c, batch_idx_c,
-                max_norm_c, vf_c,  # vf holds v.f; uphill if <= 0
-                maxstep],
+        inputs=[
+            positions_c,
+            velocities_c,
+            dt_c,
+            batch_idx_c,
+            max_norm_c,
+            vf_c,  # vf holds v.f; uphill if <= 0
+            maxstep,
+        ],
         device=wp_device,
     )
