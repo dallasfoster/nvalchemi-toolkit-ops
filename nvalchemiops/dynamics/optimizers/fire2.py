@@ -593,6 +593,8 @@ def fire2_step(
     vec_dtype = positions.dtype
     if device is None:
         device = positions.device
+    elif isinstance(device, str):
+        device = wp.get_device(device)
     sm = max(device.sm_count, 1)
 
     # Kernel 1: reduce only (no velocity write, deferred to fused kernel)

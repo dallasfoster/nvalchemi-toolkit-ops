@@ -1170,6 +1170,47 @@ class TestFire2DeviceInference:
             "Positions should change after fire2_step"
         )
 
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_device_string_accepted(self, device, dtype_vec, dtype_scalar, np_dtype):
+        """fire2_step accepts device as a string (e.g. 'cuda:0') without AttributeError."""
+        N, M = 20, 1
+        (
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            *_,
+        ) = make_fire2_state(N, M, dtype_vec, dtype_scalar, np_dtype, device)
+
+        vf, v_sumsq, f_sumsq, max_norm = make_fire2_scratch(M, dtype_scalar, device)
+        pos_before = pos.numpy().copy()
+
+        # Explicit device as string (docstring says str is supported)
+        fire2_step(
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
+            device=device,
+            **FIRE2_DEFAULTS,
+        )
+        wp.synchronize()
+
+        assert not np.allclose(pos.numpy(), pos_before), (
+            "Positions should change after fire2_step with device=str"
+        )
+
 
 # ==============================================================================
 # Tests: State Modification
