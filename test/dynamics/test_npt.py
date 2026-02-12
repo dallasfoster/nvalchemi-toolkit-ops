@@ -538,6 +538,7 @@ class TestNonMutatingAPIs:
         system = setup_npt_system(10, dtype, device)
         volumes = compute_cell_volume(system["cells"], device=device)
 
+        velocities_out = wp.empty_like(system["velocities"])
         velocities_out = npt_velocity_half_step_out(
             system["velocities"],
             system["masses"],
@@ -546,7 +547,8 @@ class TestNonMutatingAPIs:
             volumes,
             system["eta_dot"],
             system["num_atoms"],
-            dt=0.001,
+            0.001,
+            velocities_out,
             device=device,
         )
         wp.synchronize_device(device)
@@ -557,12 +559,14 @@ class TestNonMutatingAPIs:
         """Test that npt_position_update_out runs without errors."""
         system = setup_npt_system(10, dtype, device)
 
+        positions_out = wp.empty_like(system["positions"])
         positions_out = npt_position_update_out(
             system["positions"],
             system["velocities"],
             system["cells"],
             system["cell_velocities"],
-            dt=0.001,
+            0.001,
+            positions_out,
             device=device,
         )
         wp.synchronize_device(device)
@@ -573,8 +577,9 @@ class TestNonMutatingAPIs:
         """Test that npt_cell_update_out runs without errors."""
         system = setup_npt_system(10, dtype, device)
 
+        cells_out = wp.empty_like(system["cells"])
         cells_out = npt_cell_update_out(
-            system["cells"], system["cell_velocities"], dt=0.001, device=device
+            system["cells"], system["cell_velocities"], 0.001, cells_out, device=device
         )
         wp.synchronize_device(device)
 
@@ -585,6 +590,7 @@ class TestNonMutatingAPIs:
         system = setup_nph_system(10, dtype, device)
         volumes = compute_cell_volume(system["cells"], device=device)
 
+        velocities_out = wp.empty_like(system["velocities"])
         velocities_out = nph_velocity_half_step_out(
             system["velocities"],
             system["masses"],
@@ -592,7 +598,8 @@ class TestNonMutatingAPIs:
             system["cell_velocities"],
             volumes,
             system["num_atoms"],
-            dt=0.001,
+            0.001,
+            velocities_out,
             device=device,
         )
         wp.synchronize_device(device)
@@ -603,12 +610,14 @@ class TestNonMutatingAPIs:
         """Test that nph_position_update_out runs without errors."""
         system = setup_nph_system(10, dtype, device)
 
+        positions_out = wp.empty_like(system["positions"])
         positions_out = nph_position_update_out(
             system["positions"],
             system["velocities"],
             system["cells"],
             system["cell_velocities"],
-            dt=0.001,
+            0.001,
+            positions_out,
             device=device,
         )
         wp.synchronize_device(device)
@@ -644,12 +653,14 @@ class TestMutatingNonMutatingConsistency:
         )
 
         # Non-mutating
+        positions_out = wp.empty_like(system2["positions"])
         positions_out = npt_position_update_out(
             system2["positions"],
             system2["velocities"],
             system2["cells"],
             system2["cell_velocities"],
             dt,
+            positions_out,
             device=device,
         )
 
@@ -681,6 +692,7 @@ class TestMutatingNonMutatingConsistency:
         )
 
         # Non-mutating
+        velocities_out = wp.empty_like(system2["velocities"])
         velocities_out = npt_velocity_half_step_out(
             system2["velocities"],
             system2["masses"],
@@ -690,6 +702,7 @@ class TestMutatingNonMutatingConsistency:
             system2["eta_dot"],
             system2["num_atoms"],
             dt,
+            velocities_out,
             device=device,
         )
 
@@ -1429,6 +1442,7 @@ class TestAnisotropicVelocityUpdate:
         """Test that non-mutating anisotropic NPT velocity update runs."""
         system = setup_aniso_system(10, dtype, device)
 
+        vel_out = wp.empty_like(system["velocities"])
         vel_out = npt_velocity_half_step_out(
             system["velocities"],
             system["masses"],
@@ -1437,7 +1451,8 @@ class TestAnisotropicVelocityUpdate:
             system["volumes"],
             system["eta_dot"],
             system["num_atoms"],
-            dt=0.001,
+            0.001,
+            vel_out,
             mode="anisotropic",  # Use mode parameter
             device=device,
         )
@@ -1450,6 +1465,7 @@ class TestAnisotropicVelocityUpdate:
         """Test that non-mutating anisotropic NPH velocity update runs."""
         system = setup_aniso_system(10, dtype, device)
 
+        vel_out = wp.empty_like(system["velocities"])
         vel_out = nph_velocity_half_step_out(
             system["velocities"],
             system["masses"],
@@ -1457,7 +1473,8 @@ class TestAnisotropicVelocityUpdate:
             system["cell_velocities"],
             system["volumes"],
             system["num_atoms"],
-            dt=0.001,
+            0.001,
+            vel_out,
             mode="anisotropic",  # Use mode parameter
             device=device,
         )
@@ -1694,6 +1711,7 @@ class TestTriclinicVelocityCoupling:
         system = self.setup_triclinic_system(20, dtype, device)
         vel_orig = system["velocities"].numpy().copy()
 
+        vel_out = wp.empty_like(system["velocities"])
         vel_out = npt_velocity_half_step_out(
             system["velocities"],
             system["masses"],
@@ -1701,8 +1719,9 @@ class TestTriclinicVelocityCoupling:
             system["cell_velocities"],
             system["volumes"],
             system["eta_dots"],
-            num_atoms=system["num_atoms"],
-            dt=0.001,
+            system["num_atoms"],
+            0.001,
+            vel_out,
             cells_inv=system["cells_inv"],
             mode="triclinic",
             device=device,
@@ -1735,14 +1754,16 @@ class TestTriclinicVelocityCoupling:
         system = self.setup_triclinic_system(20, dtype, device)
         vel_orig = system["velocities"].numpy().copy()
 
+        vel_out = wp.empty_like(system["velocities"])
         vel_out = nph_velocity_half_step_out(
             system["velocities"],
             system["masses"],
             system["forces"],
             system["cell_velocities"],
             system["volumes"],
-            num_atoms=system["num_atoms"],
-            dt=0.001,
+            system["num_atoms"],
+            0.001,
+            vel_out,
             cells_inv=system["cells_inv"],
             mode="triclinic",
             device=device,
@@ -2268,6 +2289,7 @@ class TestNPTDeviceInference:
         eta_dots = wp.zeros((num_systems, 3), dtype=scalar_dtype, device=device)
         num_atoms_per_system = wp.array([10, 10], dtype=wp.int32, device=device)
 
+        result = wp.empty_like(velocities)
         result = npt_velocity_half_step_out(
             velocities,
             masses,
@@ -2275,8 +2297,9 @@ class TestNPTDeviceInference:
             cell_velocities,
             volumes,
             eta_dots,
-            num_atoms=10,
-            dt=0.001,
+            10,
+            0.001,
+            result,
             batch_idx=batch_idx,
             num_atoms_per_system=num_atoms_per_system,
             cells_inv=cells_inv,
@@ -2318,14 +2341,16 @@ class TestNPTDeviceInference:
         volumes = wp.array([1000.0] * num_systems, dtype=scalar_dtype, device=device)
         num_atoms_per_system = wp.array([10, 10], dtype=wp.int32, device=device)
 
+        result = wp.empty_like(velocities)
         result = nph_velocity_half_step_out(
             velocities,
             masses,
             forces,
             cell_velocities,
             volumes,
-            num_atoms=10,
-            dt=0.001,
+            10,
+            0.001,
+            result,
             batch_idx=batch_idx,
             num_atoms_per_system=num_atoms_per_system,
             cells_inv=cells_inv,
@@ -2617,13 +2642,15 @@ class TestNPTCoverageExtras:
         cells = make_cells_batch(cells_np, "float32", device)
         cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
 
-        # Don't pre-allocate output
+        # Pre-allocate output
+        result = wp.empty_like(positions)
         result = npt_position_update_out(
             positions,
             velocities,
             cells,
             cell_velocities,
-            dt=0.001,
+            0.001,
+            result,
             batch_idx=batch_idx,
             device=device,
         )
@@ -2654,13 +2681,15 @@ class TestNPTCoverageExtras:
         cells = make_cells_batch(cells_np, "float32", device)
         cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
 
-        # Don't pre-allocate output
+        # Pre-allocate output
+        result = wp.empty_like(positions)
         result = nph_position_update_out(
             positions,
             velocities,
             cells,
             cell_velocities,
-            dt=0.001,
+            0.001,
+            result,
             batch_idx=batch_idx,
             device=device,
         )
@@ -2837,7 +2866,8 @@ class TestAdditionalCoverage:
         cell_velocities = wp.zeros(num_systems, dtype=wp.mat33f, device=device)
 
         # Don't pass device
-        result = npt_cell_update_out(cells, cell_velocities, dt=0.001)
+        result = wp.empty_like(cells)
+        result = npt_cell_update_out(cells, cell_velocities, 0.001, result)
 
         wp.synchronize_device(device)
         assert result.shape[0] == num_systems

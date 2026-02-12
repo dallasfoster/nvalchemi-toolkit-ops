@@ -92,8 +92,13 @@ from typing import Any
 
 import warp as wp
 
-from ..utils.kernel_functions import (
-    scale_vector_by_scalar,
+from ..utils.launch_helpers import (
+    ExecutionMode,
+    KernelFamily,
+    launch_family,
+    register_overloads,
+    resolve_execution_mode,
+    validate_out_array,
 )
 
 __all__ = [
@@ -280,51 +285,59 @@ def _velocity_rescale_ptr_out_kernel(
 # Kernel Overloads for Explicit Typing
 # ==============================================================================
 
-_T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]  # Vector types
+# In-place kernel overloads keyed by vec_dtype
+_rescale_inplace_overloads = {
+    v: KernelFamily(
+        single=register_overloads(
+            _velocity_rescale_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_velocity_rescale_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _velocity_rescale_ptr_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
-_velocity_rescale_kernel_overload = {}
-_velocity_rescale_out_kernel_overload = {}
-_batch_velocity_rescale_kernel_overload = {}
-_batch_velocity_rescale_out_kernel_overload = {}
-_velocity_rescale_ptr_kernel_overload = {}
-_velocity_rescale_ptr_out_kernel_overload = {}
-
-for t, v in zip(_T, _V):
-    _velocity_rescale_kernel_overload[v] = wp.overload(
-        _velocity_rescale_kernel,
-        [wp.array(dtype=v), wp.array(dtype=t)],
+# Non-mutating (out) kernel overloads keyed by vec_dtype
+_rescale_out_overloads = {
+    v: KernelFamily(
+        single=register_overloads(
+            _velocity_rescale_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_velocity_rescale_out_kernel,
+            lambda v_, t: [
+                wp.array(dtype=v_),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+                wp.array(dtype=v_),
+            ],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _velocity_rescale_ptr_out_kernel,
+            lambda v_, t: [
+                wp.array(dtype=v_),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+                wp.array(dtype=v_),
+            ],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _velocity_rescale_out_kernel_overload[v] = wp.overload(
-        _velocity_rescale_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v)],
-    )
-    _batch_velocity_rescale_kernel_overload[v] = wp.overload(
-        _batch_velocity_rescale_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=t)],
-    )
-    _batch_velocity_rescale_out_kernel_overload[v] = wp.overload(
-        _batch_velocity_rescale_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _velocity_rescale_ptr_kernel_overload[v] = wp.overload(
-        _velocity_rescale_ptr_kernel,
-        [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=t)],
-    )
-    _velocity_rescale_ptr_out_kernel_overload[v] = wp.overload(
-        _velocity_rescale_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
 
 # ==============================================================================
@@ -401,46 +414,35 @@ def velocity_rescale(
     >>> # Apply rescaling
     >>> velocity_rescale(velocities, scale)
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
     vec_dtype = velocities.dtype
+    family = _rescale_inplace_overloads[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _velocity_rescale_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, atom_ptr, scale_factor],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_velocity_rescale_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, batch_idx, scale_factor],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _velocity_rescale_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, scale_factor],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, scale_factor],
+        inputs_batch=[velocities, batch_idx, scale_factor],
+        inputs_ptr=[velocities, atom_ptr, scale_factor],
+        device=device,
+    )
 
 
 def velocity_rescale_out(
     velocities: wp.array,
     scale_factor: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -454,8 +456,9 @@ def velocity_rescale_out(
         Atomic velocities. Shape (N,).
     scale_factor : wp.array
         Scaling factor(s). Shape (1,) for single system, (B,) for batched.
-    velocities_out : wp.array, optional
-        Output array. If None, allocated internally.
+    velocities_out : wp.array
+        Pre-allocated output array.  Must match ``velocities`` in shape,
+        dtype, and device.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -466,45 +469,32 @@ def velocity_rescale_out(
     Returns
     -------
     wp.array
-        Rescaled velocities.
+        Rescaled velocities (same object as ``velocities_out``).
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+
+    validate_out_array(velocities_out, velocities, "velocities_out")
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
-
-    if velocities_out is None:
-        velocities_out = wp.empty_like(velocities)
-
     vec_dtype = velocities.dtype
+    family = _rescale_out_overloads[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _velocity_rescale_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, atom_ptr, scale_factor, velocities_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_velocity_rescale_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, batch_idx, scale_factor, velocities_out],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _velocity_rescale_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, scale_factor, velocities_out],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, scale_factor, velocities_out],
+        inputs_batch=[velocities, batch_idx, scale_factor, velocities_out],
+        inputs_ptr=[velocities, atom_ptr, scale_factor, velocities_out],
+        device=device,
+    )
 
     return velocities_out

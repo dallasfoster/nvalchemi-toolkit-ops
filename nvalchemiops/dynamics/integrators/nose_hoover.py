@@ -75,12 +75,13 @@ from typing import Any
 
 import warp as wp
 
-from ...segment_ops import _compute_ept
-from ..utils.kernel_functions import (
-    compute_acceleration_from_force,
-    position_update_from_velocity,
-    scale_vector_by_scalar,
-    velocity_half_step_from_acceleration,
+from ..utils.launch_helpers import (
+    ExecutionMode,
+    KernelFamily,
+    launch_family,
+    register_overloads,
+    resolve_execution_mode,
+    validate_out_array,
 )
 
 __all__ = [
@@ -1239,22 +1240,6 @@ _batch_scale_velocities_kernel_overload = {}
 _scale_velocities_out_kernel_overload = {}
 _batch_scale_velocities_out_kernel_overload = {}
 
-# Velocity half-step kernel overloads
-_nhc_velocity_half_step_kernel_overload = {}
-_batch_nhc_velocity_half_step_kernel_overload = {}
-_nhc_velocity_half_step_ptr_kernel_overload = {}
-_nhc_velocity_half_step_out_kernel_overload = {}
-_batch_nhc_velocity_half_step_out_kernel_overload = {}
-_nhc_velocity_half_step_ptr_out_kernel_overload = {}
-
-# Position update kernel overloads
-_nhc_position_update_kernel_overload = {}
-_batch_nhc_position_update_kernel_overload = {}
-_nhc_position_update_ptr_kernel_overload = {}
-_nhc_position_update_out_kernel_overload = {}
-_batch_nhc_position_update_out_kernel_overload = {}
-_nhc_position_update_ptr_out_kernel_overload = {}
-
 # Compute masses kernel overloads (keyed by scalar type)
 _nhc_compute_masses_kernel_overload = {}
 _batch_nhc_compute_masses_kernel_overload = {}
@@ -1318,112 +1303,106 @@ for v in _V:
             ],
         )
 
-for t, v in zip(_T, _V):
-    # Velocity half-step kernels (keyed by vector type)
-    _nhc_velocity_half_step_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
+# Velocity half-step (inplace) -- keyed by vec_dtype
+_velocity_half_step_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _nhc_velocity_half_step_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_nhc_velocity_half_step_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _nhc_velocity_half_step_ptr_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _batch_nhc_velocity_half_step_kernel_overload[v] = wp.overload(
-        _batch_nhc_velocity_half_step_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_velocity_half_step_out_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _batch_nhc_velocity_half_step_out_kernel_overload[v] = wp.overload(
-        _batch_nhc_velocity_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _nhc_velocity_half_step_ptr_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_velocity_half_step_ptr_out_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
-    # Position update kernels (keyed by vector type)
-    _nhc_position_update_kernel_overload[v] = wp.overload(
-        _nhc_position_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t)],
+# Velocity half-step (out) -- keyed by vec_dtype
+_velocity_half_step_out_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _nhc_velocity_half_step_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_nhc_velocity_half_step_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32),
+                           wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _nhc_velocity_half_step_ptr_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32),
+                           wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _batch_nhc_position_update_kernel_overload[v] = wp.overload(
-        _batch_nhc_position_update_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
+
+# Position update (inplace) -- keyed by vec_dtype
+_position_update_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _nhc_position_update_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_nhc_position_update_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _nhc_position_update_ptr_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _nhc_position_update_out_kernel_overload[v] = wp.overload(
-        _nhc_position_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v)],
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
+
+# Position update (out) -- keyed by vec_dtype
+_position_update_out_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _nhc_position_update_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_nhc_position_update_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _nhc_position_update_ptr_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=wp.int32), wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _batch_nhc_position_update_out_kernel_overload[v] = wp.overload(
-        _batch_nhc_position_update_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _nhc_position_update_ptr_kernel_overload[v] = wp.overload(
-        _nhc_position_update_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_position_update_ptr_out_kernel_overload[v] = wp.overload(
-        _nhc_position_update_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
 # NHC chain propagation kernels - keyed by scalar type
 _nhc_chain_propagate_single_kernel_overload = {}
@@ -1793,9 +1772,9 @@ def nhc_thermostat_chain_update_out(
     target_temp: wp.array,
     dt: wp.array,
     ndof: wp.array,
-    velocities_out: wp.array = None,
-    eta_out: wp.array = None,
-    eta_dot_out: wp.array = None,
+    velocities_out: wp.array,
+    eta_out: wp.array,
+    eta_dot_out: wp.array,
     nloops: int = 1,
     batch_idx: wp.array = None,
     num_systems: int = 1,
@@ -1822,12 +1801,12 @@ def nhc_thermostat_chain_update_out(
         Time step. Shape (1,) or (B,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
-    velocities_out : wp.array, optional
-        Output velocities. If None, allocated internally.
-    eta_out : wp.array, optional
-        Output eta. If None, allocated internally.
-    eta_dot_out : wp.array, optional
-        Output eta_dot. If None, allocated internally.
+    velocities_out : wp.array
+        Output velocities. Must be pre-allocated with same shape/dtype/device as velocities.
+    eta_out : wp.array
+        Output eta. Must be pre-allocated with same shape/dtype/device as eta.
+    eta_dot_out : wp.array
+        Output eta_dot. Must be pre-allocated with same shape/dtype/device as eta_dot.
     nloops : int, optional
         Number of Yoshida-Suzuki integration sub-steps. Default: 1.
     batch_idx : wp.array(dtype=wp.int32), optional
@@ -1844,16 +1823,6 @@ def nhc_thermostat_chain_update_out(
     """
     if device is None:
         device = velocities.device
-
-    num_atoms = velocities.shape[0]
-
-    # Allocate outputs if needed
-    if velocities_out is None:
-        velocities_out = wp.zeros(num_atoms, dtype=velocities.dtype, device=device)
-    if eta_out is None:
-        eta_out = wp.zeros_like(eta)
-    if eta_dot_out is None:
-        eta_dot_out = wp.zeros_like(eta_dot)
 
     # Copy inputs to outputs
     wp.copy(velocities_out, velocities)
@@ -1910,40 +1879,29 @@ def nhc_velocity_half_step(
     device : str, optional
         Warp device. If None, inferred from velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
     vec_dtype = velocities.dtype
+    family = _velocity_half_step_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_velocity_half_step_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces, masses, atom_ptr, dt],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_velocity_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, batch_idx, dt],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_velocity_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, dt],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, forces, masses, dt],
+        inputs_batch=[velocities, forces, masses, batch_idx, dt],
+        inputs_ptr=[velocities, forces, masses, atom_ptr, dt],
+        device=device,
+    )
 
 
 def nhc_velocity_half_step_out(
@@ -1951,7 +1909,7 @@ def nhc_velocity_half_step_out(
     forces: wp.array,
     masses: wp.array,
     dt: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -1969,8 +1927,8 @@ def nhc_velocity_half_step_out(
         Atomic masses. Shape (N,).
     dt : wp.array(dtype=wp.float32 or wp.float64)
         Time step. Shape (1,) or (B,).
-    velocities_out : wp.array, optional
-        Output velocities. If None, allocated internally.
+    velocities_out : wp.array
+        Output velocities. Must be pre-allocated with same shape/dtype/device as velocities.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1983,44 +1941,30 @@ def nhc_velocity_half_step_out(
     wp.array
         Updated velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+    validate_out_array(velocities_out, velocities, "velocities_out")
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
-
-    if velocities_out is None:
-        velocities_out = wp.zeros(num_atoms, dtype=velocities.dtype, device=device)
-
     vec_dtype = velocities.dtype
+    family = _velocity_half_step_out_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_velocity_half_step_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces, masses, atom_ptr, dt, velocities_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_velocity_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, batch_idx, dt, velocities_out],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_velocity_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, dt, velocities_out],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, forces, masses, dt, velocities_out],
+        inputs_batch=[velocities, forces, masses, batch_idx, dt, velocities_out],
+        inputs_ptr=[velocities, forces, masses, atom_ptr, dt, velocities_out],
+        device=device,
+    )
 
     return velocities_out
 
@@ -2053,47 +1997,36 @@ def nhc_position_update(
     device : str, optional
         Warp device. If None, inferred from positions.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     if device is None:
         device = positions.device
 
     num_atoms = positions.shape[0]
     vec_dtype = positions.dtype
+    family = _position_update_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_position_update_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[positions, velocities, atom_ptr, dt],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_position_update_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, batch_idx, dt],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_position_update_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, dt],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[positions, velocities, dt],
+        inputs_batch=[positions, velocities, batch_idx, dt],
+        inputs_ptr=[positions, velocities, atom_ptr, dt],
+        device=device,
+    )
 
 
 def nhc_position_update_out(
     positions: wp.array,
     velocities: wp.array,
     dt: wp.array,
-    positions_out: wp.array = None,
+    positions_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -2109,8 +2042,8 @@ def nhc_position_update_out(
         Atomic velocities. Shape (N,).
     dt : wp.array(dtype=wp.float32 or wp.float64)
         Time step. Shape (1,) or (B,).
-    positions_out : wp.array, optional
-        Output positions. If None, allocated internally.
+    positions_out : wp.array
+        Output positions. Must be pre-allocated with same shape/dtype/device as positions.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -2123,44 +2056,30 @@ def nhc_position_update_out(
     wp.array
         Updated positions.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+    validate_out_array(positions_out, positions, "positions_out")
 
     if device is None:
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if positions_out is None:
-        positions_out = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-
     vec_dtype = positions.dtype
+    family = _position_update_out_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_position_update_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[positions, velocities, atom_ptr, dt, positions_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_position_update_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, batch_idx, dt, positions_out],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_position_update_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, dt, positions_out],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[positions, velocities, dt, positions_out],
+        inputs_batch=[positions, velocities, batch_idx, dt, positions_out],
+        inputs_ptr=[positions, velocities, atom_ptr, dt, positions_out],
+        device=device,
+    )
 
     return positions_out
 

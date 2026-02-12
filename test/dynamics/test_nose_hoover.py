@@ -262,7 +262,8 @@ class TestNHCAPI:
         )
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
-        vel_out = nhc_velocity_half_step_out(velocities, forces, masses, dt)
+        velocities_out = wp.empty_like(velocities)
+        vel_out = nhc_velocity_half_step_out(velocities, forces, masses, dt, velocities_out)
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(velocities.numpy(), vel_np)
@@ -308,7 +309,8 @@ class TestNHCAPI:
         )
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
-        pos_out = nhc_position_update_out(positions, velocities, dt)
+        positions_out = wp.empty_like(positions)
+        pos_out = nhc_position_update_out(positions, velocities, dt, positions_out)
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(positions.numpy(), pos_np)
@@ -396,6 +398,9 @@ class TestNHCAPI:
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
+        velocities_out = wp.empty_like(velocities)
+        eta_out_arr = wp.zeros_like(eta)
+        eta_dot_out_arr = wp.zeros_like(eta_dot)
         vel_out, eta_out, eta_dot_out = nhc_thermostat_chain_update_out(
             velocities,
             masses,
@@ -405,6 +410,9 @@ class TestNHCAPI:
             target_temp_arr,
             dt,
             ndof_arr,
+            velocities_out,
+            eta_out_arr,
+            eta_dot_out_arr,
             device=device,
         )
         wp.synchronize_device(device)
@@ -511,13 +519,13 @@ class TestNHCAPI:
         velocities_out = wp.empty_like(velocities)
 
         nhc_position_update_out(
-            positions, velocities, dt, positions_out=positions_out, device=device
+            positions, velocities, dt, positions_out, device=device
         )
 
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.ones(num_atoms, dtype=dtype_scalar, device=device)
         nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, velocities_out=velocities_out, device=device
+            velocities, forces, masses, dt, velocities_out, device=device
         )
 
         wp.synchronize_device(device)
@@ -588,8 +596,9 @@ class TestNHCBatched:
         batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
+        velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, batch_idx=batch_idx, device=device
+            velocities, forces, masses, dt, velocities_out, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -648,8 +657,9 @@ class TestNHCBatched:
         batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
+        positions_out = wp.empty_like(positions)
         pos_out = nhc_position_update_out(
-            positions, velocities, dt, batch_idx=batch_idx, device=device
+            positions, velocities, dt, positions_out, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -1254,8 +1264,9 @@ class TestNHCAtomPtr:
 
         vel_orig = velocities.numpy().copy()
 
+        velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, atom_ptr=atom_ptr, device=device
+            velocities, forces, masses, dt, velocities_out, atom_ptr=atom_ptr, device=device
         )
 
         wp.synchronize_device(device)
@@ -1293,8 +1304,9 @@ class TestNHCAtomPtr:
 
         pos_orig = positions.numpy().copy()
 
+        positions_out = wp.empty_like(positions)
         pos_out = nhc_position_update_out(
-            positions, velocities, dt, atom_ptr=atom_ptr, device=device
+            positions, velocities, dt, positions_out, atom_ptr=atom_ptr, device=device
         )
 
         wp.synchronize_device(device)

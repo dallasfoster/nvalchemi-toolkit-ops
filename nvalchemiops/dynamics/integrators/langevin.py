@@ -102,10 +102,13 @@ from typing import Any
 
 import warp as wp
 
-from ..utils.kernel_functions import (
-    compute_acceleration_from_force,
-    position_update_from_velocity,
-    velocity_half_step_from_acceleration,
+from ..utils.launch_helpers import (
+    ExecutionMode,
+    KernelFamily,
+    launch_family,
+    register_overloads,
+    resolve_execution_mode,
+    validate_out_array,
 )
 
 __all__ = [
@@ -1037,176 +1040,119 @@ def _langevin_baoab_finalize_ptr_out_kernel(
 
 
 # ==============================================================================
-# Kernel Overloads for Explicit Typing
+# Kernel Overloads via KernelFamily
 # ==============================================================================
 
-_T = [wp.float32, wp.float64]  # Scalar types
-_V = [wp.vec3f, wp.vec3d]  # Vector types
+# Half-step (inplace) -- keyed by vec_dtype
+_half_step_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _langevin_baoab_half_step_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.uint64],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_langevin_baoab_half_step_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.uint64],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _langevin_baoab_half_step_ptr_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.uint64],
+            dtype_pairs=((v, t),),
+        )[v],
+    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
-# Half-step kernel overloads
-_langevin_baoab_half_step_kernel_overload = {}
-_batch_langevin_baoab_half_step_kernel_overload = {}
-_langevin_baoab_half_step_ptr_kernel_overload = {}
-_langevin_baoab_half_step_out_kernel_overload = {}
-_batch_langevin_baoab_half_step_out_kernel_overload = {}
-_langevin_baoab_half_step_ptr_out_kernel_overload = {}
+# Half-step (out) -- keyed by vec_dtype
+_half_step_out_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _langevin_baoab_half_step_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.uint64,
+                           wp.array(dtype=v_), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_langevin_baoab_half_step_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.uint64,
+                           wp.array(dtype=v_), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _langevin_baoab_half_step_ptr_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.uint64,
+                           wp.array(dtype=v_), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
-# Finalize kernel overloads
-_langevin_baoab_finalize_kernel_overload = {}
-_batch_langevin_baoab_finalize_kernel_overload = {}
-_langevin_baoab_finalize_ptr_kernel_overload = {}
-_langevin_baoab_finalize_out_kernel_overload = {}
-_batch_langevin_baoab_finalize_out_kernel_overload = {}
-_langevin_baoab_finalize_ptr_out_kernel_overload = {}
+# Finalize (inplace) -- keyed by vec_dtype
+_finalize_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _langevin_baoab_finalize_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_langevin_baoab_finalize_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _langevin_baoab_finalize_ptr_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+            dtype_pairs=((v, t),),
+        )[v],
+    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
-for t, v in zip(_T, _V):
-    # Half-step kernels
-    _langevin_baoab_half_step_kernel_overload[v] = wp.overload(
-        _langevin_baoab_half_step_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-        ],
+# Finalize (out) -- keyed by vec_dtype
+_finalize_out_families = {
+    v: KernelFamily(
+        single=register_overloads(
+            _langevin_baoab_finalize_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        batch_idx=register_overloads(
+            _batch_langevin_baoab_finalize_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32),
+                           wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
+        atom_ptr=register_overloads(
+            _langevin_baoab_finalize_ptr_out_kernel,
+            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=v_),
+                           wp.array(dtype=t), wp.array(dtype=wp.int32),
+                           wp.array(dtype=t), wp.array(dtype=v_)],
+            dtype_pairs=((v, t),),
+        )[v],
     )
-    _batch_langevin_baoab_half_step_kernel_overload[v] = wp.overload(
-        _batch_langevin_baoab_half_step_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-        ],
-    )
-    _langevin_baoab_half_step_out_kernel_overload[v] = wp.overload(
-        _langevin_baoab_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-        ],
-    )
-    _batch_langevin_baoab_half_step_out_kernel_overload[v] = wp.overload(
-        _batch_langevin_baoab_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-        ],
-    )
-    _langevin_baoab_half_step_ptr_kernel_overload[v] = wp.overload(
-        _langevin_baoab_half_step_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-        ],
-    )
-    _langevin_baoab_half_step_ptr_out_kernel_overload[v] = wp.overload(
-        _langevin_baoab_half_step_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.uint64,
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-        ],
-    )
-
-    # Finalize kernels
-    _langevin_baoab_finalize_kernel_overload[v] = wp.overload(
-        _langevin_baoab_finalize_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
-    )
-    _batch_langevin_baoab_finalize_kernel_overload[v] = wp.overload(
-        _batch_langevin_baoab_finalize_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _langevin_baoab_finalize_out_kernel_overload[v] = wp.overload(
-        _langevin_baoab_finalize_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _batch_langevin_baoab_finalize_out_kernel_overload[v] = wp.overload(
-        _batch_langevin_baoab_finalize_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _langevin_baoab_finalize_ptr_kernel_overload[v] = wp.overload(
-        _langevin_baoab_finalize_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _langevin_baoab_finalize_ptr_out_kernel_overload[v] = wp.overload(
-        _langevin_baoab_finalize_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
+    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
+}
 
 
 # ==============================================================================
@@ -1316,69 +1262,33 @@ def langevin_baoab_half_step(
     --------
     langevin_baoab_finalize : Complete the BAOAB step
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     if device is None:
         device = positions.device
 
     num_atoms = positions.shape[0]
     vec_dtype = positions.dtype
+    family = _half_step_families[vec_dtype]
+    seed = wp.uint64(random_seed)
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _langevin_baoab_half_step_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                atom_ptr,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-            ],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_langevin_baoab_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                batch_idx,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-            ],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _langevin_baoab_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-            ],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[positions, velocities, forces, masses, dt,
+                        temperature, friction, seed],
+        inputs_batch=[positions, velocities, forces, masses, batch_idx, dt,
+                       temperature, friction, seed],
+        inputs_ptr=[positions, velocities, forces, masses, atom_ptr, dt,
+                     temperature, friction, seed],
+        device=device,
+    )
 
 
 def langevin_baoab_finalize(
@@ -1413,40 +1323,29 @@ def langevin_baoab_finalize(
     device : str, optional
         Warp device. If None, inferred from velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
     vec_dtype = velocities.dtype
+    family = _finalize_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _langevin_baoab_finalize_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces_new, masses, atom_ptr, dt],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_langevin_baoab_finalize_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces_new, masses, batch_idx, dt],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _langevin_baoab_finalize_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces_new, masses, dt],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, forces_new, masses, dt],
+        inputs_batch=[velocities, forces_new, masses, batch_idx, dt],
+        inputs_ptr=[velocities, forces_new, masses, atom_ptr, dt],
+        device=device,
+    )
 
 
 # ==============================================================================
@@ -1463,8 +1362,8 @@ def langevin_baoab_half_step_out(
     temperature: wp.array,
     friction: wp.array,
     random_seed: int,
-    positions_out: wp.array = None,
-    velocities_out: wp.array = None,
+    positions_out: wp.array,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -1493,10 +1392,12 @@ def langevin_baoab_half_step_out(
         Friction coefficient. Shape (1,) for single, (B,) for batched.
     random_seed : int
         Random seed for stochastic forces.
-    positions_out : wp.array, optional
-        Output array for new positions. If None, allocated internally.
-    velocities_out : wp.array, optional
-        Output array for new velocities. If None, allocated internally.
+    positions_out : wp.array
+        Pre-allocated output array for new positions.  Must match
+        ``positions`` in shape, dtype, and device.
+    velocities_out : wp.array
+        Pre-allocated output array for new velocities.  Must match
+        ``velocities`` in shape, dtype, and device.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1509,81 +1410,39 @@ def langevin_baoab_half_step_out(
     tuple[wp.array, wp.array]
         (positions_out, velocities_out) - New positions and velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+
+    validate_out_array(positions_out, positions, "positions_out")
+    validate_out_array(velocities_out, velocities, "velocities_out")
 
     if device is None:
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if positions_out is None:
-        positions_out = wp.empty_like(positions)
-    if velocities_out is None:
-        velocities_out = wp.empty_like(velocities)
-
     vec_dtype = positions.dtype
+    family = _half_step_out_families[vec_dtype]
+    seed = wp.uint64(random_seed)
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _langevin_baoab_half_step_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                atom_ptr,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-                positions_out,
-                velocities_out,
-            ],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_langevin_baoab_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                batch_idx,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-                positions_out,
-                velocities_out,
-            ],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _langevin_baoab_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[
-                positions,
-                velocities,
-                forces,
-                masses,
-                dt,
-                temperature,
-                friction,
-                wp.uint64(random_seed),
-                positions_out,
-                velocities_out,
-            ],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[positions, velocities, forces, masses, dt,
+                        temperature, friction, seed,
+                        positions_out, velocities_out],
+        inputs_batch=[positions, velocities, forces, masses, batch_idx, dt,
+                       temperature, friction, seed,
+                       positions_out, velocities_out],
+        inputs_ptr=[positions, velocities, forces, masses, atom_ptr, dt,
+                     temperature, friction, seed,
+                     positions_out, velocities_out],
+        device=device,
+    )
 
     return positions_out, velocities_out
 
@@ -1593,7 +1452,7 @@ def langevin_baoab_finalize_out(
     forces_new: wp.array,
     masses: wp.array,
     dt: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -1614,8 +1473,9 @@ def langevin_baoab_finalize_out(
         Atomic masses. Shape (N,).
     dt : wp.array
         Timestep(s). Shape (1,) for single, (B,) for batched.
-    velocities_out : wp.array, optional
-        Output array for final velocities. If None, allocated internally.
+    velocities_out : wp.array
+        Pre-allocated output array for final velocities.  Must match
+        ``velocities`` in shape, dtype, and device.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1628,43 +1488,30 @@ def langevin_baoab_finalize_out(
     wp.array
         Full-step velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+
+    validate_out_array(velocities_out, velocities, "velocities_out")
 
     if device is None:
         device = velocities.device
 
     num_atoms = velocities.shape[0]
-
-    if velocities_out is None:
-        velocities_out = wp.empty_like(velocities)
-
     vec_dtype = velocities.dtype
+    family = _finalize_out_families[vec_dtype]
 
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _langevin_baoab_finalize_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces_new, masses, atom_ptr, dt, velocities_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_langevin_baoab_finalize_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces_new, masses, batch_idx, dt, velocities_out],
-            device=device,
-        )
+    if mode is ExecutionMode.ATOM_PTR:
+        dim = atom_ptr.shape[0] - 1  # num_systems
     else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _langevin_baoab_finalize_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces_new, masses, dt, velocities_out],
-            device=device,
-        )
+        dim = num_atoms
+
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=[velocities, forces_new, masses, dt, velocities_out],
+        inputs_batch=[velocities, forces_new, masses, batch_idx, dt, velocities_out],
+        inputs_ptr=[velocities, forces_new, masses, atom_ptr, dt, velocities_out],
+        device=device,
+    )
 
     return velocities_out
