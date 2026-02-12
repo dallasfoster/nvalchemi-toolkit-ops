@@ -542,38 +542,65 @@ _segmented_sum_overloads = {}
 for _t in _SUPPORTED_TYPES:
     _segmented_sum_overloads[_t] = wp.overload(
         _segmented_sum_kernel,
-        [wp.array(dtype=_t), wp.array(dtype=wp.int32), wp.array(dtype=_t),
-         wp.int32, wp.int32],
+        [
+            wp.array(dtype=_t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_t),
+            wp.int32,
+            wp.int32,
+        ],
     )
 
 _segmented_component_sum_overloads = {}
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_component_sum_overloads[_v] = wp.overload(
         _segmented_component_sum_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=wp.int32), wp.array(dtype=_s),
-         wp.int32, wp.int32],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 
 _segmented_dot_overloads = {}
 for _s in _SCALAR_TYPES:
     _segmented_dot_overloads[_s] = wp.overload(
         _segmented_dot_scalar_kernel,
-        [wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=wp.int32),
-         wp.array(dtype=_s), wp.int32, wp.int32],
+        [
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_dot_overloads[_v] = wp.overload(
         _segmented_dot_vec_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_v), wp.array(dtype=wp.int32),
-         wp.array(dtype=_s), wp.int32, wp.int32],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 
 _segmented_max_norm_overloads = {}
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_max_norm_overloads[_v] = wp.overload(
         _segmented_max_norm_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=wp.int32), wp.array(dtype=_s),
-         wp.int32, wp.int32],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 
 _total_max_norm_overloads = {}
@@ -587,66 +614,112 @@ _segmented_axpy_overloads = {}
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_axpy_overloads[_v] = wp.overload(
         _segmented_axpy_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_v), wp.array(dtype=_s),
-         wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_v),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+        ],
     )
 for _s in _SCALAR_TYPES:
     _segmented_axpy_overloads[_s] = wp.overload(
         _segmented_axpy_kernel,
-        [wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=_s),
-         wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+        ],
     )
 
 _segmented_inner_products_overloads = {}
 for _s in _SCALAR_TYPES:
     _segmented_inner_products_overloads[_s] = wp.overload(
         _segmented_inner_products_scalar_kernel,
-        [wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=wp.int32),
-         wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=_s),
-         wp.int32, wp.int32],
+        [
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_inner_products_overloads[_v] = wp.overload(
         _segmented_inner_products_vec_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_v), wp.array(dtype=wp.int32),
-         wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=_s),
-         wp.int32, wp.int32],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.int32,
+            wp.int32,
+        ],
     )
 
 _segmented_axpby_overloads = {}
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_axpby_overloads[_v] = wp.overload(
         _segmented_axpby_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_s), wp.array(dtype=_v),
-         wp.array(dtype=_s), wp.array(dtype=_v), wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_s),
+            wp.array(dtype=_v),
+            wp.array(dtype=_s),
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.int32),
+        ],
     )
 for _s in _SCALAR_TYPES:
     _segmented_axpby_overloads[_s] = wp.overload(
         _segmented_axpby_kernel,
-        [wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=_s),
-         wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=wp.int32)],
+        [
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+        ],
     )
 
 _segmented_mul_overloads = {}
 for _s in _SCALAR_TYPES:
     _segmented_mul_overloads[(_s, _s)] = wp.overload(
         _segmented_mul_kernel,
-        [wp.array(dtype=_s), wp.array(dtype=_s), wp.array(dtype=wp.int32),
-         wp.array(dtype=_s)],
+        [
+            wp.array(dtype=_s),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_s),
+        ],
     )
 for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
     _segmented_mul_overloads[(_v, _s)] = wp.overload(
         _segmented_mul_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_s), wp.array(dtype=wp.int32),
-         wp.array(dtype=_v)],
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_s),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_v),
+        ],
     )
 
 _segmented_add_overloads = {}
 for _t in _SUPPORTED_TYPES:
     _segmented_add_overloads[(_t, _t)] = wp.overload(
         _segmented_add_kernel,
-        [wp.array(dtype=_t), wp.array(dtype=_t), wp.array(dtype=wp.int32),
-         wp.array(dtype=_t)],
+        [
+            wp.array(dtype=_t),
+            wp.array(dtype=_t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_t),
+        ],
     )
 _segmented_add_overloads[(wp.vec3f, wp.float32)] = _segmented_add_vec_scalar_f32_kernel
 _segmented_add_overloads[(wp.vec3d, wp.float64)] = _segmented_add_vec_scalar_f64_kernel
@@ -702,8 +775,8 @@ def segmented_sum(
         )
         remainder = N - full_blocks * _BLOCK_DIM
         if remainder > 0:
-            x_tail = x[full_blocks * _BLOCK_DIM:]
-            idx_tail = idx[full_blocks * _BLOCK_DIM:]
+            x_tail = x[full_blocks * _BLOCK_DIM :]
+            idx_tail = idx[full_blocks * _BLOCK_DIM :]
             wp.launch(
                 _segmented_sum_overloads[x.dtype],
                 dim=remainder,
