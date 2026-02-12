@@ -33,6 +33,8 @@ import warp as wp
 from nvalchemiops.dynamics.utils.launch_helpers import (
     ExecutionMode,
     KernelFamily,
+    build_family_dict,
+    dispatch_family,
     launch_family,
     register_overloads,
     resolve_execution_mode,
@@ -245,6 +247,12 @@ class TestValidateOutArray:
         with pytest.raises(ValueError, match="test_out dtype mismatch"):
             validate_out_array(out, ref, "test_out")
 
+    def test_device_mismatch(self):
+        ref = wp.zeros(10, dtype=wp.vec3f, device=DEVICE)
+        out = wp.zeros(10, dtype=wp.vec3f, device="cpu")
+        with pytest.raises(ValueError, match="test_out device mismatch"):
+            validate_out_array(out, ref, "test_out")
+
 
 # ==============================================================================
 # Tests for register_overloads
@@ -257,7 +265,7 @@ def _generic_test_kernel(
     b: wp.array(dtype=Any),
 ):
     """Generic kernel for overload registration tests."""
-    i = wp.tid()
+    _i = wp.tid()
     pass
 
 
@@ -300,3 +308,222 @@ class TestRegisterOverloads:
         )
         for key, value in overloads.items():
             assert value is not None, f"Overload for {key} is None"
+
+
+# ==============================================================================
+# Tests for dispatch_family
+# ==============================================================================
+
+
+@wp.kernel
+def _dispatch_write_kernel(
+    data: wp.array(dtype=wp.vec3f),
+    out: wp.array(dtype=wp.vec3f),
+):
+    i = wp.tid()
+    out[i] = data[i] + wp.vec3f(1.0, 1.0, 1.0)
+
+
+@wp.kernel
+def _dispatch_write_batch_kernel(
+    data: wp.array(dtype=wp.vec3f),
+    batch_idx: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=wp.vec3f),
+):
+    i = wp.tid()
+    out[i] = data[i] + wp.vec3f(2.0, 2.0, 2.0)
+
+
+@wp.kernel
+def _dispatch_write_ptr_kernel(
+    data: wp.array(dtype=wp.vec3f),
+    atom_ptr: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=wp.vec3f),
+):
+    sys_id = wp.tid()
+    start = atom_ptr[sys_id]
+    end = atom_ptr[sys_id + 1]
+    for i in range(start, end):
+        out[i] = data[i] + wp.vec3f(3.0, 3.0, 3.0)
+
+
+_dispatch_test_families = {
+    wp.vec3f: KernelFamily(
+        single=_dispatch_write_kernel,
+        batch_idx=_dispatch_write_batch_kernel,
+        atom_ptr=_dispatch_write_ptr_kernel,
+    ),
+}
+
+
+class TestDispatchFamily:
+    """End-to-end tests for dispatch_family."""
+
+    def test_single_mode(self):
+        data = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        out = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        dispatch_family(
+            _dispatch_test_families,
+            data,
+            inputs_single=[data, out],
+            inputs_batch=[data, None, out],
+            inputs_ptr=[data, None, out],
+            device=DEVICE,
+        )
+        wp.synchronize_device(DEVICE)
+        result = out.numpy()
+        np.testing.assert_array_equal(result, np.full((4, 3), 1.0))
+
+    def test_batch_idx_mode(self):
+        data = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        out = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        batch_idx = wp.array([0, 0, 1, 1], dtype=wp.int32, device=DEVICE)
+        dispatch_family(
+            _dispatch_test_families,
+            data,
+            batch_idx=batch_idx,
+            inputs_single=[data, out],
+            inputs_batch=[data, batch_idx, out],
+            inputs_ptr=[data, None, out],
+            device=DEVICE,
+        )
+        wp.synchronize_device(DEVICE)
+        result = out.numpy()
+        np.testing.assert_array_equal(result, np.full((4, 3), 2.0))
+
+    def test_atom_ptr_mode(self):
+        data = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        out = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        atom_ptr = wp.array([0, 2, 4], dtype=wp.int32, device=DEVICE)
+        dispatch_family(
+            _dispatch_test_families,
+            data,
+            atom_ptr=atom_ptr,
+            inputs_single=[data, out],
+            inputs_batch=[data, None, out],
+            inputs_ptr=[data, atom_ptr, out],
+            device=DEVICE,
+        )
+        wp.synchronize_device(DEVICE)
+        result = out.numpy()
+        np.testing.assert_array_equal(result, np.full((4, 3), 3.0))
+
+    def test_device_inferred_from_primary_array(self):
+        """When device=None, dispatch_family infers from primary_array."""
+        data = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        out = wp.zeros(4, dtype=wp.vec3f, device=DEVICE)
+        dispatch_family(
+            _dispatch_test_families,
+            data,
+            device=None,
+            inputs_single=[data, out],
+        )
+        wp.synchronize_device(DEVICE)
+        result = out.numpy()
+        np.testing.assert_array_equal(result, np.full((4, 3), 1.0))
+
+    def test_unknown_dtype_raises_key_error(self):
+        """dispatch_family raises KeyError when primary dtype not in family_dict."""
+        data = wp.zeros(4, dtype=wp.vec3d, device=DEVICE)
+        out = wp.zeros(4, dtype=wp.vec3d, device=DEVICE)
+        with pytest.raises(KeyError):
+            dispatch_family(
+                _dispatch_test_families,
+                data,
+                inputs_single=[data, out],
+                device=DEVICE,
+            )
+
+
+# ==============================================================================
+# Tests for build_family_dict
+# ==============================================================================
+
+
+@wp.kernel
+def _bfd_single_kernel(a: wp.array(dtype=Any), b: wp.array(dtype=Any)):
+    pass
+
+
+@wp.kernel
+def _bfd_batch_kernel(
+    a: wp.array(dtype=Any), idx: wp.array(dtype=wp.int32), b: wp.array(dtype=Any)
+):
+    pass
+
+
+@wp.kernel
+def _bfd_ptr_kernel(
+    a: wp.array(dtype=Any), ptr: wp.array(dtype=wp.int32), b: wp.array(dtype=Any)
+):
+    pass
+
+
+class TestBuildFamilyDict:
+    """Tests for build_family_dict."""
+
+    def test_default_dtype_keys(self):
+        families = build_family_dict(
+            _bfd_single_kernel,
+            lambda v, t: [wp.array(dtype=v), wp.array(dtype=t)],
+            _bfd_batch_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+            _bfd_ptr_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+        )
+        assert wp.vec3f in families
+        assert wp.vec3d in families
+        assert len(families) == 2
+
+    def test_custom_dtype_pairs(self):
+        families = build_family_dict(
+            _bfd_single_kernel,
+            lambda v, t: [wp.array(dtype=v), wp.array(dtype=t)],
+            _bfd_batch_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+            _bfd_ptr_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+            dtype_pairs=((wp.vec3f, wp.float32),),
+        )
+        assert wp.vec3f in families
+        assert wp.vec3d not in families
+        assert len(families) == 1
+
+    def test_returns_kernel_families(self):
+        families = build_family_dict(
+            _bfd_single_kernel,
+            lambda v, t: [wp.array(dtype=v), wp.array(dtype=t)],
+            _bfd_batch_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+            _bfd_ptr_kernel,
+            lambda v, t: [
+                wp.array(dtype=v),
+                wp.array(dtype=wp.int32),
+                wp.array(dtype=t),
+            ],
+        )
+        for family in families.values():
+            assert isinstance(family, KernelFamily)
+            assert family.single is not None
+            assert family.batch_idx is not None
+            assert family.atom_ptr is not None

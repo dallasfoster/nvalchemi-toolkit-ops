@@ -672,9 +672,7 @@ class TestVelocityRescalingParity:
         batch_idx_np = np.repeat(
             np.arange(num_systems, dtype=np.int32), atoms_per_system
         )
-        atom_ptr_np = np.arange(
-            0, total_atoms + 1, atoms_per_system, dtype=np.int32
-        )
+        atom_ptr_np = np.arange(0, total_atoms + 1, atoms_per_system, dtype=np.int32)
 
         return {
             "velocities_np": velocities_np,
@@ -714,7 +712,9 @@ class TestVelocityRescalingParity:
             )
             velocity_rescale(vel_single, scale_single, device=device)
             wp.synchronize_device(device)
-            expected = data["velocities_np"][:atoms_per_system] * data["scale_factors_np"][0]
+            expected = (
+                data["velocities_np"][:atoms_per_system] * data["scale_factors_np"][0]
+            )
             np.testing.assert_allclose(vel_single.numpy(), expected, rtol=1e-5)
         elif mode == "batch_idx":
             velocity_rescale(
@@ -725,7 +725,9 @@ class TestVelocityRescalingParity:
             for s in range(num_systems):
                 start = s * atoms_per_system
                 end = start + atoms_per_system
-                expected = data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                expected = (
+                    data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                )
                 np.testing.assert_allclose(result[start:end], expected, rtol=1e-5)
         else:  # atom_ptr
             velocity_rescale(
@@ -736,7 +738,9 @@ class TestVelocityRescalingParity:
             for s in range(num_systems):
                 start = s * atoms_per_system
                 end = start + atoms_per_system
-                expected = data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                expected = (
+                    data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                )
                 np.testing.assert_allclose(result[start:end], expected, rtol=1e-5)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -765,7 +769,9 @@ class TestVelocityRescalingParity:
                 [data["scale_factors_np"][0]], dtype=dtype_scalar, device=device
             )
             vel_out = wp.empty_like(vel_single)
-            result = velocity_rescale_out(vel_single, scale_single, vel_out, device=device)
+            result = velocity_rescale_out(
+                vel_single, scale_single, vel_out, device=device
+            )
             wp.synchronize_device(device)
             # Input preserved
             np.testing.assert_allclose(
@@ -774,7 +780,9 @@ class TestVelocityRescalingParity:
                 rtol=1e-6,
             )
             # Output correct
-            expected = data["velocities_np"][:atoms_per_system] * data["scale_factors_np"][0]
+            expected = (
+                data["velocities_np"][:atoms_per_system] * data["scale_factors_np"][0]
+            )
             np.testing.assert_allclose(result.numpy(), expected, rtol=1e-5)
             assert result is vel_out
         elif mode == "batch_idx":
@@ -790,7 +798,9 @@ class TestVelocityRescalingParity:
             for s in range(num_systems):
                 start = s * atoms_per_system
                 end = start + atoms_per_system
-                expected = data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                expected = (
+                    data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                )
                 np.testing.assert_allclose(result_np[start:end], expected, rtol=1e-5)
         else:  # atom_ptr
             vel_out = wp.empty_like(velocities)
@@ -805,59 +815,10 @@ class TestVelocityRescalingParity:
             for s in range(num_systems):
                 start = s * atoms_per_system
                 end = start + atoms_per_system
-                expected = data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                expected = (
+                    data["velocities_np"][start:end] * data["scale_factors_np"][s]
+                )
                 np.testing.assert_allclose(result_np[start:end], expected, rtol=1e-5)
-
-    @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
-    def test_batch_idx_vs_atom_ptr_identical(
-        self, device, dtype_vec, dtype_scalar, np_dtype
-    ):
-        """Verify batch_idx and atom_ptr produce bitwise-identical results."""
-        num_systems = 4
-        atoms_per_system = 15
-
-        data = self._make_batch_data(
-            num_systems, atoms_per_system, np_dtype, dtype_vec, dtype_scalar, device
-        )
-        scale = wp.array(data["scale_factors_np"], dtype=dtype_scalar, device=device)
-
-        # In-place: batch_idx
-        vel_batch = wp.array(
-            data["velocities_np"].copy(), dtype=dtype_vec, device=device
-        )
-        velocity_rescale(vel_batch, scale, batch_idx=data["batch_idx"], device=device)
-
-        # In-place: atom_ptr
-        vel_ptr = wp.array(
-            data["velocities_np"].copy(), dtype=dtype_vec, device=device
-        )
-        velocity_rescale(vel_ptr, scale, atom_ptr=data["atom_ptr"], device=device)
-
-        wp.synchronize_device(device)
-        np.testing.assert_allclose(
-            vel_batch.numpy(), vel_ptr.numpy(), rtol=1e-6
-        )
-
-        # Out: batch_idx
-        vel_in = wp.array(
-            data["velocities_np"].copy(), dtype=dtype_vec, device=device
-        )
-        vel_out_batch = wp.empty_like(vel_in)
-        velocity_rescale_out(
-            vel_in, scale, vel_out_batch, batch_idx=data["batch_idx"], device=device
-        )
-
-        # Out: atom_ptr
-        vel_out_ptr = wp.empty_like(vel_in)
-        velocity_rescale_out(
-            vel_in, scale, vel_out_ptr, atom_ptr=data["atom_ptr"], device=device
-        )
-
-        wp.synchronize_device(device)
-        np.testing.assert_allclose(
-            vel_out_batch.numpy(), vel_out_ptr.numpy(), rtol=1e-6
-        )
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_out_requires_velocities_out(self, device):

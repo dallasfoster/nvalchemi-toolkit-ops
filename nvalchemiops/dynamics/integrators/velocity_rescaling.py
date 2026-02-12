@@ -88,18 +88,13 @@ REFERENCES
 
 from __future__ import annotations
 
-from typing import Any
-
 import warp as wp
 
 from ..utils.launch_helpers import (
-    ExecutionMode,
-    KernelFamily,
-    launch_family,
-    register_overloads,
-    resolve_execution_mode,
+    dispatch_family,
     validate_out_array,
 )
+from ..utils.shared_kernels import velocity_rescale_families
 
 __all__ = [
     # Mutating APIs
@@ -109,235 +104,6 @@ __all__ = [
     # Utility
     "compute_rescale_factor",
 ]
-
-
-# ==============================================================================
-# Rescaling Kernels
-# ==============================================================================
-
-
-@wp.kernel
-def _velocity_rescale_kernel(
-    velocities: wp.array(dtype=Any),
-    scale_factor: wp.array(dtype=Any),
-):
-    """Rescale all velocities by a single factor (in-place).
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. MODIFIED in-place.
-    scale_factor : wp.array
-        Scaling factor sqrt(T_target/T_current). Shape (1,).
-    """
-    atom_idx = wp.tid()
-    v = velocities[atom_idx]
-    s = scale_factor[0]
-
-    velocities[atom_idx] = scale_vector_by_scalar(v, s)
-
-
-@wp.kernel
-def _velocity_rescale_out_kernel(
-    velocities: wp.array(dtype=Any),
-    scale_factor: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Rescale all velocities by a single factor (non-mutating).
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-    """
-    atom_idx = wp.tid()
-    v = velocities[atom_idx]
-    s = scale_factor[0]
-
-    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
-
-
-@wp.kernel
-def _batch_velocity_rescale_kernel(
-    velocities: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    scale_factors: wp.array(dtype=Any),
-):
-    """Rescale velocities with per-system factors (in-place).
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. MODIFIED in-place.
-    batch_idx : wp.array(dtype=wp.int32)
-        System index for each atom.
-    scale_factors : wp.array
-        Per-system scaling factors. Shape (B,).
-    """
-    atom_idx = wp.tid()
-    v = velocities[atom_idx]
-    s = scale_factors[batch_idx[atom_idx]]
-
-    velocities[atom_idx] = scale_vector_by_scalar(v, s)
-
-
-@wp.kernel
-def _batch_velocity_rescale_out_kernel(
-    velocities: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    scale_factors: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Rescale velocities with per-system factors (non-mutating).
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-    """
-    atom_idx = wp.tid()
-    v = velocities[atom_idx]
-    s = scale_factors[batch_idx[atom_idx]]
-
-    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
-
-
-# ==============================================================================
-# Pointer-Based (CSR) Rescaling Kernels
-# ==============================================================================
-
-
-@wp.kernel
-def _velocity_rescale_ptr_kernel(
-    velocities: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    scale_factors: wp.array(dtype=Any),
-):
-    """Rescale velocities using atom_ptr (in-place).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,). MODIFIED in-place.
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-        System s owns atoms in range [atom_ptr[s], atom_ptr[s+1]).
-    scale_factors : wp.array(dtype=wp.float32 or wp.float64)
-        Per-system scaling factors. Shape (num_systems,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    s = scale_factors[sys_id]
-
-    for i in range(a0, a1):
-        v = velocities[i]
-        velocities[i] = scale_vector_by_scalar(v, s)
-
-
-@wp.kernel
-def _velocity_rescale_ptr_out_kernel(
-    velocities: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    scale_factors: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Rescale velocities using atom_ptr (non-mutating).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,).
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-    scale_factors : wp.array(dtype=wp.float32 or wp.float64)
-        Per-system scaling factors. Shape (num_systems,).
-    velocities_out : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Output velocities. Shape (num_atoms_total,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    s = scale_factors[sys_id]
-
-    for i in range(a0, a1):
-        v = velocities[i]
-        velocities_out[i] = scale_vector_by_scalar(v, s)
-
-
-# ==============================================================================
-# Kernel Overloads for Explicit Typing
-# ==============================================================================
-
-# In-place kernel overloads keyed by vec_dtype
-_rescale_inplace_overloads = {
-    v: KernelFamily(
-        single=register_overloads(
-            _velocity_rescale_kernel,
-            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=t)],
-            dtype_pairs=((v, t),),
-        )[v],
-        batch_idx=register_overloads(
-            _batch_velocity_rescale_kernel,
-            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=wp.int32), wp.array(dtype=t)],
-            dtype_pairs=((v, t),),
-        )[v],
-        atom_ptr=register_overloads(
-            _velocity_rescale_ptr_kernel,
-            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=wp.int32), wp.array(dtype=t)],
-            dtype_pairs=((v, t),),
-        )[v],
-    )
-    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
-}
-
-# Non-mutating (out) kernel overloads keyed by vec_dtype
-_rescale_out_overloads = {
-    v: KernelFamily(
-        single=register_overloads(
-            _velocity_rescale_out_kernel,
-            lambda v_, t: [wp.array(dtype=v_), wp.array(dtype=t), wp.array(dtype=v_)],
-            dtype_pairs=((v, t),),
-        )[v],
-        batch_idx=register_overloads(
-            _batch_velocity_rescale_out_kernel,
-            lambda v_, t: [
-                wp.array(dtype=v_),
-                wp.array(dtype=wp.int32),
-                wp.array(dtype=t),
-                wp.array(dtype=v_),
-            ],
-            dtype_pairs=((v, t),),
-        )[v],
-        atom_ptr=register_overloads(
-            _velocity_rescale_ptr_out_kernel,
-            lambda v_, t: [
-                wp.array(dtype=v_),
-                wp.array(dtype=wp.int32),
-                wp.array(dtype=t),
-                wp.array(dtype=v_),
-            ],
-            dtype_pairs=((v, t),),
-        )[v],
-    )
-    for v, t in ((wp.vec3f, wp.float32), (wp.vec3d, wp.float64))
-}
 
 
 # ==============================================================================
@@ -414,28 +180,15 @@ def velocity_rescale(
     >>> # Apply rescaling
     >>> velocity_rescale(velocities, scale)
     """
-    mode = resolve_execution_mode(batch_idx, atom_ptr)
-
-    if device is None:
-        device = velocities.device
-
-    num_atoms = velocities.shape[0]
-    vec_dtype = velocities.dtype
-    family = _rescale_inplace_overloads[vec_dtype]
-
-    if mode is ExecutionMode.ATOM_PTR:
-        dim = atom_ptr.shape[0] - 1  # num_systems
-    else:
-        dim = num_atoms
-
-    launch_family(
-        family,
-        mode=mode,
-        dim=dim,
-        inputs_single=[velocities, scale_factor],
-        inputs_batch=[velocities, batch_idx, scale_factor],
-        inputs_ptr=[velocities, atom_ptr, scale_factor],
+    dispatch_family(
+        velocity_rescale_families,
+        velocities,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
         device=device,
+        inputs_single=[velocities, scale_factor, velocities],
+        inputs_batch=[velocities, batch_idx, scale_factor, velocities],
+        inputs_ptr=[velocities, atom_ptr, scale_factor, velocities],
     )
 
 
@@ -471,30 +224,15 @@ def velocity_rescale_out(
     wp.array
         Rescaled velocities (same object as ``velocities_out``).
     """
-    mode = resolve_execution_mode(batch_idx, atom_ptr)
-
     validate_out_array(velocities_out, velocities, "velocities_out")
-
-    if device is None:
-        device = velocities.device
-
-    num_atoms = velocities.shape[0]
-    vec_dtype = velocities.dtype
-    family = _rescale_out_overloads[vec_dtype]
-
-    if mode is ExecutionMode.ATOM_PTR:
-        dim = atom_ptr.shape[0] - 1  # num_systems
-    else:
-        dim = num_atoms
-
-    launch_family(
-        family,
-        mode=mode,
-        dim=dim,
+    dispatch_family(
+        velocity_rescale_families,
+        velocities,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
+        device=device,
         inputs_single=[velocities, scale_factor, velocities_out],
         inputs_batch=[velocities, batch_idx, scale_factor, velocities_out],
         inputs_ptr=[velocities, atom_ptr, scale_factor, velocities_out],
-        device=device,
     )
-
     return velocities_out

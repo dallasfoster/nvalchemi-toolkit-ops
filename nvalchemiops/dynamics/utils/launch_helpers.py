@@ -28,12 +28,11 @@ arguments and allocate/zero as needed.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
 
 import warp as wp
-
 
 # =============================================================================
 # Types
@@ -170,6 +169,59 @@ def launch_family(
 
 
 # =============================================================================
+# High-Level Dispatch
+# =============================================================================
+
+
+def dispatch_family(
+    family_dict: dict,
+    primary_array: wp.array,
+    *,
+    batch_idx: wp.array | None = None,
+    atom_ptr: wp.array | None = None,
+    device: str | None = None,
+    inputs_single: list,
+    inputs_batch: list | None = None,
+    inputs_ptr: list | None = None,
+) -> None:
+    """Resolve mode, infer device/dtype/dim, and launch the correct kernel.
+
+    This combines :func:`resolve_execution_mode`, device inference,
+    dtype-based family lookup, dimension calculation, and
+    :func:`launch_family` into a single call.
+
+    Parameters
+    ----------
+    family_dict : dict
+        Mapping from dtype (e.g. ``wp.vec3f``) to :class:`KernelFamily`.
+    primary_array : wp.array
+        The main input array.  Used for device inference (when *device*
+        is ``None``), dtype-based family lookup, and default ``dim``.
+    batch_idx, atom_ptr : wp.array or None
+        Optional batch metadata (mutually exclusive).
+    device : str or None
+        Warp device.  If ``None``, inferred from *primary_array*.
+    inputs_single, inputs_batch, inputs_ptr : list
+        Kernel input lists forwarded to :func:`launch_family`.
+    """
+    mode = resolve_execution_mode(batch_idx, atom_ptr)
+    if device is None:
+        device = primary_array.device
+    family = family_dict[primary_array.dtype]
+    n = primary_array.shape[0]
+    dim = atom_ptr.shape[0] - 1 if mode is ExecutionMode.ATOM_PTR else n
+    launch_family(
+        family,
+        mode=mode,
+        dim=dim,
+        inputs_single=inputs_single,
+        inputs_batch=inputs_batch,
+        inputs_ptr=inputs_ptr,
+        device=device,
+    )
+
+
+# =============================================================================
 # Overload Registration
 # =============================================================================
 
@@ -238,6 +290,45 @@ def register_overloads(
         key = key_fn(vec_dtype, scalar_dtype)
         out[key] = wp.overload(kernel, sig)
     return out
+
+
+def build_family_dict(
+    single_kernel,
+    single_sig: Callable,
+    batch_kernel,
+    batch_sig: Callable,
+    ptr_kernel,
+    ptr_sig: Callable,
+    dtype_pairs: tuple[tuple, ...] = DEFAULT_DTYPE_PAIRS,
+) -> dict:
+    """Build a ``{vec_dtype: KernelFamily}`` dict with eager overload registration.
+
+    A convenience wrapper that calls ``wp.overload`` for each dtype pair
+    and each execution-mode kernel, then packs the results into
+    :class:`KernelFamily` instances.
+
+    Parameters
+    ----------
+    single_kernel, batch_kernel, ptr_kernel
+        Generic ``@wp.kernel`` functions for each execution mode.
+    single_sig, batch_sig, ptr_sig : callable
+        Signature builders ``(vec_dtype, scalar_dtype) -> list``.
+    dtype_pairs : tuple
+        Dtype pairs to register.  Defaults to ``DEFAULT_DTYPE_PAIRS``.
+
+    Returns
+    -------
+    dict
+        ``{vec_dtype: KernelFamily}`` mapping.
+    """
+    return {
+        v: KernelFamily(
+            single=wp.overload(single_kernel, single_sig(v, t)),
+            batch_idx=wp.overload(batch_kernel, batch_sig(v, t)),
+            atom_ptr=wp.overload(ptr_kernel, ptr_sig(v, t)),
+        )
+        for v, t in dtype_pairs
+    }
 
 
 # =============================================================================

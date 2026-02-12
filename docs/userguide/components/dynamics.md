@@ -411,9 +411,12 @@ T_std = np.std(temperatures[equilibration_steps:])
 # WRONG: Using mutating function incorrectly
 new_positions = velocity_verlet_position_update(...)  # Returns None!
 
-# CORRECT: Use non-mutating variant
-new_positions, new_velocities = velocity_verlet_position_update_out(
-    positions, velocities, forces, masses, dt
+# CORRECT: Use non-mutating variant (requires pre-allocated output arrays)
+positions_out = wp.zeros_like(positions)
+velocities_out = wp.zeros_like(velocities)
+positions_out, velocities_out = velocity_verlet_position_update_out(
+    positions, velocities, forces, masses, dt,
+    positions_out, velocities_out,
 )
 
 # CORRECT: Use mutating variant in-place
