@@ -70,12 +70,19 @@ def _make_bench(num_atoms, perturbation=0.1, batch_size=1):
         pbc = torch.tensor([True, True, True], device=positions.device)
 
         lj_model = NvalchemiopsLJModel(
-            **_POTENTIAL, cell=cell, batch_idx=None,
-            device="cuda", dtype=torch.float64,
+            **_POTENTIAL,
+            cell=cell,
+            batch_idx=None,
+            device="cuda",
+            dtype=torch.float64,
         )
         return NvalchemiOpsBenchmark(
-            positions=positions, cell=cell, masses=masses, pbc=pbc,
-            model=lj_model, skin=_SKIN,
+            positions=positions,
+            cell=cell,
+            masses=masses,
+            pbc=pbc,
+            model=lj_model,
+            skin=_SKIN,
             neighbor_rebuild_interval=_NEIGHBOR_REBUILD,
         ), actual_atoms
     else:
@@ -89,23 +96,35 @@ def _make_bench(num_atoms, perturbation=0.1, batch_size=1):
         batch_masses = torch.cat(mass_list, dim=0)
         batch_cells = torch.cat(cell_list, dim=0)
         batch_idx = torch.repeat_interleave(
-            torch.arange(batch_size, device="cuda"), actual_atoms,
+            torch.arange(batch_size, device="cuda"),
+            actual_atoms,
         ).to(torch.int32)
         atom_ptr = torch.arange(
-            0, (batch_size + 1) * actual_atoms, actual_atoms,
-            device="cuda", dtype=torch.int64,
+            0,
+            (batch_size + 1) * actual_atoms,
+            actual_atoms,
+            device="cuda",
+            dtype=torch.int64,
         )
         pbc = torch.tensor([True, True, True], device="cuda")
 
         lj_model = NvalchemiopsLJModel(
-            **_POTENTIAL, cell=batch_cells, batch_idx=batch_idx,
-            device="cuda", dtype=torch.float64,
+            **_POTENTIAL,
+            cell=batch_cells,
+            batch_idx=batch_idx,
+            device="cuda",
+            dtype=torch.float64,
         )
         return NvalchemiOpsBenchmark(
-            positions=batch_positions, cell=batch_cells, masses=batch_masses,
-            pbc=pbc, model=lj_model, skin=_SKIN,
+            positions=batch_positions,
+            cell=batch_cells,
+            masses=batch_masses,
+            pbc=pbc,
+            model=lj_model,
+            skin=_SKIN,
             neighbor_rebuild_interval=_NEIGHBOR_REBUILD,
-            batch_idx=batch_idx, atom_ptr=atom_ptr,
+            batch_idx=batch_idx,
+            atom_ptr=atom_ptr,
         ), actual_atoms
 
 
@@ -115,8 +134,13 @@ def _make_bench(num_atoms, perturbation=0.1, batch_size=1):
 
 
 def run_fixed_cell_comparison(
-    system_sizes, force_tol, max_steps, check_interval,
-    fire1_params, fire2_params, perturbation,
+    system_sizes,
+    force_tol,
+    max_steps,
+    check_interval,
+    fire1_params,
+    fire2_params,
+    perturbation,
 ):
     """Run fixed-cell (coordinate-only) FIRE vs FIRE2 comparison.
 
@@ -156,15 +180,19 @@ def run_fixed_cell_comparison(
         # FIRE1
         bench1, actual = _make_bench(num_atoms, perturbation=perturbation)
         r1 = bench1.run_fire(
-            max_steps=max_steps, force_tolerance=force_tol,
-            check_interval=check_interval, **fire1_params,
+            max_steps=max_steps,
+            force_tolerance=force_tol,
+            check_interval=check_interval,
+            **fire1_params,
         )
 
         # FIRE2 (fresh benchmark with same system)
         bench2, _ = _make_bench(num_atoms, perturbation=perturbation)
         r2 = bench2.run_fire2(
-            max_steps=max_steps, force_tolerance=force_tol,
-            check_interval=check_interval, **fire2_params,
+            max_steps=max_steps,
+            force_tolerance=force_tol,
+            check_interval=check_interval,
+            **fire2_params,
         )
 
         step_ratio = r2.num_steps / r1.num_steps if r1.num_steps > 0 else float("nan")
@@ -179,22 +207,26 @@ def run_fixed_cell_comparison(
             f"{step_ratio:>10.2f}x {speedup:>7.2f}x"
         )
 
-        rows.append({
-            "num_atoms": actual,
-            "opt_type": "fixed_cell",
-            "method": "fire1",
-            "steps": r1.num_steps,
-            "wall_time_s": f"{r1.total_time:.4f}",
-            "converged": f1_converged,
-        })
-        rows.append({
-            "num_atoms": actual,
-            "opt_type": "fixed_cell",
-            "method": "fire2",
-            "steps": r2.num_steps,
-            "wall_time_s": f"{r2.total_time:.4f}",
-            "converged": f2_converged,
-        })
+        rows.append(
+            {
+                "num_atoms": actual,
+                "opt_type": "fixed_cell",
+                "method": "fire1",
+                "steps": r1.num_steps,
+                "wall_time_s": f"{r1.total_time:.4f}",
+                "converged": f1_converged,
+            }
+        )
+        rows.append(
+            {
+                "num_atoms": actual,
+                "opt_type": "fixed_cell",
+                "method": "fire2",
+                "steps": r2.num_steps,
+                "wall_time_s": f"{r2.total_time:.4f}",
+                "converged": f2_converged,
+            }
+        )
 
     return rows
 
@@ -205,8 +237,14 @@ def run_fixed_cell_comparison(
 
 
 def run_variable_cell_comparison(
-    system_sizes, force_tol, pressure_tol, max_steps, check_interval,
-    fire1_params, fire2_params, perturbation,
+    system_sizes,
+    force_tol,
+    pressure_tol,
+    max_steps,
+    check_interval,
+    fire1_params,
+    fire2_params,
+    perturbation,
 ):
     """Run variable-cell FIRE vs FIRE2 comparison.
 
@@ -248,17 +286,21 @@ def run_variable_cell_comparison(
         # FIRE1 variable-cell
         bench1, actual = _make_bench(num_atoms, perturbation=perturbation)
         r1 = bench1.run_fire_cell(
-            max_steps=max_steps, force_tolerance=force_tol,
+            max_steps=max_steps,
+            force_tolerance=force_tol,
             pressure_tolerance=pressure_tol,
-            check_interval=check_interval, **fire1_params,
+            check_interval=check_interval,
+            **fire1_params,
         )
 
         # FIRE2 variable-cell (fresh benchmark with same system)
         bench2, _ = _make_bench(num_atoms, perturbation=perturbation)
         r2 = bench2.run_fire2_cell(
-            max_steps=max_steps, force_tolerance=force_tol,
+            max_steps=max_steps,
+            force_tolerance=force_tol,
             pressure_tolerance=pressure_tol,
-            check_interval=check_interval, **fire2_params,
+            check_interval=check_interval,
+            **fire2_params,
         )
 
         step_ratio = r2.num_steps / r1.num_steps if r1.num_steps > 0 else float("nan")
@@ -273,22 +315,26 @@ def run_variable_cell_comparison(
             f"{step_ratio:>10.2f}x {speedup:>7.2f}x"
         )
 
-        rows.append({
-            "num_atoms": actual,
-            "opt_type": "variable_cell",
-            "method": "fire1",
-            "steps": r1.num_steps,
-            "wall_time_s": f"{r1.total_time:.4f}",
-            "converged": f1_converged,
-        })
-        rows.append({
-            "num_atoms": actual,
-            "opt_type": "variable_cell",
-            "method": "fire2",
-            "steps": r2.num_steps,
-            "wall_time_s": f"{r2.total_time:.4f}",
-            "converged": f2_converged,
-        })
+        rows.append(
+            {
+                "num_atoms": actual,
+                "opt_type": "variable_cell",
+                "method": "fire1",
+                "steps": r1.num_steps,
+                "wall_time_s": f"{r1.total_time:.4f}",
+                "converged": f1_converged,
+            }
+        )
+        rows.append(
+            {
+                "num_atoms": actual,
+                "opt_type": "variable_cell",
+                "method": "fire2",
+                "steps": r2.num_steps,
+                "wall_time_s": f"{r2.total_time:.4f}",
+                "converged": f2_converged,
+            }
+        )
 
     return rows
 
@@ -360,7 +406,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     gpu_sku = get_gpu_sku()
     all_rows = []
 
-    print(f"FIRE vs FIRE2 Accuracy Comparison")
+    print("FIRE vs FIRE2 Accuracy Comparison")
     print(f"GPU: {gpu_sku}")
     print(f"Force tolerance: {force_tol} eV/A")
     print(f"Max steps: {max_steps}")
@@ -368,16 +414,27 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     # Fixed-cell comparison
     if fixed_enabled:
         rows = run_fixed_cell_comparison(
-            system_sizes, force_tol, max_steps, check_interval,
-            fire1_params, fire2_params, fixed_perturbation,
+            system_sizes,
+            force_tol,
+            max_steps,
+            check_interval,
+            fire1_params,
+            fire2_params,
+            fixed_perturbation,
         )
         all_rows.extend(rows)
 
     # Variable-cell comparison
     if var_enabled:
         rows = run_variable_cell_comparison(
-            system_sizes, force_tol, pressure_tol, max_steps, check_interval,
-            fire1_params, fire2_params, var_perturbation,
+            system_sizes,
+            force_tol,
+            pressure_tol,
+            max_steps,
+            check_interval,
+            fire1_params,
+            fire2_params,
+            var_perturbation,
         )
         all_rows.extend(rows)
 
@@ -386,8 +443,12 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"fire_compare_{gpu_sku}.csv"
         fieldnames = [
-            "num_atoms", "opt_type", "method", "steps",
-            "wall_time_s", "converged",
+            "num_atoms",
+            "opt_type",
+            "method",
+            "steps",
+            "wall_time_s",
+            "converged",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -417,15 +478,22 @@ def main():
         help="Output directory for CSV files",
     )
     parser.add_argument(
-        "--system-sizes", nargs="+", type=int, default=None,
+        "--system-sizes",
+        nargs="+",
+        type=int,
+        default=None,
         help="Override system sizes from config",
     )
     parser.add_argument(
-        "--force-tol", type=float, default=None,
+        "--force-tol",
+        type=float,
+        default=None,
         help="Override force convergence tolerance (eV/A)",
     )
     parser.add_argument(
-        "--max-steps", type=int, default=None,
+        "--max-steps",
+        type=int,
+        default=None,
         help="Override maximum optimization steps",
     )
 

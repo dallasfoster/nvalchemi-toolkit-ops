@@ -24,13 +24,8 @@ Entry point:
 
 - :func:`fire2_step_coord` -- coordinate-only optimization.
 
-Modifies inputs in-place.  Scratch buffers can be passed in for
-reuse across steps, or left as ``None`` to allocate internally each call
-(PyTorch's caching allocator handles efficient reuse).
-
-Tensors are detached from the autograd graph before conversion to Warp.
-Where possible, ``return_ctype=True`` is used to avoid ``wp.array``
-Python-wrapper overhead.
+Modifies inputs in-place. Scratch buffers can be passed in for reuse
+across steps, or left as ``None`` to allocate internally each call.
 """
 
 from __future__ import annotations
@@ -59,6 +54,10 @@ def fire2_step_coord(
     dt: torch.Tensor,
     nsteps_inc: torch.Tensor,
     *,
+    vf: torch.Tensor | None = None,
+    v_sumsq: torch.Tensor | None = None,
+    f_sumsq: torch.Tensor | None = None,
+    max_norm: torch.Tensor | None = None,
     delaystep: int = 60,
     dtgrow: float = 1.05,
     dtshrink: float = 0.75,
@@ -67,52 +66,32 @@ def fire2_step_coord(
     tmax: float = 0.08,
     tmin: float = 0.005,
     maxstep: float = 0.1,
-    vf: torch.Tensor | None = None,
-    v_sumsq: torch.Tensor | None = None,
-    f_sumsq: torch.Tensor | None = None,
-    max_norm: torch.Tensor | None = None,
 ) -> None:
     """FIRE2 coordinate-only optimization step.
 
-    Modifies *positions*, *velocities*, *alpha*, *dt*, *nsteps_inc* in-place.
-    Launches 3 Warp kernels directly using ctypes for minimal overhead.
+    Modifies *positions*, *velocities*, *alpha*, *dt*, and *nsteps_inc* in-place.
 
     Parameters
     ----------
     positions : Tensor, shape (N, 3), dtype float32/float64
-        Atomic positions, modified in-place.
+        Atomic positions.
     velocities : Tensor, shape (N, 3), dtype float32/float64
-        Atomic velocities, modified in-place.
+        Atomic velocities.
     forces : Tensor, shape (N, 3), dtype float32/float64
         Forces on atoms (read-only).
     batch_idx : Tensor, shape (N,), dtype int32
         Sorted system index per atom.
     alpha : Tensor, shape (M,), dtype float32/float64
-        FIRE2 mixing parameter, modified in-place.
+        FIRE2 mixing parameter.
     dt : Tensor, shape (M,), dtype float32/float64
-        Per-system timestep, modified in-place.
+        Per-system timestep.
     nsteps_inc : Tensor, shape (M,), dtype int32
-        Consecutive positive-power counter, modified in-place.
+        Consecutive positive-power counter.
+    vf, v_sumsq, f_sumsq, max_norm : Tensor, shape (M,), optional
+        Scratch buffers for reductions. Allocated and zeroed if ``None``;
+        zeroed in-place if provided.
     delaystep, dtgrow, dtshrink, alphashrink, alpha0, tmax, tmin, maxstep
         FIRE2 hyperparameters.
-    vf : Tensor, shape (M,), optional
-        Scratch for v.f reduction. Allocated and zeroed if not provided;
-        zeroed in-place if provided.
-    v_sumsq : Tensor, shape (M,), optional
-        Scratch for v.v reduction. Same allocation/zeroing semantics.
-    f_sumsq : Tensor, shape (M,), optional
-        Scratch for f.f reduction. Same allocation/zeroing semantics.
-    max_norm : Tensor, shape (M,), optional
-        Scratch for max step norm. Same allocation/zeroing semantics.
-
-    Notes
-    -----
-    This adapter bypasses the public ``fire2_step`` Warp API and launches
-    kernel overloads directly with ``return_ctype=True`` to avoid the
-    ``wp.array`` Python wrapper overhead on every call. The launch logic
-    mirrors ``fire2_step`` exactly; see
-    ``nvalchemiops.dynamics.optimizers.fire2.fire2_step`` for the canonical
-    implementation.
     """
     dtype = positions.dtype
     device = positions.device
@@ -141,13 +120,23 @@ def fire2_step_coord(
         max_norm.zero_()
 
     # Detach from autograd graph + convert to ctypes (no wp.array overhead)
-    positions_c = wp.from_torch(positions.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    velocities_c = wp.from_torch(velocities.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    forces_c = wp.from_torch(forces.detach().contiguous(), dtype=vec_type, return_ctype=True)
-    batch_idx_c = wp.from_torch(batch_idx.detach().contiguous(), dtype=wp.int32, return_ctype=True)
-    alpha_c = wp.from_torch(alpha.detach().contiguous(), return_ctype=True)
-    dt_c = wp.from_torch(dt.detach().contiguous(), return_ctype=True)
-    nsteps_inc_c = wp.from_torch(nsteps_inc.detach().contiguous(), dtype=wp.int32, return_ctype=True)
+    positions_c = wp.from_torch(
+        positions.detach(), dtype=vec_type, return_ctype=True
+    )
+    velocities_c = wp.from_torch(
+        velocities.detach(), dtype=vec_type, return_ctype=True
+    )
+    forces_c = wp.from_torch(
+        forces.detach(), dtype=vec_type, return_ctype=True
+    )
+    batch_idx_c = wp.from_torch(
+        batch_idx.detach(), dtype=wp.int32, return_ctype=True
+    )
+    alpha_c = wp.from_torch(alpha.detach(), return_ctype=True)
+    dt_c = wp.from_torch(dt.detach(), return_ctype=True)
+    nsteps_inc_c = wp.from_torch(
+        nsteps_inc.detach(), dtype=wp.int32, return_ctype=True
+    )
     vf_c = wp.from_torch(vf, return_ctype=True)
     v_sumsq_c = wp.from_torch(v_sumsq, return_ctype=True)
     f_sumsq_c = wp.from_torch(f_sumsq, return_ctype=True)
@@ -159,8 +148,17 @@ def fire2_step_coord(
     wp.launch(
         _fire2_reduce_only_overloads[vec_type],
         dim=dim1,
-        inputs=[velocities_c, forces_c, dt_c, batch_idx_c,
-                vf_c, v_sumsq_c, f_sumsq_c, N, ept1],
+        inputs=[
+            velocities_c,
+            forces_c,
+            dt_c,
+            batch_idx_c,
+            vf_c,
+            v_sumsq_c,
+            f_sumsq_c,
+            N,
+            ept1,
+        ],
         device=wp_device,
     )
 
@@ -170,11 +168,27 @@ def fire2_step_coord(
     wp.launch(
         _fire2_fused_mix_maxnorm_overloads[vec_type],
         dim=dim2,
-        inputs=[velocities_c, forces_c, dt_c, batch_idx_c,
-                vf_c, v_sumsq_c, f_sumsq_c, alpha_c, nsteps_inc_c,
-                max_norm_c, N, ept2,
-                delaystep, dtgrow, dtshrink, alphashrink,
-                alpha0, tmax, tmin],
+        inputs=[
+            velocities_c,
+            forces_c,
+            dt_c,
+            batch_idx_c,
+            vf_c,
+            v_sumsq_c,
+            f_sumsq_c,
+            alpha_c,
+            nsteps_inc_c,
+            max_norm_c,
+            N,
+            ept2,
+            delaystep,
+            dtgrow,
+            dtshrink,
+            alphashrink,
+            alpha0,
+            tmax,
+            tmin,
+        ],
         device=wp_device,
     )
 
@@ -182,8 +196,14 @@ def fire2_step_coord(
     wp.launch(
         _fire2_clamp_apply_recompute_overloads[vec_type],
         dim=N,
-        inputs=[positions_c, velocities_c, dt_c, batch_idx_c,
-                max_norm_c, vf_c,  # vf holds v.f; uphill if <= 0
-                maxstep],
+        inputs=[
+            positions_c,
+            velocities_c,
+            dt_c,
+            batch_idx_c,
+            max_norm_c,
+            vf_c,  # vf holds v.f; uphill if <= 0
+            maxstep,
+        ],
         device=wp_device,
     )

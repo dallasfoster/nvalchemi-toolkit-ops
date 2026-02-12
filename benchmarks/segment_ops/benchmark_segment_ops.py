@@ -68,10 +68,14 @@ def _get_gpu_sku() -> str:
         return name.lower().replace(" ", "_").replace("-", "_")
     except Exception:
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                text=True,
-            ).strip().split("\n")[0]
+            out = (
+                subprocess.check_output(  # noqa: S603
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],  # noqa: S607
+                    text=True,
+                )
+                .strip()
+                .split("\n")[0]
+            )
             return out.lower().replace(" ", "_").replace("-", "_")
         except Exception:
             return "unknown_gpu"
@@ -132,8 +136,7 @@ def _print_row(N, M, ms_wp, ms_torch):
     L = N / max(M, 1)
     speedup = ms_torch / ms_wp if ms_wp > 0 else float("inf")
     print(
-        f"{N:>10}  {M:>7}  {L:>9.1f}  "
-        f"{ms_wp:>9.4f}  {ms_torch:>9.4f}  {speedup:>7.2f}x"
+        f"{N:>10}  {M:>7}  {L:>9.1f}  {ms_wp:>9.4f}  {ms_torch:>9.4f}  {speedup:>7.2f}x"
     )
 
 
@@ -183,8 +186,20 @@ def bench_segmented_sum(N, M, device, torch_device, rng, warmup, runs, dtypes=No
         idx = wp.array(idx_np, device=device)
         t_idx = torch.from_numpy(idx_np.astype(np.int64)).to(torch_device)
 
-        ms_wp = _bench_cuda(lambda: out.zero_(), lambda: segmented_sum(x, idx, out), torch_device, warmup, runs)
-        ms_t = _bench_cuda(lambda: t_out.zero_(), lambda: t_out.index_add_(0, t_idx, t_x), torch_device, warmup, runs)
+        ms_wp = _bench_cuda(
+            lambda: out.zero_(),
+            lambda: segmented_sum(x, idx, out),
+            torch_device,
+            warmup,
+            runs,
+        )
+        ms_t = _bench_cuda(
+            lambda: t_out.zero_(),
+            lambda: t_out.index_add_(0, t_idx, t_x),
+            torch_device,
+            warmup,
+            runs,
+        )
         _print_row(N, M, ms_wp, ms_t)
 
         results.append(("segmented_sum", label, N, M, ms_wp, ms_t))
@@ -192,7 +207,9 @@ def bench_segmented_sum(N, M, device, torch_device, rng, warmup, runs, dtypes=No
     return results
 
 
-def bench_segmented_component_sum(N, M, device, torch_device, rng, warmup, runs, **_kwargs):
+def bench_segmented_component_sum(
+    N, M, device, torch_device, rng, warmup, runs, **_kwargs
+):
     """segmented_component_sum vs torch (sum components + index_add)."""
     x_np = rng.standard_normal((N, 3)).astype(np.float32)
     idx_np = _make_segments(N, M, rng)
@@ -209,7 +226,13 @@ def bench_segmented_component_sum(N, M, device, torch_device, rng, warmup, runs,
         t_out.zero_()
         t_out.index_add_(0, t_idx, t_x.sum(dim=1))
 
-    ms_wp = _bench_cuda(lambda: out.zero_(), lambda: segmented_component_sum(x, idx, out), torch_device, warmup, runs)
+    ms_wp = _bench_cuda(
+        lambda: out.zero_(),
+        lambda: segmented_component_sum(x, idx, out),
+        torch_device,
+        warmup,
+        runs,
+    )
     ms_t = _bench_cuda(_noop, _torch_component_sum, torch_device, warmup, runs)
     _print_row(N, M, ms_wp, ms_t)
 
@@ -259,7 +282,13 @@ def bench_segmented_dot(N, M, device, torch_device, rng, warmup, runs, dtypes=No
                 t_out.zero_()
                 t_out.index_add_(0, t_idx, t_x * t_y)
 
-        ms_wp = _bench_cuda(lambda: out.zero_(), lambda: segmented_dot(x, y, idx, out), torch_device, warmup, runs)
+        ms_wp = _bench_cuda(
+            lambda: out.zero_(),
+            lambda: segmented_dot(x, y, idx, out),
+            torch_device,
+            warmup,
+            runs,
+        )
         ms_t = _bench_cuda(_noop, _torch_dot, torch_device, warmup, runs)
         _print_row(N, M, ms_wp, ms_t)
 
@@ -285,7 +314,13 @@ def bench_segmented_max_norm(N, M, device, torch_device, rng, warmup, runs, **_k
         t_out.zero_()
         t_out.scatter_reduce_(0, t_idx, t_x.norm(dim=1), reduce="amax")
 
-    ms_wp = _bench_cuda(lambda: out.zero_(), lambda: segmented_max_norm(x, idx, out), torch_device, warmup, runs)
+    ms_wp = _bench_cuda(
+        lambda: out.zero_(),
+        lambda: segmented_max_norm(x, idx, out),
+        torch_device,
+        warmup,
+        runs,
+    )
     ms_t = _bench_cuda(_noop, _torch_max_norm, torch_device, warmup, runs)
     _print_row(N, M, ms_wp, ms_t)
 
@@ -328,7 +363,9 @@ def bench_segmented_mul(N, M, device, torch_device, rng, warmup, runs, **_kwargs
             def _torch_mul():
                 t_out.copy_(t_x * t_y[t_idx])
 
-        ms_wp = _bench_cuda(_noop, lambda: segmented_mul(x, y, idx, out), torch_device, warmup, runs)
+        ms_wp = _bench_cuda(
+            _noop, lambda: segmented_mul(x, y, idx, out), torch_device, warmup, runs
+        )
         ms_t = _bench_cuda(_noop, _torch_mul, torch_device, warmup, runs)
         _print_row(N, M, ms_wp, ms_t)
 
@@ -373,7 +410,9 @@ def bench_segmented_add(N, M, device, torch_device, rng, warmup, runs, **_kwargs
             def _torch_add():
                 t_out.copy_(t_x + t_y[t_idx])
 
-        ms_wp = _bench_cuda(_noop, lambda: segmented_add(x, y, idx, out), torch_device, warmup, runs)
+        ms_wp = _bench_cuda(
+            _noop, lambda: segmented_add(x, y, idx, out), torch_device, warmup, runs
+        )
         ms_t = _bench_cuda(_noop, _torch_add, torch_device, warmup, runs)
         _print_row(N, M, ms_wp, ms_t)
 
@@ -403,7 +442,9 @@ def bench_segmented_matvec(N, M, device, torch_device, rng, warmup, runs, **_kwa
         gathered = t_m[t_idx]
         t_out.copy_(torch.einsum("nji,nj->ni", gathered, t_v))
 
-    ms_wp = _bench_cuda(_noop, lambda: segmented_matvec(v, m, idx, out), torch_device, warmup, runs)
+    ms_wp = _bench_cuda(
+        _noop, lambda: segmented_matvec(v, m, idx, out), torch_device, warmup, runs
+    )
     ms_t = _bench_cuda(_noop, _torch_matvec, torch_device, warmup, runs)
     _print_row(N, M, ms_wp, ms_t)
 
@@ -417,7 +458,12 @@ def bench_segmented_matvec(N, M, device, torch_device, rng, warmup, runs, **_kwa
 # Registry: (config_key, display_name, bench_fn, supports_dtypes_kwarg)
 _BENCHMARKS = [
     ("segmented_sum", "segmented_sum", bench_segmented_sum, True),
-    ("segmented_component_sum", "segmented_component_sum", bench_segmented_component_sum, False),
+    (
+        "segmented_component_sum",
+        "segmented_component_sum",
+        bench_segmented_component_sum,
+        False,
+    ),
     ("segmented_dot", "segmented_dot", bench_segmented_dot, True),
     ("segmented_max_norm", "segmented_max_norm", bench_segmented_max_norm, False),
     ("segmented_mul", "segmented_mul", bench_segmented_mul, False),
@@ -443,7 +489,7 @@ def run_benchmarks(config: dict, output_dir: Path, device_str: str) -> None:
     rng = np.random.default_rng(42)
     gpu_sku = _get_gpu_sku()
 
-    print(f"Segment Operations Benchmark")
+    print("Segment Operations Benchmark")
     print(f"Device: {wp_device.name}  (SM count: {wp_device.sm_count})")
     print(f"Timing: CUDA events, {warmup} warmup, median of {runs} runs")
 
@@ -474,7 +520,9 @@ def run_benchmarks(config: dict, output_dir: Path, device_str: str) -> None:
                 if L > N:
                     continue
                 M = max(N // L, 1)
-                results = bench_fn(N, M, wp_device, torch_device, rng, warmup, runs, **kwargs)
+                results = bench_fn(
+                    N, M, wp_device, torch_device, rng, warmup, runs, **kwargs
+                )
                 all_results.extend(results)
             print()
 
@@ -483,8 +531,14 @@ def run_benchmarks(config: dict, output_dir: Path, device_str: str) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"segment_ops_benchmark_{gpu_sku}.csv"
         fieldnames = [
-            "operation", "dtype", "total_elements", "num_segments",
-            "avg_segment_length", "warp_median_ms", "torch_median_ms", "speedup",
+            "operation",
+            "dtype",
+            "total_elements",
+            "num_segments",
+            "avg_segment_length",
+            "warp_median_ms",
+            "torch_median_ms",
+            "speedup",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -492,23 +546,23 @@ def run_benchmarks(config: dict, output_dir: Path, device_str: str) -> None:
             for op, dtype_label, N, M, ms_wp, ms_t in all_results:
                 L = N / max(M, 1)
                 speedup = ms_t / ms_wp if ms_wp > 0 else float("inf")
-                writer.writerow({
-                    "operation": op,
-                    "dtype": dtype_label,
-                    "total_elements": N,
-                    "num_segments": M,
-                    "avg_segment_length": f"{L:.1f}",
-                    "warp_median_ms": f"{ms_wp:.4f}",
-                    "torch_median_ms": f"{ms_t:.4f}",
-                    "speedup": f"{speedup:.2f}",
-                })
+                writer.writerow(
+                    {
+                        "operation": op,
+                        "dtype": dtype_label,
+                        "total_elements": N,
+                        "num_segments": M,
+                        "avg_segment_length": f"{L:.1f}",
+                        "warp_median_ms": f"{ms_wp:.4f}",
+                        "torch_median_ms": f"{ms_t:.4f}",
+                        "speedup": f"{speedup:.2f}",
+                    }
+                )
         print(f"Wrote results to {csv_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark segmented ops vs PyTorch"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark segmented ops vs PyTorch")
     parser.add_argument(
         "--config",
         type=str,
