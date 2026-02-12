@@ -721,6 +721,38 @@ class TestFire2TorchCoord:
         assert torch.isfinite(dt).all(), "dt should be finite"
 
     @pytest.mark.parametrize("device", DEVICES)
+    def test_coord_step_requires_contiguous(self, device):
+        """fire2_step_coord raises RuntimeError for non-contiguous compound-type tensors."""
+        N, M = 20, 1
+        dtype = torch.float32
+        rng = np.random.default_rng(42)
+        (
+            pos,
+            vel,
+            forces,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            *_,
+        ) = make_fire2_torch_state(N, M, dtype, device, rng=rng)
+        # Non-contiguous view: (N, 3, 2) -> [:, :, 0] has shape (N, 3) but is not contiguous
+        base = torch.randn(N, 3, 2, device=device, dtype=dtype)
+        pos_view = base[:, :, 0]
+        assert not pos_view.is_contiguous()
+        with pytest.raises(RuntimeError):
+            fire2_step_coord(
+                pos_view,
+                vel,
+                forces,
+                batch_idx,
+                alpha,
+                dt,
+                nsteps_inc,
+                **FIRE2_DEFAULTS,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.float64])
     def test_coord_step_correctness(self, device, torch_dtype):
         """Verify fire2_step_coord matches NumPy reference."""
