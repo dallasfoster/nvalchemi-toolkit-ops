@@ -75,7 +75,6 @@ import warp as wp
 
 from ...segment_ops import _compute_ept
 
-
 # =============================================================================
 # Kernel 1: Triple inner-product reduction (deferred half-step)
 # =============================================================================
@@ -419,53 +418,53 @@ for _t, _v in zip(_T, _V):
     _fire2_reduce_only_overloads[_v] = wp.overload(
         _fire2_reduce_only_kernel,
         [
-            wp.array(dtype=_v),         # velocities
-            wp.array(dtype=_v),         # forces
-            wp.array(dtype=_t),         # dt
-            wp.array(dtype=wp.int32),   # batch_idx
-            wp.array(dtype=_t),         # vf
-            wp.array(dtype=_t),         # v_sumsq
-            wp.array(dtype=_t),         # f_sumsq
-            wp.int32,                   # N
-            wp.int32,                   # elems_per_thread
+            wp.array(dtype=_v),  # velocities
+            wp.array(dtype=_v),  # forces
+            wp.array(dtype=_t),  # dt
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=_t),  # vf
+            wp.array(dtype=_t),  # v_sumsq
+            wp.array(dtype=_t),  # f_sumsq
+            wp.int32,  # N
+            wp.int32,  # elems_per_thread
         ],
     )
 
     _fire2_fused_mix_maxnorm_overloads[_v] = wp.overload(
         _fire2_fused_mix_maxnorm_kernel,
         [
-            wp.array(dtype=_v),         # velocities
-            wp.array(dtype=_v),         # forces
-            wp.array(dtype=_t),         # dt
-            wp.array(dtype=wp.int32),   # batch_idx
-            wp.array(dtype=_t),         # vf
-            wp.array(dtype=_t),         # v_sumsq
-            wp.array(dtype=_t),         # f_sumsq
-            wp.array(dtype=_t),         # alpha
-            wp.array(dtype=wp.int32),   # nsteps_inc
-            wp.array(dtype=_t),         # max_norm
-            wp.int32,                   # N
-            wp.int32,                   # elems_per_thread
-            wp.int32,                   # delaystep
-            _t,                         # dtgrow
-            _t,                         # dtshrink
-            _t,                         # alphashrink
-            _t,                         # alpha0
-            _t,                         # tmax
-            _t,                         # tmin
+            wp.array(dtype=_v),  # velocities
+            wp.array(dtype=_v),  # forces
+            wp.array(dtype=_t),  # dt
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=_t),  # vf
+            wp.array(dtype=_t),  # v_sumsq
+            wp.array(dtype=_t),  # f_sumsq
+            wp.array(dtype=_t),  # alpha
+            wp.array(dtype=wp.int32),  # nsteps_inc
+            wp.array(dtype=_t),  # max_norm
+            wp.int32,  # N
+            wp.int32,  # elems_per_thread
+            wp.int32,  # delaystep
+            _t,  # dtgrow
+            _t,  # dtshrink
+            _t,  # alphashrink
+            _t,  # alpha0
+            _t,  # tmax
+            _t,  # tmin
         ],
     )
 
     _fire2_clamp_apply_recompute_overloads[_v] = wp.overload(
         _fire2_clamp_apply_recompute_kernel,
         [
-            wp.array(dtype=_v),         # positions
-            wp.array(dtype=_v),         # velocities
-            wp.array(dtype=_t),         # dt
-            wp.array(dtype=wp.int32),   # batch_idx
-            wp.array(dtype=_t),         # max_norm
-            wp.array(dtype=_t),         # vf (v.f inner product)
-            _t,                         # maxstep
+            wp.array(dtype=_v),  # positions
+            wp.array(dtype=_v),  # velocities
+            wp.array(dtype=_t),  # dt
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=_t),  # max_norm
+            wp.array(dtype=_t),  # vf (v.f inner product)
+            _t,  # maxstep
         ],
     )
 
@@ -485,6 +484,11 @@ def fire2_step(
     alpha: wp.array,
     dt: wp.array,
     nsteps_inc: wp.array,
+    # Scratch buffers (M,)
+    vf: wp.array,
+    v_sumsq: wp.array,
+    f_sumsq: wp.array,
+    max_norm: wp.array,
     # Hyperparameters (Python scalars)
     delaystep: int = 60,
     dtgrow: float = 1.05,
@@ -494,11 +498,6 @@ def fire2_step(
     tmax: float = 0.08,
     tmin: float = 0.005,
     maxstep: float = 0.1,
-    # Scratch buffers
-    vf: wp.array = None,
-    v_sumsq: wp.array = None,
-    f_sumsq: wp.array = None,
-    max_norm: wp.array = None,
     # Device
     device: str = None,
 ) -> None:
@@ -524,6 +523,14 @@ def fire2_step(
         Per-system timestep, modified in-place.
     nsteps_inc : wp.array, shape (M,), dtype int32
         Consecutive positive-power step counter, modified in-place.
+    vf : wp.array, shape (M,), dtype float*
+        Scratch for v.f reduction. Must be zero-initialized.
+    v_sumsq : wp.array, shape (M,), dtype float*
+        Scratch for v.v reduction. Must be zero-initialized.
+    f_sumsq : wp.array, shape (M,), dtype float*
+        Scratch for f.f reduction. Must be zero-initialized.
+    max_norm : wp.array, shape (M,), dtype float*
+        Scratch for max step norm. Must be zero-initialized.
     delaystep : int
         Minimum positive steps before dt growth.
     dtgrow : float
@@ -540,14 +547,6 @@ def fire2_step(
         Minimum timestep.
     maxstep : float
         Maximum allowed step magnitude per system.
-    vf : wp.array, shape (M,), dtype float*
-        Scratch for v.f reduction. Must be zero-initialized.
-    v_sumsq : wp.array, shape (M,), dtype float*
-        Scratch for v.v reduction. Must be zero-initialized.
-    f_sumsq : wp.array, shape (M,), dtype float*
-        Scratch for f.f reduction. Must be zero-initialized.
-    max_norm : wp.array, shape (M,), dtype float*
-        Scratch for max step norm. Must be zero-initialized.
     device : str, optional
         Warp device. Inferred from ``positions`` if not provided.
 
@@ -566,8 +565,7 @@ def fire2_step(
     --------
     >>> fire2_step(positions, velocities, forces, batch_idx,
     ...            alpha, dt, nsteps_inc,
-    ...            vf=vf, v_sumsq=v_sumsq, f_sumsq=f_sumsq,
-    ...            max_norm=max_norm)
+    ...            vf, v_sumsq, f_sumsq, max_norm)
     """
     # --- Input validation ---
     N = positions.shape[0]
@@ -580,9 +578,7 @@ def fire2_step(
             f"velocities length {velocities.shape[0]} != positions length {N}"
         )
     if forces.shape[0] != N:
-        raise ValueError(
-            f"forces length {forces.shape[0]} != positions length {N}"
-        )
+        raise ValueError(f"forces length {forces.shape[0]} != positions length {N}")
     if batch_idx.shape[0] != N:
         raise ValueError(
             f"batch_idx length {batch_idx.shape[0]} != positions length {N}"
@@ -590,13 +586,9 @@ def fire2_step(
 
     M = alpha.shape[0]
     if dt.shape[0] != M:
-        raise ValueError(
-            f"dt length {dt.shape[0]} != alpha length {M}"
-        )
+        raise ValueError(f"dt length {dt.shape[0]} != alpha length {M}")
     if nsteps_inc.shape[0] != M:
-        raise ValueError(
-            f"nsteps_inc length {nsteps_inc.shape[0]} != alpha length {M}"
-        )
+        raise ValueError(f"nsteps_inc length {nsteps_inc.shape[0]} != alpha length {M}")
 
     vec_dtype = positions.dtype
     if device is None:
@@ -609,8 +601,7 @@ def fire2_step(
     wp.launch(
         _fire2_reduce_only_overloads[vec_dtype],
         dim=dim1,
-        inputs=[velocities, forces, dt, batch_idx,
-                vf, v_sumsq, f_sumsq, N, ept1],
+        inputs=[velocities, forces, dt, batch_idx, vf, v_sumsq, f_sumsq, N, ept1],
         device=device,
     )
 
@@ -620,11 +611,27 @@ def fire2_step(
     wp.launch(
         _fire2_fused_mix_maxnorm_overloads[vec_dtype],
         dim=dim2,
-        inputs=[velocities, forces, dt, batch_idx,
-                vf, v_sumsq, f_sumsq, alpha, nsteps_inc,
-                max_norm, N, ept2,
-                delaystep, dtgrow, dtshrink, alphashrink,
-                alpha0, tmax, tmin],
+        inputs=[
+            velocities,
+            forces,
+            dt,
+            batch_idx,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            alpha,
+            nsteps_inc,
+            max_norm,
+            N,
+            ept2,
+            delaystep,
+            dtgrow,
+            dtshrink,
+            alphashrink,
+            alpha0,
+            tmax,
+            tmin,
+        ],
         device=device,
     )
 
@@ -632,8 +639,14 @@ def fire2_step(
     wp.launch(
         _fire2_clamp_apply_recompute_overloads[vec_dtype],
         dim=N,
-        inputs=[positions, velocities, dt, batch_idx,
-                max_norm, vf,  # vf holds v.f; uphill if <= 0
-                maxstep],
+        inputs=[
+            positions,
+            velocities,
+            dt,
+            batch_idx,
+            max_norm,
+            vf,  # vf holds v.f; uphill if <= 0
+            maxstep,
+        ],
         device=device,
     )

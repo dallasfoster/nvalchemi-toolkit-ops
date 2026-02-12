@@ -40,10 +40,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import warp as wp
+from shared_utils import get_gpu_sku, load_config
 
 from nvalchemiops.dynamics.optimizers import fire2_step, fire_step
 from nvalchemiops.torch.fire2 import fire2_step_coord
-from shared_utils import get_gpu_sku, load_config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -111,8 +111,14 @@ def bench_fire2_warp(N, M, device, dtype, hyper, warmup, runs):
     vel_wp = wp.from_torch(vel.clone(), dtype=vec_dtype)
     forces_wp = wp.from_torch(forces, dtype=vec_dtype)
     bidx_wp = wp.from_torch(bidx, dtype=wp.int32)
-    alpha_wp = wp.array(np.full(M, hyper["alpha0"], dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    dt_wp = wp.array(np.full(M, 0.05, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
+    alpha_wp = wp.array(
+        np.full(M, hyper["alpha0"], dtype=np_dtype),
+        dtype=scalar_dtype,
+        device=wp_device,
+    )
+    dt_wp = wp.array(
+        np.full(M, 0.05, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
     nsteps_wp = wp.array(np.zeros(M, dtype=np.int32), dtype=wp.int32, device=wp_device)
 
     # Pre-allocate scratch buffers (reused across iterations)
@@ -127,10 +133,17 @@ def bench_fire2_warp(N, M, device, dtype, hyper, warmup, runs):
         f_sumsq.zero_()
         max_norm.zero_()
         fire2_step(
-            pos_wp, vel_wp, forces_wp, bidx_wp,
-            alpha_wp, dt_wp, nsteps_wp,
-            vf=vf, v_sumsq=v_sumsq, f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            pos_wp,
+            vel_wp,
+            forces_wp,
+            bidx_wp,
+            alpha_wp,
+            dt_wp,
+            nsteps_wp,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **hyper,
         )
 
@@ -154,19 +167,39 @@ def bench_fire1_warp(N, M, device, dtype, warmup, runs):
     vel_wp = wp.from_torch(vel.clone(), dtype=vec_dtype)
     forces_wp = wp.from_torch(forces, dtype=vec_dtype)
     bidx_wp = wp.from_torch(bidx, dtype=wp.int32)
-    masses_wp = wp.array(np.ones(N, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
+    masses_wp = wp.array(
+        np.ones(N, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
 
-    alpha_wp = wp.array(np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    dt_wp = wp.array(np.full(M, 0.01, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    alpha_start_wp = wp.array(np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    f_alpha_wp = wp.array(np.full(M, 0.99, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    dt_min_wp = wp.array(np.full(M, 0.001, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    dt_max_wp = wp.array(np.full(M, 1.0, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    maxstep_wp = wp.array(np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
+    alpha_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_wp = wp.array(
+        np.full(M, 0.01, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    alpha_start_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    f_alpha_wp = wp.array(
+        np.full(M, 0.99, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_min_wp = wp.array(
+        np.full(M, 0.001, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_max_wp = wp.array(
+        np.full(M, 1.0, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    maxstep_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
     nsteps_wp = wp.array(np.zeros(M, dtype=np.int32), dtype=wp.int32, device=wp_device)
     nmin_wp = wp.array(np.full(M, 5, dtype=np.int32), dtype=wp.int32, device=wp_device)
-    f_dec_wp = wp.array(np.full(M, 0.5, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
-    f_inc_wp = wp.array(np.full(M, 1.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device)
+    f_dec_wp = wp.array(
+        np.full(M, 0.5, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    f_inc_wp = wp.array(
+        np.full(M, 1.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
 
     # Pre-allocate scratch buffers
     vf = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
@@ -178,11 +211,24 @@ def bench_fire1_warp(N, M, device, dtype, warmup, runs):
         vv.zero_()
         ff.zero_()
         fire_step(
-            pos_wp, vel_wp, forces_wp, masses_wp,
-            alpha_wp, dt_wp, alpha_start_wp, f_alpha_wp,
-            dt_min_wp, dt_max_wp, maxstep_wp,
-            nsteps_wp, nmin_wp, f_dec_wp, f_inc_wp,
-            vf, vv, ff,
+            pos_wp,
+            vel_wp,
+            forces_wp,
+            masses_wp,
+            alpha_wp,
+            dt_wp,
+            alpha_start_wp,
+            f_alpha_wp,
+            dt_min_wp,
+            dt_max_wp,
+            maxstep_wp,
+            nsteps_wp,
+            nmin_wp,
+            f_dec_wp,
+            f_inc_wp,
+            vf,
+            vv,
+            ff,
             batch_idx=bidx_wp,
         )
 
@@ -210,9 +256,16 @@ def bench_fire2_torch_adapter(N, M, device, dtype, hyper, warmup, runs):
 
     def run():
         fire2_step_coord(
-            pos, vel, forces, bidx,
-            alpha, dt, nsteps_inc,
-            vf=vf, v_sumsq=v_sumsq, f_sumsq=f_sumsq,
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            vf=vf,
+            v_sumsq=v_sumsq,
+            f_sumsq=f_sumsq,
             max_norm=max_norm,
             **hyper,
         )
@@ -345,17 +398,47 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
     # Order: FIRE1(wp), FIRE2(wp), FIRE2(adapt), PyTorch
     method_registry = []
     if methods_cfg.get("warp_fire1", True):
-        method_registry.append(("warp_fire1", "FIRE1(wp)", "F1wp",
-                                lambda N, M, dev, dt, w, r: bench_fire1_warp(N, M, dev, dt, w, r)))
+        method_registry.append(
+            (
+                "warp_fire1",
+                "FIRE1(wp)",
+                "F1wp",
+                lambda N, M, dev, dt, w, r: bench_fire1_warp(N, M, dev, dt, w, r),
+            )
+        )
     if methods_cfg.get("warp_fire2", True):
-        method_registry.append(("warp_fire2", "FIRE2(wp)", "F2wp",
-                                lambda N, M, dev, dt, w, r: bench_fire2_warp(N, M, dev, dt, hyper, w, r)))
+        method_registry.append(
+            (
+                "warp_fire2",
+                "FIRE2(wp)",
+                "F2wp",
+                lambda N, M, dev, dt, w, r: bench_fire2_warp(
+                    N, M, dev, dt, hyper, w, r
+                ),
+            )
+        )
     if methods_cfg.get("torch_adapter", True):
-        method_registry.append(("torch_adapter", "FIRE2(adapt)", "F2ad",
-                                lambda N, M, dev, dt, w, r: bench_fire2_torch_adapter(N, M, dev, dt, hyper, w, r)))
+        method_registry.append(
+            (
+                "torch_adapter",
+                "FIRE2(adapt)",
+                "F2ad",
+                lambda N, M, dev, dt, w, r: bench_fire2_torch_adapter(
+                    N, M, dev, dt, hyper, w, r
+                ),
+            )
+        )
     if methods_cfg.get("torch_reference", True):
-        method_registry.append(("torch_reference", "PyTorch", "PT",
-                                lambda N, M, dev, dt, w, r: bench_fire2_torch_ref(N, M, dev, dt, hyper, w, r)))
+        method_registry.append(
+            (
+                "torch_reference",
+                "PyTorch",
+                "PT",
+                lambda N, M, dev, dt, w, r: bench_fire2_torch_ref(
+                    N, M, dev, dt, hyper, w, r
+                ),
+            )
+        )
 
     for dtype_str in dtypes:
         torch_dtype, dtype_label = _DTYPE_MAP[dtype_str]
@@ -367,9 +450,9 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
         # Build dynamic header
         method_labels = [label for _, label, _, _ in method_registry]
         short_labels = [short for _, _, short, _ in method_registry]
-        header_parts = [f"{'N':>10}", f"{'M':>6}"]
-        for label in method_labels:
-            header_parts.append(f"{label:>14}")
+        header_parts = [f"{'N':>10}", f"{'M':>6}"] + [
+            f"{label:>14}" for label in method_labels
+        ]
         # Add ratio columns: first method vs each other method
         if len(short_labels) > 1:
             base_short = short_labels[0]
@@ -391,18 +474,20 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
                     timings[key] = (label, result)
 
                     # Collect CSV row
-                    all_rows.append({
-                        "method": key,
-                        "dtype": dtype_label,
-                        "total_atoms": N,
-                        "num_systems": M,
-                        "atoms_per_system": N // M,
-                        "warmup": warmup,
-                        "runs": runs,
-                        "median_time_ms": f"{result['median_ms']:.4f}",
-                        "min_time_ms": f"{result['min_ms']:.4f}",
-                        "max_time_ms": f"{result['max_ms']:.4f}",
-                    })
+                    all_rows.append(
+                        {
+                            "method": key,
+                            "dtype": dtype_label,
+                            "total_atoms": N,
+                            "num_systems": M,
+                            "atoms_per_system": N // M,
+                            "warmup": warmup,
+                            "runs": runs,
+                            "median_time_ms": f"{result['median_ms']:.4f}",
+                            "min_time_ms": f"{result['min_ms']:.4f}",
+                            "max_time_ms": f"{result['max_ms']:.4f}",
+                        }
+                    )
 
                 # Print row
                 row_parts = [f"{N:>10,}", f"{M:>6}"]
@@ -428,9 +513,16 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / f"fire2_kernel_benchmark_{gpu_sku}.csv"
         fieldnames = [
-            "method", "dtype", "total_atoms", "num_systems",
-            "atoms_per_system", "warmup", "runs",
-            "median_time_ms", "min_time_ms", "max_time_ms",
+            "method",
+            "dtype",
+            "total_atoms",
+            "num_systems",
+            "atoms_per_system",
+            "warmup",
+            "runs",
+            "median_time_ms",
+            "min_time_ms",
+            "max_time_ms",
         ]
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -468,9 +560,9 @@ def main():
     output_dir = Path(args.output_dir)
     device = torch.device(args.device)
 
-    print(f"FIRE2 Kernel Performance Benchmark")
+    print("FIRE2 Kernel Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(device)}")
-    print(f"N = total atoms, M = number of systems (batches)")
+    print("N = total atoms, M = number of systems (batches)")
 
     run_benchmarks(config, output_dir, device)
 
