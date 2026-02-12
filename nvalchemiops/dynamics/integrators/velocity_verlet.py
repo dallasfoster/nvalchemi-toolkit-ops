@@ -18,6 +18,23 @@ providing time-reversible, symplectic integration for NVE molecular dynamics.
 This module provides both mutating (in-place) and non-mutating versions
 of each kernel for gradient tracking compatibility.
 
+NAMING CONVENTION
+=================
+
+Functions in this module follow a consistent naming scheme:
+
+- **Mutating functions** (e.g., ``velocity_verlet_position_update``):
+  Modify arrays in-place for efficiency. Use when gradients are not needed.
+  Faster but not compatible with autograd.
+
+- **Non-mutating functions** (e.g., ``velocity_verlet_position_update_out``):
+  Append ``_out`` suffix and return new arrays without modifying inputs.
+  Use when gradient tracking is required. Compatible with autograd but
+  requires additional memory.
+
+This pattern is consistent across all dynamics modules (integrators, optimizers).
+See CLAUDE.md architectural patterns section for implementation details.
+
 MATHEMATICAL FORMULATION
 ========================
 
@@ -175,8 +192,9 @@ def _velocity_verlet_position_update_kernel(
     """Update positions and half-step velocities (in-place).
 
     Computes:
-        r(t+dt) = r(t) + v(t)*dt + 0.5*a(t)*dt^2
-        v_half = v(t) + 0.5*a(t)*dt
+
+    - :math:`\\mathbf{r}(t+\\Delta t) = \\mathbf{r}(t) + \\mathbf{v}(t)\\Delta t + \\frac{1}{2}\\mathbf{a}(t)\\Delta t^2`
+    - :math:`\\mathbf{v}_{\\text{half}} = \\mathbf{v}(t) + \\frac{1}{2}\\mathbf{a}(t)\\Delta t`
 
     Launch Grid
     -----------
@@ -265,8 +283,9 @@ def _velocity_verlet_position_update_out_kernel(
     """Update positions and half-step velocities (non-mutating).
 
     Computes:
-        r(t+dt) = r(t) + v(t)*dt + 0.5*a(t)*dt^2
-        v_half = v(t) + 0.5*a(t)*dt
+
+    - :math:`\\mathbf{r}(t+\\Delta t) = \\mathbf{r}(t) + \\mathbf{v}(t)\\Delta t + \\frac{1}{2}\\mathbf{a}(t)\\Delta t^2`
+    - :math:`\\mathbf{v}_{\\text{half}} = \\mathbf{v}(t) + \\frac{1}{2}\\mathbf{a}(t)\\Delta t`
 
     Launch Grid
     -----------

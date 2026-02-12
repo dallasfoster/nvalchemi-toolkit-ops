@@ -66,6 +66,8 @@ from typing import Any
 
 import warp as wp
 
+from ...segment_ops import _compute_ept
+
 
 @wp.kernel
 def _fire_step_no_downhill_kernel(
@@ -199,6 +201,500 @@ def _fire_step_no_downhill_kernel(
     positions[atom_idx] += scale * dr
 
 
+@wp.kernel(enable_backward=False)
+def _fire_uphill_check_kernel(
+    energy: wp.array(dtype=Any),
+    energy_last: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    uphill_flag: wp.array(dtype=wp.int32),
+):
+    """Per-system uphill check for FIRE downhill variant.
+
+    Compares current energy to last accepted energy and sets uphill flag.
+    Only the first atom per system writes the energy updates.
+
+    Launch Grid
+    -----------
+    dim = N (total atoms)
+
+    Parameters
+    ----------
+    energy : wp.array, shape (M,), dtype float*
+        Current per-system energies.
+    energy_last : wp.array, shape (M,), dtype float*
+        Last accepted per-system energies.
+    batch_idx : wp.array, shape (N,), dtype int32
+        Sorted system index per atom. **MUST BE SORTED**.
+    uphill_flag : wp.array, shape (M,), dtype int32
+        OUTPUT: 1 if system is uphill, 0 otherwise.
+
+    Notes
+    -----
+    - batch_idx MUST be sorted for correct first-atom detection
+    - Only first atom per system modifies energy arrays
+    - All atoms read uphill_flag for their system
+    """
+    atom_idx = wp.tid()
+    sys = batch_idx[atom_idx]
+
+    # All atoms check uphill condition
+    is_uphill = energy[sys] > energy_last[sys]
+
+    # Only first atom per system writes state
+    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+        if is_uphill:
+            uphill_flag[sys] = 1
+            energy[sys] = energy_last[sys]  # Revert energy
+        else:
+            uphill_flag[sys] = 0
+            energy_last[sys] = energy[sys]  # Accept energy
+
+
+@wp.kernel(enable_backward=False)
+def _fire_revert_and_reduce_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    positions_last: wp.array(dtype=Any),
+    velocities_last: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    uphill_flag: wp.array(dtype=wp.int32),
+    vf: wp.array(dtype=Any),
+    vv: wp.array(dtype=Any),
+    ff: wp.array(dtype=Any),
+    N: wp.int32,
+    elems_per_thread: wp.int32,
+):
+    """Revert uphill systems and perform RLE-based reduction.
+
+    For uphill systems, reverts positions/velocities to last accepted state.
+    Then performs RLE reduction for vf, vv, ff diagnostics.
+
+    Launch Grid
+    -----------
+    dim = ceil(N / elems_per_thread)
+
+    Parameters
+    ----------
+    positions : wp.array, shape (N,), dtype vec3*
+        Atomic positions, modified in-place for uphill systems.
+    velocities : wp.array, shape (N,), dtype vec3*
+        Atomic velocities, modified in-place for uphill systems.
+    forces : wp.array, shape (N,), dtype vec3*
+        Forces (read-only).
+    positions_last : wp.array, shape (N,), dtype vec3*
+        Last accepted positions. Modified in-place for downhill systems.
+    velocities_last : wp.array, shape (N,), dtype vec3*
+        Last accepted velocities. Modified in-place for downhill systems.
+    batch_idx : wp.array, shape (N,), dtype int32
+        Sorted system index per atom. **MUST BE SORTED**.
+    uphill_flag : wp.array, shape (M,), dtype int32
+        Per-system uphill flags from uphill check kernel.
+    vf, vv, ff : wp.array, shape (M,), dtype float*
+        OUTPUT: Diagnostic accumulators. Must be zero-initialized.
+    N : int32
+        Total number of atoms.
+    elems_per_thread : int32
+        Elements per thread (auto-tuned).
+
+    Notes
+    -----
+    - Uphill systems: revert from positions_last/velocities_last
+    - Downhill systems: update positions_last/velocities_last
+    - RLE reduction minimizes atomic operations
+    """
+    t = wp.tid()
+    start = t * elems_per_thread
+    if start >= N:
+        return
+    end = wp.min(start + elems_per_thread, N)
+
+    # First element
+    s_cur = batch_idx[start]
+    is_uphill = uphill_flag[s_cur] != 0
+
+    if is_uphill:
+        positions[start] = positions_last[start]
+        velocities[start] = velocities_last[start]
+    else:
+        positions_last[start] = positions[start]
+        velocities_last[start] = velocities[start]
+
+    acc_vf = wp.dot(velocities[start], forces[start])
+    acc_vv = wp.dot(velocities[start], velocities[start])
+    acc_ff = wp.dot(forces[start], forces[start])
+
+    # Process remaining elements
+    for i in range(start + 1, end):
+        s = batch_idx[i]
+
+        # Handle revert/accept on segment boundary
+        if s != s_cur:
+            # Flush accumulation for previous segment
+            wp.atomic_add(vf, s_cur, acc_vf)
+            wp.atomic_add(vv, s_cur, acc_vv)
+            wp.atomic_add(ff, s_cur, acc_ff)
+
+            # Start new segment
+            s_cur = s
+            is_uphill = uphill_flag[s] != 0
+            acc_vf = type(acc_vf)(0.0)
+            acc_vv = type(acc_vv)(0.0)
+            acc_ff = type(acc_ff)(0.0)
+
+        # Revert or accept state
+        if is_uphill:
+            positions[i] = positions_last[i]
+            velocities[i] = velocities_last[i]
+        else:
+            positions_last[i] = positions[i]
+            velocities_last[i] = velocities[i]
+
+        # Accumulate diagnostics
+        val_vf = wp.dot(velocities[i], forces[i])
+        val_vv = wp.dot(velocities[i], velocities[i])
+        val_ff = wp.dot(forces[i], forces[i])
+        acc_vf = acc_vf + val_vf
+        acc_vv = acc_vv + val_vv
+        acc_ff = acc_ff + val_ff
+
+    # Flush final segment
+    wp.atomic_add(vf, s_cur, acc_vf)
+    wp.atomic_add(vv, s_cur, acc_vv)
+    wp.atomic_add(ff, s_cur, acc_ff)
+
+
+@wp.kernel(enable_backward=False)
+def _fire_update_downhill_batch_idx_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    alpha: wp.array(dtype=Any),
+    dt: wp.array(dtype=Any),
+    alpha_start: wp.array(dtype=Any),
+    f_alpha: wp.array(dtype=Any),
+    dt_min: wp.array(dtype=Any),
+    dt_max: wp.array(dtype=Any),
+    maxstep: wp.array(dtype=Any),
+    n_steps_positive: wp.array(dtype=wp.int32),
+    n_min: wp.array(dtype=wp.int32),
+    f_dec: wp.array(dtype=Any),
+    f_inc: wp.array(dtype=Any),
+    vf: wp.array(dtype=Any),
+    vv: wp.array(dtype=Any),
+    ff: wp.array(dtype=Any),
+    uphill_flag: wp.array(dtype=wp.int32),
+):
+    """Parameter update for FIRE downhill variant with uphill masking.
+
+    Same as no_downhill update kernel but vf_mask includes uphill check.
+
+    Launch Grid
+    -----------
+    dim = N (total atoms)
+
+    Parameters
+    ----------
+    positions : wp.array, shape (N,), dtype vec3*
+        Atomic positions, modified in-place.
+    velocities : wp.array, shape (N,), dtype vec3*
+        Atomic velocities, modified in-place.
+    forces : wp.array, shape (N,), dtype vec3*
+        Forces (read-only).
+    masses : wp.array, shape (N,), dtype float*
+        Per-atom masses (read-only).
+    batch_idx : wp.array, shape (N,), dtype int32
+        Sorted system index per atom. **MUST BE SORTED**.
+    alpha, dt, etc. : wp.array, shape (M,), dtype float*
+        Per-system FIRE parameters.
+    vf, vv, ff : wp.array, shape (M,), dtype float*
+        Diagnostic values from reduction kernel (read-only).
+    uphill_flag : wp.array, shape (M,), dtype int32
+        Per-system uphill flags (read-only).
+
+    Notes
+    -----
+    - Redundant computation of parameter updates (no synchronization)
+    - Only first atom per segment writes dt, alpha, n_steps_positive
+    - Uphill systems are masked out from velocity mixing
+    """
+    atom_idx = wp.tid()
+    sys = batch_idx[atom_idx]
+
+    # Snapshot dt before any thread modifies it
+    local_dt = dt[sys]
+    zero = type(local_dt)(0.0)
+    one = type(local_dt)(1.0)
+
+    # Redundantly compute parameter updates
+    _vf = vf[sys]
+    _vv = vv[sys]
+    _ff = ff[sys]
+    is_uphill = uphill_flag[sys] != 0
+
+    vf_mask = (_vf > zero) and (not is_uphill)
+    if vf_mask:
+        _nsi = n_steps_positive[sys] + 1
+        n_steps_positive_mask = _nsi >= n_min[sys]
+        if n_steps_positive_mask:
+            new_dt = wp.min(local_dt * f_inc[sys], dt_max[sys])
+            new_alpha = alpha[sys] * f_alpha[sys]
+        else:
+            new_dt = local_dt
+            new_alpha = alpha[sys]
+    else:
+        _nsi = 0
+        new_dt = wp.max(local_dt * f_dec[sys], dt_min[sys])
+        new_alpha = alpha_start[sys]
+
+    # First atom per segment writes
+    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+        dt[sys] = new_dt
+        alpha[sys] = new_alpha
+        n_steps_positive[sys] = _nsi
+
+    # Velocity mixing with uphill masking
+    if _ff > zero:
+        ratio = wp.sqrt(_vv / _ff)
+    else:
+        ratio = zero
+
+    if vf_mask:
+        velocities[atom_idx] = (one - new_alpha) * velocities[atom_idx] + (
+            new_alpha * forces[atom_idx] * ratio
+        )
+    else:
+        velocities[atom_idx] = zero * velocities[atom_idx]
+
+    # Position update
+    velocities[atom_idx] = (
+        velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
+    )
+    dr = local_dt * velocities[atom_idx]
+    dr_len = wp.length(dr)
+    if dr_len > zero:
+        scale = wp.min(one, maxstep[sys] / dr_len)
+    else:
+        scale = one
+    positions[atom_idx] = positions[atom_idx] + scale * dr
+
+
+@wp.kernel(enable_backward=False)
+def _fire_reduce_batch_idx_rle_kernel(
+    velocities: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    vf: wp.array(dtype=Any),
+    vv: wp.array(dtype=Any),
+    ff: wp.array(dtype=Any),
+    N: wp.int32,
+    elems_per_thread: wp.int32,
+):
+    """RLE-based reduction for FIRE diagnostics (vf, vv, ff).
+
+    Uses run-length encoding to minimize atomic operations: accumulates
+    locally while batch_idx stays constant, emits atomic_add only on
+    segment boundaries.
+
+    This kernel implements the reduction phase for FIRE optimization,
+    computing three per-system inner products:
+    - vf[s] = sum(v·f for atoms in system s)
+    - vv[s] = sum(v·v for atoms in system s)
+    - ff[s] = sum(f·f for atoms in system s)
+
+    Launch Grid
+    -----------
+    dim = ceil(N / elems_per_thread)
+
+    Parameters
+    ----------
+    velocities : wp.array, shape (N,), dtype vec3f/vec3d
+        Atomic velocities (read-only).
+    forces : wp.array, shape (N,), dtype vec3f/vec3d
+        Forces on atoms (read-only).
+    batch_idx : wp.array, shape (N,), dtype int32
+        Sorted system index per atom in [0, M). **MUST BE SORTED**.
+    vf : wp.array, shape (M,), dtype float32/float64
+        OUTPUT: v·f per system. Must be zero-initialized by caller.
+    vv : wp.array, shape (M,), dtype float32/float64
+        OUTPUT: v·v per system. Must be zero-initialized by caller.
+    ff : wp.array, shape (M,), dtype float32/float64
+        OUTPUT: f·f per system. Must be zero-initialized by caller.
+    N : int32
+        Total number of atoms.
+    elems_per_thread : int32
+        Elements processed per thread (auto-tuned based on array size).
+
+    Notes
+    -----
+    - batch_idx MUST be sorted in non-decreasing order for correctness
+    - Uses run-length encoding: O(segments) atomic operations instead of O(N)
+    - Typically reduces atomics by 100-1000x compared to naive approach
+    """
+    t = wp.tid()
+    start = t * elems_per_thread
+    if start >= N:
+        return
+    end = wp.min(start + elems_per_thread, N)
+
+    # First element
+    s_cur = batch_idx[start]
+    acc_vf = wp.dot(velocities[start], forces[start])
+    acc_vv = wp.dot(velocities[start], velocities[start])
+    acc_ff = wp.dot(forces[start], forces[start])
+
+    # Process remaining elements in chunk
+    for i in range(start + 1, end):
+        s = batch_idx[i]
+        val_vf = wp.dot(velocities[i], forces[i])
+        val_vv = wp.dot(velocities[i], velocities[i])
+        val_ff = wp.dot(forces[i], forces[i])
+        if s == s_cur:
+            # Same segment: accumulate locally
+            acc_vf = acc_vf + val_vf
+            acc_vv = acc_vv + val_vv
+            acc_ff = acc_ff + val_ff
+        else:
+            # Segment boundary: emit atomic and start new run
+            wp.atomic_add(vf, s_cur, acc_vf)
+            wp.atomic_add(vv, s_cur, acc_vv)
+            wp.atomic_add(ff, s_cur, acc_ff)
+            s_cur = s
+            acc_vf = val_vf
+            acc_vv = val_vv
+            acc_ff = val_ff
+
+    # Flush final run
+    wp.atomic_add(vf, s_cur, acc_vf)
+    wp.atomic_add(vv, s_cur, acc_vv)
+    wp.atomic_add(ff, s_cur, acc_ff)
+
+
+@wp.kernel(enable_backward=False)
+def _fire_update_batch_idx_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    alpha: wp.array(dtype=Any),
+    dt: wp.array(dtype=Any),
+    alpha_start: wp.array(dtype=Any),
+    f_alpha: wp.array(dtype=Any),
+    dt_min: wp.array(dtype=Any),
+    dt_max: wp.array(dtype=Any),
+    maxstep: wp.array(dtype=Any),
+    n_steps_positive: wp.array(dtype=wp.int32),
+    n_min: wp.array(dtype=wp.int32),
+    f_dec: wp.array(dtype=Any),
+    f_inc: wp.array(dtype=Any),
+    vf: wp.array(dtype=Any),
+    vv: wp.array(dtype=Any),
+    ff: wp.array(dtype=Any),
+):
+    """Parameter update, velocity mixing, and position update for FIRE.
+
+    This kernel performs the second phase of FIRE optimization after
+    reduction is complete. Each thread redundantly computes per-system
+    parameter updates from shared read-only inputs (vf, vv, ff), avoiding
+    inter-thread synchronization. Only the first atom per segment writes
+    shared state.
+
+    Launch Grid
+    -----------
+    dim = N (total atoms)
+
+    Parameters
+    ----------
+    positions : wp.array, shape (N,), dtype vec3f/vec3d
+        Atomic positions, modified in-place.
+    velocities : wp.array, shape (N,), dtype vec3f/vec3d
+        Atomic velocities, modified in-place.
+    forces : wp.array, shape (N,), dtype vec3f/vec3d
+        Forces on atoms (read-only).
+    masses : wp.array, shape (N,), dtype float32/float64
+        Per-atom masses (read-only).
+    batch_idx : wp.array, shape (N,), dtype int32
+        Sorted system index per atom. **MUST BE SORTED**.
+    alpha, dt, alpha_start, f_alpha, dt_min, dt_max, maxstep : wp.array, shape (M,), dtype float*
+        Per-system FIRE parameters. dt and alpha modified in-place.
+    n_steps_positive, n_min : wp.array, shape (M,), dtype int32
+        Per-system counters. n_steps_positive modified in-place.
+    f_dec, f_inc : wp.array, shape (M,), dtype float*
+        Per-system timestep factors (read-only).
+    vf, vv, ff : wp.array, shape (M,), dtype float*
+        Per-system diagnostic values from reduction kernel (read-only).
+
+    Notes
+    -----
+    - batch_idx MUST be sorted for correct first-atom-per-segment detection
+    - Each thread redundantly computes parameter updates (no synchronization)
+    - Only first atom in each segment writes dt, alpha, n_steps_positive
+    - Position updates use snapshot of dt before any thread modifies it
+    """
+    atom_idx = wp.tid()
+    sys = batch_idx[atom_idx]
+
+    # Snapshot dt before any thread modifies it (race-condition guard)
+    local_dt = dt[sys]
+    zero = type(local_dt)(0.0)
+    one = type(local_dt)(1.0)
+
+    # Redundantly compute per-system parameter updates from read-only inputs
+    _vf = vf[sys]
+    _vv = vv[sys]
+    _ff = ff[sys]
+
+    vf_mask = _vf > zero
+    if vf_mask:
+        _nsi = n_steps_positive[sys] + 1
+        n_steps_positive_mask = _nsi >= n_min[sys]
+        if n_steps_positive_mask:
+            new_dt = wp.min(local_dt * f_inc[sys], dt_max[sys])
+            new_alpha = alpha[sys] * f_alpha[sys]
+        else:
+            new_dt = local_dt
+            new_alpha = alpha[sys]
+    else:
+        _nsi = 0
+        new_dt = wp.max(local_dt * f_dec[sys], dt_min[sys])
+        new_alpha = alpha_start[sys]
+
+    # First atom per segment writes updated params
+    if atom_idx == 0 or batch_idx[atom_idx - 1] != sys:
+        dt[sys] = new_dt
+        alpha[sys] = new_alpha
+        n_steps_positive[sys] = _nsi
+
+    # Velocity mixing (all atoms)
+    # Guard against division by zero when forces are zero
+    if _ff > zero:
+        ratio = wp.sqrt(_vv / _ff)
+    else:
+        ratio = zero
+
+    if vf_mask:
+        velocities[atom_idx] = (one - new_alpha) * velocities[atom_idx] + (
+            new_alpha * forces[atom_idx] * ratio
+        )
+    else:
+        velocities[atom_idx] = zero * velocities[atom_idx]
+
+    # Update velocities with forces (mass-aware) and positions
+    velocities[atom_idx] = (
+        velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
+    )
+    dr = local_dt * velocities[atom_idx]
+    dr_len = wp.length(dr)
+    if dr_len > zero:
+        scale = wp.min(one, maxstep[sys] / dr_len)
+    else:
+        scale = one
+    positions[atom_idx] = positions[atom_idx] + scale * dr
+
+
 @wp.kernel
 def _fire_step_no_downhill_batch_idx_kernel(
     positions: wp.array(dtype=Any),
@@ -223,8 +719,15 @@ def _fire_step_no_downhill_batch_idx_kernel(
 ):
     r"""FIRE no-downhill step (batched via `batch_idx`; launched over atoms).
 
+    .. deprecated::
+        This kernel has race conditions due to non-atomic accumulation.
+        It is kept for backward compatibility but should not be used.
+        Use the two-kernel approach with _fire_reduce_batch_idx_rle_kernel
+        followed by _fire_update_batch_idx_kernel instead, or use the
+        atom_ptr kernel which is race-free.
+
     This kernel applies the same per-system FIRE logic as the single-system kernel,
-    but uses `batch_idx[atom] -> sys` to select which system’s control parameters
+    but uses `batch_idx[atom] -> sys` to select which system's control parameters
     (`dt`, `alpha`, counters, etc.) apply to each atom.
 
     Parameters
@@ -255,9 +758,9 @@ def _fire_step_no_downhill_batch_idx_kernel(
 
     Notes
     -----
-    - This is the “batch_idx” formulation: it is convenient, but because it relies on
-      cross-thread accumulation into `vf/vv/ff`, the user must ensure those arrays are
-      properly reset each step.
+    - **DEPRECATED:** This kernel has known race conditions
+    - Race conditions occur on lines with += operations on shared arrays
+    - Use _fire_reduce_batch_idx_rle_kernel + _fire_update_batch_idx_kernel instead
     - The FIRE logic uses per-system scalar values via `sys = batch_idx[atom_idx]`.
     """
     atom_idx = wp.tid()
@@ -324,7 +827,7 @@ def _fire_step_no_downhill_ptr_kernel(
 ):
     """FIRE no-downhill step (ptr/CSR batched; launched over systems).
 
-    This is the ptr-based (“CSR”) batching formulation analogous to the reference
+    This is the ptr-based ("CSR") batching formulation analogous to the reference
     implementation you shared:
 
     - Launch grid is over systems: `dim = [num_systems]`
@@ -378,12 +881,19 @@ def _fire_step_no_downhill_ptr_kernel(
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
     n_steps_positive_mask = n_steps_positive[sys] >= n_min[sys]
 
+    # Guard against division by zero when forces are zero
+    zero = type(dt[sys])(0.0)
+    if ff > zero:
+        ratio = wp.sqrt(vv / ff)
+    else:
+        ratio = zero
+
     for i in range(a0, a1):
         velocities[i] = wp.where(
             vf_mask,
             (type(dt[sys])(1.0) - alpha[sys]) * velocities[i]
-            + (alpha[sys] * forces[i] * wp.sqrt(vv / ff)),
-            type(dt[sys])(0.0) * velocities[i],
+            + (alpha[sys] * forces[i] * ratio),
+            zero * velocities[i],
         )
     dt[sys] = wp.where(
         vf_mask,
@@ -596,6 +1106,11 @@ def _fire_step_downhill_batch_idx_kernel(
 ):
     r"""FIRE downhill-check step (batched via `batch_idx`; launched over atoms).
 
+    .. deprecated::
+        This kernel has race conditions due to non-atomic operations on shared state.
+        Use the 3-kernel approach: _fire_uphill_check_kernel, _fire_revert_and_reduce_kernel,
+        and _fire_update_downhill_batch_idx_kernel instead, or use the atom_ptr kernel.
+
     This is the batched analogue of the single-system downhill kernel. Each atom
     reads its system id via `batch_idx` and uses per-system scalars for the FIRE
     controls and downhill bookkeeping.
@@ -791,12 +1306,19 @@ def _fire_step_downhill_ptr_kernel(
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
     n_steps_positive_mask = n_steps_positive[sys] >= n_min[sys]
 
+    # Guard against division by zero when forces are zero
+    zero = type(dt[sys])(0.0)
+    if ff > zero:
+        ratio = wp.sqrt(vv / ff)
+    else:
+        ratio = zero
+
     for i in range(a0, a1):
         velocities[i] = wp.where(
             vf_mask,
             (type(dt[sys])(1.0) - alpha[sys]) * velocities[i]
-            + (alpha[sys] * forces[i] * wp.sqrt(vv / ff)),
-            type(dt[sys])(0.0) * velocities[i],
+            + (alpha[sys] * forces[i] * ratio),
+            zero * velocities[i],
         )
 
     dt[sys] = wp.where(
@@ -1121,12 +1643,19 @@ def _fire_update_params_no_downhill_ptr_kernel(
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
     n_steps_positive_mask = n_steps_positive[sys] >= n_min[sys]
 
+    # Guard against division by zero when forces are zero
+    zero = type(dt[sys])(0.0)
+    if ff > zero:
+        ratio = wp.sqrt(vv / ff)
+    else:
+        ratio = zero
+
     for i in range(a0, a1):
         velocities[i] = wp.where(
             vf_mask,
             (type(dt[sys])(1.0) - alpha[sys]) * velocities[i]
-            + (alpha[sys] * forces[i] * wp.sqrt(vv / ff)),
-            type(dt[sys])(0.0) * velocities[i],
+            + (alpha[sys] * forces[i] * ratio),
+            zero * velocities[i],
         )
     dt[sys] = wp.where(
         vf_mask,
@@ -1526,13 +2055,20 @@ def _fire_update_params_downhill_ptr_kernel(
     n_steps_positive[sys] = wp.where(vf_mask, n_steps_positive[sys] + 1, 0)
     n_steps_positive_mask = n_steps_positive[sys] >= n_min[sys]
 
+    # Guard against division by zero when forces are zero
+    zero = type(dt[sys])(0.0)
+    if ff > zero:
+        ratio = wp.sqrt(vv / ff)
+    else:
+        ratio = zero
+
     # Velocity mixing
     for i in range(a0, a1):
         velocities[i] = wp.where(
             vf_mask,
             (type(dt[sys])(1.0) - alpha[sys]) * velocities[i]
-            + (alpha[sys] * forces[i] * wp.sqrt(vv / ff)),
-            type(dt[sys])(0.0) * velocities[i],
+            + (alpha[sys] * forces[i] * ratio),
+            zero * velocities[i],
         )
 
     dt[sys] = wp.where(
@@ -1569,6 +2105,13 @@ _fire_step_no_downhill_ptr_kernel_overload = {}
 _fire_step_downhill_kernel_overload = {}
 _fire_step_downhill_batch_idx_kernel_overload = {}
 _fire_step_downhill_ptr_kernel_overload = {}
+
+# RLE-based kernels (race-condition free)
+_fire_reduce_batch_idx_rle_kernel_overload = {}
+_fire_update_batch_idx_kernel_overload = {}
+_fire_uphill_check_kernel_overload = {}
+_fire_revert_and_reduce_kernel_overload = {}
+_fire_update_downhill_batch_idx_kernel_overload = {}
 
 # Update-only kernels (no MD integration)
 _fire_update_params_no_downhill_kernel_overload = {}
@@ -1648,6 +2191,102 @@ for t, v in zip(_T, _V):
             wp.array(dtype=t),  # f_dec
             wp.array(dtype=t),  # f_inc
             wp.array(dtype=wp.int32),  # atom_ptr
+        ],
+    )
+
+    # RLE-based reduction kernel (race-condition free)
+    _fire_reduce_batch_idx_rle_kernel_overload[v] = wp.overload(
+        _fire_reduce_batch_idx_rle_kernel,
+        [
+            wp.array(dtype=v),  # velocities
+            wp.array(dtype=v),  # forces
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=t),  # vf
+            wp.array(dtype=t),  # vv
+            wp.array(dtype=t),  # ff
+            wp.int32,  # N
+            wp.int32,  # elems_per_thread
+        ],
+    )
+
+    # RLE-based update kernel (race-condition free)
+    _fire_update_batch_idx_kernel_overload[v] = wp.overload(
+        _fire_update_batch_idx_kernel,
+        [
+            wp.array(dtype=v),  # positions
+            wp.array(dtype=v),  # velocities
+            wp.array(dtype=v),  # forces
+            wp.array(dtype=t),  # masses
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=t),  # alpha
+            wp.array(dtype=t),  # dt
+            wp.array(dtype=t),  # alpha_start
+            wp.array(dtype=t),  # f_alpha
+            wp.array(dtype=t),  # dt_min
+            wp.array(dtype=t),  # dt_max
+            wp.array(dtype=t),  # maxstep
+            wp.array(dtype=wp.int32),  # n_steps_positive
+            wp.array(dtype=wp.int32),  # n_min
+            wp.array(dtype=t),  # f_dec
+            wp.array(dtype=t),  # f_inc
+            wp.array(dtype=t),  # vf
+            wp.array(dtype=t),  # vv
+            wp.array(dtype=t),  # ff
+        ],
+    )
+
+    # RLE-based downhill kernels (race-condition free)
+    _fire_uphill_check_kernel_overload[v] = wp.overload(
+        _fire_uphill_check_kernel,
+        [
+            wp.array(dtype=t),  # energy
+            wp.array(dtype=t),  # energy_last
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=wp.int32),  # uphill_flag
+        ],
+    )
+
+    _fire_revert_and_reduce_kernel_overload[v] = wp.overload(
+        _fire_revert_and_reduce_kernel,
+        [
+            wp.array(dtype=v),  # positions
+            wp.array(dtype=v),  # velocities
+            wp.array(dtype=v),  # forces
+            wp.array(dtype=v),  # positions_last
+            wp.array(dtype=v),  # velocities_last
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=wp.int32),  # uphill_flag
+            wp.array(dtype=t),  # vf
+            wp.array(dtype=t),  # vv
+            wp.array(dtype=t),  # ff
+            wp.int32,  # N
+            wp.int32,  # elems_per_thread
+        ],
+    )
+
+    _fire_update_downhill_batch_idx_kernel_overload[v] = wp.overload(
+        _fire_update_downhill_batch_idx_kernel,
+        [
+            wp.array(dtype=v),  # positions
+            wp.array(dtype=v),  # velocities
+            wp.array(dtype=v),  # forces
+            wp.array(dtype=t),  # masses
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=t),  # alpha
+            wp.array(dtype=t),  # dt
+            wp.array(dtype=t),  # alpha_start
+            wp.array(dtype=t),  # f_alpha
+            wp.array(dtype=t),  # dt_min
+            wp.array(dtype=t),  # dt_max
+            wp.array(dtype=t),  # maxstep
+            wp.array(dtype=wp.int32),  # n_steps_positive
+            wp.array(dtype=wp.int32),  # n_min
+            wp.array(dtype=t),  # f_dec
+            wp.array(dtype=t),  # f_inc
+            wp.array(dtype=t),  # vf
+            wp.array(dtype=t),  # vv
+            wp.array(dtype=t),  # ff
+            wp.array(dtype=wp.int32),  # uphill_flag
         ],
     )
 
@@ -2082,17 +2721,60 @@ def fire_step(
 
     elif batch_idx is not None:
         # BATCH_IDX mode - one thread per atom
+        num_systems = dt.shape[0]
         if vf is None or vv is None or ff is None:
             raise ValueError("vf, vv, ff accumulators required for batch_idx mode")
         if downhill_enabled:
+            # Three-kernel RLE approach for race-free downhill batch_idx mode
+            # Allocate uphill flag buffer
+            uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
+
+            # Kernel 1: Uphill check
             wp.launch(
-                _fire_step_downhill_batch_idx_kernel_overload[vec_dtype],
+                _fire_uphill_check_kernel_overload[vec_dtype],
                 dim=num_atoms,
                 inputs=[
                     energy,
-                    forces,
+                    energy_last,
+                    batch_idx,
+                    uphill_flag,
+                ],
+                device=device,
+            )
+
+            # Kernel 2: Revert if uphill + RLE reduction
+            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
+            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            dim_reduce = (num_atoms + ept - 1) // ept
+
+            wp.launch(
+                _fire_revert_and_reduce_kernel_overload[vec_dtype],
+                dim=dim_reduce,
+                inputs=[
                     positions,
                     velocities,
+                    forces,
+                    positions_last,
+                    velocities_last,
+                    batch_idx,
+                    uphill_flag,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
+                ],
+                device=device,
+            )
+
+            # Kernel 3: Parameter update + velocity mixing
+            wp.launch(
+                _fire_update_downhill_batch_idx_kernel_overload[vec_dtype],
+                dim=num_atoms,
+                inputs=[
+                    positions,
+                    velocities,
+                    forces,
                     masses,
                     batch_idx,
                     alpha,
@@ -2106,18 +2788,39 @@ def fire_step(
                     n_min,
                     f_dec,
                     f_inc,
-                    energy_last,
-                    positions_last,
-                    velocities_last,
                     vf,
                     vv,
                     ff,
+                    uphill_flag,
                 ],
                 device=device,
             )
         else:
+            # Two-kernel RLE approach for race-free batch_idx mode
+            # Kernel 1: RLE-based reduction
+            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
+            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            dim_reduce = (num_atoms + ept - 1) // ept
+
             wp.launch(
-                _fire_step_no_downhill_batch_idx_kernel_overload[vec_dtype],
+                _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
+                dim=dim_reduce,
+                inputs=[
+                    velocities,
+                    forces,
+                    batch_idx,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
+                ],
+                device=device,
+            )
+
+            # Kernel 2: Parameter update + velocity mixing + position update
+            wp.launch(
+                _fire_update_batch_idx_kernel_overload[vec_dtype],
                 dim=num_atoms,
                 inputs=[
                     positions,

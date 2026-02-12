@@ -26,17 +26,21 @@ References
 - Tuckerman et al. J Phys A: Math Gen, 39, 5629 (2006)
 
 The Nosé-Hoover chain equations of motion:
-    ṙᵢ = vᵢ
-    v̇ᵢ = Fᵢ/mᵢ - η̇₁·vᵢ
-    η̇₁ = (2·KE - Ndof·kT) / Q₁
-    η̇ₖ = (Qₖ₋₁·η̇²ₖ₋₁ - kT) / Qₖ   for k > 1
+
+.. math::
+
+    \\dot{\\mathbf{r}}_i &= \\mathbf{v}_i \\\\
+    \\dot{\\mathbf{v}}_i &= \\frac{\\mathbf{F}_i}{m_i} - \\dot{\\eta}_1 \\cdot \\mathbf{v}_i \\\\
+    \\dot{\\eta}_1 &= \\frac{2 \\cdot KE - N_{\\text{dof}} \\cdot k_B T}{Q_1} \\\\
+    \\dot{\\eta}_k &= \\frac{Q_{k-1} \\dot{\\eta}_{k-1}^2 - k_B T}{Q_k} \\quad \\text{for } k > 1
 
 Where:
-    η   : thermostat chain positions (unitless)
-    η̇   : thermostat chain velocities (1/time)
-    Q   : thermostat chain masses (energy·time²)
-    Ndof: degrees of freedom (typically 3N - 3)
-    kT  : target temperature in energy units (k_B = 1)
+
+- :math:`\\eta`: thermostat chain positions (unitless)
+- :math:`\\dot{\\eta}`: thermostat chain velocities (1/time)
+- :math:`Q`: thermostat chain masses (energy·time²)
+- :math:`N_{\\text{dof}}`: degrees of freedom (typically 3N - 3)
+- :math:`k_B T`: target temperature in energy units
 
 BATCH MODE
 ==========

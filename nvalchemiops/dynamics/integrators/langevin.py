@@ -268,10 +268,11 @@ def _langevin_baoab_half_step_out_kernel(
     """BAOAB Langevin half-step: B-A-O-A sequence (non-mutating).
 
     Performs the first four operations of BAOAB:
-    B: v += (dt/2m)*F
-    A: r += (dt/2)*v
-    O: v = c1*v + c2*xi (thermostat)
-    A: r += (dt/2)*v
+
+    - **B**: :math:`\\mathbf{v} \\leftarrow \\mathbf{v} + \\frac{\\Delta t}{2m}\\mathbf{F}`
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
+    - **O**: :math:`\\mathbf{v} \\leftarrow c_1 \\mathbf{v} + c_2 \\boldsymbol{\\xi}` (thermostat)
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
 
     Parameters
     ----------
@@ -406,10 +407,11 @@ def _batch_langevin_baoab_half_step_kernel(
     """BAOAB Langevin half-step for batched systems (in-place).
 
     Performs the first four operations of BAOAB:
-    B: v += (dt/2m)*F
-    A: r += (dt/2)*v
-    O: v = c1*v + c2*xi (thermostat)
-    A: r += (dt/2)*v
+
+    - **B**: :math:`\\mathbf{v} \\leftarrow \\mathbf{v} + \\frac{\\Delta t}{2m}\\mathbf{F}`
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
+    - **O**: :math:`\\mathbf{v} \\leftarrow c_1 \\mathbf{v} + c_2 \\boldsymbol{\\xi}` (thermostat)
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
 
     Parameters
     ----------
@@ -546,10 +548,11 @@ def _batch_langevin_baoab_half_step_out_kernel(
     """BAOAB Langevin half-step for batched systems (non-mutating).
 
     Performs the first four operations of BAOAB:
-    B: v += (dt/2m)*F
-    A: r += (dt/2)*v
-    O: v = c1*v + c2*xi (thermostat)
-    A: r += (dt/2)*v
+
+    - **B**: :math:`\\mathbf{v} \\leftarrow \\mathbf{v} + \\frac{\\Delta t}{2m}\\mathbf{F}`
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
+    - **O**: :math:`\\mathbf{v} \\leftarrow c_1 \\mathbf{v} + c_2 \\boldsymbol{\\xi}` (thermostat)
+    - **A**: :math:`\\mathbf{r} \\leftarrow \\mathbf{r} + \\frac{\\Delta t}{2}\\mathbf{v}`
 
     Parameters
     ----------
