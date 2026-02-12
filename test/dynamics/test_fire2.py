@@ -349,10 +349,10 @@ class TestFire2Step:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -407,10 +407,10 @@ class TestFire2Step:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -464,10 +464,10 @@ class TestFire2Step:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
             _fire2_reference_step(
@@ -531,10 +531,10 @@ class TestFire2Convergence:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
             wp.synchronize()
@@ -591,10 +591,10 @@ class TestFire2Convergence:
                 alpha,
                 dt_arr,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
             wp.synchronize()
@@ -660,10 +660,10 @@ class TestFire2Convergence:
                 alpha,
                 dt_arr,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
             wp.synchronize()
@@ -719,6 +719,38 @@ class TestFire2TorchCoord:
         assert torch.isfinite(vel).all(), "Velocities should be finite"
         assert torch.isfinite(alpha).all(), "Alpha should be finite"
         assert torch.isfinite(dt).all(), "dt should be finite"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_coord_step_requires_contiguous(self, device):
+        """fire2_step_coord raises RuntimeError for non-contiguous compound-type tensors."""
+        N, M = 20, 1
+        dtype = torch.float32
+        rng = np.random.default_rng(42)
+        (
+            pos,
+            vel,
+            forces,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            *_,
+        ) = make_fire2_torch_state(N, M, dtype, device, rng=rng)
+        # Non-contiguous view: (N, 3, 2) -> [:, :, 0] has shape (N, 3) but is not contiguous
+        base = torch.randn(N, 3, 2, device=device, dtype=dtype)
+        pos_view = base[:, :, 0]
+        assert not pos_view.is_contiguous()
+        with pytest.raises(RuntimeError):
+            fire2_step_coord(
+                pos_view,
+                vel,
+                forces,
+                batch_idx,
+                alpha,
+                dt,
+                nsteps_inc,
+                **FIRE2_DEFAULTS,
+            )
 
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.float64])
@@ -974,10 +1006,10 @@ class TestFire2StepErrors:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
 
@@ -1011,10 +1043,10 @@ class TestFire2StepErrors:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
 
@@ -1047,10 +1079,10 @@ class TestFire2StepErrors:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
 
@@ -1084,10 +1116,38 @@ class TestFire2StepErrors:
                 alpha,
                 dt_wrong,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
+                **FIRE2_DEFAULTS,
+            )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_missing_scratch_buffers_error(self, device):
+        """fire2_step raises TypeError when scratch buffers are omitted."""
+        N, M = 20, 1
+        dtype_vec, dtype_scalar, np_dtype = wp.vec3f, wp.float32, np.float32
+        (
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            *_,
+        ) = make_fire2_state(N, M, dtype_vec, dtype_scalar, np_dtype, device)
+
+        with pytest.raises(TypeError):
+            fire2_step(
+                pos,
+                vel,
+                forces,
+                bidx,
+                alpha,
+                dt,
+                nsteps_inc,
                 **FIRE2_DEFAULTS,
             )
 
@@ -1129,10 +1189,10 @@ class TestFire2DeviceInference:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1140,6 +1200,47 @@ class TestFire2DeviceInference:
         # Positions should be modified
         assert not np.allclose(pos.numpy(), pos_before), (
             "Positions should change after fire2_step"
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,np_dtype", DTYPE_CONFIGS)
+    def test_device_string_accepted(self, device, dtype_vec, dtype_scalar, np_dtype):
+        """fire2_step accepts device as a string (e.g. 'cuda:0') without AttributeError."""
+        N, M = 20, 1
+        (
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            *_,
+        ) = make_fire2_state(N, M, dtype_vec, dtype_scalar, np_dtype, device)
+
+        vf, v_sumsq, f_sumsq, max_norm = make_fire2_scratch(M, dtype_scalar, device)
+        pos_before = pos.numpy().copy()
+
+        # Explicit device as string (docstring says str is supported)
+        fire2_step(
+            pos,
+            vel,
+            forces,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
+            device=device,
+            **FIRE2_DEFAULTS,
+        )
+        wp.synchronize()
+
+        assert not np.allclose(pos.numpy(), pos_before), (
+            "Positions should change after fire2_step with device=str"
         )
 
 
@@ -1178,10 +1279,10 @@ class TestFire2StateModification:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1217,10 +1318,10 @@ class TestFire2StateModification:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1256,10 +1357,10 @@ class TestFire2StateModification:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1314,10 +1415,10 @@ class TestFire2VariableSystemSizes:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1374,10 +1475,10 @@ class TestFire2VariableSystemSizes:
                 alpha,
                 dt,
                 nsteps_inc,
-                vf=vf,
-                v_sumsq=v_sumsq,
-                f_sumsq=f_sumsq,
-                max_norm=max_norm,
+                vf,
+                v_sumsq,
+                f_sumsq,
+                max_norm,
                 **FIRE2_DEFAULTS,
             )
             _fire2_reference_step(
@@ -1445,10 +1546,10 @@ class TestFire2AlgorithmicBehavior:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1526,10 +1627,10 @@ class TestFire2AlgorithmicBehavior:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1598,10 +1699,10 @@ class TestFire2AlgorithmicBehavior:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1649,10 +1750,10 @@ class TestFire2AlgorithmicBehavior:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1700,10 +1801,10 @@ class TestFire2AlgorithmicBehavior:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1757,10 +1858,10 @@ class TestFire2EdgeCases:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1817,10 +1918,10 @@ class TestFire2EdgeCases:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1882,10 +1983,10 @@ class TestFire2EdgeCases:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -1955,10 +2056,10 @@ class TestFire2EdgeCases:
             alpha,
             dt_arr,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -2012,10 +2113,10 @@ class TestFire2EdgeCases:
             alpha,
             dt,
             nsteps_inc,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()

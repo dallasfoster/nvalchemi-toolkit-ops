@@ -140,10 +140,10 @@ def bench_fire2_warp(N, M, device, dtype, hyper, warmup, runs):
             alpha_wp,
             dt_wp,
             nsteps_wp,
-            vf=vf,
-            v_sumsq=v_sumsq,
-            f_sumsq=f_sumsq,
-            max_norm=max_norm,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm,
             **hyper,
         )
 
@@ -450,9 +450,9 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
         # Build dynamic header
         method_labels = [label for _, label, _, _ in method_registry]
         short_labels = [short for _, _, short, _ in method_registry]
-        header_parts = [f"{'N':>10}", f"{'M':>6}"]
-        header_parts.extend([f"{label:>14}" for label in method_labels])
-
+        header_parts = [f"{'N':>10}", f"{'M':>6}"] + [
+            f"{label:>14}" for label in method_labels
+        ]
         # Add ratio columns: first method vs each other method
         if len(short_labels) > 1:
             base_short = short_labels[0]

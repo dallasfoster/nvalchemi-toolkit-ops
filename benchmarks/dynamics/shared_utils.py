@@ -2553,13 +2553,17 @@ class NvalchemiOpsBenchmark:
 
             # FIRE2 step
             fire2_step(
-                positions=wp_positions,
-                velocities=wp_velocities,
-                forces=wp_forces,
-                batch_idx=wp_bidx,
-                alpha=wp_alpha,
-                dt=wp_dt,
-                nsteps_inc=wp_nsteps_inc,
+                wp_positions,
+                wp_velocities,
+                wp_forces,
+                wp_bidx,
+                wp_alpha,
+                wp_dt,
+                wp_nsteps_inc,
+                wp_vf,
+                wp_v_sumsq,
+                wp_f_sumsq,
+                wp_max_norm,
                 delaystep=delaystep,
                 dtgrow=dtgrow,
                 dtshrink=dtshrink,
@@ -2568,10 +2572,6 @@ class NvalchemiOpsBenchmark:
                 tmax=tmax,
                 tmin=tmin,
                 maxstep=maxstep,
-                vf=wp_vf,
-                v_sumsq=wp_v_sumsq,
-                f_sumsq=wp_f_sumsq,
-                max_norm=wp_max_norm,
             )
 
             # Wrap positions back into cell
@@ -3134,13 +3134,17 @@ class NvalchemiOpsBenchmark:
 
             # FIRE2 step on extended arrays (mass-free)
             fire2_step(
-                positions=ext_positions,
-                velocities=ext_velocities,
-                forces=ext_forces,
-                batch_idx=ext_bidx,
-                alpha=wp_alpha,
-                dt=wp_dt,
-                nsteps_inc=wp_nsteps_inc,
+                ext_positions,
+                ext_velocities,
+                ext_forces,
+                ext_bidx,
+                wp_alpha,
+                wp_dt,
+                wp_nsteps_inc,
+                wp_vf,
+                wp_v_sumsq,
+                wp_f_sumsq,
+                wp_max_norm,
                 delaystep=delaystep,
                 dtgrow=dtgrow,
                 dtshrink=dtshrink,
@@ -3149,10 +3153,6 @@ class NvalchemiOpsBenchmark:
                 tmax=tmax,
                 tmin=tmin,
                 maxstep=maxstep,
-                vf=wp_vf,
-                v_sumsq=wp_v_sumsq,
-                f_sumsq=wp_f_sumsq,
-                max_norm=wp_max_norm,
             )
 
             # Unpack extended positions -> atom positions + cell

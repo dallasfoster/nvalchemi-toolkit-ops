@@ -549,6 +549,11 @@ def fire2_step(
     alpha: wp.array,
     dt: wp.array,
     nsteps_inc: wp.array,
+    # Scratch buffers (M,)
+    vf: wp.array,
+    v_sumsq: wp.array,
+    f_sumsq: wp.array,
+    max_norm: wp.array,
     # Hyperparameters (Python scalars)
     delaystep: int = 60,
     dtgrow: float = 1.05,
@@ -558,80 +563,57 @@ def fire2_step(
     tmax: float = 0.08,
     tmin: float = 0.005,
     maxstep: float = 0.1,
-    # Scratch buffers
-    vf: wp.array = None,
-    v_sumsq: wp.array = None,
-    f_sumsq: wp.array = None,
-    max_norm: wp.array = None,
     # Device
     device: str = None,
 ) -> None:
     """Complete FIRE2 optimization step.
 
-    Performs velocity update, adaptive parameter tuning, velocity mixing,
-    step computation with uphill correction, clamping, position update,
-    and coupled dt scaling.
+    Modifies *positions*, *velocities*, *alpha*, *dt*, and *nsteps_inc* in-place.
 
     Parameters
     ----------
     positions : wp.array, shape (N,), dtype vec3f/vec3d
-        Atomic positions, modified in-place.
+        Atomic positions.
     velocities : wp.array, shape (N,), dtype vec3f/vec3d
-        Atomic velocities, modified in-place.
+        Atomic velocities.
     forces : wp.array, shape (N,), dtype vec3f/vec3d
         Forces on atoms (read-only).
     batch_idx : wp.array, shape (N,), dtype int32
         Sorted system index per atom (required).
     alpha : wp.array, shape (M,), dtype float*
-        FIRE2 mixing parameter, modified in-place.
+        FIRE2 mixing parameter.
     dt : wp.array, shape (M,), dtype float*
-        Per-system timestep, modified in-place.
+        Per-system timestep.
     nsteps_inc : wp.array, shape (M,), dtype int32
-        Consecutive positive-power step counter, modified in-place.
+        Consecutive positive-power step counter.
+    vf, v_sumsq, f_sumsq, max_norm : wp.array, shape (M,), dtype float*
+        Scratch buffers for reductions. Must be zero-initialized.
     delaystep : int
         Minimum positive steps before dt growth.
-    dtgrow : float
-        Timestep growth factor.
-    dtshrink : float
-        Timestep shrink factor.
+    dtgrow, dtshrink : float
+        Timestep growth/shrink factors.
     alphashrink : float
         Alpha decay factor.
     alpha0 : float
         Alpha reset value.
-    tmax : float
-        Maximum timestep.
-    tmin : float
-        Minimum timestep.
+    tmax, tmin : float
+        Timestep bounds.
     maxstep : float
-        Maximum allowed step magnitude per system.
-    vf : wp.array, shape (M,), dtype float*
-        Scratch for v.f reduction. Must be zero-initialized.
-    v_sumsq : wp.array, shape (M,), dtype float*
-        Scratch for v.v reduction. Must be zero-initialized.
-    f_sumsq : wp.array, shape (M,), dtype float*
-        Scratch for f.f reduction. Must be zero-initialized.
-    max_norm : wp.array, shape (M,), dtype float*
-        Scratch for max step norm. Must be zero-initialized.
+        Maximum step magnitude per system.
     device : str, optional
         Warp device. Inferred from ``positions`` if not provided.
 
     Notes
     -----
-    - Uses 3 fused kernel launches per step to minimize Python/launch overhead.
-    - ``batch_idx`` must be sorted in non-decreasing order; the segment-based
-      reductions assume contiguous atom ranges per system.
-    - All scratch buffers (``vf``, ``v_sumsq``, ``f_sumsq``, ``max_norm``)
-      must be zeroed before each call. The caller is responsible for zeroing.
-    - Unlike ``fire_step``, FIRE2 does not require per-atom masses; the
-      algorithm uses mass-free velocity Verlet integration.
-    - FIRE2 uses uniform (scalar) hyperparameters across all systems.
+    - ``batch_idx`` must be sorted; segment reductions assume contiguous
+      atom ranges per system.
+    - Scratch buffers must be zeroed before each call.
 
     Examples
     --------
     >>> fire2_step(positions, velocities, forces, batch_idx,
     ...            alpha, dt, nsteps_inc,
-    ...            vf=vf, v_sumsq=v_sumsq, f_sumsq=f_sumsq,
-    ...            max_norm=max_norm)
+    ...            vf, v_sumsq, f_sumsq, max_norm)
     """
     # --- Input validation ---
     N = positions.shape[0]
@@ -659,6 +641,8 @@ def fire2_step(
     vec_dtype = positions.dtype
     if device is None:
         device = positions.device
+    elif isinstance(device, str):
+        device = wp.get_device(device)
     sm = max(device.sm_count, 1)
 
     # Kernel 1: reduce only (no velocity write, deferred to fused kernel)

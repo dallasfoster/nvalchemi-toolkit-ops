@@ -116,7 +116,7 @@ class TestScalarSegmentReduce:
         lengths = [500, 1, 3, 200, 2, 1, 50, 1, 1, 100]
         M = len(lengths)
         idx_np = np.concatenate(
-            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+            [np.full(length, s, dtype=np.int32) for s, length in enumerate(lengths)]
         )
         N = len(idx_np)
         x_np = rng.standard_normal(N).astype(np_dtype)
@@ -320,7 +320,7 @@ class TestSegmentedComponentSum:
         lengths = [300, 1, 50, 2, 100]
         M = len(lengths)
         idx_np = np.concatenate(
-            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+            [np.full(length, s, dtype=np.int32) for s, length in enumerate(lengths)]
         )
         N = len(idx_np)
         x_np = rng.standard_normal((N, 3)).astype(np_dtype)
@@ -438,7 +438,7 @@ class TestSegmentedMaxNorm:
         lengths = [200, 1, 3, 100, 50]
         M = len(lengths)
         idx_np = np.concatenate(
-            [np.full(ell, s, dtype=np.int32) for s, ell in enumerate(lengths)]
+            [np.full(length, s, dtype=np.int32) for s, length in enumerate(lengths)]
         )
         N = len(idx_np)
         x_np = rng.standard_normal((N, 3)).astype(np.float32)
