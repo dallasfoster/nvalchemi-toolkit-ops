@@ -9,27 +9,30 @@
 # its affiliates is strictly prohibited.
 
 """
-Variable-Cell FIRE Optimization with LJ Potential
-=================================================
+Variable-Cell FIRE2 Optimization with LJ Potential
+===================================================
 
-This example demonstrates **joint optimization of atomic positions and cell parameters**
-using the FIRE optimizer with the cell filter utilities on a realistic LJ argon crystal.
+This example demonstrates **joint optimization of atomic positions and cell
+parameters** using the FIRE2 optimizer (Guenole et al., 2020) with manual
+pack/unpack of extended arrays.
 
-The workflow demonstrates:
-1. **align_cell()** - Transform cell to upper-triangular form for stability
-2. **LJ energy/forces/virial** - Compute realistic interatomic interactions
-3. **Virial → Stress → Cell Force** - Convert atomic virial to cell driving force
+Compared to FIRE (``07_fire_variable_cell.py``), FIRE2:
+
+- Assumes unit mass (no ``masses`` / ``pack_masses_with_cell`` needed)
+- Requires ``batch_idx`` (all zeros for single system on extended arrays)
+- Has simpler state: ``alpha``, ``dt``, ``nsteps_inc``
+- Hyperparameters are Python scalars
+
+The workflow is otherwise the same:
+
+1. **align_cell()** - Transform cell to upper-triangular form
+2. **LJ energy/forces/virial** - Compute interatomic interactions
+3. **Virial -> Stress -> Cell Force** - Convert virial to cell driving force
 4. **pack_*_with_cell()** - Combine atomic + cell DOFs into extended arrays
-5. **fire_step()** - Standard FIRE optimization on extended arrays
+5. **fire2_step()** - FIRE2 optimization on extended arrays
 6. **unpack_positions_with_cell()** - Extract optimized geometry
 
-We optimize an FCC argon crystal under external pressure, demonstrating:
-- Atomic relaxation (force minimization)
-- Cell relaxation (pressure equilibration)
-- Simultaneous optimization of both
-
-The external pressure creates a driving force on the cell to expand or contract
-until the internal stress matches the applied pressure.
+We optimize an FCC argon crystal under external pressure.
 """
 
 from __future__ import annotations
@@ -51,12 +54,11 @@ from _langevin_utils import (
     virial_to_stress,
 )
 
-from nvalchemiops.dynamics.optimizers import fire_step
+from nvalchemiops.dynamics.optimizers import fire2_step
 from nvalchemiops.dynamics.utils import (
     align_cell,
     compute_cell_volume,
     pack_forces_with_cell,
-    pack_masses_with_cell,
     pack_positions_with_cell,
     stress_to_cell_force,
     unpack_positions_with_cell,
@@ -78,10 +80,6 @@ print(f"Using device: {device}")
 # %%
 # Create Initial System
 # ---------------------
-#
-# Start with an FCC argon crystal at a non-equilibrium density.
-# The optimization will find the equilibrium lattice constant
-# that balances internal stress with external pressure.
 
 n_cells = 3  # 3x3x3 = 108 atoms
 a_initial = 5.5  # Å (slightly expanded from equilibrium ~5.26 Å)
@@ -90,15 +88,14 @@ positions_np, cell_np = create_fcc_lattice(n_cells, a_initial)
 num_atoms = len(positions_np)
 
 # Target external pressure (positive = compression)
-# At ~0.01 GPa, argon should compress slightly from the initial density
 target_pressure_gpa = 0.01
 target_pressure = pressure_gpa_to_ev_per_a3(target_pressure_gpa)
 
-print(f"System: {num_atoms} atoms in {n_cells}³ FCC lattice")
-print(f"Initial lattice constant: {a_initial:.3f} Å")
-print(f"Initial density: {num_atoms / np.linalg.det(cell_np):.4f} atoms/Å³")
+print(f"System: {num_atoms} atoms in {n_cells}\u00b3 FCC lattice")
+print(f"Initial lattice constant: {a_initial:.3f} \u00c5")
+print(f"Initial density: {num_atoms / np.linalg.det(cell_np):.4f} atoms/\u00c5\u00b3")
 print(f"Target external pressure: {target_pressure_gpa:.3f} GPa")
-print(f"LJ parameters: ε = {EPSILON_AR:.4f} eV, σ = {SIGMA_AR:.2f} Å")
+print(f"LJ parameters: \u03b5 = {EPSILON_AR:.4f} eV, \u03c3 = {SIGMA_AR:.2f} \u00c5")
 
 # %%
 # Initialize System
@@ -108,7 +105,7 @@ print(f"LJ parameters: ε = {EPSILON_AR:.4f} eV, σ = {SIGMA_AR:.2f} Å")
 positions = wp.array(positions_np, dtype=wp.vec3d, device=device)
 cell = wp.array(cell_np.reshape(1, 3, 3), dtype=wp.mat33d, device=device)
 
-# Create MD system for force computation (reuses _langevin_utils.MDSystem)
+# Create MD system for force computation
 md_system = MDSystem(
     positions=positions_np,
     cell=cell_np,
@@ -125,7 +122,8 @@ md_system = MDSystem(
 # ------------------
 
 print("\n--- Step 1: Align cell to upper-triangular form ---")
-positions, cell = align_cell(positions, cell, device=device)
+transform = wp.empty(1, dtype=wp.mat33d, device=device)
+positions, cell = align_cell(positions, cell, transform=transform, device=device)
 
 wp.synchronize()
 print(f"Aligned cell:\n{cell.numpy()[0]}")
@@ -136,55 +134,41 @@ print(f"Aligned cell:\n{cell.numpy()[0]}")
 
 print("\n--- Step 2: Pack into extended arrays ---")
 
-# Atomic masses (converted to internal units)
-atom_masses_np = np.full(num_atoms, MASS_AR * AMU_TO_INTERNAL, dtype=np.float64)
-atom_masses = wp.array(atom_masses_np, dtype=wp.float64, device=device)
-
-# Cell DOF mass (controls how fast cell responds vs atoms)
-# Larger mass = slower cell dynamics, more stable
-cell_mass = 5000.0
-
-# Pack into extended arrays
-ext_positions = pack_positions_with_cell(positions, cell, device=device)
-ext_velocities = wp.zeros(num_atoms + 2, dtype=wp.vec3d, device=device)
-ext_masses = pack_masses_with_cell(atom_masses, cell_mass, device=device)
+# Pack positions into extended arrays (atoms + 2 cell DOFs)
+# FIRE2 does NOT use masses, so no pack_masses_with_cell needed.
+N_ext = num_atoms + 2
+ext_positions = wp.empty(N_ext, dtype=wp.vec3d, device=device)
+pack_positions_with_cell(positions, cell, extended=ext_positions, device=device)
+ext_velocities = wp.zeros(N_ext, dtype=wp.vec3d, device=device)
+ext_forces = wp.empty(N_ext, dtype=wp.vec3d, device=device)
 
 print(
     f"Extended array size: {ext_positions.shape[0]} ({num_atoms} atoms + 2 cell DOFs)"
 )
 
 # %%
-# Step 3: FIRE Parameters
-# -----------------------
+# Step 3: FIRE2 Parameters
+# ------------------------
 
-# FIRE optimization parameters
-dt0 = 0.001
-dt_max = 1.0
-dt_min = 0.001
-alpha0 = 0.1
-f_inc = 1.1
-f_dec = 0.5
-f_alpha = 0.99
-n_min = 5
-maxstep = 0.1  # Conservative for stability
+# Per-system state arrays (shape (1,) for single system)
+alpha = wp.array([0.09], dtype=wp.float64, device=device)
+dt = wp.array([0.005], dtype=wp.float64, device=device)
+nsteps_inc = wp.zeros(1, dtype=wp.int32, device=device)
 
-# Device-side FIRE state arrays
-dt = wp.array([dt0], dtype=wp.float64, device=device)
-alpha = wp.array([alpha0], dtype=wp.float64, device=device)
-alpha_start = wp.array([alpha0], dtype=wp.float64, device=device)
-f_alpha_arr = wp.array([f_alpha], dtype=wp.float64, device=device)
-dt_min_arr = wp.array([dt_min], dtype=wp.float64, device=device)
-dt_max_arr = wp.array([dt_max], dtype=wp.float64, device=device)
-maxstep_arr = wp.array([maxstep], dtype=wp.float64, device=device)
-n_steps_positive = wp.zeros(1, dtype=wp.int32, device=device)
-n_min_arr = wp.array([n_min], dtype=wp.int32, device=device)
-f_dec_arr = wp.array([f_dec], dtype=wp.float64, device=device)
-f_inc_arr = wp.array([f_inc], dtype=wp.float64, device=device)
-
-# Accumulators
+# Scratch buffers (shape (1,) for single system)
 vf = wp.zeros(1, dtype=wp.float64, device=device)
-vv = wp.zeros(1, dtype=wp.float64, device=device)
-ff = wp.zeros(1, dtype=wp.float64, device=device)
+v_sumsq = wp.zeros(1, dtype=wp.float64, device=device)
+f_sumsq = wp.zeros(1, dtype=wp.float64, device=device)
+max_norm_buf = wp.zeros(1, dtype=wp.float64, device=device)
+
+# batch_idx for extended arrays (all zeros = single system)
+ext_batch_idx = wp.zeros(N_ext, dtype=wp.int32, device=device)
+
+# Scratch arrays for unpack/stress/volume
+pos_scratch = wp.empty(num_atoms, dtype=wp.vec3d, device=device)
+cell_scratch = wp.empty(1, dtype=wp.mat33d, device=device)
+cell_force_scratch = wp.empty(1, dtype=wp.mat33d, device=device)
+volume_scratch = wp.empty(1, dtype=wp.float64, device=device)
 
 # %%
 # Step 4: Optimization Loop
@@ -192,8 +176,8 @@ ff = wp.zeros(1, dtype=wp.float64, device=device)
 
 max_steps = 1000
 force_tol = 1e-4  # Convergence: max force/stress component
-log_interval = 100  # Print every N steps
-check_interval = 50  # Check convergence every N steps
+log_interval = 100
+check_interval = 50
 
 # History for plotting
 energy_hist = []
@@ -202,8 +186,9 @@ volume_hist = []
 pressure_hist = []
 lattice_const_hist = []
 
-print("\n--- Step 4: Variable-cell FIRE optimization ---")
+print("\n--- Step 4: Variable-cell FIRE2 optimization ---")
 print(f"Force tolerance: {force_tol:.1e}")
+print(f"FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
 print("=" * 90)
 print(
     f"{'Step':>6} {'Energy':>12} {'max|F|':>10} {'Volume':>10} "
@@ -215,7 +200,8 @@ converged = False
 for step in range(max_steps):
     # Unpack current state
     pos_current, cell_current = unpack_positions_with_cell(
-        ext_positions, num_atoms=num_atoms, device=device
+        ext_positions, positions=pos_scratch, cell=cell_scratch,
+        num_atoms=num_atoms, device=device,
     )
 
     # Update MD system with current geometry
@@ -237,54 +223,45 @@ for step in range(max_steps):
     stress = virial_to_stress(virial, md_system.wp_cell, target_pressure, device)
 
     # Convert stress to cell force (for optimization)
-    cell_force = stress_to_cell_force(
-        stress, md_system.wp_cell, keep_aligned=True, device=device
+    compute_cell_volume(md_system.wp_cell, volumes=volume_scratch, device=device)
+    stress_to_cell_force(
+        stress, md_system.wp_cell, volume=volume_scratch,
+        cell_force=cell_force_scratch, keep_aligned=True, device=device,
     )
 
     # Pack forces into extended array
-    ext_forces = pack_forces_with_cell(forces, cell_force, device=device)
+    pack_forces_with_cell(forces, cell_force_scratch, extended=ext_forces, device=device)
 
     # Re-pack positions (after wrapping)
-    ext_positions = pack_positions_with_cell(
-        md_system.wp_positions, md_system.wp_cell, device=device
+    pack_positions_with_cell(
+        md_system.wp_positions, md_system.wp_cell, extended=ext_positions, device=device,
     )
 
-    # Zero accumulators before FIRE step
-    vf.zero_()
-    vv.zero_()
-    ff.zero_()
-
-    # FIRE step on extended arrays
-    fire_step(
+    # FIRE2 step on extended arrays
+    fire2_step(
         positions=ext_positions,
         velocities=ext_velocities,
         forces=ext_forces,
-        masses=ext_masses,
+        batch_idx=ext_batch_idx,
         alpha=alpha,
         dt=dt,
-        alpha_start=alpha_start,
-        f_alpha=f_alpha_arr,
-        dt_min=dt_min_arr,
-        dt_max=dt_max_arr,
-        maxstep=maxstep_arr,
-        n_steps_positive=n_steps_positive,
-        n_min=n_min_arr,
-        f_dec=f_dec_arr,
-        f_inc=f_inc_arr,
+        nsteps_inc=nsteps_inc,
         vf=vf,
-        vv=vv,
-        ff=ff,
+        v_sumsq=v_sumsq,
+        f_sumsq=f_sumsq,
+        max_norm=max_norm_buf,
         device=device,
     )
 
-    # Check convergence and log only at intervals (avoid sync every step)
+    # Check convergence and log only at intervals
     if step % check_interval == 0 or step == max_steps - 1:
         wp.synchronize()
         ext_forces_np = ext_forces.numpy()
         max_force = np.max(np.abs(ext_forces_np))
 
         total_energy = float(energies.numpy().sum())
-        volume = float(compute_cell_volume(md_system.wp_cell, device=device).numpy()[0])
+        compute_cell_volume(md_system.wp_cell, volumes=volume_scratch, device=device)
+        volume = float(volume_scratch.numpy()[0])
 
         # Compute deviation from target pressure (trace of stress / 3)
         stress_np = stress.numpy()[0]
@@ -300,7 +277,6 @@ for step in range(max_steps):
         pressure_hist.append(pressure_deviation_gpa)
         lattice_const_hist.append(lattice_const)
 
-        # Print at log intervals
         if step % log_interval == 0 or step == max_steps - 1:
             print(
                 f"{step:>6d} {total_energy:>12.6f} {max_force:>10.2e} {volume:>10.2f} "
@@ -318,7 +294,8 @@ for step in range(max_steps):
 
 wp.synchronize()
 final_pos, final_cell = unpack_positions_with_cell(
-    ext_positions, num_atoms=num_atoms, device=device
+    ext_positions, positions=pos_scratch, cell=cell_scratch,
+    num_atoms=num_atoms, device=device,
 )
 
 wp.synchronize()
@@ -331,9 +308,9 @@ print("\n" + "=" * 60)
 print("FINAL RESULTS")
 print("=" * 60)
 print(f"Final cell:\n{final_cell_np}")
-print(f"\nFinal volume: {final_volume:.2f} Å³")
-print(f"Final density: {final_density:.6f} atoms/Å³")
-print(f"Effective lattice constant: {final_a:.4f} Å")
+print(f"\nFinal volume: {final_volume:.2f} \u00c5\u00b3")
+print(f"Final density: {final_density:.6f} atoms/\u00c5\u00b3")
+print(f"Effective lattice constant: {final_a:.4f} \u00c5")
 print(f"Target pressure: {target_pressure_gpa:.4f} GPa")
 
 # %%
@@ -361,18 +338,18 @@ axes[0, 1].legend()
 # Volume
 axes[1, 0].plot(steps, volume_hist, "g-", lw=1.5)
 axes[1, 0].set_xlabel("Step")
-axes[1, 0].set_ylabel("Volume (Å³)")
+axes[1, 0].set_ylabel("Volume (\u00c5\u00b3)")
 axes[1, 0].set_title("Cell Volume")
 
 # Lattice constant
 axes[1, 1].plot(steps, lattice_const_hist, "m-", lw=1.5)
-axes[1, 1].axhline(5.26, color="k", ls="--", lw=1, label="~equilibrium (5.26 Å)")
+axes[1, 1].axhline(5.26, color="k", ls="--", lw=1, label="~equilibrium (5.26 \u00c5)")
 axes[1, 1].set_xlabel("Step")
-axes[1, 1].set_ylabel("Lattice constant (Å)")
+axes[1, 1].set_ylabel("Lattice constant (\u00c5)")
 axes[1, 1].set_title("Effective Lattice Constant")
 axes[1, 1].legend()
 
 fig.suptitle(
-    f"Variable-Cell FIRE: LJ Argon at P = {target_pressure_gpa:.3f} GPa", fontsize=14
+    f"Variable-Cell FIRE2: LJ Argon at P = {target_pressure_gpa:.3f} GPa", fontsize=14
 )
 plt.show()

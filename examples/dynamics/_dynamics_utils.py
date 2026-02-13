@@ -43,14 +43,15 @@ from nvalchemiops.dynamics.integrators import (
 )
 from nvalchemiops.dynamics.utils import (
     compute_cell_inverse,
+    compute_cell_volume,
     compute_kinetic_energy,
     compute_temperature,
     initialize_velocities,
     wrap_positions_to_cell,
 )
 from nvalchemiops.interactions import lj_energy_forces, lj_energy_forces_virial
-from nvalchemiops.neighborlist import batch_cell_list, cell_list
-from nvalchemiops.neighborlist.rebuild_detection import neighbor_list_needs_rebuild
+from nvalchemiops.torch.neighbors import batch_cell_list, cell_list
+from nvalchemiops.torch.neighbors.rebuild_detection import neighbor_list_needs_rebuild
 
 # ==============================================================================
 # Physical Constants
@@ -847,20 +848,26 @@ class MDSystem:
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""
-        return compute_kinetic_energy(
+        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
+            kinetic_energy=ke,
             device=self.device,
         )
+        return ke
 
     def temperature_kT(self) -> wp.array:
         """Compute instantaneous temperature on device (kB*T in eV, shape (1,))."""
-        return compute_temperature(
-            velocities=self.wp_velocities,
-            masses=self.wp_masses,
+        ke = self.kinetic_energy()
+        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_temperature(
+            kinetic_energy=ke,
+            temperature=temp,
             num_atoms=self.num_atoms,
             device=self.device,
         )
+        return temp
 
     def initialize_temperature(self, temperature: float, seed: int = 42) -> None:
         """Initialize velocities to target temperature (single system).
@@ -875,10 +882,18 @@ class MDSystem:
         kT = float(temperature) * KB_EV
         wp_temperature = wp.array([kT], dtype=self.wp_dtype, device=self.device)
 
+        # Scratch arrays for COM removal
+        wp_total_momentum = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+        wp_total_mass = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        wp_com_velocities = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+
         initialize_velocities(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
             temperature=wp_temperature,
+            total_momentum=wp_total_momentum,
+            total_mass=wp_total_mass,
+            com_velocities=wp_com_velocities,
             random_seed=seed,
             remove_com=True,
             device=self.device,
@@ -998,13 +1013,21 @@ class BatchedMDSystem:
         wp_temperature = wp.array(
             kT.astype(self.dtype), dtype=self.wp_dtype, device=self.device
         )
+        B = self.num_systems
+        wp_total_momentum = wp.zeros(B, dtype=self.wp_vec_dtype, device=self.device)
+        wp_total_mass = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        wp_com_velocities = wp.zeros(B, dtype=self.wp_vec_dtype, device=self.device)
         init_vel(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
             temperature=wp_temperature,
+            total_momentum=wp_total_momentum,
+            total_mass=wp_total_mass,
+            com_velocities=wp_com_velocities,
             random_seed=seed,
             remove_com=True,
             batch_idx=self.wp_batch_idx,
+            num_systems=B,
             device=self.device,
         )
 
@@ -1013,13 +1036,16 @@ class BatchedMDSystem:
             compute_kinetic_energy as ke_fn,
         )
 
-        ke = ke_fn(
+        wp_ke = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        ke_fn(
             self.wp_velocities,
             self.wp_masses,
+            kinetic_energy=wp_ke,
             batch_idx=self.wp_batch_idx,
-            num_systems=self.num_systems,
+            num_systems=B,
             device=self.device,
-        ).numpy()
+        )
+        ke = wp_ke.numpy()
         dof = np.maximum(3 * self.num_atoms_per_system - 3, 1).astype(np.float64)
         actual_kT = 2.0 * ke / dof
         actual_T = actual_kT / KB_EV
@@ -1047,13 +1073,17 @@ class BatchedMDSystem:
 
     def kinetic_energy_per_system(self) -> wp.array:
         """Compute kinetic energy per system (shape (B,), in eV)."""
-        return compute_kinetic_energy(
+        B = self.num_systems
+        ke = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
+            kinetic_energy=ke,
             batch_idx=self.wp_batch_idx,
-            num_systems=self.num_systems,
+            num_systems=B,
             device=self.device,
         )
+        return ke
 
     def temperature_kT_per_system(self) -> wp.array:
         """Compute temperature per system (kB*T, shape (B,)).
@@ -1070,14 +1100,18 @@ class BatchedMDSystem:
                 "temperature_kT_per_system requires uniform num_atoms per system; "
                 f"got {n}."
             )
-        return compute_temperature(
-            velocities=self.wp_velocities,
-            masses=self.wp_masses,
+        B = self.num_systems
+        ke = self.kinetic_energy_per_system()
+        temp = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        compute_temperature(
+            kinetic_energy=ke,
+            temperature=temp,
             num_atoms=int(n[0]),
             batch_idx=self.wp_batch_idx,
-            num_systems=self.num_systems,
+            num_systems=B,
             device=self.device,
         )
+        return temp
 
 
 def run_langevin_baoab(
@@ -1221,6 +1255,8 @@ def run_batched_langevin_baoab(
         compute_kinetic_energy as ke_fn,
     )
 
+    wp_ke_scratch = wp.zeros(system.num_systems, dtype=system.wp_dtype, device=system.device)
+
     dof = np.maximum(
         3 * np.asarray(system.num_atoms_per_system, dtype=np.int64) - 3, 1
     ).astype(np.float64)
@@ -1250,13 +1286,15 @@ def run_batched_langevin_baoab(
 
         energies = system.compute_forces()
 
-        ke = ke_fn(
+        ke_fn(
             system.wp_velocities,
             system.wp_masses,
+            kinetic_energy=wp_ke_scratch,
             batch_idx=system.wp_batch_idx,
             num_systems=system.num_systems,
             device=system.device,
         )
+        ke = wp_ke_scratch
         langevin_baoab_finalize(
             velocities=system.wp_velocities,
             forces_new=system.wp_forces,
@@ -1443,22 +1481,29 @@ def _scalar_pressure_and_volume(
 ) -> tuple[float, float]:
     """Compute scalar pressure (eV/Å^3) and volume (Å^3)."""
     tensor_dtype = vec9f if system.wp_dtype == wp.float32 else vec9d
+
+    # Pre-allocate scratch arrays
+    volumes = wp.empty(1, dtype=system.wp_dtype, device=system.device)
+    compute_cell_volume(system.wp_cell, volumes=volumes, device=system.device)
+
+    kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
     pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
-    pressure_tensors = compute_pressure_tensor(
+    compute_pressure_tensor(
         velocities=system.wp_velocities,
         masses=system.wp_masses,
         virial_tensors=virial_tensors,
         cells=system.wp_cell,
+        kinetic_tensors=kinetic_tensors,
         pressure_tensors=pressure_tensors,
+        volumes=volumes,
         device=system.device,
     )
-    p = float(
-        compute_scalar_pressure(pressure_tensors, device=system.device).numpy()[0]
-    )
 
-    # Volume from cell determinant (host read at log points)
-    cell_np = wp.to_torch(system.wp_cell).squeeze(0).cpu().numpy()
-    V = float(abs(np.linalg.det(cell_np)))
+    scalar_pressures = wp.empty(1, dtype=system.wp_dtype, device=system.device)
+    compute_scalar_pressure(pressure_tensors, scalar_pressures, device=system.device)
+    p = float(scalar_pressures.numpy()[0])
+
+    V = float(volumes.numpy()[0])
     return p, V
 
 
@@ -1478,11 +1523,15 @@ def run_nph_mtk(
 
     # Barostat mass uses kT and tau_p
     kT_ref = float(reference_temperature_K) * KB_EV
-    cell_masses = compute_barostat_mass(
-        target_temperature=kT_ref,
-        tau_p=float(pdamp_fs),
-        num_atoms=system.num_atoms,
-        dtype=system.wp_dtype,
+    wp_temp_arr = wp.array([kT_ref], dtype=system.wp_dtype, device=system.device)
+    wp_tau_arr = wp.array([float(pdamp_fs)], dtype=system.wp_dtype, device=system.device)
+    wp_natoms_arr = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+    cell_masses = wp.empty(1, dtype=system.wp_dtype, device=system.device)
+    compute_barostat_mass(
+        target_temperature=wp_temp_arr,
+        tau_p=wp_tau_arr,
+        num_atoms=wp_natoms_arr,
+        masses_out=cell_masses,
         device=system.device,
     )
 
@@ -1490,8 +1539,23 @@ def run_nph_mtk(
     tensor_dtype = vec9f if system.wp_dtype == wp.float32 else vec9d
     virial_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
 
+    # Scratch arrays for NPH step
+    nph_pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
+    nph_volumes = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
+    nph_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
+    nph_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
+    nph_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
+    nph_num_atoms_per_system = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+
     # Initial forces/virial
     wp_energies = system.compute_forces_virial(virial_tensors)
+
+    # Pre-compute volumes and kinetic energy for the first step
+    compute_cell_volume(system.wp_cell, volumes=nph_volumes, device=system.device)
+    compute_kinetic_energy(
+        system.wp_velocities, system.wp_masses,
+        kinetic_energy=nph_kinetic_energy, device=system.device,
+    )
 
     stats_history: list[BarostatStats] = []
 
@@ -1522,6 +1586,12 @@ def run_nph_mtk(
             target_pressure=wp_target_pressure,
             num_atoms=system.num_atoms,
             dt=float(dt_fs),
+            pressure_tensors=nph_pressure_tensors,
+            volumes=nph_volumes,
+            kinetic_energy=nph_kinetic_energy,
+            cells_inv=nph_cells_inv,
+            kinetic_tensors=nph_kinetic_tensors,
+            num_atoms_per_system=nph_num_atoms_per_system,
             compute_forces_fn=_compute_forces_cb,
             device=system.device,
         )
@@ -1590,16 +1660,18 @@ def run_npt_mtk(
     wp_target_pressure = wp.array([p_ext], dtype=system.wp_dtype, device=system.device)
 
     # Thermostat chain masses/state (expects kT, tau in same time units as dt)
-    thermostat_masses = nhc_compute_masses(
+    thermostat_masses = wp.empty(int(chain_length), dtype=system.wp_dtype, device=system.device)
+    nhc_compute_masses(
         ndof=3 * system.num_atoms,
         target_temp=kT,
         tau=float(tdamp_fs),
         chain_length=int(chain_length),
+        masses=thermostat_masses,
         num_systems=1,
         device=system.device,
         dtype=system.wp_dtype,
     )
-    # nhc_compute_masses may return shape (chain_length,) for single-system; NPT expects (B, chain_length)
+    # nhc_compute_masses returns shape (chain_length,) for single-system; NPT expects (B, chain_length)
     if thermostat_masses.ndim == 1:
         thermostat_masses_2d = wp.zeros(
             (1, chain_length), dtype=system.wp_dtype, device=system.device
@@ -1615,11 +1687,15 @@ def run_npt_mtk(
     eta_dot = wp.zeros((1, chain_length), dtype=system.wp_dtype, device=system.device)
 
     # Barostat masses/state
-    cell_masses = compute_barostat_mass(
-        target_temperature=kT,
-        tau_p=float(pdamp_fs),
-        num_atoms=system.num_atoms,
-        dtype=system.wp_dtype,
+    wp_temp_baro = wp.array([kT], dtype=system.wp_dtype, device=system.device)
+    wp_tau_baro = wp.array([float(pdamp_fs)], dtype=system.wp_dtype, device=system.device)
+    wp_natoms_baro = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+    cell_masses = wp.empty(1, dtype=system.wp_dtype, device=system.device)
+    compute_barostat_mass(
+        target_temperature=wp_temp_baro,
+        tau_p=wp_tau_baro,
+        num_atoms=wp_natoms_baro,
+        masses_out=cell_masses,
         device=system.device,
     )
     cell_velocities = wp.zeros(1, dtype=system.wp_mat_dtype, device=system.device)
@@ -1627,8 +1703,23 @@ def run_npt_mtk(
     tensor_dtype = vec9f if system.wp_dtype == wp.float32 else vec9d
     virial_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
 
+    # Scratch arrays for NPT step
+    npt_pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
+    npt_volumes = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
+    npt_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
+    npt_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
+    npt_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
+    npt_num_atoms_per_system = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+
     # Initial forces/virial
     wp_energies = system.compute_forces_virial(virial_tensors)
+
+    # Pre-compute volumes and kinetic energy for the first step
+    compute_cell_volume(system.wp_cell, volumes=npt_volumes, device=system.device)
+    compute_kinetic_energy(
+        system.wp_velocities, system.wp_masses,
+        kinetic_energy=npt_kinetic_energy, device=system.device,
+    )
 
     stats_history: list[BarostatStats] = []
 
@@ -1667,6 +1758,12 @@ def run_npt_mtk(
             num_atoms=system.num_atoms,
             chain_length=int(chain_length),
             dt=float(dt_fs),
+            pressure_tensors=npt_pressure_tensors,
+            volumes=npt_volumes,
+            kinetic_energy=npt_kinetic_energy,
+            cells_inv=npt_cells_inv,
+            kinetic_tensors=npt_kinetic_tensors,
+            num_atoms_per_system=npt_num_atoms_per_system,
             compute_forces_fn=_compute_forces_cb,
             device=system.device,
         )

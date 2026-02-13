@@ -50,7 +50,7 @@ from _dynamics_utils import (
 from nvalchemiops.batch_utils import create_atom_ptr, create_batch_idx
 from nvalchemiops.dynamics.optimizers import fire_step
 from nvalchemiops.interactions import lj_energy_forces
-from nvalchemiops.neighborlist import batch_cell_list
+from nvalchemiops.torch.neighbors import batch_cell_list
 from nvalchemiops.segment_ops import (
     segmented_max_norm,
     segmented_sum,
@@ -256,6 +256,7 @@ f_inc_arr = wp.array([f_inc] * num_systems, dtype=wp.float64, device=device)
 vf = wp.zeros(num_systems, dtype=wp.float64, device=device)
 vv = wp.zeros(num_systems, dtype=wp.float64, device=device)
 ff = wp.zeros(num_systems, dtype=wp.float64, device=device)
+uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
 
 
 # %%
@@ -321,6 +322,7 @@ for step in range(max_steps):
         n_min=n_min_arr,
         f_dec=f_dec_arr,
         f_inc=f_inc_arr,
+        uphill_flag=uphill_flag,
         vf=vf,
         vv=vv,
         ff=ff,
@@ -412,6 +414,7 @@ for step in range(max_steps):
         n_min=n_min_arr,
         f_dec=f_dec_arr,
         f_inc=f_inc_arr,
+        uphill_flag=uphill_flag,
         atom_ptr=atom_ptr,  # Use atom_ptr instead of batch_idx
         device=device,
     )
