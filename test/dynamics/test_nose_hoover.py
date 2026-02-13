@@ -134,6 +134,10 @@ def run_nhc_nvt_step(
     device: str = None,
 ):
     """Run one complete NVT integration step with Nosé-Hoover chain."""
+    dev = device if device is not None else velocities.device
+    chain_dtype = eta.dtype
+
+    # First thermostat half-step
     nhc_thermostat_chain_update(
         velocities,
         masses,
@@ -143,6 +147,10 @@ def run_nhc_nvt_step(
         target_temp,
         dt,
         ndof,
+        ke2=wp.empty(1, dtype=chain_dtype, device=dev),
+        total_scale=wp.ones(1, dtype=chain_dtype, device=dev),
+        step_scale=wp.empty(1, dtype=chain_dtype, device=dev),
+        dt_chain=wp.empty(1, dtype=chain_dtype, device=dev),
         nloops=nloops,
         device=device,
     )
@@ -150,6 +158,8 @@ def run_nhc_nvt_step(
     nhc_position_update(positions, velocities, dt, device=device)
     compute_forces_fn()
     nhc_velocity_half_step(velocities, forces, masses, dt, device=device)
+
+    # Second thermostat half-step
     nhc_thermostat_chain_update(
         velocities,
         masses,
@@ -159,6 +169,10 @@ def run_nhc_nvt_step(
         target_temp,
         dt,
         ndof,
+        ke2=wp.empty(1, dtype=chain_dtype, device=dev),
+        total_scale=wp.ones(1, dtype=chain_dtype, device=dev),
+        step_scale=wp.empty(1, dtype=chain_dtype, device=dev),
+        dt_chain=wp.empty(1, dtype=chain_dtype, device=dev),
         nloops=nloops,
         device=device,
     )
@@ -180,7 +194,8 @@ class TestNHCMassComputation:
         tau = 0.1
         chain_length = 3
 
-        masses = nhc_compute_masses(ndof, target_temp, tau, chain_length, device=device)
+        masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(ndof, target_temp, tau, chain_length, masses, device=device)
 
         assert len(masses) == chain_length
         expected_q0 = ndof * target_temp * tau * tau
@@ -198,8 +213,9 @@ class TestNHCMassComputation:
         tau = 0.05
 
         for chain_length in [1, 3, 5]:
-            masses = nhc_compute_masses(
-                ndof, target_temp, tau, chain_length, device=device
+            masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+            nhc_compute_masses(
+                ndof, target_temp, tau, chain_length, masses, device=device
             )
             assert len(masses) == chain_length
 
@@ -262,7 +278,10 @@ class TestNHCAPI:
         )
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
-        vel_out = nhc_velocity_half_step_out(velocities, forces, masses, dt)
+        velocities_out = wp.empty_like(velocities)
+        vel_out = nhc_velocity_half_step_out(
+            velocities, forces, masses, dt, velocities_out
+        )
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(velocities.numpy(), vel_np)
@@ -308,7 +327,8 @@ class TestNHCAPI:
         )
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
-        pos_out = nhc_position_update_out(positions, velocities, dt)
+        positions_out = wp.empty_like(positions)
+        pos_out = nhc_position_update_out(positions, velocities, dt, positions_out)
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(positions.numpy(), pos_np)
@@ -338,8 +358,9 @@ class TestNHCAPI:
         )
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
 
         eta = wp.zeros(chain_length, dtype=dtype_scalar, device=device)
@@ -358,6 +379,10 @@ class TestNHCAPI:
             target_temp_arr,
             dt,
             ndof_arr,
+            ke2=wp.empty(1, dtype=dtype_scalar, device=device),
+            total_scale=wp.ones(1, dtype=dtype_scalar, device=device),
+            step_scale=wp.empty(1, dtype=dtype_scalar, device=device),
+            dt_chain=wp.empty(1, dtype=dtype_scalar, device=device),
             device=device,
         )
         wp.synchronize_device(device)
@@ -383,8 +408,9 @@ class TestNHCAPI:
         )
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
 
         eta_np = np.zeros(chain_length)
@@ -396,6 +422,9 @@ class TestNHCAPI:
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
+        velocities_out = wp.empty_like(velocities)
+        eta_out_arr = wp.empty_like(eta)
+        eta_dot_out_arr = wp.empty_like(eta_dot)
         vel_out, eta_out, eta_dot_out = nhc_thermostat_chain_update_out(
             velocities,
             masses,
@@ -405,6 +434,13 @@ class TestNHCAPI:
             target_temp_arr,
             dt,
             ndof_arr,
+            ke2=wp.empty(1, dtype=dtype_scalar, device=device),
+            total_scale=wp.ones(1, dtype=dtype_scalar, device=device),
+            step_scale=wp.empty(1, dtype=dtype_scalar, device=device),
+            dt_chain=wp.empty(1, dtype=dtype_scalar, device=device),
+            velocities_out=velocities_out,
+            eta_out=eta_out_arr,
+            eta_dot_out=eta_dot_out_arr,
             device=device,
         )
         wp.synchronize_device(device)
@@ -433,8 +469,17 @@ class TestNHCAPI:
         target_temp_arr = wp.array([target_temp], dtype=dtype_scalar, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=dtype_scalar, device=device)
 
-        ke_chain, pe_chain = nhc_compute_chain_energy(
-            eta, eta_dot, eta_mass, target_temp_arr, ndof_arr, device=device
+        ke_chain = wp.empty(1, dtype=dtype_scalar, device=device)
+        pe_chain = wp.empty(1, dtype=dtype_scalar, device=device)
+        nhc_compute_chain_energy(
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            ndof_arr,
+            ke_chain,
+            pe_chain,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -452,8 +497,9 @@ class TestNHCAPI:
         dt_val = 0.01
 
         masses_np = np.ones(num_atoms, dtype=np_dtype)
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
 
         velocities = wp.array(
@@ -480,6 +526,10 @@ class TestNHCAPI:
             target_temp_arr,
             dt,
             ndof_arr,
+            ke2=wp.empty(1, dtype=dtype_scalar, device=device),
+            total_scale=wp.ones(1, dtype=dtype_scalar, device=device),
+            step_scale=wp.empty(1, dtype=dtype_scalar, device=device),
+            dt_chain=wp.empty(1, dtype=dtype_scalar, device=device),
             nloops=1,
         )
 
@@ -510,14 +560,12 @@ class TestNHCAPI:
         positions_out = wp.empty_like(positions)
         velocities_out = wp.empty_like(velocities)
 
-        nhc_position_update_out(
-            positions, velocities, dt, positions_out=positions_out, device=device
-        )
+        nhc_position_update_out(positions, velocities, dt, positions_out, device=device)
 
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.ones(num_atoms, dtype=dtype_scalar, device=device)
         nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, velocities_out=velocities_out, device=device
+            velocities, forces, masses, dt, velocities_out, device=device
         )
 
         wp.synchronize_device(device)
@@ -588,8 +636,15 @@ class TestNHCBatched:
         batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
+        velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, batch_idx=batch_idx, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -648,8 +703,9 @@ class TestNHCBatched:
         batch_idx = wp.array([0] * 10 + [1] * 10, dtype=wp.int32, device=device)
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
+        positions_out = wp.empty_like(positions)
         pos_out = nhc_position_update_out(
-            positions, velocities, dt, batch_idx=batch_idx, device=device
+            positions, velocities, dt, positions_out, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -678,8 +734,17 @@ class TestNHCBatched:
         target_temp = wp.array([1.0, 1.5], dtype=wp.float64, device=device)
         ndof = wp.array([27.0, 27.0], dtype=wp.float64, device=device)
 
-        ke_chain, pe_chain = nhc_compute_chain_energy(
-            eta, eta_dot, eta_mass, target_temp, ndof, num_systems=num_systems
+        ke_chain = wp.empty(num_systems, dtype=wp.float64, device=device)
+        pe_chain = wp.empty(num_systems, dtype=wp.float64, device=device)
+        nhc_compute_chain_energy(
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp,
+            ndof,
+            ke_chain,
+            pe_chain,
+            num_systems=num_systems,
         )
 
         wp.synchronize_device(device)
@@ -758,8 +823,17 @@ class TestNHCPhysics:
         target_temp_arr = wp.array([target_temp], dtype=wp.float64, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=wp.float64, device=device)
 
-        ke_chain, pe_chain = nhc_compute_chain_energy(
-            eta, eta_dot, eta_mass, target_temp_arr, ndof_arr, device=device
+        ke_chain = wp.empty(1, dtype=wp.float64, device=device)
+        pe_chain = wp.empty(1, dtype=wp.float64, device=device)
+        nhc_compute_chain_energy(
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            ndof_arr,
+            ke_chain,
+            pe_chain,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -781,8 +855,17 @@ class TestNHCPhysics:
         target_temp_arr = wp.array([target_temp], dtype=wp.float64, device=device)
         ndof_arr = wp.array([float(ndof)], dtype=wp.float64, device=device)
 
-        ke_chain, pe_chain = nhc_compute_chain_energy(
-            eta, eta_dot, eta_mass, target_temp_arr, ndof_arr, device=device
+        ke_chain = wp.empty(1, dtype=wp.float64, device=device)
+        pe_chain = wp.empty(1, dtype=wp.float64, device=device)
+        nhc_compute_chain_energy(
+            eta,
+            eta_dot,
+            eta_mass,
+            target_temp_arr,
+            ndof_arr,
+            ke_chain,
+            pe_chain,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -806,8 +889,9 @@ class TestNHCPhysics:
         np.random.seed(42)
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
@@ -882,8 +966,9 @@ class TestNHCPhysics:
         np.random.seed(42)
 
         ndof = 3 * num_atoms - 3
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
@@ -917,8 +1002,17 @@ class TestNHCPhysics:
             ke_particles = compute_kinetic_energy_np(vel_np, masses_np)
             pe_particles = compute_harmonic_energy(pos_np, spring_k)
 
-            ke_chain, pe_chain = nhc_compute_chain_energy(
-                eta, eta_dot, eta_mass, target_temp_arr, ndof_arr, device=device
+            ke_chain = wp.empty(1, dtype=wp.float64, device=device)
+            pe_chain = wp.empty(1, dtype=wp.float64, device=device)
+            nhc_compute_chain_energy(
+                eta,
+                eta_dot,
+                eta_mass,
+                target_temp_arr,
+                ndof_arr,
+                ke_chain,
+                pe_chain,
+                device=device,
             )
             wp.synchronize_device(device)
 
@@ -983,8 +1077,9 @@ class TestNHCPhysics:
         masses_np = np.ones(num_atoms, dtype=np.float32)
 
         def measure_temperature(target_temp):
-            chain_masses = nhc_compute_masses(
-                ndof, target_temp, tau, chain_length, device=device
+            chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+            nhc_compute_masses(
+                ndof, target_temp, tau, chain_length, chain_masses, device=device
             )
             initial_pos = np.random.randn(num_atoms, 3).astype(np.float32) * 0.5
             initial_vel = np.random.randn(num_atoms, 3).astype(np.float32) * 0.1
@@ -1056,8 +1151,9 @@ class TestNHCPhysics:
 
         np.random.seed(42)
         masses_np = np.ones(num_atoms, dtype=np.float32)
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
 
         positions = wp.array(
@@ -1090,6 +1186,10 @@ class TestNHCPhysics:
                 target_temp_arr,
                 dt,
                 ndof_arr,
+                ke2=wp.empty(1, dtype=wp.float32, device=device),
+                total_scale=wp.ones(1, dtype=wp.float32, device=device),
+                step_scale=wp.empty(1, dtype=wp.float32, device=device),
+                dt_chain=wp.empty(1, dtype=wp.float32, device=device),
                 nloops=1,
                 device=device,
             )
@@ -1112,8 +1212,9 @@ class TestNHCPhysics:
 
         np.random.seed(42)
         masses_np = np.ones(num_atoms, dtype=np.float32)
-        chain_masses = nhc_compute_masses(
-            ndof, target_temp, tau, chain_length, device=device
+        chain_masses = wp.empty(chain_length, dtype=wp.float64, device=device)
+        nhc_compute_masses(
+            ndof, target_temp, tau, chain_length, chain_masses, device=device
         )
 
         velocities = wp.array(
@@ -1139,6 +1240,10 @@ class TestNHCPhysics:
             target_temp_arr,
             dt,
             ndof_arr,
+            ke2=wp.empty(1, dtype=wp.float32, device=device),
+            total_scale=wp.ones(1, dtype=wp.float32, device=device),
+            step_scale=wp.empty(1, dtype=wp.float32, device=device),
+            dt_chain=wp.empty(1, dtype=wp.float32, device=device),
             nloops=nloops,
             device=device,
         )
@@ -1254,8 +1359,15 @@ class TestNHCAtomPtr:
 
         vel_orig = velocities.numpy().copy()
 
+        velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, atom_ptr=atom_ptr, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1293,8 +1405,9 @@ class TestNHCAtomPtr:
 
         pos_orig = positions.numpy().copy()
 
+        positions_out = wp.empty_like(positions)
         pos_out = nhc_position_update_out(
-            positions, velocities, dt, atom_ptr=atom_ptr, device=device
+            positions, velocities, dt, positions_out, atom_ptr=atom_ptr, device=device
         )
 
         wp.synchronize_device(device)

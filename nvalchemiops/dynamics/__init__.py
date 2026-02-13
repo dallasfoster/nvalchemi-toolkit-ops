@@ -40,8 +40,11 @@ Example
 >>>
 >>> # Non-mutating API (for gradient tracking)
 >>> from nvalchemiops.dynamics.integrators import velocity_verlet_position_update_out
->>> new_pos, new_vel = velocity_verlet_position_update_out(
-...     positions, velocities, forces, masses, dt
+>>> positions_out = wp.zeros_like(positions)
+>>> velocities_out = wp.zeros_like(velocities)
+>>> positions_out, velocities_out = velocity_verlet_position_update_out(
+...     positions, velocities, forces, masses, dt,
+...     positions_out, velocities_out,
 ... )
 """
 
