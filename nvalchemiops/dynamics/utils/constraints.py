@@ -476,7 +476,7 @@ def shake_iteration(
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
     bond_lengths_sq: wp.array,
-    max_error: wp.array = None,
+    max_error: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -496,8 +496,9 @@ def shake_iteration(
         Second atom index for each bond. Shape (M,).
     bond_lengths_sq : wp.array
         Target bond length squared. Shape (M,).
-    max_error : wp.array(dtype=wp.float64), optional
-        Array to store max error. If None, allocated internally.
+    max_error : wp.array(dtype=wp.float64)
+        Output array to store max error. Shape (1,).
+        Zeroed internally before each use.
     device : str, optional
         Warp device.
 
@@ -509,12 +510,8 @@ def shake_iteration(
     if device is None:
         device = positions.device
 
+    max_error.zero_()
     num_bonds = bond_atom_i.shape[0]
-
-    if max_error is None:
-        max_error = wp.zeros(1, dtype=wp.float64, device=device)
-    else:
-        max_error.zero_()
 
     vec_dtype = positions.dtype
     wp.launch(
@@ -542,6 +539,7 @@ def shake_constraints(
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
     bond_lengths_sq: wp.array,
+    max_error: wp.array,
     num_iter: int = 10,
     device: str = None,
 ) -> wp.array:
@@ -566,6 +564,9 @@ def shake_constraints(
         Second atom index for each bond. Shape (M,).
     bond_lengths_sq : wp.array
         Target bond length squared. Shape (M,).
+    max_error : wp.array(dtype=wp.float64)
+        Scratch array for max error tracking. Shape (1,).
+        Caller must pre-allocate. Zeroed internally between iterations.
     num_iter : int, optional
         Number of iterations to run. Default 10.
         Typical values: 3-20 depending on constraint stiffness.
@@ -580,19 +581,17 @@ def shake_constraints(
     Example
     -------
     >>> # After unconstrained position update
+    >>> max_error = wp.empty(1, dtype=wp.float64, device=device)
     >>> final_error = shake_constraints(
     ...     positions, positions_old, masses,
-    ...     bond_i, bond_j, bond_lengths_sq,
+    ...     bond_i, bond_j, bond_lengths_sq, max_error,
     ...     num_iter=10
     ... )
     """
     if device is None:
         device = positions.device
 
-    max_error = wp.zeros(1, dtype=wp.float64, device=device)
-
     for _ in range(num_iter):
-        max_error.zero_()
         max_error = shake_iteration(
             positions,
             positions_old,
@@ -614,8 +613,8 @@ def shake_iteration_out(
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
     bond_lengths_sq: wp.array,
-    position_corrections: wp.array = None,
-    max_error: wp.array = None,
+    position_corrections: wp.array,
+    max_error: wp.array,
     device: str = None,
 ) -> tuple[wp.array, wp.array]:
     """
@@ -635,10 +634,10 @@ def shake_iteration_out(
         Second atom index for each bond. Shape (M,).
     bond_lengths_sq : wp.array
         Target bond length squared. Shape (M,).
-    position_corrections : wp.array, optional
-        Output corrections. If None, allocated internally.
-    max_error : wp.array(dtype=wp.float64), optional
-        Array to store max error. If None, allocated internally.
+    position_corrections : wp.array
+        Output corrections. Shape (N,). Zeroed internally before each use.
+    max_error : wp.array(dtype=wp.float64)
+        Output max error. Shape (1,). Zeroed internally before each use.
     device : str, optional
         Warp device.
 
@@ -651,18 +650,9 @@ def shake_iteration_out(
     if device is None:
         device = positions.device
 
-    num_atoms = positions.shape[0]
+    position_corrections.zero_()
+    max_error.zero_()
     num_bonds = bond_atom_i.shape[0]
-
-    if position_corrections is None:
-        position_corrections = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-    else:
-        position_corrections.zero_()
-
-    if max_error is None:
-        max_error = wp.zeros(1, dtype=wp.float64, device=device)
-    else:
-        max_error.zero_()
 
     vec_dtype = positions.dtype
     wp.launch(
@@ -691,7 +681,8 @@ def shake_constraints_out(
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
     bond_lengths_sq: wp.array,
-    positions_out: wp.array = None,
+    positions_out: wp.array,
+    max_error: wp.array,
     num_iter: int = 10,
     device: str = None,
 ) -> tuple[wp.array, wp.array]:
@@ -712,8 +703,13 @@ def shake_constraints_out(
         Second atom index for each bond. Shape (M,).
     bond_lengths_sq : wp.array
         Target bond length squared. Shape (M,).
-    positions_out : wp.array, optional
-        Output positions. If None, allocated internally.
+    positions_out : wp.array
+        Output positions. Shape (N,). Caller must pre-allocate.
+        Caller must copy input positions into this array before calling
+        (e.g., via ``wp.copy(positions_out, positions)``).
+    max_error : wp.array(dtype=wp.float64)
+        Scratch array for max error tracking. Shape (1,).
+        Caller must pre-allocate. Zeroed internally between iterations.
     num_iter : int, optional
         Number of iterations to run. Default 10.
     device : str, optional
@@ -728,11 +724,6 @@ def shake_constraints_out(
     if device is None:
         device = positions.device
 
-    if positions_out is None:
-        positions_out = wp.clone(positions)
-    else:
-        wp.copy(positions_out, positions)
-
     error = shake_constraints(
         positions_out,
         positions_old,
@@ -740,6 +731,7 @@ def shake_constraints_out(
         bond_atom_i,
         bond_atom_j,
         bond_lengths_sq,
+        max_error,
         num_iter,
         device,
     )
@@ -758,7 +750,7 @@ def rattle_iteration(
     masses: wp.array,
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
-    max_error: wp.array = None,
+    max_error: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -776,8 +768,9 @@ def rattle_iteration(
         First atom index for each bond. Shape (M,).
     bond_atom_j : wp.array(dtype=wp.int32)
         Second atom index for each bond. Shape (M,).
-    max_error : wp.array(dtype=wp.float64), optional
-        Array to store max error.
+    max_error : wp.array(dtype=wp.float64)
+        Output array to store max error. Shape (1,).
+        Zeroed internally before each use.
     device : str, optional
         Warp device.
 
@@ -789,12 +782,8 @@ def rattle_iteration(
     if device is None:
         device = positions.device
 
+    max_error.zero_()
     num_bonds = bond_atom_i.shape[0]
-
-    if max_error is None:
-        max_error = wp.zeros(1, dtype=wp.float64, device=device)
-    else:
-        max_error.zero_()
 
     vec_dtype = positions.dtype
     wp.launch(
@@ -813,6 +802,7 @@ def rattle_constraints(
     masses: wp.array,
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
+    max_error: wp.array,
     num_iter: int = 10,
     device: str = None,
 ) -> wp.array:
@@ -835,6 +825,9 @@ def rattle_constraints(
         First atom index for each bond. Shape (M,).
     bond_atom_j : wp.array(dtype=wp.int32)
         Second atom index for each bond. Shape (M,).
+    max_error : wp.array(dtype=wp.float64)
+        Scratch array for max error tracking. Shape (1,).
+        Caller must pre-allocate. Zeroed internally between iterations.
     num_iter : int, optional
         Number of iterations to run. Default 10.
     device : str, optional
@@ -848,10 +841,7 @@ def rattle_constraints(
     if device is None:
         device = positions.device
 
-    max_error = wp.zeros(1, dtype=wp.float64, device=device)
-
     for _ in range(num_iter):
-        max_error.zero_()
         max_error = rattle_iteration(
             positions, velocities, masses, bond_atom_i, bond_atom_j, max_error, device
         )
@@ -865,8 +855,8 @@ def rattle_iteration_out(
     masses: wp.array,
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
-    velocity_corrections: wp.array = None,
-    max_error: wp.array = None,
+    velocity_corrections: wp.array,
+    max_error: wp.array,
     device: str = None,
 ) -> tuple[wp.array, wp.array]:
     """
@@ -884,10 +874,10 @@ def rattle_iteration_out(
         First atom index for each bond. Shape (M,).
     bond_atom_j : wp.array(dtype=wp.int32)
         Second atom index for each bond. Shape (M,).
-    velocity_corrections : wp.array, optional
-        Output corrections. If None, allocated internally.
-    max_error : wp.array(dtype=wp.float64), optional
-        Array to store max error. If None, allocated internally.
+    velocity_corrections : wp.array
+        Output corrections. Shape (N,). Zeroed internally before each use.
+    max_error : wp.array(dtype=wp.float64)
+        Output max error. Shape (1,). Zeroed internally before each use.
     device : str, optional
         Warp device.
 
@@ -900,20 +890,9 @@ def rattle_iteration_out(
     if device is None:
         device = positions.device
 
-    num_atoms = positions.shape[0]
+    velocity_corrections.zero_()
+    max_error.zero_()
     num_bonds = bond_atom_i.shape[0]
-
-    if velocity_corrections is None:
-        velocity_corrections = wp.zeros(
-            num_atoms, dtype=velocities.dtype, device=device
-        )
-    else:
-        velocity_corrections.zero_()
-
-    if max_error is None:
-        max_error = wp.zeros(1, dtype=wp.float64, device=device)
-    else:
-        max_error.zero_()
 
     vec_dtype = positions.dtype
     wp.launch(
@@ -940,7 +919,8 @@ def rattle_constraints_out(
     masses: wp.array,
     bond_atom_i: wp.array,
     bond_atom_j: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
+    max_error: wp.array,
     num_iter: int = 10,
     device: str = None,
 ) -> tuple[wp.array, wp.array]:
@@ -959,8 +939,13 @@ def rattle_constraints_out(
         First atom index for each bond. Shape (M,).
     bond_atom_j : wp.array(dtype=wp.int32)
         Second atom index for each bond. Shape (M,).
-    velocities_out : wp.array, optional
-        Output velocities. If None, allocated internally.
+    velocities_out : wp.array
+        Output velocities. Shape (N,). Caller must pre-allocate.
+        Caller must copy input velocities into this array before calling
+        (e.g., via ``wp.copy(velocities_out, velocities)``).
+    max_error : wp.array(dtype=wp.float64)
+        Scratch array for max error tracking. Shape (1,).
+        Caller must pre-allocate. Zeroed internally between iterations.
     num_iter : int, optional
         Number of iterations to run. Default 10.
     device : str, optional
@@ -975,13 +960,15 @@ def rattle_constraints_out(
     if device is None:
         device = positions.device
 
-    if velocities_out is None:
-        velocities_out = wp.clone(velocities)
-    else:
-        wp.copy(velocities_out, velocities)
-
     error = rattle_constraints(
-        positions, velocities_out, masses, bond_atom_i, bond_atom_j, num_iter, device
+        positions,
+        velocities_out,
+        masses,
+        bond_atom_i,
+        bond_atom_j,
+        max_error,
+        num_iter,
+        device,
     )
 
     return velocities_out, error

@@ -54,8 +54,10 @@ Supports three execution modes for scaling velocities:
     from nvalchemiops.dynamics.utils import compute_temperature, compute_kinetic_energy
 
     # Compute current temperature
-    ke = compute_kinetic_energy(velocities, masses)
-    T_current = compute_temperature(velocities, masses, num_atoms=100)
+    ke = wp.empty(1, dtype=wp.float64, device="cuda:0")
+    compute_kinetic_energy(velocities, masses, ke)
+    T_current = wp.empty(1, dtype=wp.float64, device="cuda:0")
+    compute_temperature(ke, T_current, num_atoms=100)
 
     # Compute scaling factor
     factor = compute_rescale_factor(T_current.numpy()[0], T_target=1.0)
@@ -90,10 +92,9 @@ from __future__ import annotations
 
 import warp as wp
 
-from ..utils.launch_helpers import (
-    dispatch_family,
-    validate_out_array,
-)
+from nvalchemiops.warp_dispatch import validate_out_array
+
+from ..utils.launch_helpers import dispatch_family
 from ..utils.shared_kernels import velocity_rescale_families
 
 __all__ = [
@@ -170,8 +171,10 @@ def velocity_rescale(
     Example
     -------
     >>> # Compute current temperature
-    >>> ke = compute_kinetic_energy(velocities, masses)
-    >>> T_current = compute_temperature(ke, ndof)
+    >>> ke = wp.empty(1, dtype=wp.float64, device=device)
+    >>> compute_kinetic_energy(velocities, masses, ke)
+    >>> T_current = wp.empty(1, dtype=wp.float64, device=device)
+    >>> compute_temperature(ke, T_current, num_atoms=100)
     >>>
     >>> # Compute rescaling factor
     >>> factor = compute_rescale_factor(T_current, T_target)

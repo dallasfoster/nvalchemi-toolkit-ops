@@ -944,6 +944,7 @@ for t, v, m in zip(_T, _V, _M):
 def align_cell(
     positions: wp.array,
     cell: wp.array,
+    transform: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
 ) -> tuple[wp.array, wp.array]:
@@ -960,6 +961,9 @@ def align_cell(
         Atomic positions. Shape (N,). Modified in-place.
     cell : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,). Modified in-place.
+    transform : wp.array(dtype=wp.mat33f or wp.mat33d)
+        Scratch array for rotation transform. Shape (B,).
+        Caller must pre-allocate.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Shape (N,). If None, assumes single system.
     device : str, optional
@@ -973,7 +977,8 @@ def align_cell(
     Example
     -------
     >>> # Before optimization loop
-    >>> positions, cell = align_cell(positions, cell)
+    >>> transform = wp.zeros(1, dtype=wp.mat33d, device=device)
+    >>> positions, cell = align_cell(positions, cell, transform)
     """
     if device is None:
         device = positions.device
@@ -983,9 +988,6 @@ def align_cell(
 
     mat_dtype = cell.dtype
     vec_dtype = positions.dtype
-
-    # Allocate transform matrix
-    transform = wp.zeros(num_systems, dtype=mat_dtype, device=device)
 
     # Align cell and compute transform
     wp.launch(
@@ -1019,7 +1021,7 @@ def extend_batch_idx(
     batch_idx: wp.array,
     num_atoms: int,
     num_systems: int,
-    extended_batch_idx: wp.array = None,
+    extended_batch_idx: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1037,8 +1039,9 @@ def extend_batch_idx(
         Number of atoms (N).
     num_systems : int
         Number of systems (B).
-    extended_batch_idx : wp.array, optional
-        Output extended batch index. Shape (N + 2*B,). If None, allocated.
+    extended_batch_idx : wp.array
+        Output extended batch index. Shape (N + 2*B,).
+        Caller must pre-allocate.
     device : str, optional
         Warp device.
 
@@ -1051,15 +1054,13 @@ def extend_batch_idx(
     -------
     >>> # Original: 100 atoms across 2 systems
     >>> # Extended: 100 + 4 = 104 "atoms" (2 cell DOFs per system)
-    >>> ext_batch_idx = extend_batch_idx(batch_idx, num_atoms=100, num_systems=2)
+    >>> ext_batch_idx = wp.zeros(104, dtype=wp.int32, device=device)
+    >>> extend_batch_idx(batch_idx, num_atoms=100, num_systems=2, extended_batch_idx=ext_batch_idx)
     """
     if device is None:
         device = batch_idx.device
 
     extended_size = num_atoms + 2 * num_systems
-
-    if extended_batch_idx is None:
-        extended_batch_idx = wp.zeros(extended_size, dtype=wp.int32, device=device)
 
     wp.launch(
         _extend_batch_idx_kernel,
@@ -1073,7 +1074,7 @@ def extend_batch_idx(
 
 def extend_atom_ptr(
     atom_ptr: wp.array,
-    extended_atom_ptr: wp.array = None,
+    extended_atom_ptr: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1086,8 +1087,9 @@ def extend_atom_ptr(
     ----------
     atom_ptr : wp.array(dtype=wp.int32)
         Original CSR pointers. Shape (B+1,).
-    extended_atom_ptr : wp.array, optional
-        Output extended CSR pointers. Shape (B+1,). If None, allocated.
+    extended_atom_ptr : wp.array
+        Output extended CSR pointers. Shape (B+1,).
+        Caller must pre-allocate.
     device : str, optional
         Warp device.
 
@@ -1100,17 +1102,13 @@ def extend_atom_ptr(
     -------
     >>> # Original: atom_ptr = [0, 50, 100] (2 systems, 50 atoms each)
     >>> # Extended: [0, 52, 104] (50+2=52, 100+4=104)
-    >>> ext_atom_ptr = extend_atom_ptr(atom_ptr)
+    >>> ext_atom_ptr = wp.zeros(3, dtype=wp.int32, device=device)
+    >>> extend_atom_ptr(atom_ptr, ext_atom_ptr)
     """
     if device is None:
         device = atom_ptr.device
 
     num_systems_plus_one = atom_ptr.shape[0]
-
-    if extended_atom_ptr is None:
-        extended_atom_ptr = wp.zeros(
-            num_systems_plus_one, dtype=wp.int32, device=device
-        )
 
     wp.launch(
         _extend_atom_ptr_kernel,
@@ -1125,9 +1123,9 @@ def extend_atom_ptr(
 def pack_positions_with_cell(
     positions: wp.array,
     cell: wp.array,
+    extended: wp.array,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
-    extended: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1142,7 +1140,7 @@ def pack_positions_with_cell(
     Batched mode (atom_ptr provided):
         Positions are concatenated across systems, cells have shape (B,).
         The extended array interleaves each system's positions with its cell DOFs.
-        Use extend_atom_ptr() to get ext_atom_ptr for indexing the result.
+        Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
@@ -1151,13 +1149,14 @@ def pack_positions_with_cell(
     cell : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrix (should be upper-triangular from align_cell).
         Shape (1,) for single system or (B,) for batched.
+    extended : wp.array
+        Output extended array. Caller must pre-allocate.
+        Shape (N+2,) for single, (N+2*B,) for batched.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
-        Required if atom_ptr is provided; if None, computed automatically.
-    extended : wp.array, optional
-        Output extended array. If None, allocated.
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1165,16 +1164,6 @@ def pack_positions_with_cell(
     -------
     wp.array
         Extended position array.
-
-    Example
-    -------
-    >>> # Single system
-    >>> ext = pack_positions_with_cell(positions, cell)
-    >>>
-    >>> # Batched (3 systems with different atom counts)
-    >>> atom_ptr = wp.array([0, 10, 25, 40], dtype=wp.int32)  # systems have 10, 15, 15 atoms
-    >>> ext_atom_ptr = extend_atom_ptr(atom_ptr)
-    >>> ext = pack_positions_with_cell(positions, cells, atom_ptr, ext_atom_ptr)
     """
     if device is None:
         device = positions.device
@@ -1185,9 +1174,6 @@ def pack_positions_with_cell(
         # Single system mode
         num_atoms = positions.shape[0]
 
-        if extended is None:
-            extended = wp.zeros(num_atoms + 2, dtype=vec_dtype, device=device)
-
         wp.launch(
             _pack_positions_kernel_overload[vec_dtype],
             dim=num_atoms + 2,
@@ -1196,15 +1182,7 @@ def pack_positions_with_cell(
         )
     else:
         # Batched mode with atom_ptr
-        if ext_atom_ptr is None:
-            ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
-
         num_systems = atom_ptr.shape[0] - 1
-
-        if extended is None:
-            num_atoms = positions.shape[0]
-            ext_size = num_atoms + 2 * num_systems
-            extended = wp.zeros(ext_size, dtype=vec_dtype, device=device)
 
         # Launch with num_systems threads (each handles one system)
         wp.launch(
@@ -1219,9 +1197,9 @@ def pack_positions_with_cell(
 
 def unpack_positions_with_cell(
     extended: wp.array,
+    positions: wp.array,
+    cell: wp.array,
     num_atoms: int = None,
-    positions: wp.array = None,
-    cell: wp.array = None,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
     device: str = None,
@@ -1235,23 +1213,23 @@ def unpack_positions_with_cell(
 
     Batched mode (atom_ptr provided):
         Unpacks extended array to concatenated positions (total_atoms,) and
-        cells (B,). The num_atoms parameter is ignored in batched mode.
+        cells (B,). Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
     extended : wp.array(dtype=wp.vec3f or wp.vec3d)
         Extended position array.
+    positions : wp.array
+        Output atomic positions. Caller must pre-allocate.
+    cell : wp.array
+        Output cell matrix. Caller must pre-allocate.
     num_atoms : int, optional
         Number of atoms (N). Required for single-system mode.
-    positions : wp.array, optional
-        Output atomic positions. If None, allocated.
-    cell : wp.array, optional
-        Output cell matrix. If None, allocated.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
-        Required if atom_ptr is provided; if None, computed automatically.
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1264,20 +1242,11 @@ def unpack_positions_with_cell(
         device = extended.device
 
     vec_dtype = extended.dtype
-    if vec_dtype == wp.vec3f:
-        mat_dtype = wp.mat33f
-    else:
-        mat_dtype = wp.mat33d
 
     if atom_ptr is None:
         # Single system mode
         if num_atoms is None:
             raise ValueError("num_atoms is required for single-system mode")
-
-        if positions is None:
-            positions = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
-        if cell is None:
-            cell = wp.zeros(1, dtype=mat_dtype, device=device)
 
         wp.launch(
             _unpack_positions_kernel_overload[vec_dtype],
@@ -1287,21 +1256,7 @@ def unpack_positions_with_cell(
         )
     else:
         # Batched mode with atom_ptr
-        if ext_atom_ptr is None:
-            ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
-
         num_systems = atom_ptr.shape[0] - 1
-
-        # Only sync if we need to allocate output arrays
-        if positions is None or cell is None:
-            if positions is None:
-                if num_atoms is None:
-                    # Sync to get total_atoms
-                    atom_ptr_np = atom_ptr.numpy()
-                    num_atoms = int(atom_ptr_np[-1])
-                positions = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
-            if cell is None:
-                cell = wp.zeros(num_systems, dtype=mat_dtype, device=device)
 
         # Launch with num_systems threads (each handles one system)
         wp.launch(
@@ -1317,9 +1272,9 @@ def unpack_positions_with_cell(
 def pack_velocities_with_cell(
     velocities: wp.array,
     cell_velocity: wp.array,
+    extended: wp.array,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
-    extended: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1330,7 +1285,7 @@ def pack_velocities_with_cell(
 
     Batched mode (atom_ptr provided):
         Velocities are concatenated across systems, cell velocities have shape (B,).
-        Use extend_atom_ptr() to get ext_atom_ptr for indexing the result.
+        Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
@@ -1338,12 +1293,13 @@ def pack_velocities_with_cell(
         Atomic velocities. Shape (N,) for single system or (total_atoms,) for batched.
     cell_velocity : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell velocity matrix. Shape (1,) for single system or (B,) for batched.
+    extended : wp.array
+        Output extended array. Caller must pre-allocate.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
-    extended : wp.array, optional
-        Output extended array. If None, allocated.
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1354,15 +1310,15 @@ def pack_velocities_with_cell(
     """
     # Reuse pack_positions_with_cell - same packing format
     return pack_positions_with_cell(
-        velocities, cell_velocity, atom_ptr, ext_atom_ptr, extended, device
+        velocities, cell_velocity, extended, atom_ptr, ext_atom_ptr, device
     )
 
 
 def unpack_velocities_with_cell(
     extended: wp.array,
+    velocities: wp.array,
+    cell_velocity: wp.array,
     num_atoms: int = None,
-    velocities: wp.array = None,
-    cell_velocity: wp.array = None,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
     device: str = None,
@@ -1375,21 +1331,23 @@ def unpack_velocities_with_cell(
 
     Batched mode (atom_ptr provided):
         Unpacks to concatenated velocities (total_atoms,) and cell velocities (B,).
+        Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
     extended : wp.array(dtype=wp.vec3f or wp.vec3d)
         Extended velocity array.
+    velocities : wp.array
+        Output atomic velocities. Caller must pre-allocate.
+    cell_velocity : wp.array
+        Output cell velocity matrix. Caller must pre-allocate.
     num_atoms : int, optional
         Number of atoms (N). Required for single-system mode.
-    velocities : wp.array, optional
-        Output atomic velocities. If None, allocated.
-    cell_velocity : wp.array, optional
-        Output cell velocity matrix. If None, allocated.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1399,16 +1357,16 @@ def unpack_velocities_with_cell(
         (velocities, cell_velocity)
     """
     return unpack_positions_with_cell(
-        extended, num_atoms, velocities, cell_velocity, atom_ptr, ext_atom_ptr, device
+        extended, velocities, cell_velocity, num_atoms, atom_ptr, ext_atom_ptr, device
     )
 
 
 def pack_forces_with_cell(
     forces: wp.array,
     cell_force: wp.array,
+    extended: wp.array,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
-    extended: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1419,6 +1377,7 @@ def pack_forces_with_cell(
 
     Batched mode (atom_ptr provided):
         Forces are concatenated across systems, cell forces have shape (B,).
+        Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
@@ -1427,12 +1386,14 @@ def pack_forces_with_cell(
     cell_force : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell force matrix (from stress_to_cell_force).
         Shape (1,) for single system or (B,) for batched.
+    extended : wp.array
+        Output extended array. Caller must pre-allocate.
+        Shape (N+2,) for single, (N+2*B,) for batched.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
-    extended : wp.array, optional
-        Output extended array. If None, allocated.
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1450,9 +1411,6 @@ def pack_forces_with_cell(
         # Single system mode
         num_atoms = forces.shape[0]
 
-        if extended is None:
-            extended = wp.zeros(num_atoms + 2, dtype=vec_dtype, device=device)
-
         wp.launch(
             _pack_forces_kernel_overload[vec_dtype],
             dim=num_atoms + 2,
@@ -1461,16 +1419,7 @@ def pack_forces_with_cell(
         )
     else:
         # Batched mode with atom_ptr
-        if ext_atom_ptr is None:
-            ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
-
         num_systems = atom_ptr.shape[0] - 1
-
-        # Only sync if we need to allocate the output array
-        if extended is None:
-            num_atoms = forces.shape[0]
-            ext_size = num_atoms + 2 * num_systems
-            extended = wp.zeros(ext_size, dtype=vec_dtype, device=device)
 
         # Launch with num_systems threads (each handles one system)
         wp.launch(
@@ -1485,10 +1434,10 @@ def pack_forces_with_cell(
 
 def pack_masses_with_cell(
     masses: wp.array,
-    cell_mass: float,
+    cell_mass_arr: wp.array,
+    extended: wp.array,
     atom_ptr: wp.array = None,
     ext_atom_ptr: wp.array = None,
-    extended: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1499,19 +1448,23 @@ def pack_masses_with_cell(
 
     Batched mode (atom_ptr provided):
         Masses are concatenated across systems. Cell mass is applied to all systems.
+        Both atom_ptr and ext_atom_ptr must be provided.
 
     Parameters
     ----------
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,) for single system or (total_atoms,) for batched.
-    cell_mass : float
-        Mass for cell DOFs (controls cell response speed).
+    cell_mass_arr : wp.array
+        Cell mass as a warp array. Shape (1,) for single system or (B,) for batched.
+        Caller must pre-allocate.
+    extended : wp.array
+        Output extended array. Caller must pre-allocate.
+        Shape (N+2,) for single, (N+2*B,) for batched.
     atom_ptr : wp.array(dtype=wp.int32), optional
         CSR-style atom pointers. Shape (B+1,). If provided, enables batched mode.
     ext_atom_ptr : wp.array(dtype=wp.int32), optional
         Extended atom pointers from extend_atom_ptr(). Shape (B+1,).
-    extended : wp.array, optional
-        Output extended array. If None, allocated.
+        Required if atom_ptr is provided.
     device : str, optional
         Warp device.
 
@@ -1529,11 +1482,6 @@ def pack_masses_with_cell(
         # Single system mode
         num_atoms = masses.shape[0]
 
-        if extended is None:
-            extended = wp.zeros(num_atoms + 2, dtype=scalar_dtype, device=device)
-
-        cell_mass_arr = wp.array([cell_mass], dtype=scalar_dtype, device=device)
-
         wp.launch(
             _pack_masses_kernel_overload[scalar_dtype],
             dim=num_atoms + 2,
@@ -1542,21 +1490,7 @@ def pack_masses_with_cell(
         )
     else:
         # Batched mode with atom_ptr
-        if ext_atom_ptr is None:
-            ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
-
         num_systems = atom_ptr.shape[0] - 1
-
-        # Only sync if we need to allocate the output array
-        if extended is None:
-            num_atoms = masses.shape[0]
-            ext_size = num_atoms + 2 * num_systems
-            extended = wp.zeros(ext_size, dtype=scalar_dtype, device=device)
-
-        # Create cell mass array for all systems
-        cell_mass_arr = wp.array(
-            [cell_mass] * num_systems, dtype=scalar_dtype, device=device
-        )
 
         # Launch with num_systems threads (each handles one system)
         wp.launch(
@@ -1572,8 +1506,8 @@ def pack_masses_with_cell(
 def stress_to_cell_force(
     stress: wp.array,
     cell: wp.array,
-    volume: wp.array = None,
-    cell_force: wp.array = None,
+    volume: wp.array,
+    cell_force: wp.array,
     keep_aligned: bool = True,
     device: str = None,
 ) -> wp.array:
@@ -1592,10 +1526,11 @@ def stress_to_cell_force(
         Convention: positive values indicate compression.
     cell : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-    volume : wp.array, optional
-        Cell volumes. Shape (B,). If None, computed from cell.
-    cell_force : wp.array, optional
-        Output cell force matrices. Shape (B,). If None, allocated.
+    volume : wp.array
+        Cell volumes. Shape (B,). Caller must pre-compute via
+        ``compute_cell_volume``.
+    cell_force : wp.array
+        Output cell force matrices. Shape (B,). Caller must pre-allocate.
     keep_aligned : bool, default=True
         If True, zero out upper-triangular off-diagonal elements [0,1], [0,2], [1,2]
         of the cell force. This is **essential** to prevent the cell from rotating
@@ -1624,19 +1559,11 @@ def stress_to_cell_force(
     This prevents the optimizer from introducing rotations that would break
     the upper-triangular cell representation from `align_cell()`.
     """
-    from .cell_utils import compute_cell_volume
-
     if device is None:
         device = stress.device
 
     num_systems = stress.shape[0]
     mat_dtype = stress.dtype
-
-    if volume is None:
-        volume = compute_cell_volume(cell, device=device)
-
-    if cell_force is None:
-        cell_force = wp.zeros(num_systems, dtype=mat_dtype, device=device)
 
     wp.launch(
         _stress_to_cell_force_kernel_overload[mat_dtype],

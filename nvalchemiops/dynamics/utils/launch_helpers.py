@@ -34,9 +34,10 @@ compatibility.
 Design Rule
 -----------
 Warp interface functions must receive ALL arrays pre-allocated.
-Output arrays are required, not optional.  Zero-init is the caller's
-responsibility.  Only Torch interface functions may accept optional
-arguments and allocate/zero as needed.
+Output arrays are required, not optional.  Output/scratch arrays that
+require zeroing are zeroed internally by the function before use.
+Only Torch interface functions may accept optional arguments and
+allocate as needed.
 """
 
 from __future__ import annotations

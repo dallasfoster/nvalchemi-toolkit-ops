@@ -115,13 +115,16 @@ class TestShakeIteration:
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
         bond_lengths_sq = wp.array([bond_length**2], dtype=dtype_scalar, device=device)
 
-        max_error = shake_iteration(
+        max_error = wp.zeros(1, dtype=wp.float64, device=device)
+
+        shake_iteration(
             positions,
             positions_old,
             masses,
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
+            max_error,
             device=device,
         )
 
@@ -167,7 +170,7 @@ class TestShakeIteration:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
-            max_error=max_error,
+            max_error,
             device=device,
         )
 
@@ -197,6 +200,8 @@ class TestShakeConstraints:
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
         bond_lengths_sq = wp.array([bond_length**2], dtype=dtype_scalar, device=device)
 
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         shake_constraints(
             positions,
             positions_old,
@@ -204,6 +209,7 @@ class TestShakeConstraints:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
+            max_error,
             num_iter=20,
             device=device,
         )
@@ -246,6 +252,8 @@ class TestShakeConstraints:
             [bond_length**2] * 3, dtype=dtype_scalar, device=device
         )
 
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         shake_constraints(
             positions,
             positions_old,
@@ -253,6 +261,7 @@ class TestShakeConstraints:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
+            max_error,
             num_iter=30,
             device=device,
         )
@@ -287,6 +296,10 @@ class TestShakeIterationOut:
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
         bond_lengths_sq = wp.array([1.0], dtype=dtype_scalar, device=device)
 
+        num_atoms = 2
+        position_corrections = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        max_error = wp.zeros(1, dtype=wp.float64, device=device)
+
         corrections, max_error = shake_iteration_out(
             positions,
             positions_old,
@@ -294,6 +307,8 @@ class TestShakeIterationOut:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
+            position_corrections,
+            max_error,
             device=device,
         )
 
@@ -336,8 +351,8 @@ class TestShakeIterationOut:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
-            position_corrections=corrections,
-            max_error=max_error,
+            corrections,
+            max_error,
             device=device,
         )
 
@@ -367,6 +382,11 @@ class TestShakeConstraintsOut:
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
         bond_lengths_sq = wp.array([bond_length**2], dtype=dtype_scalar, device=device)
 
+        num_atoms = 2
+        positions_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        wp.copy(positions_out, positions)
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         positions_out, final_error = shake_constraints_out(
             positions,
             positions_old,
@@ -374,6 +394,8 @@ class TestShakeConstraintsOut:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
+            positions_out,
+            max_error,
             num_iter=20,
             device=device,
         )
@@ -408,7 +430,9 @@ class TestShakeConstraintsOut:
         bond_lengths_sq = wp.array([1.0], dtype=dtype_scalar, device=device)
 
         # Pre-allocate output
-        positions_out = wp.zeros(2, dtype=dtype_vec, device=device)
+        positions_out = wp.empty(2, dtype=dtype_vec, device=device)
+        wp.copy(positions_out, positions)
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
 
         result_pos, _ = shake_constraints_out(
             positions,
@@ -417,7 +441,8 @@ class TestShakeConstraintsOut:
             bond_atom_i,
             bond_atom_j,
             bond_lengths_sq,
-            positions_out=positions_out,
+            positions_out,
+            max_error,
             num_iter=20,
             device=device,
         )
@@ -450,12 +475,15 @@ class TestRattleIteration:
         bond_atom_i = wp.array([0], dtype=wp.int32, device=device)
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
 
-        max_error = rattle_iteration(
+        max_error = wp.zeros(1, dtype=wp.float64, device=device)
+
+        rattle_iteration(
             positions,
             velocities,
             masses,
             bond_atom_i,
             bond_atom_j,
+            max_error,
             device=device,
         )
 
@@ -496,7 +524,7 @@ class TestRattleIteration:
             masses,
             bond_atom_i,
             bond_atom_j,
-            max_error=max_error,
+            max_error,
             device=device,
         )
 
@@ -522,12 +550,15 @@ class TestRattleConstraints:
         bond_atom_i = wp.array([0], dtype=wp.int32, device=device)
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
 
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         final_error = rattle_constraints(
             positions,
             velocities,
             masses,
             bond_atom_i,
             bond_atom_j,
+            max_error,
             num_iter=20,
             device=device,
         )
@@ -562,12 +593,15 @@ class TestRattleConstraints:
         bond_atom_i = wp.array([0, 1, 2], dtype=wp.int32, device=device)
         bond_atom_j = wp.array([1, 2, 3], dtype=wp.int32, device=device)
 
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         final_error = rattle_constraints(
             positions,
             velocities,
             masses,
             bond_atom_i,
             bond_atom_j,
+            max_error,
             num_iter=30,
             device=device,
         )
@@ -599,12 +633,18 @@ class TestRattleIterationOut:
         bond_atom_i = wp.array([0], dtype=wp.int32, device=device)
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
 
+        num_atoms = 2
+        velocity_corrections = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        max_error = wp.zeros(1, dtype=wp.float64, device=device)
+
         corrections, max_error = rattle_iteration_out(
             positions,
             velocities,
             masses,
             bond_atom_i,
             bond_atom_j,
+            velocity_corrections,
+            max_error,
             device=device,
         )
 
@@ -645,8 +685,8 @@ class TestRattleIterationOut:
             masses,
             bond_atom_i,
             bond_atom_j,
-            velocity_corrections=corrections,
-            max_error=max_error,
+            corrections,
+            max_error,
             device=device,
         )
 
@@ -674,12 +714,19 @@ class TestRattleConstraintsOut:
         bond_atom_i = wp.array([0], dtype=wp.int32, device=device)
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
 
+        num_atoms = 2
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        wp.copy(velocities_out, velocities)
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
+
         velocities_out, final_error = rattle_constraints_out(
             positions,
             velocities,
             masses,
             bond_atom_i,
             bond_atom_j,
+            velocities_out,
+            max_error,
             num_iter=20,
             device=device,
         )
@@ -711,7 +758,9 @@ class TestRattleConstraintsOut:
         bond_atom_j = wp.array([1], dtype=wp.int32, device=device)
 
         # Pre-allocate output
-        velocities_out = wp.zeros(2, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(2, dtype=dtype_vec, device=device)
+        wp.copy(velocities_out, velocities)
+        max_error = wp.empty(1, dtype=wp.float64, device=device)
 
         result_vel, _ = rattle_constraints_out(
             positions,
@@ -719,7 +768,8 @@ class TestRattleConstraintsOut:
             masses,
             bond_atom_i,
             bond_atom_j,
-            velocities_out=velocities_out,
+            velocities_out,
+            max_error,
             num_iter=20,
             device=device,
         )

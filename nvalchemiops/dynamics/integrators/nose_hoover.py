@@ -71,10 +71,9 @@ from typing import Any
 
 import warp as wp
 
-from ..utils.launch_helpers import (
-    dispatch_family,
-    validate_out_array,
-)
+from nvalchemiops.warp_dispatch import validate_out_array
+
+from ..utils.launch_helpers import dispatch_family
 from ..utils.shared_kernels import position_update_families, velocity_kick_families
 
 __all__ = [
@@ -931,6 +930,7 @@ def nhc_compute_masses(
     target_temp: float,
     tau: float,
     chain_length: int,
+    masses: wp.array,
     num_systems: int = 1,
     device: str = None,
     dtype=wp.float64,
@@ -951,6 +951,10 @@ def nhc_compute_masses(
         Time constant.
     chain_length : int
         Number of thermostats in the chain.
+    masses : wp.array
+        Chain masses output. Caller must pre-allocate.
+        Shape (chain_length,) for single system,
+        (num_systems, chain_length) for batched.
     num_systems : int, optional
         Number of systems for batched mode. Default: 1.
     device : str, optional
@@ -983,7 +987,6 @@ def nhc_compute_masses(
     scalar_type = dtype
 
     if is_batched:
-        masses = wp.zeros((num_systems, chain_length), dtype=dtype, device=device)
         wp.launch(
             _batch_nhc_compute_masses_kernel_overload[scalar_type],
             dim=(num_systems, chain_length),
@@ -991,7 +994,6 @@ def nhc_compute_masses(
             device=device,
         )
     else:
-        masses = wp.zeros(chain_length, dtype=dtype, device=device)
         wp.launch(
             _nhc_compute_masses_kernel_overload[scalar_type],
             dim=chain_length,
@@ -1011,6 +1013,10 @@ def nhc_thermostat_chain_update(
     target_temp: wp.array,
     dt: wp.array,
     ndof: wp.array,
+    ke2: wp.array,
+    total_scale: wp.array,
+    step_scale: wp.array,
+    dt_chain: wp.array,
     nloops: int = 1,
     batch_idx: wp.array = None,
     num_systems: int = 1,
@@ -1043,6 +1049,19 @@ def nhc_thermostat_chain_update(
         Time step. Shape (1,) or (num_systems,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (num_systems,).
+    ke2 : wp.array
+        Scratch array for 2*KE computation. Zeroed internally before each use.
+        Shape (1,) for single system, (num_systems,) for batched.
+    total_scale : wp.array
+        Scratch array for accumulated velocity scale factor.
+        Must be initialized to ones by caller (wp.ones).
+        Shape (1,) for single system, (num_systems,) for batched.
+    step_scale : wp.array
+        Scratch array for per-step velocity scale factor.
+        Shape (1,) for single system, (num_systems,) for batched.
+    dt_chain : wp.array
+        Scratch array for weighted time steps.
+        Shape (1,) for single system, (num_systems,) for batched.
     nloops : int, optional
         Number of Yoshida-Suzuki integration sub-steps. Default: 1.
         Use nloops=3 or 5 for higher accuracy.
@@ -1081,11 +1100,12 @@ def nhc_thermostat_chain_update(
             f"Chain length {chain_length} exceeds maximum {MAX_CHAIN_LENGTH}"
         )
 
-    # Compute 2*KE - output dtype should match chain state dtype for consistency
+    # Compute 2*KE - ke2 is zeroed internally before each use
     vec_dtype = velocities.dtype
     chain_dtype = eta.dtype
+    n_scale = num_systems if is_batched else 1
+    ke2.zero_()
     if is_batched:
-        ke2 = wp.zeros(num_systems, dtype=chain_dtype, device=device)
         wp.launch(
             _batch_compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
             dim=num_atoms,
@@ -1093,20 +1113,12 @@ def nhc_thermostat_chain_update(
             device=device,
         )
     else:
-        ke2 = wp.zeros(1, dtype=chain_dtype, device=device)
         wp.launch(
             _compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
             dim=num_atoms,
             inputs=[velocities, masses, ke2],
             device=device,
         )
-    # Allocate total velocity scale factor - use chain state dtype for consistency
-    n_scale = num_systems if is_batched else 1
-    total_scale = wp.ones(n_scale, dtype=chain_dtype, device=device)
-    step_scale = wp.zeros(n_scale, dtype=chain_dtype, device=device)
-
-    # Create dt_chain array for weighted time steps - use chain state dtype
-    dt_chain = wp.zeros(n_scale, dtype=chain_dtype, device=device)
 
     # Run Yoshida-Suzuki sub-steps
     for w in weights:
@@ -1236,6 +1248,10 @@ def nhc_thermostat_chain_update_out(
     target_temp: wp.array,
     dt: wp.array,
     ndof: wp.array,
+    ke2: wp.array,
+    total_scale: wp.array,
+    step_scale: wp.array,
+    dt_chain: wp.array,
     velocities_out: wp.array,
     eta_out: wp.array,
     eta_dot_out: wp.array,
@@ -1265,6 +1281,19 @@ def nhc_thermostat_chain_update_out(
         Time step. Shape (1,) or (B,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
+    ke2 : wp.array
+        Scratch array for 2*KE computation. Zeroed internally before each use.
+        Shape (1,) for single system, (num_systems,) for batched.
+    total_scale : wp.array
+        Scratch array for accumulated velocity scale factor.
+        Must be initialized to ones by caller (wp.ones).
+        Shape (1,) for single system, (num_systems,) for batched.
+    step_scale : wp.array
+        Scratch array for per-step velocity scale factor.
+        Shape (1,) for single system, (num_systems,) for batched.
+    dt_chain : wp.array
+        Scratch array for weighted time steps.
+        Shape (1,) for single system, (num_systems,) for batched.
     velocities_out : wp.array
         Output velocities. Must be pre-allocated with same shape/dtype/device as velocities.
     eta_out : wp.array
@@ -1307,6 +1336,10 @@ def nhc_thermostat_chain_update_out(
         target_temp,
         dt,
         ndof,
+        ke2,
+        total_scale,
+        step_scale,
+        dt_chain,
         nloops=nloops,
         batch_idx=batch_idx,
         num_systems=num_systems,
@@ -1504,6 +1537,8 @@ def nhc_compute_chain_energy(
     eta_mass: wp.array,
     target_temp: wp.array,
     ndof: wp.array,
+    ke_chain: wp.array,
+    pe_chain: wp.array,
     batch_idx: wp.array = None,
     num_systems: int = 1,
     device: str = None,
@@ -1530,6 +1565,12 @@ def nhc_compute_chain_energy(
         Target temperature (kT). Shape (1,) or (B,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
+    ke_chain : wp.array
+        Output kinetic energy of the chain.
+        Shape (1,) for single system, (num_systems,) for batched.
+    pe_chain : wp.array
+        Output potential energy of the chain.
+        Shape (1,) for single system, (num_systems,) for batched.
     batch_idx : wp.array(dtype=wp.int32), optional
         Not used directly, but included for API consistency.
     num_systems : int, optional
@@ -1553,11 +1594,7 @@ def nhc_compute_chain_energy(
     else:
         chain_length = eta.shape[0]
 
-    # Allocate output arrays - use chain state dtype for consistency
-    n_out = num_systems if is_batched else 1
     chain_dtype = eta.dtype
-    ke_chain = wp.zeros(n_out, dtype=chain_dtype, device=device)
-    pe_chain = wp.zeros(n_out, dtype=chain_dtype, device=device)
 
     if is_batched:
         wp.launch(

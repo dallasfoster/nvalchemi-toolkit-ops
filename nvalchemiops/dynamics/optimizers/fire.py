@@ -150,7 +150,7 @@ def _fire_step_no_downhill_kernel(
         Multiplicative growth factor for `dt` after `n_min` positive steps.
     vf, vv, ff : wp.array, shape (1,), dtype=wp.float*
         Accumulators for \\(\\sum v\\cdot f\\), \\(\\sum v\\cdot v\\), \\(\\sum f\\cdot f\\).
-        These are intended to be zeroed before launch.
+        Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -298,7 +298,7 @@ def _fire_revert_and_reduce_kernel(
     uphill_flag : wp.array, shape (M,), dtype int32
         Per-system uphill flags from uphill check kernel.
     vf, vv, ff : wp.array, shape (M,), dtype float*
-        OUTPUT: Diagnostic accumulators. Must be zero-initialized.
+        OUTPUT: Diagnostic accumulators. Zeroed internally before each use.
     N : int32
         Total number of atoms.
     elems_per_thread : int32
@@ -510,11 +510,11 @@ def _fire_reduce_batch_idx_rle_kernel(
     batch_idx : wp.array, shape (N,), dtype int32
         Sorted system index per atom in [0, M). **MUST BE SORTED**.
     vf : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: v·f per system. Must be zero-initialized by caller.
+        OUTPUT: v·f per system. Zeroed internally before each use.
     vv : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: v·v per system. Must be zero-initialized by caller.
+        OUTPUT: v·v per system. Zeroed internally before each use.
     ff : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: f·f per system. Must be zero-initialized by caller.
+        OUTPUT: f·f per system. Zeroed internally before each use.
     N : int32
         Total number of atoms.
     elems_per_thread : int32
@@ -728,7 +728,7 @@ def _fire_step_no_downhill_batch_idx_kernel(
         Per-system timestep factors.
     vf, vv, ff : wp.array, shape (B,), dtype=wp.float*
         Per-system accumulators for \(v\cdot f\), \(v\cdot v\), \(f\cdot f\).
-        Intended to be zeroed before launch.
+        Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -983,7 +983,7 @@ def _fire_step_downhill_kernel(
         Last accepted velocities; used for rollback.
     vf, vv, ff : wp.array, shape (1,), dtype=wp.float*
         Accumulators for \\(\\sum v\\cdot f\\), \\(\\sum v\\cdot v\\), \\(\\sum f\\cdot f\\).
-        These are intended to be zeroed before launch.
+        Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -1124,7 +1124,7 @@ def _fire_step_downhill_batch_idx_kernel(
         Per-atom last accepted velocities.
     vf, vv, ff : wp.array, shape (B,), dtype=wp.float*
         Per-system accumulators for \(v\cdot f\), \(v\cdot v\), \(f\cdot f\).
-        These must be zeroed by the caller before each step.
+        Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -1384,11 +1384,11 @@ def _fire_update_params_no_downhill_kernel(
     f_inc : wp.array, shape (1,), dtype=wp.float*
         Multiplicative growth factor for `dt` after `n_min` positive steps.
     vv : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum v\\cdot v\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum v\\cdot v\\). Zeroed internally before each use.
     ff : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum f\\cdot f\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum f\\cdot f\\). Zeroed internally before each use.
     vf : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum v\\cdot f\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum v\\cdot f\\). Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -1398,7 +1398,7 @@ def _fire_update_params_no_downhill_kernel(
     -----
     - This kernel does NOT perform the MD step (velocity integration + position update).
     - The caller is responsible for performing the MD step separately after this kernel.
-    - `vf/vv/ff` are cross-thread accumulators and must be zeroed before each launch.
+    - `vf/vv/ff` are cross-thread accumulators and zeroed internally before each use.
     """
     atom_idx = wp.tid()
 
@@ -1493,11 +1493,11 @@ def _fire_update_params_no_downhill_batch_idx_kernel(
     f_inc : wp.array, shape (B,), dtype=wp.float*
         Per-system growth factor for `dt` after `n_min` positive steps.
     vf : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum v\\cdot f\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum v\\cdot f\\). Zeroed internally before each use.
     vv : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum v\\cdot v\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum v\\cdot v\\). Zeroed internally before each use.
     ff : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum f\\cdot f\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum f\\cdot f\\). Zeroed internally before each use.
     batch_idx : wp.array, shape (N_total,), dtype=wp.int32
         System index for each atom.
 
@@ -1509,7 +1509,7 @@ def _fire_update_params_no_downhill_batch_idx_kernel(
     -----
     - This kernel does NOT perform the MD step (velocity integration + position update).
     - The caller is responsible for performing the MD step separately after this kernel.
-    - `vf/vv/ff` are per-system accumulators and must be zeroed before each launch.
+    - `vf/vv/ff` are per-system accumulators and zeroed internally before each use.
     """
     atom_idx = wp.tid()
     sys = batch_idx[atom_idx]
@@ -1730,11 +1730,11 @@ def _fire_update_params_downhill_kernel(
     f_inc : wp.array, shape (1,), dtype=wp.float*
         Multiplicative growth factor for `dt` after `n_min` positive steps.
     vv : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum v\\cdot v\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum v\\cdot v\\). Zeroed internally before each use.
     ff : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum f\\cdot f\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum f\\cdot f\\). Zeroed internally before each use.
     vf : wp.array, shape (1,), dtype=wp.float*
-        Accumulator for \\(\\sum v\\cdot f\\). Must be zeroed before launch.
+        Accumulator for \\(\\sum v\\cdot f\\). Zeroed internally before each use.
 
     Launch Grid
     -----------
@@ -1747,7 +1747,7 @@ def _fire_update_params_downhill_kernel(
       are rolled back to `*_last` arrays. Energy is also rolled back.
     - If energy <= energy_last, the `*_last` arrays are updated with current values.
     - Velocity mixing only occurs if \\(v\\cdot f > 0\\) AND the step is not uphill.
-    - `vf/vv/ff` are cross-thread accumulators and must be zeroed before each launch.
+    - `vf/vv/ff` are cross-thread accumulators and zeroed internally before each use.
     """
     atom_idx = wp.tid()
 
@@ -1867,11 +1867,11 @@ def _fire_update_params_downhill_batch_idx_kernel(
     f_inc : wp.array, shape (B,), dtype=wp.float*
         Per-system growth factor for `dt` after `n_min` positive steps.
     vv : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum v\\cdot v\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum v\\cdot v\\). Zeroed internally before each use.
     ff : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum f\\cdot f\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum f\\cdot f\\). Zeroed internally before each use.
     vf : wp.array, shape (B,), dtype=wp.float*
-        Per-system accumulator for \\(\\sum v\\cdot f\\). Must be zeroed before launch.
+        Per-system accumulator for \\(\\sum v\\cdot f\\). Zeroed internally before each use.
     batch_idx : wp.array, shape (N_total,), dtype=wp.int32
         System index for each atom.
 
@@ -1883,7 +1883,7 @@ def _fire_update_params_downhill_batch_idx_kernel(
     -----
     - This kernel does NOT perform the MD step (velocity integration + position update).
     - Uphill detection is per system: each atom checks `energy[sys]` vs `energy_last[sys]`.
-    - `vf/vv/ff` are per-system accumulators and must be zeroed before each launch.
+    - `vf/vv/ff` are per-system accumulators and zeroed internally before each use.
     """
     atom_idx = wp.tid()
     sys = batch_idx[atom_idx]
@@ -2527,6 +2527,8 @@ def fire_step(
     n_min: wp.array,
     f_dec: wp.array,
     f_inc: wp.array,
+    # Scratch arrays
+    uphill_flag: wp.array,
     # Accumulators (required for single/batch_idx; ignored for ptr)
     vf: wp.array = None,
     vv: wp.array = None,
@@ -2582,8 +2584,11 @@ def fire_step(
     f_inc : wp.array, shape (1,) or (B,), dtype=wp.float*
         Timestep increase factor.
     vf, vv, ff : wp.array, shape (1,) or (B,), dtype=wp.float*
-        Accumulators for diagnostics. Must be zeroed before call.
+        Accumulators for diagnostics. Zeroed internally before each use.
         Required for single/batch_idx modes. Ignored for atom_ptr mode.
+    uphill_flag : wp.array, shape (B,), dtype=wp.int32, optional
+        Scratch array for uphill detection. Shape (B,) where B = num_systems.
+        Only used when downhill_enabled=True and batch_idx is provided.
     batch_idx : wp.array, shape (N_total,), dtype=wp.int32, optional
         System index per atom. If provided, uses batch_idx kernel.
     atom_ptr : wp.array, shape (B+1,), dtype=wp.int32, optional
@@ -2633,6 +2638,11 @@ def fire_step(
     """
     if device is None:
         device = positions.device
+
+    if vf is not None:
+        vf.zero_()
+        vv.zero_()
+        ff.zero_()
 
     num_atoms = positions.shape[0]
     vec_dtype = positions.dtype
@@ -2714,8 +2724,6 @@ def fire_step(
             raise ValueError("vf, vv, ff accumulators required for batch_idx mode")
         if downhill_enabled:
             # Three-kernel RLE approach for race-free downhill batch_idx mode
-            # Allocate uphill flag buffer
-            uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
 
             # Kernel 1: Uphill check
             wp.launch(
@@ -2966,7 +2974,7 @@ def fire_update(
     f_inc : wp.array, shape (1,) or (B,), dtype=wp.float*
         Timestep increase factor.
     vf, vv, ff : wp.array, shape (1,) or (B,), dtype=wp.float*
-        Accumulators for diagnostics. Must be zeroed before call.
+        Accumulators for diagnostics. Zeroed internally before each use.
         Required for single/batch_idx modes. Ignored for atom_ptr mode.
     batch_idx : wp.array, shape (N_total,), dtype=wp.int32, optional
         System index per atom. If provided, uses batch_idx kernel.
@@ -2994,9 +3002,6 @@ def fire_update(
     >>> ext_vel = pack_velocities_with_cell(velocities, cell_velocity)
     >>> ext_forces = pack_forces_with_cell(forces, cell_force)
     >>>
-    >>> # Zero accumulators
-    >>> vf.zero_(); vv.zero_(); ff.zero_()
-    >>>
     >>> # FIRE velocity mixing only (no position update)
     >>> fire_update(ext_vel, ext_forces,
     ...             alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
@@ -3012,6 +3017,11 @@ def fire_update(
     """
     if device is None:
         device = velocities.device
+
+    if vf is not None:
+        vf.zero_()
+        vv.zero_()
+        ff.zero_()
 
     num_atoms = velocities.shape[0]
 

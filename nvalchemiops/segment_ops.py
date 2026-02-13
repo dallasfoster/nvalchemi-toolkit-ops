@@ -125,7 +125,7 @@ def _total_sum_tile_kernel(
     x : wp.array, shape (N,), dtype float32/float64/vec3f/vec3d
         Input values to sum.
     out : wp.array, shape (1,), dtype matches x
-        OUTPUT: Accumulated sum. Must be zero-initialized by caller.
+        OUTPUT: Accumulated sum. Zeroed internally before each use.
 
     Notes
     -----
@@ -168,7 +168,7 @@ def _segmented_sum_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M). Must be sorted in non-decreasing order.
     out : wp.array, shape (M,), dtype matches x
-        OUTPUT: Per-segment sums. Must be zero-initialized by caller.
+        OUTPUT: Per-segment sums. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -228,7 +228,7 @@ def _segmented_component_sum_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: Scalar sums of all components per segment. Must be zero-initialized.
+        OUTPUT: Scalar sums of all components per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -288,7 +288,7 @@ def _total_component_sum_tile_kernel(
     x : wp.array, shape (N,), dtype vec3f/vec3d
         Input vector array.
     out : wp.array, shape (1,), dtype float32/float64
-        Accumulated component sum. Must be zero-initialized by caller.
+        Accumulated component sum. Zeroed internally before each use.
     """
     i = wp.tid()
     t = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
@@ -328,7 +328,7 @@ def _segmented_dot_scalar_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out : wp.array, shape (M,), dtype matches x
-        OUTPUT: Dot product per segment. Must be zero-initialized.
+        OUTPUT: Dot product per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -384,7 +384,7 @@ def _segmented_dot_vec_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: Scalar dot product sum per segment. Must be zero-initialized.
+        OUTPUT: Scalar dot product sum per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -433,7 +433,7 @@ def _total_dot_scalar_tile_kernel(
     x, y : wp.array, shape (N,), dtype float32/float64
         Input scalar arrays.
     out : wp.array, shape (1,), dtype matches x
-        Accumulated dot product. Must be zero-initialized by caller.
+        Accumulated dot product. Zeroed internally before each use.
     """
     i = wp.tid()
     tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
@@ -462,7 +462,7 @@ def _total_dot_vec_tile_kernel(
     x, y : wp.array, shape (N,), dtype vec3f/vec3d
         Input vector arrays.
     out : wp.array, shape (1,), dtype float32/float64
-        Accumulated dot product sum. Must be zero-initialized by caller.
+        Accumulated dot product sum. Zeroed internally before each use.
     """
     i = wp.tid()
     tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
@@ -500,7 +500,7 @@ def _segmented_max_norm_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: Maximum vector norm per segment. Must be zero-initialized.
+        OUTPUT: Maximum vector norm per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -551,7 +551,7 @@ def _total_max_norm_kernel(
     x : wp.array, shape (N,), dtype vec3f/vec3d
         Input vector array.
     out : wp.array, shape (1,), dtype float32/float64
-        OUTPUT: Maximum norm across all elements. Must be zero-initialized.
+        OUTPUT: Maximum norm across all elements. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -653,11 +653,11 @@ def _segmented_inner_products_scalar_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out_xy : wp.array, shape (M,), dtype matches x
-        OUTPUT: x·y per segment. Must be zero-initialized.
+        OUTPUT: x·y per segment. Zeroed internally before each use.
     out_xx : wp.array, shape (M,), dtype matches x
-        OUTPUT: x·x per segment. Must be zero-initialized.
+        OUTPUT: x·x per segment. Zeroed internally before each use.
     out_yy : wp.array, shape (M,), dtype matches x
-        OUTPUT: y·y per segment. Must be zero-initialized.
+        OUTPUT: y·y per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -732,11 +732,11 @@ def _segmented_inner_products_vec_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out_xy : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: x·y per segment. Must be zero-initialized.
+        OUTPUT: x·y per segment. Zeroed internally before each use.
     out_xx : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: x·x per segment. Must be zero-initialized.
+        OUTPUT: x·x per segment. Zeroed internally before each use.
     out_yy : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: y·y per segment. Must be zero-initialized.
+        OUTPUT: y·y per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -799,7 +799,7 @@ def _total_inner_products_scalar_tile_kernel(
     x, y : wp.array, shape (N,), dtype float32/float64
         Input scalar arrays.
     out_xy, out_xx, out_yy : wp.array, shape (1,), dtype matches x
-        Accumulated triple dot products. Must be zero-initialized.
+        Accumulated triple dot products. Zeroed internally before each use.
     """
     i = wp.tid()
     tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
@@ -831,7 +831,7 @@ def _total_inner_products_vec_tile_kernel(
     x, y : wp.array, shape (N,), dtype vec3f/vec3d
         Input vector arrays.
     out_xy, out_xx, out_yy : wp.array, shape (1,), dtype float32/float64
-        Accumulated triple dot products. Must be zero-initialized.
+        Accumulated triple dot products. Zeroed internally before each use.
     """
     i = wp.tid()
     tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
@@ -1297,7 +1297,7 @@ def _segmented_count_kernel(
     idx : wp.array, shape (N,), dtype int32
         Sorted segment indices in [0, M).
     out : wp.array, shape (M,), dtype int32
-        OUTPUT: Element counts per segment. Must be zero-initialized.
+        OUTPUT: Element counts per segment. Zeroed internally before each use.
     N : int32
         Total number of elements.
     elems_per_thread : int32
@@ -1621,8 +1621,7 @@ def segmented_sum(
 
     ``out[s] = sum(x[i] for i where idx[i] == s)``
 
-    The caller must zero-initialize ``out`` before calling (e.g. via
-    ``out.zero_()``).  Requires sorted ``idx`` in non-decreasing order.
+    Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
@@ -1631,12 +1630,13 @@ def segmented_sum(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype matches x
-        Per-segment sums. Must be zero-initialized by caller.
+        Per-segment sums. Zeroed internally before each use.
     """
     N = x.shape[0]
     if N == 0:
         return
 
+    out.zero_()
     device = x.device
     M = out.shape[0]
 
@@ -1682,8 +1682,7 @@ def segmented_component_sum(
 
     ``out[s] = sum(x[i][0] + x[i][1] + x[i][2] for i where idx[i] == s)``
 
-    Requires sorted ``idx`` in non-decreasing order.  Caller must
-    zero-initialize ``out``.
+    Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
@@ -1692,7 +1691,7 @@ def segmented_component_sum(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Per-segment scalar sums. Must be zero-initialized by caller.
+        Per-segment scalar sums. Zeroed internally before each use.
 
     See Also
     --------
@@ -1702,6 +1701,8 @@ def segmented_component_sum(
     N = x.shape[0]
     if N == 0:
         return
+
+    out.zero_()
     device = x.device
     M = out.shape[0]
 
@@ -1749,8 +1750,7 @@ def segmented_dot(
     - Scalar types: ``out[s] = sum(x[i] * y[i] for i where idx[i] == s)``
     - Vector types: ``out[s] = sum(dot(x[i], y[i]) for i where idx[i] == s)``
 
-    Requires sorted ``idx`` in non-decreasing order.  Caller must
-    zero-initialize ``out``.
+    Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
@@ -1760,7 +1760,7 @@ def segmented_dot(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Per-segment dot products. Must be zero-initialized by caller.
+        Per-segment dot products. Zeroed internally before each use.
 
     See Also
     --------
@@ -1770,6 +1770,8 @@ def segmented_dot(
     N = x.shape[0]
     if N == 0:
         return
+
+    out.zero_()
     device = x.device
     M = out.shape[0]
 
@@ -1821,9 +1823,9 @@ def segmented_max_norm(
 
     ``out[s] = max(length(x[i]) for i where idx[i] == s)``
 
-    Requires sorted ``idx`` in non-decreasing order.  Caller must
-    zero-initialize ``out``.  For single-segment cases (M=1) with
-    N >= 8192, an optimized fast path reduces atomic contention.
+    Requires sorted ``idx`` in non-decreasing order.  For single-segment
+    cases (M=1) with N >= 8192, an optimized fast path reduces atomic
+    contention.
 
     Parameters
     ----------
@@ -1832,7 +1834,7 @@ def segmented_max_norm(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Maximum norms per segment. Must be zero-initialized by caller.
+        Maximum norms per segment. Zeroed internally before each use.
 
     See Also
     --------
@@ -1841,6 +1843,8 @@ def segmented_max_norm(
     N = x.shape[0]
     if N == 0:
         return
+
+    out.zero_()
     device = x.device
     M = out.shape[0]
 
@@ -1921,8 +1925,7 @@ def segmented_inner_products(
     inner products) in a single kernel launch, roughly 3x faster than three
     separate ``segmented_dot`` calls.
 
-    Requires sorted ``idx`` in non-decreasing order.  All output arrays must
-    be zero-initialized by the caller.
+    Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
@@ -1932,7 +1935,7 @@ def segmented_inner_products(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out_xy, out_xx, out_yy : wp.array, shape (M,), dtype float32 / float64
-        Per-segment inner products. Must be zero-initialized by caller.
+        Per-segment inner products. Zeroed internally before each use.
 
     See Also
     --------
@@ -1941,6 +1944,10 @@ def segmented_inner_products(
     N = x.shape[0]
     if N == 0:
         return
+
+    out_xy.zero_()
+    out_xx.zero_()
+    out_yy.zero_()
     device = x.device
     M = out_xy.shape[0]
 
@@ -2305,8 +2312,8 @@ def segmented_mean(
     For vector types (vec3f/vec3d), computes the mean vector per segment.
     Requires sorted ``idx`` in non-decreasing order.
 
-    All scratch arrays must be pre-allocated and zero-initialized by the
-    caller. This avoids hidden allocations and allows reuse across calls.
+    All scratch arrays must be pre-allocated. This avoids hidden allocations
+    and allows reuse across calls.
 
     Parameters
     ----------
@@ -2315,9 +2322,9 @@ def segmented_mean(
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     sums : wp.array, shape (M,), dtype matches x
-        Scratch array for per-segment sums. Must be zero-initialized.
+        Scratch array for per-segment sums. Zeroed internally before each use.
     counts : wp.array(dtype=int32), shape (M,)
-        Scratch array for per-segment element counts. Must be zero-initialized.
+        Scratch array for per-segment element counts. Zeroed internally before each use.
     out : wp.array, shape (M,), dtype matches x
         Output mean values per segment.
 
@@ -2362,8 +2369,7 @@ def segmented_rms_norm(
     This is ``sqrt(sum_of_squared_norms / count)`` for each segment.
     Requires sorted ``idx`` in non-decreasing order.
 
-    All scratch arrays must be pre-allocated and zero-initialized by the
-    caller.
+    All scratch arrays must be pre-allocated.
 
     Parameters
     ----------
@@ -2373,10 +2379,10 @@ def segmented_rms_norm(
         Sorted segment indices in ``[0, M)``.
     sum_sq : wp.array, shape (M,), dtype float32 / float64
         Scratch array for per-segment sum of squared norms.
-        Must be zero-initialized.
+        Zeroed internally before each use.
     counts : wp.array(dtype=int32), shape (M,)
         Scratch array for per-segment element counts.
-        Must be zero-initialized.
+        Zeroed internally before each use.
     out : wp.array, shape (M,), dtype float32 / float64
         Output RMS norms per segment. Precision matches ``x``.
 
@@ -2412,19 +2418,20 @@ def segmented_count(
 
     ``out[s] = count(i where idx[i] == s)``
 
-    Requires sorted ``idx`` in non-decreasing order.  Caller must
-    zero-initialize ``out``.
+    Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
     idx : wp.array(dtype=int32), shape (N,)
         Sorted segment indices in ``[0, M)``.
     out : wp.array(dtype=int32), shape (M,)
-        Per-segment element counts. Must be zero-initialized by caller.
+        Per-segment element counts. Zeroed internally before each use.
     """
     N = idx.shape[0]
     if N == 0:
         return
+
+    out.zero_()
     device = idx.device
     M = out.shape[0]
 

@@ -155,10 +155,11 @@ from typing import Any
 
 import warp as wp
 
+from nvalchemiops.warp_dispatch import validate_out_array
+
 from ..utils.launch_helpers import (
     build_family_dict,
     dispatch_family,
-    validate_out_array,
 )
 from ..utils.shared_kernels import velocity_kick_families
 

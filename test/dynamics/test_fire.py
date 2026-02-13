@@ -39,6 +39,7 @@ import warp as wp
 from nvalchemiops.dynamics.optimizers import fire_step, fire_update
 from nvalchemiops.dynamics.utils import (
     align_cell,
+    compute_cell_volume,
     extend_atom_ptr,
     extend_batch_idx,
     pack_forces_with_cell,
@@ -101,6 +102,8 @@ def make_fire_params(num_systems, dtype_scalar, device, np_dtype):
         np.full(num_systems, 1.1, dtype=np_dtype), dtype=dtype_scalar, device=device
     )
 
+    uphill_flag = wp.empty(num_systems, dtype=wp.int32, device=device)
+
     return {
         "alpha": alpha,
         "dt": dt,
@@ -113,6 +116,7 @@ def make_fire_params(num_systems, dtype_scalar, device, np_dtype):
         "n_min": n_min,
         "f_dec": f_dec,
         "f_inc": f_inc,
+        "uphill_flag": uphill_flag,
     }
 
 
@@ -135,8 +139,8 @@ def make_downhill_arrays(
     energy_last = wp.array(
         np.full(num_systems, 100.0, dtype=np_dtype), dtype=dtype_scalar, device=device
     )
-    positions_last = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-    velocities_last = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+    positions_last = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+    velocities_last = wp.empty(num_atoms, dtype=dtype_vec, device=device)
 
     return {
         "energy": energy,
@@ -637,6 +641,7 @@ class TestFireUpdate:
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         # Remove params not needed for fire_update
         del params["maxstep"]
+        del params["uphill_flag"]
 
         fire_update(
             velocities=velocities,
@@ -672,6 +677,7 @@ class TestFireUpdate:
 
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         fire_update(
             velocities=velocities,
@@ -710,6 +716,7 @@ class TestFireUpdate:
 
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
         accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
 
         fire_update(
@@ -751,6 +758,7 @@ class TestFireUpdate:
 
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
         accum = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
 
         fire_update(
@@ -795,6 +803,7 @@ class TestFireUpdate:
 
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         # Create downhill arrays for fire_update
         energy = wp.array([1.0], dtype=dtype_scalar, device=device)
@@ -849,6 +858,7 @@ class TestFireUpdate:
 
         params = make_fire_params(1, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         # Don't pass device - should be inferred
         fire_update(
@@ -885,6 +895,7 @@ class TestFireUpdateErrors:
 
         params = make_fire_params(1, wp.float64, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         with pytest.raises(
             ValueError, match="Cannot specify both batch_idx and atom_ptr"
@@ -918,6 +929,7 @@ class TestFireUpdateErrors:
 
         params = make_fire_params(1, wp.float64, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         # Only provide energy, not the other required arrays
         energy = wp.array([1.0], dtype=wp.float64, device=device)
@@ -958,6 +970,7 @@ class TestFireUpdateErrors:
 
         params = make_fire_params(num_systems, wp.float64, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         with pytest.raises(ValueError, match="vf, vv, ff accumulators required"):
             fire_update(
@@ -998,8 +1011,9 @@ class TestAlignCell:
             dtype=dtype_vec,
             device=device,
         )
+        transform = wp.empty(1, dtype=dtype_mat, device=device)
 
-        align_cell(positions, cell, device=device)
+        align_cell(positions, cell, transform, device=device)
 
         wp.synchronize_device(device)
         aligned_cell = cell_to_numpy(cell)
@@ -1036,8 +1050,9 @@ class TestAlignCell:
             dtype=dtype_vec,
             device=device,
         )
+        transform = wp.empty(1, dtype=dtype_mat, device=device)
 
-        align_cell(positions, cell, device=device)
+        align_cell(positions, cell, transform, device=device)
 
         wp.synchronize_device(device)
         aligned_cell = cell_to_numpy(cell)
@@ -1062,7 +1077,12 @@ class TestExtendBatchIdx:
         num_systems = 1
 
         batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
-        extended = extend_batch_idx(batch_idx, num_atoms, num_systems, device=device)
+        extended_batch_idx = wp.empty(
+            num_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
+        extended = extend_batch_idx(
+            batch_idx, num_atoms, num_systems, extended_batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         result = extended.numpy()
@@ -1083,8 +1103,13 @@ class TestExtendBatchIdx:
             np.int32
         )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+        extended_batch_idx = wp.empty(
+            num_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
 
-        extended = extend_batch_idx(batch_idx, num_atoms, num_systems, device=device)
+        extended = extend_batch_idx(
+            batch_idx, num_atoms, num_systems, extended_batch_idx, device=device
+        )
 
         wp.synchronize_device(device)
         result = extended.numpy()
@@ -1111,8 +1136,11 @@ class TestExtendAtomPtr:
         # Original: 2 systems, 10 and 15 atoms
         atom_ptr_np = np.array([0, 10, 25], dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        extended_atom_ptr = wp.empty(
+            atom_ptr_np.shape[0], dtype=wp.int32, device=device
+        )
 
-        extended = extend_atom_ptr(atom_ptr, device=device)
+        extended = extend_atom_ptr(atom_ptr, extended_atom_ptr, device=device)
 
         wp.synchronize_device(device)
         result = extended.numpy()
@@ -1158,14 +1186,17 @@ class TestPackUnpack:
         cell = make_cell(cell_np, dtype_mat, device)
 
         # Pack
-        extended = pack_positions_with_cell(positions, cell, device=device)
+        extended = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(positions, cell, extended, device=device)
 
         wp.synchronize_device(device)
         assert extended.shape[0] == num_atoms + 2
 
         # Unpack
-        pos_out, cell_out = unpack_positions_with_cell(
-            extended, num_atoms, device=device
+        pos_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell_out = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            extended, pos_out, cell_out, num_atoms=num_atoms, device=device
         )
 
         wp.synchronize_device(device)
@@ -1208,10 +1239,11 @@ class TestPackUnpack:
             # Pack each system
             pos_wp = wp.array(pos_np, dtype=dtype_vec, device=device)
             cell_wp = make_cell(cell_np, dtype_mat, device)
-            extended = pack_positions_with_cell(pos_wp, cell_wp, device=device)
+            ext = wp.empty(n_atoms + 2, dtype=dtype_vec, device=device)
+            pack_positions_with_cell(pos_wp, cell_wp, ext, device=device)
 
             wp.synchronize_device(device)
-            extended_list.append(extended.numpy())
+            extended_list.append(ext.numpy())
 
         # Concatenate extended arrays
         extended_concat = np.vstack(extended_list)
@@ -1224,8 +1256,11 @@ class TestPackUnpack:
             ]
         )
         batch_idx = wp.array(original_batch_idx, dtype=wp.int32, device=device)
+        ext_batch_idx_arr = wp.empty(
+            total_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
         ext_batch_idx = extend_batch_idx(
-            batch_idx, total_atoms, num_systems, device=device
+            batch_idx, total_atoms, num_systems, ext_batch_idx_arr, device=device
         )
 
         wp.synchronize_device(device)
@@ -1246,8 +1281,10 @@ class TestPackUnpack:
             sys_extended = wp.array(
                 extended_concat[start:end], dtype=dtype_vec, device=device
             )
-            pos_out, cell_out = unpack_positions_with_cell(
-                sys_extended, n_atoms, device=device
+            pos_out = wp.empty(n_atoms, dtype=dtype_vec, device=device)
+            cell_out = wp.empty(1, dtype=dtype_mat, device=device)
+            unpack_positions_with_cell(
+                sys_extended, pos_out, cell_out, num_atoms=n_atoms, device=device
             )
 
             wp.synchronize_device(device)
@@ -1299,7 +1336,8 @@ class TestPackUnpack:
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
 
         # Extended atom_ptr
-        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+        ext_atom_ptr_arr = wp.empty(atom_ptr_np.shape[0], dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, ext_atom_ptr_arr, device=device)
         wp.synchronize_device(device)
         ext_atom_ptr_np = ext_atom_ptr.numpy()
 
@@ -1311,9 +1349,13 @@ class TestPackUnpack:
             )
 
         # Pack all systems at once using atom_ptr
-        extended = pack_positions_with_cell(
+        extended = wp.empty(
+            total_atoms + 2 * num_systems, dtype=dtype_vec, device=device
+        )
+        pack_positions_with_cell(
             positions,
             cells,
+            extended,
             atom_ptr=atom_ptr,
             ext_atom_ptr=ext_atom_ptr,
             device=device,
@@ -1347,8 +1389,15 @@ class TestPackUnpack:
             np.testing.assert_allclose(cell_v2[2], expected_cell[2, 2], rtol=1e-5)
 
         # Test unpack roundtrip
-        pos_out, cells_out = unpack_positions_with_cell(
-            extended, atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device
+        pos_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cells_out = wp.empty(num_systems, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            extended,
+            pos_out,
+            cells_out,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1397,14 +1446,17 @@ class TestPackUnpack:
         cell_vel = make_cell(cell_vel_np, dtype_mat, device)
 
         # Pack
-        extended = pack_velocities_with_cell(velocities, cell_vel, device=device)
+        extended = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_velocities_with_cell(velocities, cell_vel, extended, device=device)
 
         wp.synchronize_device(device)
         assert extended.shape[0] == num_atoms + 2
 
         # Unpack
-        vel_out, cell_vel_out = unpack_velocities_with_cell(
-            extended, num_atoms, device=device
+        vel_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell_vel_out = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_velocities_with_cell(
+            extended, vel_out, cell_vel_out, num_atoms=num_atoms, device=device
         )
 
         wp.synchronize_device(device)
@@ -1459,14 +1511,19 @@ class TestPackUnpack:
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
 
         # Extended atom_ptr
-        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+        ext_atom_ptr_arr = wp.empty(atom_ptr_np.shape[0], dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, ext_atom_ptr_arr, device=device)
         wp.synchronize_device(device)
         ext_atom_ptr_np = ext_atom_ptr.numpy()
 
         # Pack all systems at once using atom_ptr
-        extended = pack_velocities_with_cell(
+        extended = wp.empty(
+            total_atoms + 2 * num_systems, dtype=dtype_vec, device=device
+        )
+        pack_velocities_with_cell(
             velocities,
             cell_vels,
+            extended,
             atom_ptr=atom_ptr,
             ext_atom_ptr=ext_atom_ptr,
             device=device,
@@ -1481,8 +1538,15 @@ class TestPackUnpack:
         assert len(extended_np) == ext_atom_ptr_np[-1]
 
         # Test unpack roundtrip
-        vel_out, cell_vels_out = unpack_velocities_with_cell(
-            extended, atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device
+        vel_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cell_vels_out = wp.empty(num_systems, dtype=dtype_mat, device=device)
+        unpack_velocities_with_cell(
+            extended,
+            vel_out,
+            cell_vels_out,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1530,10 +1594,11 @@ class TestPackUnpack:
             # Pack each system
             vel_wp = wp.array(vel_np, dtype=dtype_vec, device=device)
             cell_vel_wp = make_cell(cell_vel_np, dtype_mat, device)
-            extended = pack_velocities_with_cell(vel_wp, cell_vel_wp, device=device)
+            ext = wp.empty(n_atoms + 2, dtype=dtype_vec, device=device)
+            pack_velocities_with_cell(vel_wp, cell_vel_wp, ext, device=device)
 
             wp.synchronize_device(device)
-            extended_list.append(extended.numpy())
+            extended_list.append(ext.numpy())
 
         # Concatenate extended arrays
         extended_concat = np.vstack(extended_list)
@@ -1546,8 +1611,11 @@ class TestPackUnpack:
             ]
         )
         batch_idx = wp.array(original_batch_idx, dtype=wp.int32, device=device)
+        ext_batch_idx_arr = wp.empty(
+            total_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
         ext_batch_idx = extend_batch_idx(
-            batch_idx, total_atoms, num_systems, device=device
+            batch_idx, total_atoms, num_systems, ext_batch_idx_arr, device=device
         )
 
         wp.synchronize_device(device)
@@ -1574,8 +1642,10 @@ class TestPackUnpack:
             sys_extended = wp.array(
                 extended_concat[start:end], dtype=dtype_vec, device=device
             )
-            vel_out, cell_vel_out = unpack_velocities_with_cell(
-                sys_extended, n_atoms, device=device
+            vel_out = wp.empty(n_atoms, dtype=dtype_vec, device=device)
+            cell_vel_out = wp.empty(1, dtype=dtype_mat, device=device)
+            unpack_velocities_with_cell(
+                sys_extended, vel_out, cell_vel_out, num_atoms=n_atoms, device=device
             )
 
             wp.synchronize_device(device)
@@ -1613,14 +1683,17 @@ class TestPackUnpack:
         cell_force = make_cell(cell_force_np, dtype_mat, device)
 
         # Pack
-        extended = pack_forces_with_cell(forces, cell_force, device=device)
+        extended = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_forces_with_cell(forces, cell_force, extended, device=device)
 
         wp.synchronize_device(device)
         assert extended.shape[0] == num_atoms + 2
 
         # Use position unpack to verify (same format)
-        forces_out, cell_force_out = unpack_positions_with_cell(
-            extended, num_atoms, device=device
+        forces_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell_force_out = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            extended, forces_out, cell_force_out, num_atoms=num_atoms, device=device
         )
 
         wp.synchronize_device(device)
@@ -1679,14 +1752,19 @@ class TestPackUnpack:
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
 
         # Extended atom_ptr
-        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+        ext_atom_ptr_arr = wp.empty(atom_ptr_np.shape[0], dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, ext_atom_ptr_arr, device=device)
         wp.synchronize_device(device)
         ext_atom_ptr_np = ext_atom_ptr.numpy()
 
         # Pack all systems at once using atom_ptr
-        extended = pack_forces_with_cell(
+        extended = wp.empty(
+            total_atoms + 2 * num_systems, dtype=dtype_vec, device=device
+        )
+        pack_forces_with_cell(
             forces,
             cell_forces,
+            extended,
             atom_ptr=atom_ptr,
             ext_atom_ptr=ext_atom_ptr,
             device=device,
@@ -1742,10 +1820,11 @@ class TestPackUnpack:
             # Pack each system
             forces_wp = wp.array(forces_np, dtype=dtype_vec, device=device)
             cell_force_wp = make_cell(cell_force_np, dtype_mat, device)
-            extended = pack_forces_with_cell(forces_wp, cell_force_wp, device=device)
+            ext = wp.empty(n_atoms + 2, dtype=dtype_vec, device=device)
+            pack_forces_with_cell(forces_wp, cell_force_wp, ext, device=device)
 
             wp.synchronize_device(device)
-            extended_list.append(extended.numpy())
+            extended_list.append(ext.numpy())
 
         # Concatenate extended arrays
         extended_concat = np.vstack(extended_list)
@@ -1758,8 +1837,11 @@ class TestPackUnpack:
             ]
         )
         batch_idx = wp.array(original_batch_idx, dtype=wp.int32, device=device)
+        ext_batch_idx_arr = wp.empty(
+            total_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
         ext_batch_idx = extend_batch_idx(
-            batch_idx, total_atoms, num_systems, device=device
+            batch_idx, total_atoms, num_systems, ext_batch_idx_arr, device=device
         )
 
         wp.synchronize_device(device)
@@ -1787,8 +1869,14 @@ class TestPackUnpack:
                 extended_concat[start:end], dtype=dtype_vec, device=device
             )
             # Use position unpack to verify (forces use same format)
-            forces_out, cell_force_out = unpack_positions_with_cell(
-                sys_extended, n_atoms, device=device
+            forces_out = wp.empty(n_atoms, dtype=dtype_vec, device=device)
+            cell_force_out = wp.empty(1, dtype=dtype_mat, device=device)
+            unpack_positions_with_cell(
+                sys_extended,
+                forces_out,
+                cell_force_out,
+                num_atoms=n_atoms,
+                device=device,
             )
 
             wp.synchronize_device(device)
@@ -1818,8 +1906,10 @@ class TestPackUnpack:
             dtype=dtype_scalar,
             device=device,
         )
+        cell_mass_arr = wp.array([cell_mass], dtype=dtype_scalar, device=device)
 
-        extended = pack_masses_with_cell(masses, cell_mass, device=device)
+        extended = wp.empty(num_atoms + 2, dtype=dtype_scalar, device=device)
+        pack_masses_with_cell(masses, cell_mass_arr, extended, device=device)
 
         wp.synchronize_device(device)
         result = extended.numpy()
@@ -1869,14 +1959,24 @@ class TestPackUnpack:
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
 
         # Extended atom_ptr
-        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+        ext_atom_ptr_arr = wp.empty(atom_ptr_np.shape[0], dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, ext_atom_ptr_arr, device=device)
         wp.synchronize_device(device)
         ext_atom_ptr_np = ext_atom_ptr.numpy()
 
         # Pack all systems at once using atom_ptr
-        extended = pack_masses_with_cell(
+        cell_mass_arr = wp.array(
+            np.full(num_systems, cell_mass, dtype=np_dtype),
+            dtype=dtype_scalar,
+            device=device,
+        )
+        extended = wp.empty(
+            total_atoms + 2 * num_systems, dtype=dtype_scalar, device=device
+        )
+        pack_masses_with_cell(
             masses,
-            cell_mass,
+            cell_mass_arr,
+            extended,
             atom_ptr=atom_ptr,
             ext_atom_ptr=ext_atom_ptr,
             device=device,
@@ -1934,10 +2034,12 @@ class TestPackUnpack:
 
             # Pack each system
             masses_wp = wp.array(masses_np, dtype=dtype_scalar, device=device)
-            extended = pack_masses_with_cell(masses_wp, cell_mass, device=device)
+            cell_mass_arr = wp.array([cell_mass], dtype=dtype_scalar, device=device)
+            ext = wp.empty(n_atoms + 2, dtype=dtype_scalar, device=device)
+            pack_masses_with_cell(masses_wp, cell_mass_arr, ext, device=device)
 
             wp.synchronize_device(device)
-            ext_np = extended.numpy()
+            ext_np = ext.numpy()
             extended_list.append(ext_np)
 
             # Verify this system's masses in isolation
@@ -1955,8 +2057,11 @@ class TestPackUnpack:
             ]
         )
         batch_idx = wp.array(original_batch_idx, dtype=wp.int32, device=device)
+        ext_batch_idx_arr = wp.empty(
+            total_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
         ext_batch_idx = extend_batch_idx(
-            batch_idx, total_atoms, num_systems, device=device
+            batch_idx, total_atoms, num_systems, ext_batch_idx_arr, device=device
         )
 
         wp.synchronize_device(device)
@@ -2026,10 +2131,15 @@ class TestPackUnpack:
         cell_vel = make_cell(cell_vel_np, dtype_mat, device)
         cell_force = make_cell(cell_force_np, dtype_mat, device)
 
-        ext_pos = pack_positions_with_cell(positions, cell, device=device)
-        ext_vel = pack_velocities_with_cell(velocities, cell_vel, device=device)
-        ext_forces = pack_forces_with_cell(forces, cell_force, device=device)
-        ext_masses = pack_masses_with_cell(masses, cell_mass, device=device)
+        ext_pos = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(positions, cell, ext_pos, device=device)
+        ext_vel = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_velocities_with_cell(velocities, cell_vel, ext_vel, device=device)
+        ext_forces = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_forces_with_cell(forces, cell_force, ext_forces, device=device)
+        cell_mass_arr = wp.array([cell_mass], dtype=dtype_scalar, device=device)
+        ext_masses = wp.empty(num_atoms + 2, dtype=dtype_scalar, device=device)
+        pack_masses_with_cell(masses, cell_mass_arr, ext_masses, device=device)
 
         wp.synchronize_device(device)
 
@@ -2041,11 +2151,15 @@ class TestPackUnpack:
         assert ext_masses.shape[0] == expected_size
 
         # Unpack and verify positions and cell
-        pos_out, cell_out = unpack_positions_with_cell(
-            ext_pos, num_atoms, device=device
+        pos_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell_out = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            ext_pos, pos_out, cell_out, num_atoms=num_atoms, device=device
         )
-        vel_out, cell_vel_out = unpack_velocities_with_cell(
-            ext_vel, num_atoms, device=device
+        vel_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell_vel_out = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_velocities_with_cell(
+            ext_vel, vel_out, cell_vel_out, num_atoms=num_atoms, device=device
         )
 
         wp.synchronize_device(device)
@@ -2073,7 +2187,10 @@ class TestStressToCellForce:
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
         cell = make_cell(cell_np, dtype_mat, device)
 
-        cell_force = stress_to_cell_force(stress, cell, device=device)
+        volume = wp.empty(1, dtype=dtype_scalar, device=device)
+        compute_cell_volume(cell, volume, device=device)
+        cell_force = wp.empty(1, dtype=dtype_mat, device=device)
+        stress_to_cell_force(stress, cell, volume, cell_force, device=device)
 
         wp.synchronize_device(device)
         assert cell_force.shape[0] == 1
@@ -2105,8 +2222,11 @@ class TestStressToCellForce:
         )
         cell = make_cell(cell_np, dtype_mat, device)
 
-        cell_force = stress_to_cell_force(
-            stress, cell, keep_aligned=True, device=device
+        volume = wp.empty(1, dtype=dtype_scalar, device=device)
+        compute_cell_volume(cell, volume, device=device)
+        cell_force = wp.empty(1, dtype=dtype_mat, device=device)
+        stress_to_cell_force(
+            stress, cell, volume, cell_force, keep_aligned=True, device=device
         )
 
         wp.synchronize_device(device)
@@ -2142,7 +2262,8 @@ class TestCellFilterDeviceInference:
         cell = make_cell(cell_np, dtype_mat, device)
 
         # Don't pass device
-        extended = pack_positions_with_cell(positions, cell)
+        extended = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(positions, cell, extended)
 
         wp.synchronize_device(device)
         assert extended.device == device
@@ -2161,7 +2282,9 @@ class TestCellFilterDeviceInference:
         extended = wp.array(extended_np, dtype=dtype_vec, device=device)
 
         # Don't pass device
-        positions, cell = unpack_positions_with_cell(extended, num_atoms)
+        positions = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        cell = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(extended, positions, cell, num_atoms=num_atoms)
 
         wp.synchronize_device(device)
         assert positions.device == device
@@ -2182,9 +2305,10 @@ class TestCellFilterDeviceInference:
 
         positions = wp.array(positions_np, dtype=dtype_vec, device=device)
         cell = make_cell(cell_np, dtype_mat, device)
+        transform = wp.empty(1, dtype=dtype_mat, device=device)
 
         # Don't pass device
-        pos_out, cell_out = align_cell(positions, cell)
+        pos_out, cell_out = align_cell(positions, cell, transform)
 
         wp.synchronize_device(device)
         assert pos_out.device == device
@@ -2201,9 +2325,14 @@ class TestCellFilterDeviceInference:
 
         batch_idx_np = np.array([0] * 8 + [1] * 7, dtype=np.int32)
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+        extended_batch_idx = wp.empty(
+            num_atoms + 2 * num_systems, dtype=wp.int32, device=device
+        )
 
         # Don't pass device
-        extended = extend_batch_idx(batch_idx, num_atoms, num_systems)
+        extended = extend_batch_idx(
+            batch_idx, num_atoms, num_systems, extended_batch_idx
+        )
 
         wp.synchronize_device(device)
         assert extended.device == device
@@ -2217,9 +2346,12 @@ class TestCellFilterDeviceInference:
         """Test extend_atom_ptr infers device from atom_ptr."""
         atom_ptr_np = np.array([0, 8, 15], dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        extended_atom_ptr = wp.empty(
+            atom_ptr_np.shape[0], dtype=wp.int32, device=device
+        )
 
         # Don't pass device
-        extended = extend_atom_ptr(atom_ptr)
+        extended = extend_atom_ptr(atom_ptr, extended_atom_ptr)
 
         wp.synchronize_device(device)
         assert extended.device == device
@@ -2247,7 +2379,8 @@ class TestCellFilterBatchedModeEdgeCases:
         # Create atom_ptr
         atom_ptr_np = np.array([0, atoms_per_system[0], total_atoms], dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
-        ext_atom_ptr = extend_atom_ptr(atom_ptr, device=device)
+        ext_atom_ptr_arr = wp.empty(atom_ptr_np.shape[0], dtype=wp.int32, device=device)
+        ext_atom_ptr = extend_atom_ptr(atom_ptr, ext_atom_ptr_arr, device=device)
 
         # Pre-allocate outputs
         if dtype_mat == wp.mat33f:
@@ -2255,17 +2388,16 @@ class TestCellFilterBatchedModeEdgeCases:
         else:
             mat_dtype = wp.mat33d
 
-        positions = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
-        cell = wp.zeros(num_systems, dtype=mat_dtype, device=device)
+        positions = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cell = wp.empty(num_systems, dtype=mat_dtype, device=device)
 
         # Unpack with pre-allocated outputs
         pos_out, cell_out = unpack_positions_with_cell(
             extended,
-            num_atoms=total_atoms,
+            positions,
+            cell,
             atom_ptr=atom_ptr,
             ext_atom_ptr=ext_atom_ptr,
-            positions=positions,
-            cell=cell,
             device=device,
         )
 
@@ -2304,10 +2436,11 @@ class TestCellFilterBatchedModeEdgeCases:
             np.int32
         )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+        transform = wp.empty(num_systems, dtype=dtype_mat, device=device)
 
         # Align
         pos_out, cell_out = align_cell(
-            positions, cell, batch_idx=batch_idx, device=device
+            positions, cell, transform, batch_idx=batch_idx, device=device
         )
 
         wp.synchronize_device(device)
@@ -2404,6 +2537,7 @@ class TestVariableCellOptimization:
 
         params = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
         del params["maxstep"]
+        del params["uphill_flag"]
 
         fire_update(
             velocities=velocities,
@@ -2463,7 +2597,7 @@ class TestVariableCellOptimization:
 
         ext_positions = wp.array(ext_pos_np, dtype=dtype_vec, device=device)
         ext_velocities = wp.zeros(num_extended, dtype=dtype_vec, device=device)
-        ext_forces = wp.zeros(num_extended, dtype=dtype_vec, device=device)
+        ext_forces = wp.empty(num_extended, dtype=dtype_vec, device=device)
         ext_masses = wp.array(
             np.ones(num_extended, dtype=np_dtype) * 100.0,
             dtype=dtype_scalar,
@@ -2504,8 +2638,16 @@ class TestVariableCellOptimization:
             )
 
             # Convert stress to cell force
-            cell_force = stress_to_cell_force(
-                stress, cell_current, keep_aligned=True, device=device
+            volume = wp.empty(1, dtype=dtype_scalar, device=device)
+            compute_cell_volume(cell_current, volume, device=device)
+            cell_force = wp.empty(1, dtype=dtype_mat, device=device)
+            stress_to_cell_force(
+                stress,
+                cell_current,
+                volume,
+                cell_force,
+                keep_aligned=True,
+                device=device,
             )
 
             # Pack cell force into extended force array
@@ -2604,10 +2746,12 @@ class TestVariableCellOptimization:
         cell = make_cell(initial_cell_np, dtype_mat, device)
 
         # Align cell (should be no-op for already upper-triangular, but test workflow)
-        positions, cell = align_cell(positions, cell, device=device)
+        transform = wp.empty(1, dtype=dtype_mat, device=device)
+        positions, cell = align_cell(positions, cell, transform, device=device)
 
         # Pack into extended arrays
-        ext_positions = pack_positions_with_cell(positions, cell, device=device)
+        ext_positions = wp.empty(num_extended, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(positions, cell, ext_positions, device=device)
         ext_velocities = wp.zeros(num_extended, dtype=dtype_vec, device=device)
         ext_masses_np = np.concatenate(
             [
@@ -2624,7 +2768,7 @@ class TestVariableCellOptimization:
 
         # Allocate force arrays
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
-        cell_force = wp.zeros(1, dtype=dtype_mat, device=device)
+        cell_force = wp.empty(1, dtype=dtype_mat, device=device)
 
         # Optimization loop
         max_steps = 1000
@@ -2632,8 +2776,14 @@ class TestVariableCellOptimization:
 
         for step in range(max_steps):
             # Unpack current state
-            pos_current, cell_current = unpack_positions_with_cell(
-                ext_positions, num_atoms, device=device
+            pos_current = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+            cell_current = wp.empty(1, dtype=dtype_mat, device=device)
+            unpack_positions_with_cell(
+                ext_positions,
+                pos_current,
+                cell_current,
+                num_atoms=num_atoms,
+                device=device,
             )
 
             # Compute atomic forces (harmonic to origin)
@@ -2645,12 +2795,21 @@ class TestVariableCellOptimization:
             )
 
             # Convert stress to cell force
-            cell_force = stress_to_cell_force(
-                stress, cell_current, keep_aligned=True, device=device
+            volume = wp.empty(1, dtype=dtype_scalar, device=device)
+            compute_cell_volume(cell_current, volume, device=device)
+            cell_force = wp.empty(1, dtype=dtype_mat, device=device)
+            stress_to_cell_force(
+                stress,
+                cell_current,
+                volume,
+                cell_force,
+                keep_aligned=True,
+                device=device,
             )
 
             # Pack forces into extended array
-            ext_forces = pack_forces_with_cell(forces, cell_force, device=device)
+            ext_forces = wp.empty(num_extended, dtype=dtype_vec, device=device)
+            pack_forces_with_cell(forces, cell_force, ext_forces, device=device)
 
             # Check convergence
             wp.synchronize_device(device)
@@ -2674,8 +2833,10 @@ class TestVariableCellOptimization:
         wp.synchronize_device(device)
 
         # Unpack final state
-        final_pos, final_cell = unpack_positions_with_cell(
-            ext_positions, num_atoms, device=device
+        final_pos = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        final_cell = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            ext_positions, final_pos, final_cell, num_atoms=num_atoms, device=device
         )
         wp.synchronize_device(device)
 
@@ -2741,7 +2902,8 @@ class TestVariableCellOptimization:
         cell = make_cell(original_cell_np.copy(), dtype_mat, device)
 
         # Apply cell alignment
-        positions, cell = align_cell(positions, cell, device=device)
+        transform = wp.empty(1, dtype=dtype_mat, device=device)
+        positions, cell = align_cell(positions, cell, transform, device=device)
 
         wp.synchronize_device(device)
         aligned_pos_np = positions.numpy()
@@ -2772,9 +2934,16 @@ class TestVariableCellOptimization:
         )
 
         # Now test pack/unpack roundtrip
-        ext_positions = pack_positions_with_cell(positions, cell, device=device)
-        unpacked_pos, unpacked_cell = unpack_positions_with_cell(
-            ext_positions, num_atoms, device=device
+        ext_positions = wp.empty(num_atoms + 2, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(positions, cell, ext_positions, device=device)
+        unpacked_pos = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        unpacked_cell = wp.empty(1, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            ext_positions,
+            unpacked_pos,
+            unpacked_cell,
+            num_atoms=num_atoms,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -2864,8 +3033,16 @@ class TestVariableCellOptimization:
             stress = compute_harmonic_cell_stress(
                 cell_current, target_cell, k_cell, device=device
             )
-            cell_force = stress_to_cell_force(
-                stress, cell_current, keep_aligned=True, device=device
+            volume = wp.empty(1, dtype=dtype_scalar, device=device)
+            compute_cell_volume(cell_current, volume, device=device)
+            cell_force = wp.empty(1, dtype=dtype_mat, device=device)
+            stress_to_cell_force(
+                stress,
+                cell_current,
+                volume,
+                cell_force,
+                keep_aligned=True,
+                device=device,
             )
 
             wp.synchronize_device(device)

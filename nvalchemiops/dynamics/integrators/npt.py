@@ -50,11 +50,12 @@ from typing import Any
 
 import warp as wp
 
+from nvalchemiops.warp_dispatch import validate_out_array
+
 from ..utils.cell_utils import compute_cell_inverse, compute_cell_volume
 from ..utils.launch_helpers import (
     ExecutionMode,
     resolve_execution_mode,
-    validate_out_array,
 )
 from ..utils.thermostat_utils import compute_kinetic_energy
 
@@ -1421,9 +1422,10 @@ def compute_pressure_tensor(
     masses: wp.array,
     virial_tensors: wp.array,
     cells: wp.array,
-    pressure_tensors: wp.array = None,
+    kinetic_tensors: wp.array,
+    pressure_tensors: wp.array,
+    volumes: wp.array,
     batch_idx: wp.array = None,
-    volumes: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1441,12 +1443,16 @@ def compute_pressure_tensor(
         Virial tensor from forces. Shape (B,).
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-    pressure_tensors : wp.array, optional
-        Output pressure tensor. If None, allocated internally.
+    kinetic_tensors : wp.array(dtype=scalar, ndim=2)
+        Scratch array for kinetic tensor accumulation. Shape (B, 9).
+        Zeroed internally before each use.
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Output pressure tensor. Shape (B,).
+    volumes : wp.array(dtype=scalar)
+        Pre-computed cell volumes. Shape (B,).
+        Caller must pre-compute via compute_cell_volume.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. If None, assumes single system.
-    volumes : wp.array, optional
-        Pre-computed volumes. If None, computed internally.
     device : str, optional
         Warp device.
 
@@ -1458,21 +1464,9 @@ def compute_pressure_tensor(
     if device is None:
         device = velocities.device
 
+    kinetic_tensors.zero_()
     num_atoms = velocities.shape[0]
     num_systems = cells.shape[0]
-
-    if velocities.dtype == wp.vec3f:
-        tensor_dtype = vec9f
-        scalar_dtype = wp.float32
-    else:
-        tensor_dtype = vec9d
-        scalar_dtype = wp.float64
-
-    if volumes is None:
-        volumes = compute_cell_volume(cells, device=device)
-
-    # Use array2d for atomic accumulation
-    kinetic_tensors = wp.zeros((num_systems, 9), dtype=scalar_dtype, device=device)
 
     if batch_idx is None:
         wp.launch(
@@ -1489,9 +1483,6 @@ def compute_pressure_tensor(
             device=device,
         )
 
-    if pressure_tensors is None:
-        pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
-
     wp.launch(
         _finalize_pressure_tensor_kernel,
         dim=num_systems,
@@ -1504,7 +1495,7 @@ def compute_pressure_tensor(
 
 def compute_scalar_pressure(
     pressure_tensors: wp.array,
-    scalar_pressures: wp.array = None,
+    scalar_pressures: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1516,8 +1507,8 @@ def compute_scalar_pressure(
     ----------
     pressure_tensors : wp.array(dtype=vec9f or vec9d)
         Pressure tensor. Shape (B,).
-    scalar_pressures : wp.array, optional
-        Output scalar pressure. If None, allocated internally.
+    scalar_pressures : wp.array(dtype=scalar)
+        Output scalar pressure. Shape (B,).
     device : str, optional
         Warp device.
 
@@ -1530,14 +1521,6 @@ def compute_scalar_pressure(
         device = pressure_tensors.device
 
     num_systems = pressure_tensors.shape[0]
-
-    if pressure_tensors.dtype == vec9f:
-        scalar_dtype = wp.float32
-    else:
-        scalar_dtype = wp.float64
-
-    if scalar_pressures is None:
-        scalar_pressures = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
 
     wp.launch(
         _compute_scalar_pressure_kernel,
@@ -1655,10 +1638,10 @@ def _compute_barostat_mass_kernel(
 
 
 def compute_barostat_mass(
-    target_temperature,
-    tau_p,
-    num_atoms,
-    dtype: type = wp.float32,
+    target_temperature: wp.array,
+    tau_p: wp.array,
+    num_atoms: wp.array,
+    masses_out: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1684,22 +1667,20 @@ def compute_barostat_mass(
 
     Parameters
     ----------
-    target_temperature : float or wp.array
-        Target temperature(s). Can be:
-        - float: Same temperature for all systems
-        - wp.array: Per-system temperatures, shape (num_systems,)
-    tau_p : float or wp.array
-        Pressure relaxation time(s). Typical values: 0.5-2.0 ps.
-        Can be float (same for all) or wp.array (per-system).
-    num_atoms : int or wp.array
-        Number of atoms. Can be:
-        - int: Same for all systems
-        - wp.array: Per-system atom counts, shape (num_systems,)
-    dtype : type, optional
-        Warp data type for output (wp.float32 or wp.float64).
-        Default: wp.float32.
+    target_temperature : wp.array
+        Per-system target temperatures. Shape (num_systems,).
+        Caller must pre-broadcast if a single value applies to all systems.
+    tau_p : wp.array
+        Per-system pressure relaxation times. Shape (num_systems,).
+        Typical values: 0.5-2.0 ps.
+        Caller must pre-broadcast if a single value applies to all systems.
+    num_atoms : wp.array(dtype=wp.int32)
+        Per-system atom counts. Shape (num_systems,).
+        Caller must pre-broadcast if a single value applies to all systems.
+    masses_out : wp.array
+        Output barostat masses W. Shape (num_systems,).
     device : str, optional
-        Warp device. Default: "cuda:0" if available, else "cpu".
+        Warp device.
 
     Returns
     -------
@@ -1708,22 +1689,13 @@ def compute_barostat_mass(
 
     Examples
     --------
-    Single system:
-
-    >>> W = compute_barostat_mass(
-    ...     target_temperature=1.0,
-    ...     tau_p=1.0,
-    ...     num_atoms=100,
-    ...     dtype=wp.float32
-    ... )
-    >>> print(W.numpy())  # W = (300 + 3) * 1.0 * 1.0 = 303.0
-
     Batched systems (using wp.arrays):
 
     >>> temps = wp.array([1.0, 2.0], dtype=wp.float64, device="cuda:0")
     >>> tau = wp.array([1.0, 1.0], dtype=wp.float64, device="cuda:0")
     >>> n_atoms = wp.array([100, 200], dtype=wp.int32, device="cuda:0")
-    >>> W = compute_barostat_mass(temps, tau, n_atoms, dtype=wp.float64)
+    >>> W = wp.empty(2, dtype=wp.float64, device="cuda:0")
+    >>> compute_barostat_mass(temps, tau, n_atoms, W)
     >>> print(W.numpy())  # [303.0, 1206.0]
 
     Notes
@@ -1733,6 +1705,8 @@ def compute_barostat_mass(
     - For isotropic barostat, a single mass controls all cell dimensions.
     - For anisotropic/triclinic barostat, the same mass is typically used
       for all cell velocity components.
+    - All input arrays must have the same length (num_systems). The caller
+      is responsible for broadcasting scalar values to arrays before calling.
 
     References
     ----------
@@ -1740,89 +1714,15 @@ def compute_barostat_mass(
     .. [2] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
     """
     if device is None:
-        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        device = target_temperature.device
 
-    # Handle scalar/array inputs
-    if isinstance(target_temperature, (int, float)):
-        T_arr = wp.array([float(target_temperature)], dtype=dtype, device=device)
-    elif isinstance(target_temperature, wp.array):
-        T_arr = target_temperature
-    else:
-        # Try to convert from list/tuple
-        T_arr = wp.array(list(target_temperature), dtype=dtype, device=device)
-
-    if isinstance(tau_p, (int, float)):
-        tau_arr = wp.array([float(tau_p)], dtype=dtype, device=device)
-    elif isinstance(tau_p, wp.array):
-        tau_arr = tau_p
-    else:
-        tau_arr = wp.array(list(tau_p), dtype=dtype, device=device)
-
-    if isinstance(num_atoms, int):
-        N_arr = wp.array([num_atoms], dtype=wp.int32, device=device)
-    elif isinstance(num_atoms, wp.array):
-        N_arr = num_atoms
-    else:
-        N_arr = wp.array(list(num_atoms), dtype=wp.int32, device=device)
-
-    # Determine number of systems from largest input
-    num_systems = max(T_arr.shape[0], tau_arr.shape[0], N_arr.shape[0])
-
-    # Broadcast scalar inputs to match num_systems using Warp kernels (no numpy)
-    if T_arr.shape[0] == 1 and num_systems > 1:
-        T_broadcast = wp.zeros(num_systems, dtype=dtype, device=device)
-        if dtype == wp.float32:
-            wp.launch(
-                _broadcast_scalar_f32_kernel,
-                dim=num_systems,
-                inputs=[T_arr, T_broadcast],
-                device=device,
-            )
-        else:
-            wp.launch(
-                _broadcast_scalar_f64_kernel,
-                dim=num_systems,
-                inputs=[T_arr, T_broadcast],
-                device=device,
-            )
-        T_arr = T_broadcast
-
-    if tau_arr.shape[0] == 1 and num_systems > 1:
-        tau_broadcast = wp.zeros(num_systems, dtype=dtype, device=device)
-        if dtype == wp.float32:
-            wp.launch(
-                _broadcast_scalar_f32_kernel,
-                dim=num_systems,
-                inputs=[tau_arr, tau_broadcast],
-                device=device,
-            )
-        else:
-            wp.launch(
-                _broadcast_scalar_f64_kernel,
-                dim=num_systems,
-                inputs=[tau_arr, tau_broadcast],
-                device=device,
-            )
-        tau_arr = tau_broadcast
-
-    if N_arr.shape[0] == 1 and num_systems > 1:
-        N_broadcast = wp.zeros(num_systems, dtype=wp.int32, device=device)
-        wp.launch(
-            _broadcast_scalar_i32_kernel,
-            dim=num_systems,
-            inputs=[N_arr, N_broadcast],
-            device=device,
-        )
-        N_arr = N_broadcast
-
-    # Allocate output
-    masses_out = wp.zeros(num_systems, dtype=dtype, device=device)
+    num_systems = target_temperature.shape[0]
 
     # Launch kernel
     wp.launch(
         _compute_barostat_mass_kernel,
         dim=num_systems,
-        inputs=[T_arr, tau_arr, N_arr, masses_out],
+        inputs=[target_temperature, tau_p, num_atoms, masses_out],
         device=device,
     )
 
@@ -1832,7 +1732,7 @@ def compute_barostat_mass(
 def compute_cell_kinetic_energy(
     cell_velocities: wp.array,
     cell_masses: wp.array,
-    kinetic_energy: wp.array = None,
+    kinetic_energy: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1846,8 +1746,8 @@ def compute_cell_kinetic_energy(
         Cell velocity matrices. Shape (B,).
     cell_masses : wp.array
         Barostat masses. Shape (B,).
-    kinetic_energy : wp.array, optional
-        Output kinetic energy. If None, allocated internally.
+    kinetic_energy : wp.array(dtype=scalar)
+        Output cell kinetic energy. Shape (B,).
     device : str, optional
         Warp device.
 
@@ -1860,14 +1760,6 @@ def compute_cell_kinetic_energy(
         device = cell_velocities.device
 
     num_systems = cell_velocities.shape[0]
-
-    if cell_velocities.dtype == wp.mat33f:
-        scalar_dtype = wp.float32
-    else:
-        scalar_dtype = wp.float64
-
-    if kinetic_energy is None:
-        kinetic_energy = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
 
     wp.launch(
         _compute_cell_kinetic_energy_kernel,
@@ -1882,7 +1774,7 @@ def compute_cell_kinetic_energy(
 def compute_barostat_potential_energy(
     target_pressures: wp.array,
     volumes: wp.array,
-    potential_energy: wp.array = None,
+    potential_energy: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -1894,8 +1786,8 @@ def compute_barostat_potential_energy(
         External/target pressures. Shape (B,).
     volumes : wp.array
         Cell volumes. Shape (B,).
-    potential_energy : wp.array, optional
-        Output potential energy. If None, allocated internally.
+    potential_energy : wp.array
+        Output barostat potential energy. Shape (B,).
     device : str, optional
         Warp device.
 
@@ -1908,11 +1800,6 @@ def compute_barostat_potential_energy(
         device = target_pressures.device
 
     num_systems = target_pressures.shape[0]
-
-    if potential_energy is None:
-        potential_energy = wp.zeros(
-            num_systems, dtype=target_pressures.dtype, device=device
-        )
 
     wp.launch(
         _compute_barostat_potential_kernel,
@@ -2573,7 +2460,7 @@ def npt_position_update(
     cells: wp.array,
     cell_velocities: wp.array,
     dt: float,
-    cells_inv: wp.array = None,
+    cells_inv: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
 ) -> None:
@@ -2592,8 +2479,9 @@ def npt_position_update(
         Cell velocity matrices.
     dt : float
         Time step.
-    cells_inv : wp.array, optional
-        Pre-computed cell inverses.
+    cells_inv : wp.array
+        Pre-computed cell inverses. Caller must pre-compute via
+        ``compute_cell_inverse``.
     batch_idx : wp.array, optional
         System index for each atom.
     device : str, optional
@@ -2606,8 +2494,8 @@ def npt_position_update(
         cells,
         cell_velocities,
         dt,
-        positions_out=positions,
-        cells_inv=cells_inv,
+        positions,
+        cells_inv,
         batch_idx=batch_idx,
         device=device,
         _skip_validation=True,
@@ -2621,13 +2509,19 @@ def npt_position_update_out(
     cell_velocities: wp.array,
     dt: float,
     positions_out: wp.array,
-    cells_inv: wp.array = None,
+    cells_inv: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
     _skip_validation: bool = False,
 ) -> wp.array:
     """
     Update positions for NPT integration (non-mutating).
+
+    Parameters
+    ----------
+    cells_inv : wp.array
+        Pre-computed cell inverses. Caller must pre-compute via
+        ``compute_cell_inverse``.
 
     Returns
     -------
@@ -2642,9 +2536,6 @@ def npt_position_update_out(
 
     exec_mode = resolve_execution_mode(batch_idx, None)
     num_atoms = positions.shape[0]
-
-    if cells_inv is None:
-        cells_inv = compute_cell_inverse(cells, device=device)
 
     dt_typed = _cast_dt(positions.dtype, dt)
 
@@ -2762,9 +2653,14 @@ def run_npt_step(
     num_atoms: int,
     chain_length: int,
     dt: float,
+    pressure_tensors: wp.array,
+    volumes: wp.array,
+    kinetic_energy: wp.array,
+    cells_inv: wp.array,
+    kinetic_tensors: wp.array,
+    num_atoms_per_system: wp.array,
     compute_forces_fn=None,
     batch_idx: wp.array = None,
-    num_atoms_per_system: wp.array = None,
     device: str = None,
 ) -> None:
     """
@@ -2807,49 +2703,41 @@ def run_npt_step(
         Number of thermostats in chain.
     dt : float
         Time step.
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Scratch array for pressure tensor. Shape (B,).
+    volumes : wp.array(dtype=scalar)
+        Scratch array for cell volumes. Shape (B,).
+    kinetic_energy : wp.array(dtype=scalar)
+        Scratch array for kinetic energy. Shape (B,).
+        Zeroed internally before each use.
+    cells_inv : wp.array(dtype=mat33)
+        Scratch array for cell inverses. Shape (B,).
+    kinetic_tensors : wp.array(dtype=scalar, ndim=2)
+        Scratch array for kinetic tensor accumulation. Shape (B, 9).
+        Zeroed internally before each use.
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Number of atoms per system. Shape (B,).
     compute_forces_fn : callable, optional
         Force computation function.
     batch_idx : wp.array, optional
         System index for each atom.
-    num_atoms_per_system : wp.array, optional
-        Number of atoms per system.
     device : str, optional
         Warp device.
     """
     if device is None:
         device = positions.device
 
-    num_systems = cells.shape[0]
-
-    if masses.dtype == wp.float32:
-        tensor_dtype = vec9f
-    else:
-        tensor_dtype = vec9d
-
-    volumes = compute_cell_volume(cells, device=device)
-
-    kinetic_energy = compute_kinetic_energy(
-        velocities, masses, batch_idx=batch_idx, device=device
-    )
-
-    pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
-    pressure_tensors = compute_pressure_tensor(
+    compute_pressure_tensor(
         velocities,
         masses,
         virial_tensors,
         cells,
-        pressure_tensors=pressure_tensors,
+        kinetic_tensors,
+        pressure_tensors,
+        volumes,
         batch_idx=batch_idx,
-        volumes=volumes,
         device=device,
     )
-
-    if batch_idx is None:
-        num_atoms_per_system_local = wp.array(
-            [num_atoms], dtype=wp.int32, device=device
-        )
-    else:
-        num_atoms_per_system_local = num_atoms_per_system
 
     # 1. Thermostat half-step
     npt_thermostat_half_step(
@@ -2858,7 +2746,7 @@ def run_npt_step(
         kinetic_energy,
         target_temperature,
         thermostat_masses,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         chain_length,
         dt * 0.5,
         device=device,
@@ -2872,7 +2760,7 @@ def run_npt_step(
         volumes,
         cell_masses,
         kinetic_energy,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         eta_dot,
         dt,
         device=device,
@@ -2894,7 +2782,7 @@ def run_npt_step(
     )
 
     # 4. Position update
-    cells_inv = compute_cell_inverse(cells, device=device)
+    compute_cell_inverse(cells, cells_inv=cells_inv, device=device)
     npt_position_update(
         positions,
         velocities,
@@ -2914,18 +2802,23 @@ def run_npt_step(
         compute_forces_fn(positions, cells, forces, virial_tensors)
 
     # Recompute pressure and volumes
-    volumes = compute_cell_volume(cells, device=device)
-    kinetic_energy = compute_kinetic_energy(
-        velocities, masses, batch_idx=batch_idx, device=device
+    compute_cell_volume(cells, volumes=volumes, device=device)
+    compute_kinetic_energy(
+        velocities,
+        masses,
+        kinetic_energy=kinetic_energy,
+        batch_idx=batch_idx,
+        device=device,
     )
-    pressure_tensors = compute_pressure_tensor(
+    compute_pressure_tensor(
         velocities,
         masses,
         virial_tensors,
         cells,
-        pressure_tensors=pressure_tensors,
+        kinetic_tensors,
+        pressure_tensors,
+        volumes,
         batch_idx=batch_idx,
-        volumes=volumes,
         device=device,
     )
 
@@ -2952,7 +2845,7 @@ def run_npt_step(
         volumes,
         cell_masses,
         kinetic_energy,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         eta_dot,
         dt,
         device=device,
@@ -2965,7 +2858,7 @@ def run_npt_step(
         kinetic_energy,
         target_temperature,
         thermostat_masses,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         chain_length,
         dt * 0.5,
         device=device,
@@ -3474,7 +3367,7 @@ def nph_position_update(
     cells: wp.array,
     cell_velocities: wp.array,
     dt: float,
-    cells_inv: wp.array = None,
+    cells_inv: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
 ) -> None:
@@ -3489,7 +3382,7 @@ def nph_position_update(
         cells,
         cell_velocities,
         dt,
-        cells_inv=cells_inv,
+        cells_inv,
         batch_idx=batch_idx,
         device=device,
     )
@@ -3502,7 +3395,7 @@ def nph_position_update_out(
     cell_velocities: wp.array,
     dt: float,
     positions_out: wp.array,
-    cells_inv: wp.array = None,
+    cells_inv: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
 ) -> wp.array:
@@ -3520,8 +3413,8 @@ def nph_position_update_out(
         cells,
         cell_velocities,
         dt,
-        positions_out=positions_out,
-        cells_inv=cells_inv,
+        positions_out,
+        cells_inv,
         batch_idx=batch_idx,
         device=device,
     )
@@ -3553,9 +3446,14 @@ def run_nph_step(
     target_pressure: wp.array,
     num_atoms: int,
     dt: float,
+    pressure_tensors: wp.array,
+    volumes: wp.array,
+    kinetic_energy: wp.array,
+    cells_inv: wp.array,
+    kinetic_tensors: wp.array,
+    num_atoms_per_system: wp.array,
     compute_forces_fn=None,
     batch_idx: wp.array = None,
-    num_atoms_per_system: wp.array = None,
     device: str = None,
 ) -> None:
     """
@@ -3590,49 +3488,41 @@ def run_nph_step(
         Total number of atoms.
     dt : float
         Time step.
+    pressure_tensors : wp.array(dtype=vec9f or vec9d)
+        Scratch array for pressure tensor. Shape (B,).
+    volumes : wp.array(dtype=scalar)
+        Scratch array for cell volumes. Shape (B,).
+    kinetic_energy : wp.array(dtype=scalar)
+        Scratch array for kinetic energy. Shape (B,).
+        Zeroed internally before each use.
+    cells_inv : wp.array(dtype=mat33)
+        Scratch array for cell inverses. Shape (B,).
+    kinetic_tensors : wp.array(dtype=scalar, ndim=2)
+        Scratch array for kinetic tensor accumulation. Shape (B, 9).
+        Zeroed internally before each use.
+    num_atoms_per_system : wp.array(dtype=wp.int32)
+        Number of atoms per system. Shape (B,).
     compute_forces_fn : callable, optional
         Force computation function.
     batch_idx : wp.array, optional
         System index for each atom.
-    num_atoms_per_system : wp.array, optional
-        Number of atoms per system.
     device : str, optional
         Warp device.
     """
     if device is None:
         device = positions.device
 
-    num_systems = cells.shape[0]
-
-    if masses.dtype == wp.float32:
-        tensor_dtype = vec9f
-    else:
-        tensor_dtype = vec9d
-
-    volumes = compute_cell_volume(cells, device=device)
-
-    kinetic_energy = compute_kinetic_energy(
-        velocities, masses, batch_idx=batch_idx, device=device
-    )
-
-    pressure_tensors = wp.zeros(num_systems, dtype=tensor_dtype, device=device)
-    pressure_tensors = compute_pressure_tensor(
+    compute_pressure_tensor(
         velocities,
         masses,
         virial_tensors,
         cells,
-        pressure_tensors=pressure_tensors,
+        kinetic_tensors,
+        pressure_tensors,
+        volumes,
         batch_idx=batch_idx,
-        volumes=volumes,
         device=device,
     )
-
-    if batch_idx is None:
-        num_atoms_per_system_local = wp.array(
-            [num_atoms], dtype=wp.int32, device=device
-        )
-    else:
-        num_atoms_per_system_local = num_atoms_per_system
 
     # 1. Barostat half-step
     nph_barostat_half_step(
@@ -3642,7 +3532,7 @@ def run_nph_step(
         volumes,
         cell_masses,
         kinetic_energy,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         dt,
         device=device,
     )
@@ -3662,7 +3552,7 @@ def run_nph_step(
     )
 
     # 3. Position update
-    cells_inv = compute_cell_inverse(cells, device=device)
+    compute_cell_inverse(cells, cells_inv=cells_inv, device=device)
     nph_position_update(
         positions,
         velocities,
@@ -3682,18 +3572,23 @@ def run_nph_step(
         compute_forces_fn(positions, cells, forces, virial_tensors)
 
     # Recompute pressure and volumes
-    volumes = compute_cell_volume(cells, device=device)
-    kinetic_energy = compute_kinetic_energy(
-        velocities, masses, batch_idx=batch_idx, device=device
+    compute_cell_volume(cells, volumes=volumes, device=device)
+    compute_kinetic_energy(
+        velocities,
+        masses,
+        kinetic_energy=kinetic_energy,
+        batch_idx=batch_idx,
+        device=device,
     )
-    pressure_tensors = compute_pressure_tensor(
+    compute_pressure_tensor(
         velocities,
         masses,
         virial_tensors,
         cells,
-        pressure_tensors=pressure_tensors,
+        kinetic_tensors,
+        pressure_tensors,
+        volumes,
         batch_idx=batch_idx,
-        volumes=volumes,
         device=device,
     )
 
@@ -3719,7 +3614,7 @@ def run_nph_step(
         volumes,
         cell_masses,
         kinetic_energy,
-        num_atoms_per_system_local,
+        num_atoms_per_system,
         dt,
         device=device,
     )
