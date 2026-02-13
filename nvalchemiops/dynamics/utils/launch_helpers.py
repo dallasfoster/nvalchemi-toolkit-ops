@@ -12,11 +12,24 @@
 Launch Helpers for Dynamics Kernels
 ====================================
 
-Host-side helpers for kernel dispatch, overload registration, and
-output validation shared by integrators and (in future) optimizers.
+Dynamics-specific dispatch wrappers built on top of
+:mod:`nvalchemiops.warp_dispatch` generic primitives.
 
-These helpers do **not** generate or modify Warp kernels at runtime.
-All overloads are registered eagerly at module import time.
+This module provides:
+
+- :class:`ExecutionMode` -- the three dynamics execution modes
+  (single / batch_idx / atom_ptr).
+- :class:`KernelFamily` -- container grouping per-mode kernel variants.
+- :func:`resolve_execution_mode` -- pick mode from optional batch arrays.
+- :func:`launch_family` -- launch the right variant from a KernelFamily.
+- :func:`dispatch_family` -- end-to-end: resolve mode, infer
+  device/dtype/dim, launch.
+- :func:`build_family_dict` -- build ``{vec_dtype: KernelFamily}`` dicts
+  with eager overload registration.
+
+Generic utilities (:func:`register_overloads`, :data:`DEFAULT_DTYPE_PAIRS`)
+are re-exported from :mod:`nvalchemiops.warp_dispatch` for backward
+compatibility.
 
 Design Rule
 -----------
@@ -33,6 +46,12 @@ from dataclasses import dataclass
 from enum import Enum
 
 import warp as wp
+
+# Re-export generic primitives from warp_dispatch for backward compatibility.
+from nvalchemiops.warp_dispatch import (
+    DEFAULT_DTYPE_PAIRS,
+    register_overloads,
+)
 
 # =============================================================================
 # Types
@@ -222,74 +241,8 @@ def dispatch_family(
 
 
 # =============================================================================
-# Overload Registration
+# Family Construction
 # =============================================================================
-
-# Default dtype pairs: (vec3_type, scalar_type)
-DEFAULT_DTYPE_PAIRS = (
-    (wp.vec3f, wp.float32),
-    (wp.vec3d, wp.float64),
-)
-
-
-def register_overloads(
-    kernel,
-    signature_builder: Callable,
-    dtype_pairs: tuple[tuple, ...] = DEFAULT_DTYPE_PAIRS,
-    *,
-    key_fn: Callable | None = None,
-) -> dict:
-    """Register ``wp.overload`` variants for each dtype pair.
-
-    Parameters
-    ----------
-    kernel : warp kernel
-        The generic ``@wp.kernel`` function to overload.
-    signature_builder : callable
-        A function ``(vec_dtype, scalar_dtype) -> list`` that returns
-        the overload argument type list for a given dtype pair.
-    dtype_pairs : tuple of (vec_dtype, scalar_dtype) tuples
-        Dtype pairs to register.  Defaults to ``(vec3f, float32)``
-        and ``(vec3d, float64)``.
-    key_fn : callable or None
-        Optional function ``(vec_dtype, scalar_dtype) -> key`` that
-        produces the dictionary key for each overload.  Defaults to
-        using ``vec_dtype`` as the key.
-
-    Returns
-    -------
-    dict
-        Mapping from key (default: ``vec_dtype``) to the overloaded
-        kernel handle.
-
-    Examples
-    --------
-    Register single-system rescale kernel overloads::
-
-        overloads = register_overloads(
-            _velocity_rescale_kernel,
-            lambda v, t: [wp.array(dtype=v), wp.array(dtype=t)],
-        )
-        # overloads[wp.vec3f] -> overloaded kernel for float32
-        # overloads[wp.vec3d] -> overloaded kernel for float64
-
-    Register with a composite key::
-
-        overloads = register_overloads(
-            _my_kernel,
-            lambda v, t: [wp.array(dtype=v), wp.array(dtype=t)],
-            key_fn=lambda v, t: (v, t),
-        )
-    """
-    if key_fn is None:
-        key_fn = lambda v, t: v  # noqa: E731
-
-    out = {}
-    for vec_dtype, scalar_dtype in dtype_pairs:
-        sig = signature_builder(vec_dtype, scalar_dtype)
-        key = key_fn(vec_dtype, scalar_dtype)
-        out[key] = wp.overload(kernel, sig)
-    return out
 
 
 def build_family_dict(
@@ -303,8 +256,8 @@ def build_family_dict(
 ) -> dict:
     """Build a ``{vec_dtype: KernelFamily}`` dict with eager overload registration.
 
-    A convenience wrapper that calls ``wp.overload`` for each dtype pair
-    and each execution-mode kernel, then packs the results into
+    A convenience wrapper that calls :func:`~nvalchemiops.warp_dispatch.register_overloads`
+    for each execution-mode kernel, then packs the results into
     :class:`KernelFamily` instances.
 
     Parameters
@@ -321,51 +274,15 @@ def build_family_dict(
     dict
         ``{vec_dtype: KernelFamily}`` mapping.
     """
+    single_overloads = register_overloads(single_kernel, single_sig, dtype_pairs)
+    batch_overloads = register_overloads(batch_kernel, batch_sig, dtype_pairs)
+    ptr_overloads = register_overloads(ptr_kernel, ptr_sig, dtype_pairs)
+
     return {
-        v: KernelFamily(
-            single=wp.overload(single_kernel, single_sig(v, t)),
-            batch_idx=wp.overload(batch_kernel, batch_sig(v, t)),
-            atom_ptr=wp.overload(ptr_kernel, ptr_sig(v, t)),
+        vec_dtype: KernelFamily(
+            single=single_overloads[vec_dtype],
+            batch_idx=batch_overloads[vec_dtype],
+            atom_ptr=ptr_overloads[vec_dtype],
         )
-        for v, t in dtype_pairs
+        for vec_dtype, _ in dtype_pairs
     }
-
-
-# =============================================================================
-# Validation
-# =============================================================================
-
-
-def validate_out_array(
-    out: wp.array,
-    reference: wp.array,
-    name: str,
-) -> None:
-    """Validate that an output array matches a reference in shape, dtype, device.
-
-    Parameters
-    ----------
-    out : wp.array
-        Output array to validate.
-    reference : wp.array
-        Reference array whose shape, dtype, and device are expected.
-    name : str
-        Human-readable name for error messages.
-
-    Raises
-    ------
-    ValueError
-        If shape, dtype, or device do not match.
-    """
-    if out.shape != reference.shape:
-        raise ValueError(
-            f"{name} shape mismatch: expected {reference.shape}, got {out.shape}"
-        )
-    if out.dtype != reference.dtype:
-        raise ValueError(
-            f"{name} dtype mismatch: expected {reference.dtype}, got {out.dtype}"
-        )
-    if str(out.device) != str(reference.device):
-        raise ValueError(
-            f"{name} device mismatch: expected {reference.device}, got {out.device}"
-        )
