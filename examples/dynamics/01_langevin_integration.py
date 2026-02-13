@@ -96,9 +96,11 @@ system.initialize_temperature(temperature=94.4, seed=42)
 print("\n--- Initial Energy Calculation ---")
 wp_energies = system.compute_forces()
 pe = float(wp_energies.numpy().sum())
-ke_arr = compute_kinetic_energy(
+ke_arr = wp.zeros(1, dtype=wp.float64, device=device)
+compute_kinetic_energy(
     velocities=system.wp_velocities,
     masses=system.wp_masses,
+    kinetic_energy=ke_arr,
     device=device,
 )
 ke = float(ke_arr.numpy()[0])

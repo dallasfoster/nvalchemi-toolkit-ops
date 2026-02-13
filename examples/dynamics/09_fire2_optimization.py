@@ -9,16 +9,24 @@
 # its affiliates is strictly prohibited.
 
 """
-FIRE Geometry Optimization (LJ Cluster)
-======================================
+FIRE2 Geometry Optimization (LJ Cluster)
+=========================================
 
-This example demonstrates geometry optimization with the FIRE optimizer using:
+This example demonstrates geometry optimization with the **FIRE2** optimizer
+(Guenole et al., 2020) using:
+
 - The **package LJ implementation** (neighbor-list accelerated)
-- The **package FIRE kernels** (:mod:`nvalchemiops.dynamics.optimizers`)
+- The **package FIRE2 kernels** (:func:`nvalchemiops.dynamics.optimizers.fire2_step`)
 - The shared example utilities in :mod:`examples.dynamics._dynamics_utils`
 
-We optimize a small Lennard-Jones cluster (an isolated cluster inside a large box)
-and plot convergence (energy and max force).
+Compared to FIRE (``06_fire_optimization.py``), FIRE2:
+
+- Assumes unit mass (no ``masses`` parameter)
+- Requires ``batch_idx`` even for single-system mode
+- Uses fewer per-system state arrays (``alpha``, ``dt``, ``nsteps_inc``)
+- Hyperparameters are Python scalars (``delaystep``, ``dtgrow``, etc.)
+
+We optimize the same small Lennard-Jones cluster and plot convergence.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ import torch
 import warp as wp
 from _dynamics_utils import MDSystem, create_random_cluster
 
-from nvalchemiops.dynamics.optimizers import fire_step
+from nvalchemiops.dynamics.optimizers import fire2_step
 
 wp.init()
 
@@ -39,9 +47,6 @@ print(f"Using device: {device}")
 # %%
 # Create a Lennard-Jones Cluster
 # ------------------------------
-#
-# We use an "isolated cluster in a large box" approach (PBC far away),
-# which works well with the existing neighbor-list machinery.
 
 num_atoms = 32
 epsilon = 0.0104  # eV (argon-like)
@@ -73,48 +78,34 @@ system = MDSystem(
 )
 
 # %%
-# FIRE Optimization Loop
-# ----------------------
+# FIRE2 Optimization Loop
+# -----------------------
 #
-# We use the unified ``fire_step`` API that handles:
-# - Velocity mixing (FIRE algorithm)
-# - Adaptive timestep (dt)
-# - Adaptive mixing parameter (alpha)
-# - MD-like position update with maxstep capping
+# FIRE2 uses a simpler state than FIRE: just ``alpha``, ``dt``, ``nsteps_inc``
+# per system, plus 4 scratch buffers. Hyperparameters are Python scalars.
+# ``batch_idx`` is always required (all zeros for single system).
 
 max_steps = 3000
 force_tolerance = 1e-3  # eV/Å (max force)
 
-# FIRE parameters
-dt0 = 1.0
-dt_max = 10.0
-dt_min = 1e-3
-alpha0 = 0.1
-f_inc = 1.1
-f_dec = 0.5
-f_alpha = 0.99
-n_min = 5
-maxstep = 0.2 * sigma  # Å (max displacement per iteration)
-
-# Device-side FIRE state arrays (shape = (1,) for single system)
 wp_dtype = system.wp_dtype
-dt_wp = wp.array([dt0], dtype=wp_dtype, device=device)
-alpha_wp = wp.array([alpha0], dtype=wp_dtype, device=device)
-alpha_start_wp = wp.array([alpha0], dtype=wp_dtype, device=device)
-f_alpha_wp = wp.array([f_alpha], dtype=wp_dtype, device=device)
-dt_min_wp = wp.array([dt_min], dtype=wp_dtype, device=device)
-dt_max_wp = wp.array([dt_max], dtype=wp_dtype, device=device)
-maxstep_wp = wp.array([maxstep], dtype=wp_dtype, device=device)
-n_steps_positive_wp = wp.zeros(1, dtype=wp.int32, device=device)
-n_min_wp = wp.array([n_min], dtype=wp.int32, device=device)
-f_dec_wp = wp.array([f_dec], dtype=wp_dtype, device=device)
-f_inc_wp = wp.array([f_inc], dtype=wp_dtype, device=device)
-uphill_flag_wp = wp.zeros(1, dtype=wp.int32, device=device)
 
-# Accumulators for diagnostic scalars (vf, vv, ff) - must be zeroed before each step
-vf_wp = wp.zeros(1, dtype=wp_dtype, device=device)
-vv_wp = wp.zeros(1, dtype=wp_dtype, device=device)
-ff_wp = wp.zeros(1, dtype=wp_dtype, device=device)
+# Per-system state arrays (shape (1,) for single system)
+alpha = wp.array([0.09], dtype=wp_dtype, device=device)
+dt = wp.array([0.005], dtype=wp_dtype, device=device)
+nsteps_inc = wp.zeros(1, dtype=wp.int32, device=device)
+
+# Scratch buffers (shape (1,) for single system)
+vf = wp.zeros(1, dtype=wp_dtype, device=device)
+v_sumsq = wp.zeros(1, dtype=wp_dtype, device=device)
+f_sumsq = wp.zeros(1, dtype=wp_dtype, device=device)
+max_norm = wp.zeros(1, dtype=wp_dtype, device=device)
+
+# batch_idx: all zeros for single system
+batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+# Velocities (FIRE2 uses unit mass, so velocities are just momenta)
+velocities = wp.zeros(num_atoms, dtype=system.wp_vec_dtype, device=device)
 
 # History for plotting
 energy_hist: list[float] = []
@@ -123,12 +114,11 @@ dt_hist: list[float] = []
 alpha_hist: list[float] = []
 
 print("\n" + "=" * 95)
-print("FIRE GEOMETRY OPTIMIZATION (LJ cluster)")
+print("FIRE2 GEOMETRY OPTIMIZATION (LJ cluster)")
 print("=" * 95)
 print(f"  atoms: {num_atoms}, cutoff={cutoff:.2f} Å, box={box_L:.1f} Å")
 print(f"  max_steps={max_steps}, force_tol={force_tolerance:.2e} eV/Å")
-print(f"  dt0={dt0}, dt_max={dt_max}, alpha0={alpha0}, n_min={n_min}")
-print(f"  dt_min={dt_min}, maxstep={maxstep:.3f} Å")
+print(f"  FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
 
 log_interval = 100
 check_interval = 50
@@ -137,35 +127,19 @@ for step in range(max_steps):
     # Compute forces at current positions
     energies = system.compute_forces()
 
-    # Zero the accumulators before each FIRE step
-    vf_wp.zero_()
-    vv_wp.zero_()
-    ff_wp.zero_()
-
-    # Single FIRE step using the unified API
-    # This performs: diagnostic computation, velocity mixing, parameter update, MD step
-    fire_step(
+    # FIRE2 step: updates positions, velocities, alpha, dt, nsteps_inc in-place
+    fire2_step(
         positions=system.wp_positions,
-        velocities=system.wp_velocities,
+        velocities=velocities,
         forces=system.wp_forces,
-        masses=system.wp_masses,
-        alpha=alpha_wp,
-        dt=dt_wp,
-        alpha_start=alpha_start_wp,
-        f_alpha=f_alpha_wp,
-        dt_min=dt_min_wp,
-        dt_max=dt_max_wp,
-        maxstep=maxstep_wp,
-        n_steps_positive=n_steps_positive_wp,
-        n_min=n_min_wp,
-        f_dec=f_dec_wp,
-        f_inc=f_inc_wp,
-        uphill_flag=uphill_flag_wp,
-        vf=vf_wp,
-        vv=vv_wp,
-        ff=ff_wp,
-        # Single system mode: no batch_idx, no atom_ptr
-        # No downhill check: energy, energy_last, positions_last, velocities_last not provided
+        batch_idx=batch_idx,
+        alpha=alpha,
+        dt=dt,
+        nsteps_inc=nsteps_inc,
+        vf=vf,
+        v_sumsq=v_sumsq,
+        f_sumsq=f_sumsq,
+        max_norm=max_norm,
         device=device,
     )
 
@@ -178,14 +152,14 @@ for step in range(max_steps):
 
         energy_hist.append(pe)
         maxf_hist.append(fmax)
-        dt_hist.append(float(dt_wp.numpy()[0]))
-        alpha_hist.append(float(alpha_wp.numpy()[0]))
+        dt_hist.append(float(dt.numpy()[0]))
+        alpha_hist.append(float(alpha.numpy()[0]))
 
         if step % log_interval == 0 or step == max_steps - 1:
             print(
                 f"step={step:5d}  PE={pe:12.6f} eV  max|F|={fmax:10.3e} eV/Å  "
-                f"dt={dt_hist[-1]:6.3f}  alpha={alpha_hist[-1]:7.4f}  "
-                f"n+={int(n_steps_positive_wp.numpy()[0]):3d}"
+                f"dt={dt_hist[-1]:8.5f}  alpha={alpha_hist[-1]:7.4f}  "
+                f"n+={int(nsteps_inc.numpy()[0]):3d}"
             )
 
         if fmax < force_tolerance:
@@ -193,14 +167,14 @@ for step in range(max_steps):
             break
 
 # %%
-# Plot convergence (sphinx-gallery will render)
+# Plot convergence
 
 steps = np.arange(len(energy_hist))
 
 fig, ax = plt.subplots(2, 1, figsize=(7.0, 5.5), sharex=True, constrained_layout=True)
 ax[0].plot(steps, energy_hist, lw=1.5)
 ax[0].set_ylabel("Potential Energy (eV)")
-ax[0].set_title("FIRE Optimization Convergence")
+ax[0].set_title("FIRE2 Optimization Convergence")
 
 ax[1].semilogy(steps, maxf_hist, lw=1.5)
 ax[1].axhline(force_tolerance, color="k", ls="--", lw=1.0, label="tolerance")

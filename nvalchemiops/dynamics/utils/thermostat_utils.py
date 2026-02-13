@@ -46,9 +46,15 @@ All functions in this module support three execution modes:
 
 **Single System Mode**::
 
-    ke = compute_kinetic_energy(velocities, masses)
+    ke = wp.empty(1, dtype=wp.float64, device="cuda:0")
+    compute_kinetic_energy(velocities, masses, ke)
     temperature = wp.array([1.0], dtype=wp.float64, device="cuda:0")
-    initialize_velocities(velocities, masses, temperature)
+    total_momentum = wp.empty(1, dtype=wp.vec3d, device="cuda:0")
+    total_mass = wp.empty(1, dtype=wp.float64, device="cuda:0")
+    com_velocities = wp.empty(1, dtype=wp.vec3d, device="cuda:0")
+    initialize_velocities(
+        velocities, masses, temperature, total_momentum, total_mass, com_velocities
+    )
 
 **Batch Mode with batch_idx** (atomic operations)::
 
@@ -56,14 +62,20 @@ All functions in this module support three execution modes:
     batch_idx = wp.array([0]*N0 + [1]*N1 + [2]*N2, dtype=wp.int32, device="cuda:0")
 
     # Compute per-system kinetic energies
-    ke = compute_kinetic_energy(
-        velocities, masses, batch_idx=batch_idx, num_systems=3
-    )  # Returns array of shape (3,)
+    ke = wp.empty(3, dtype=wp.float64, device="cuda:0")
+    compute_kinetic_energy(
+        velocities, masses, ke, batch_idx=batch_idx, num_systems=3
+    )  # ke now has shape (3,)
 
     # Initialize with per-system temperatures
     temperature = wp.array([1.0, 1.5, 0.8], dtype=wp.float64, device="cuda:0")
+    total_momentum = wp.empty(3, dtype=wp.vec3d, device="cuda:0")
+    total_mass = wp.empty(3, dtype=wp.float64, device="cuda:0")
+    com_velocities = wp.empty(3, dtype=wp.vec3d, device="cuda:0")
     initialize_velocities(
-        velocities, masses, temperature, batch_idx=batch_idx, num_systems=3
+        velocities, masses, temperature,
+        total_momentum, total_mass, com_velocities,
+        batch_idx=batch_idx, num_systems=3
     )
 
 **Batch Mode with atom_ptr** (sequential per-system)::
@@ -72,8 +84,9 @@ All functions in this module support three execution modes:
     atom_ptr = wp.array([0, N0, N0+N1, N0+N1+N2], dtype=wp.int32, device="cuda:0")
 
     # Same operations as batch_idx mode, but with atom_ptr
-    ke = compute_kinetic_energy(
-        velocities, masses, atom_ptr=atom_ptr, num_systems=3
+    ke = wp.empty(3, dtype=wp.float64, device="cuda:0")
+    compute_kinetic_energy(
+        velocities, masses, ke, atom_ptr=atom_ptr, num_systems=3
     )
 """
 
@@ -1318,7 +1331,7 @@ for t, v in zip(_T, _V):
 def compute_kinetic_energy(
     velocities: wp.array,
     masses: wp.array,
-    kinetic_energy: wp.array = None,
+    kinetic_energy: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     num_systems: int = 1,
@@ -1333,9 +1346,10 @@ def compute_kinetic_energy(
         Atomic velocities. Shape (N,).
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,).
-    kinetic_energy : wp.array, optional
-        Pre-allocated output array. If None, will be created with same dtype as masses.
+    kinetic_energy : wp.array
+        Output array. Same dtype as masses.
         Shape (1,) for single system, (B,) for batched.
+        Zeroed internally before each use.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1360,23 +1374,26 @@ def compute_kinetic_energy(
         velocities = wp.array(np.random.randn(100, 3), dtype=wp.vec3d, device="cuda:0")
         masses = wp.array(np.ones(100), dtype=wp.float64, device="cuda:0")
 
-        ke = compute_kinetic_energy(velocities, masses)
+        ke = wp.empty(1, dtype=wp.float64, device="cuda:0")
+        ke = compute_kinetic_energy(velocities, masses, ke)
         print(f"Kinetic energy: {ke.numpy()[0]}")
 
     Batched mode with batch_idx::
 
         # 3 systems with different atom counts
         batch_idx = wp.array([0]*30 + [1]*40 + [2]*30, dtype=wp.int32, device="cuda:0")
+        ke = wp.empty(3, dtype=wp.float64, device="cuda:0")
         ke = compute_kinetic_energy(
-            velocities, masses, batch_idx=batch_idx, num_systems=3
+            velocities, masses, ke, batch_idx=batch_idx, num_systems=3
         )
         # ke.shape = (3,), one KE per system
 
     Batched mode with atom_ptr::
 
         atom_ptr = wp.array([0, 30, 70, 100], dtype=wp.int32, device="cuda:0")
+        ke = wp.empty(3, dtype=wp.float64, device="cuda:0")
         ke = compute_kinetic_energy(
-            velocities, masses, atom_ptr=atom_ptr, num_systems=3
+            velocities, masses, ke, atom_ptr=atom_ptr, num_systems=3
         )
 
     See Also
@@ -1389,16 +1406,8 @@ def compute_kinetic_energy(
     if device is None:
         device = velocities.device
 
+    kinetic_energy.zero_()
     num_atoms = velocities.shape[0]
-
-    # Determine output dtype from masses
-    scalar_dtype = masses.dtype
-
-    # Allocate output if needed
-    if kinetic_energy is None:
-        kinetic_energy = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
-    else:
-        kinetic_energy.zero_()
 
     vec_dtype = velocities.dtype
 
@@ -1433,11 +1442,10 @@ def compute_kinetic_energy(
 
 
 def compute_temperature(
-    velocities: wp.array,
-    masses: wp.array,
+    kinetic_energy: wp.array,
+    temperature: wp.array,
     num_atoms: int,
     dof: int = None,
-    kinetic_energy: wp.array = None,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     num_systems: int = 1,
@@ -1451,16 +1459,14 @@ def compute_temperature(
 
     Parameters
     ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (N,).
-    masses : wp.array(dtype=wp.float32 or wp.float64)
-        Atomic masses. Shape (N,).
+    kinetic_energy : wp.array
+        Pre-computed kinetic energy. Shape (1,) or (B,).
+    temperature : wp.array
+        Output temperature array. Shape (1,) or (B,).
     num_atoms : int
         Number of atoms (per system for batched).
     dof : int, optional
         Degrees of freedom. If None, uses 3*N - 3.
-    kinetic_energy : wp.array, optional
-        Pre-computed kinetic energy. If None, will be computed.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1474,27 +1480,15 @@ def compute_temperature(
     -------
     wp.array
         Temperature in energy units (k_B*T). Shape (1,) or (B,).
-        Dtype matches masses dtype.
     """
     if batch_idx is not None and atom_ptr is not None:
         raise ValueError("Provide batch_idx OR atom_ptr, not both")
 
     if device is None:
-        device = velocities.device
+        device = kinetic_energy.device
 
-    # Determine scalar dtype from masses
-    scalar_dtype = masses.dtype
-
-    # Compute kinetic energy if not provided
-    if kinetic_energy is None:
-        kinetic_energy = compute_kinetic_energy(
-            velocities,
-            masses,
-            batch_idx=batch_idx,
-            atom_ptr=atom_ptr,
-            num_systems=num_systems,
-            device=device,
-        )
+    # Determine scalar dtype from kinetic_energy
+    scalar_dtype = kinetic_energy.dtype
 
     # Determine DOF
     if dof is None:
@@ -1510,8 +1504,6 @@ def compute_temperature(
 
     # Compute temperature: T = 2*KE / DOF using Warp kernel
     is_batched = batch_idx is not None or atom_ptr is not None or num_systems > 1
-    n_out = num_systems if is_batched else 1
-    temperature = wp.zeros(n_out, dtype=scalar_dtype, device=device)
 
     if is_batched:
         wp.launch(
@@ -1535,6 +1527,9 @@ def initialize_velocities(
     velocities: wp.array,
     masses: wp.array,
     temperature: wp.array,
+    total_momentum: wp.array,
+    total_mass: wp.array,
+    com_velocities: wp.array,
     random_seed: int = 42,
     remove_com: bool = True,
     batch_idx: wp.array = None,
@@ -1553,6 +1548,20 @@ def initialize_velocities(
         Atomic masses. Shape (N,).
     temperature : wp.array(dtype=wp.float32 or wp.float64)
         Target temperature (k_B*T in energy units). Shape (1,) or (B,).
+    total_momentum : wp.array
+        Scratch array for COM removal. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+        Only used when ``remove_com=True``.
+    total_mass : wp.array
+        Scratch array for COM removal. Same scalar dtype as masses.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+        Only used when ``remove_com=True``.
+    com_velocities : wp.array
+        Scratch array for COM removal. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Only used when ``remove_com=True``.
     random_seed : int, optional
         Random seed for reproducibility. Default: 42.
     remove_com : bool, optional
@@ -1565,35 +1574,6 @@ def initialize_velocities(
         Number of systems. Default 1.
     device : str, optional
         Warp device.
-
-    Example
-    -------
-    Initialize single system at T=1.0::
-
-        import warp as wp
-        import numpy as np
-
-        velocities = wp.zeros((100, 3), dtype=wp.vec3d, device="cuda:0")
-        masses = wp.array(np.ones(100), dtype=wp.float64, device="cuda:0")
-        temperature = wp.array([1.0], dtype=wp.float64, device="cuda:0")
-
-        # Initialize with Maxwell-Boltzmann distribution
-        initialize_velocities(velocities, masses, temperature, random_seed=42)
-
-        # Verify temperature
-        ke = compute_kinetic_energy(velocities, masses)
-        T_actual = compute_temperature(velocities, masses, num_atoms=100)
-        print(f"Target T: 1.0, Actual T: {T_actual.numpy()[0]}")
-
-    Batched initialization with different temperatures::
-
-        batch_idx = wp.array([0]*30 + [1]*40 + [2]*30, dtype=wp.int32, device="cuda:0")
-        temperature = wp.array([1.0, 1.5, 0.8], dtype=wp.float64, device="cuda:0")
-
-        initialize_velocities(
-            velocities, masses, temperature,
-            random_seed=42, batch_idx=batch_idx, num_systems=3
-        )
 
     See Also
     --------
@@ -1639,6 +1619,9 @@ def initialize_velocities(
         remove_com_motion(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
             batch_idx=batch_idx,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
@@ -1649,7 +1632,10 @@ def initialize_velocities(
 def initialize_velocities_out(
     masses: wp.array,
     temperature: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
+    total_momentum: wp.array,
+    total_mass: wp.array,
+    com_velocities: wp.array,
     random_seed: int = 42,
     remove_com: bool = True,
     batch_idx: wp.array = None,
@@ -1666,8 +1652,22 @@ def initialize_velocities_out(
         Atomic masses. Shape (N,).
     temperature : wp.array(dtype=wp.float32 or wp.float64)
         Target temperature (k_B*T in energy units). Shape (1,) or (B,).
-    velocities_out : wp.array, optional
-        Output array. If None, allocated internally (needs dtype hint from masses).
+    velocities_out : wp.array
+        Output array for velocities. Shape (N,). Caller must pre-allocate.
+    total_momentum : wp.array
+        Scratch array for COM removal. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+        Only used when ``remove_com=True``.
+    total_mass : wp.array
+        Scratch array for COM removal. Same scalar dtype as masses.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+        Only used when ``remove_com=True``.
+    com_velocities : wp.array
+        Scratch array for COM removal. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Only used when ``remove_com=True``.
     random_seed : int, optional
         Random seed for reproducibility. Default: 42.
     remove_com : bool, optional
@@ -1700,10 +1700,6 @@ def initialize_velocities_out(
         vec_dtype = wp.vec3d
     else:
         vec_dtype = wp.vec3f
-
-    # Allocate output if needed
-    if velocities_out is None:
-        velocities_out = wp.zeros(num_atoms, dtype=vec_dtype, device=device)
 
     if atom_ptr is not None:
         # Use atom_ptr mode - launch with dim=num_systems
@@ -1744,9 +1740,12 @@ def initialize_velocities_out(
         )
 
     if remove_com:
-        velocities_out = remove_com_motion_out(
+        remove_com_motion(
             velocities_out,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
             batch_idx=batch_idx,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
@@ -1759,6 +1758,9 @@ def initialize_velocities_out(
 def remove_com_motion(
     velocities: wp.array,
     masses: wp.array,
+    total_momentum: wp.array,
+    total_mass: wp.array,
+    com_velocities: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     num_systems: int = 1,
@@ -1773,6 +1775,17 @@ def remove_com_motion(
         Atomic velocities. Shape (N,). MODIFIED in-place.
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,).
+    total_momentum : wp.array
+        Scratch array for momentum accumulation. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+    total_mass : wp.array
+        Scratch array for mass accumulation. Same scalar dtype as masses.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+    com_velocities : wp.array
+        Scratch array for COM velocities. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1788,17 +1801,15 @@ def remove_com_motion(
     if device is None:
         device = velocities.device
 
+    total_momentum.zero_()
+    total_mass.zero_()
     num_atoms = velocities.shape[0]
 
     vec_dtype = velocities.dtype
-    # Determine scalar dtype from vector dtype
-    scalar_dtype = wp.float32 if vec_dtype == wp.vec3f else wp.float64
 
     if atom_ptr is not None:
         # Use atom_ptr mode - launch with dim=num_systems
         num_systems_actual = atom_ptr.shape[0] - 1
-        total_momentum = wp.zeros(num_systems_actual, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(num_systems_actual, dtype=scalar_dtype, device=device)
 
         wp.launch(
             _compute_com_velocity_ptr_kernel_overload[vec_dtype],
@@ -1808,7 +1819,6 @@ def remove_com_motion(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocities = wp.zeros(num_systems_actual, dtype=vec_dtype, device=device)
         wp.launch(
             _batch_compute_com_from_momentum_kernel,
             dim=num_systems_actual,
@@ -1823,9 +1833,7 @@ def remove_com_motion(
             device=device,
         )
     elif batch_idx is not None:
-        # Use batch_idx mode (no tiles - threads in block belong to different systems)
-        total_momentum = wp.zeros(num_systems, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
+        # Use batch_idx mode
 
         wp.launch(
             _batch_compute_com_velocity_kernel_overload[vec_dtype],
@@ -1835,7 +1843,6 @@ def remove_com_motion(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocities = wp.zeros(num_systems, dtype=vec_dtype, device=device)
         wp.launch(
             _batch_compute_com_from_momentum_kernel,
             dim=num_systems,
@@ -1850,10 +1857,7 @@ def remove_com_motion(
             device=device,
         )
     else:
-        # Single system with tiles - launch with dim=num_atoms
-        total_momentum = wp.zeros(1, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(1, dtype=scalar_dtype, device=device)
-
+        # Single system - launch with dim=num_atomm
         wp.launch(
             _compute_com_velocity_tiled_kernel_overload[vec_dtype],
             dim=num_atoms,
@@ -1863,18 +1867,17 @@ def remove_com_motion(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocity = wp.zeros(1, dtype=vec_dtype, device=device)
         wp.launch(
             _compute_com_from_momentum_kernel,
             dim=1,
-            inputs=[total_momentum, total_mass, com_velocity],
+            inputs=[total_momentum, total_mass, com_velocities],
             device=device,
         )
 
         wp.launch(
             _remove_com_motion_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, com_velocity],
+            inputs=[velocities, com_velocities],
             device=device,
         )
 
@@ -1882,7 +1885,10 @@ def remove_com_motion(
 def remove_com_motion_out(
     velocities: wp.array,
     masses: wp.array,
-    velocities_out: wp.array = None,
+    total_momentum: wp.array,
+    total_mass: wp.array,
+    com_velocities: wp.array,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     num_systems: int = 1,
@@ -1897,8 +1903,19 @@ def remove_com_motion_out(
         Atomic velocities. Shape (N,).
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,).
-    velocities_out : wp.array, optional
-        Output array. If None, allocated internally.
+    total_momentum : wp.array
+        Scratch array for momentum accumulation. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+    total_mass : wp.array
+        Scratch array for mass accumulation. Same scalar dtype as masses.
+        Shape (B,) for batched, (1,) for single.
+        Zeroed internally before each use.
+    com_velocities : wp.array
+        Scratch array for COM velocities. Same vec dtype as velocities.
+        Shape (B,) for batched, (1,) for single.
+    velocities_out : wp.array
+        Output array. Shape (N,). Caller must pre-allocate.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -1919,20 +1936,15 @@ def remove_com_motion_out(
     if device is None:
         device = velocities.device
 
+    total_momentum.zero_()
+    total_mass.zero_()
     num_atoms = velocities.shape[0]
 
-    if velocities_out is None:
-        velocities_out = wp.empty_like(velocities)
-
     vec_dtype = velocities.dtype
-    # Determine scalar dtype from vector dtype
-    scalar_dtype = wp.float32 if vec_dtype == wp.vec3f else wp.float64
 
     if atom_ptr is not None:
         # Use atom_ptr mode - launch with dim=num_systems
         num_systems_actual = atom_ptr.shape[0] - 1
-        total_momentum = wp.zeros(num_systems_actual, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(num_systems_actual, dtype=scalar_dtype, device=device)
 
         wp.launch(
             _compute_com_velocity_ptr_kernel_overload[vec_dtype],
@@ -1942,7 +1954,6 @@ def remove_com_motion_out(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocities = wp.zeros(num_systems_actual, dtype=vec_dtype, device=device)
         wp.launch(
             _batch_compute_com_from_momentum_kernel,
             dim=num_systems_actual,
@@ -1957,9 +1968,7 @@ def remove_com_motion_out(
             device=device,
         )
     elif batch_idx is not None:
-        # Use batch_idx mode (no tiles - threads in block belong to different systems)
-        total_momentum = wp.zeros(num_systems, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
+        # Use batch_idx mode - launch with dim=num_atoms
 
         wp.launch(
             _batch_compute_com_velocity_kernel_overload[vec_dtype],
@@ -1969,7 +1978,6 @@ def remove_com_motion_out(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocities = wp.zeros(num_systems, dtype=vec_dtype, device=device)
         wp.launch(
             _batch_compute_com_from_momentum_kernel,
             dim=num_systems,
@@ -1984,9 +1992,7 @@ def remove_com_motion_out(
             device=device,
         )
     else:
-        # Single system with tiles - launch with dim=num_atoms
-        total_momentum = wp.zeros(1, dtype=vec_dtype, device=device)
-        total_mass = wp.zeros(1, dtype=scalar_dtype, device=device)
+        # Single system - launch with dim=num_atoms
 
         wp.launch(
             _compute_com_velocity_tiled_kernel_overload[vec_dtype],
@@ -1997,18 +2003,17 @@ def remove_com_motion_out(
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
-        com_velocity = wp.zeros(1, dtype=vec_dtype, device=device)
         wp.launch(
             _compute_com_from_momentum_kernel,
             dim=1,
-            inputs=[total_momentum, total_mass, com_velocity],
+            inputs=[total_momentum, total_mass, com_velocities],
             device=device,
         )
 
         wp.launch(
             _remove_com_motion_out_kernel_overload[vec_dtype],
             dim=num_atoms,
-            inputs=[velocities, com_velocity, velocities_out],
+            inputs=[velocities, com_velocities, velocities_out],
             device=device,
         )
 

@@ -40,7 +40,7 @@ from nvalchemiops.interactions.lj import (
     lj_energy_forces_virial,
     lj_forces,
 )
-from nvalchemiops.neighborlist import cell_list
+from nvalchemiops.torch.neighbors import cell_list
 
 wp.init()
 
@@ -925,7 +925,7 @@ class TestLJBatched:
         batch_idx_torch = torch.from_numpy(batch_idx_np).cuda().long()
         pbc_torch = torch.tensor([True, True, True], dtype=torch.bool, device="cuda")
 
-        from nvalchemiops.neighborlist import batch_cell_list
+        from nvalchemiops.torch.neighbors import batch_cell_list
 
         neighbor_matrix, num_neighbors, neighbor_shifts = batch_cell_list(
             positions=positions_torch,
@@ -1010,7 +1010,7 @@ class TestLJBatched:
         batch_idx_torch = torch.from_numpy(batch_idx_np).cuda().long()
         pbc_torch = torch.tensor([True, True, True], dtype=torch.bool, device="cuda")
 
-        from nvalchemiops.neighborlist import batch_cell_list
+        from nvalchemiops.torch.neighbors import batch_cell_list
 
         neighbor_matrix, num_neighbors, neighbor_shifts = batch_cell_list(
             positions=positions_torch,

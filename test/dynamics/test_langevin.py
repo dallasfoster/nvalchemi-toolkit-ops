@@ -259,6 +259,9 @@ class TestLangevinAPI:
         pos_orig = positions.numpy().copy()
         vel_orig = velocities.numpy().copy()
 
+        positions_out = wp.empty_like(positions)
+        velocities_out = wp.empty_like(velocities)
+
         pos_out, vel_out = langevin_baoab_half_step_out(
             positions,
             velocities,
@@ -268,6 +271,8 @@ class TestLangevinAPI:
             temperature,
             friction,
             random_seed,
+            positions_out,
+            velocities_out,
         )
         wp.synchronize_device(device)
 
@@ -313,9 +318,9 @@ class TestLangevinAPI:
             dt,
             temperature,
             friction,
-            random_seed=42,
-            positions_out=positions_out,
-            velocities_out=velocities_out,
+            42,
+            positions_out,
+            velocities_out,
             device=device,
         )
 
@@ -377,8 +382,9 @@ class TestLangevinAPI:
 
         vel_orig = velocities.numpy().copy()
 
+        velocities_out = wp.empty_like(velocities)
         velocities_out = langevin_baoab_finalize_out(
-            velocities, forces_new, masses, dt, device=device
+            velocities, forces_new, masses, dt, velocities_out, device=device
         )
 
         np.testing.assert_array_equal(velocities.numpy(), vel_orig)
@@ -402,7 +408,10 @@ class TestLangevinAPI:
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
         # Call without explicit device
-        vel_out = langevin_baoab_finalize_out(velocities, forces_new, masses, dt)
+        velocities_out = wp.empty_like(velocities)
+        vel_out = langevin_baoab_finalize_out(
+            velocities, forces_new, masses, dt, velocities_out
+        )
 
         wp.synchronize_device(device)
         assert vel_out.shape[0] == num_atoms
@@ -492,6 +501,9 @@ class TestLangevinBatched:
         temperature = wp.array([1.0, 1.5], dtype=dtype_scalar, device=device)
         friction = wp.array([0.01, 0.01], dtype=dtype_scalar, device=device)
 
+        positions_out = wp.empty_like(positions)
+        velocities_out = wp.empty_like(velocities)
+
         pos_out, vel_out = langevin_baoab_half_step_out(
             positions,
             velocities,
@@ -500,7 +512,9 @@ class TestLangevinBatched:
             dt,
             temperature,
             friction,
-            random_seed=42,
+            42,
+            positions_out,
+            velocities_out,
             batch_idx=batch_idx,
             device=device,
         )
@@ -571,8 +585,15 @@ class TestLangevinBatched:
         )
         dt = wp.array([0.001, 0.001], dtype=dtype_scalar, device=device)
 
+        velocities_out = wp.empty_like(velocities)
         velocities_out = langevin_baoab_finalize_out(
-            velocities, forces_new, masses, dt, batch_idx=batch_idx, device=device
+            velocities,
+            forces_new,
+            masses,
+            dt,
+            velocities_out,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert velocities_out.shape[0] == num_atoms
@@ -1115,6 +1136,9 @@ class TestLangevinAtomPtr:
         pos_orig = positions.numpy().copy()
         vel_orig = velocities.numpy().copy()
 
+        positions_out = wp.empty_like(positions)
+        velocities_out = wp.empty_like(velocities)
+
         pos_out, vel_out = langevin_baoab_half_step_out(
             positions,
             velocities,
@@ -1123,7 +1147,9 @@ class TestLangevinAtomPtr:
             dt,
             temperature,
             friction,
-            random_seed=42,
+            42,
+            positions_out,
+            velocities_out,
             atom_ptr=atom_ptr,
             device=device,
         )
@@ -1167,8 +1193,15 @@ class TestLangevinAtomPtr:
 
         vel_orig = velocities.numpy().copy()
 
+        velocities_out = wp.empty_like(velocities)
         vel_out = langevin_baoab_finalize_out(
-            velocities, forces, masses, dt, atom_ptr=atom_ptr, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)

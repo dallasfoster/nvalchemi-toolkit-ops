@@ -1249,7 +1249,8 @@ class NvalchemiOpsBenchmark:
         wp_dt = wp.array([dt], dtype=self.wp_dtype, device=self.wp_device)
 
         # Pre-compute cell inverse
-        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+        wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
 
         # Initial forces
         _, wp_forces, _ = self._compute_forces(wp_positions)
@@ -1391,7 +1392,8 @@ class NvalchemiOpsBenchmark:
         wp_temp = wp.array([kT], dtype=self.wp_dtype, device=self.wp_device)
         wp_friction = wp.array([friction], dtype=self.wp_dtype, device=self.wp_device)
         # Pre-compute cell inverse
-        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+        wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
 
         # Initial forces
         _, wp_forces, _ = self._compute_forces(wp_positions)
@@ -1572,7 +1574,8 @@ class NvalchemiOpsBenchmark:
         wp_eta_dot = wp.from_torch(eta_dot, dtype=self.wp_dtype)
         wp_ndof = wp.array([ndof], dtype=self.wp_dtype, device=self.wp_device)
         # Pre-compute cell inverse
-        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+        wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
 
         # Initial forces
         _, wp_forces, _ = self._compute_forces(wp_positions)
@@ -1897,6 +1900,9 @@ class NvalchemiOpsBenchmark:
                 new_virial, virial_out, negate=True, device=self.wp_device
             )
 
+        # Pre-allocate cell inverse scratch buffer for wrapping
+        wp_cell_inv = wp.empty_like(wp_cells)
+
         # Warmup
         def warmup_step():
             run_npt_step(
@@ -1922,7 +1928,7 @@ class NvalchemiOpsBenchmark:
                 device=self.wp_device,
             )
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cells, device=self.wp_device)
+            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cells,
@@ -1957,7 +1963,7 @@ class NvalchemiOpsBenchmark:
                 device=self.wp_device,
             )
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cells, device=self.wp_device)
+            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cells,
@@ -2118,6 +2124,9 @@ class NvalchemiOpsBenchmark:
                 new_virial, virial_out, negate=True, device=self.wp_device
             )
 
+        # Pre-allocate cell inverse scratch buffer for wrapping
+        wp_cell_inv = wp.empty_like(wp_cells)
+
         # Warmup
         def warmup_step():
             run_nph_step(
@@ -2138,7 +2147,7 @@ class NvalchemiOpsBenchmark:
                 device=self.wp_device,
             )
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cells, device=self.wp_device)
+            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cells,
@@ -2168,7 +2177,7 @@ class NvalchemiOpsBenchmark:
                 device=self.wp_device,
             )
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cells, device=self.wp_device)
+            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cells,
@@ -2273,7 +2282,8 @@ class NvalchemiOpsBenchmark:
         wp_velocities = wp.from_torch(velocities, dtype=self.wp_vec_dtype)
 
         # Pre-compute cell inverse
-        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+        wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
 
         # Initialize FIRE control parameters as warp arrays
         wp_alpha = wp.array(
@@ -2314,6 +2324,9 @@ class NvalchemiOpsBenchmark:
         wp_vf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
         wp_vv = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
         wp_ff = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_uphill_flag = wp.zeros(
+            self.num_systems, dtype=wp.int32, device=self.wp_device
+        )
 
         # Initial forces
         _, wp_forces, _ = self._compute_forces(wp_positions)
@@ -2364,6 +2377,7 @@ class NvalchemiOpsBenchmark:
                 n_min=wp_n_min,
                 f_dec=wp_f_dec,
                 f_inc=wp_f_inc,
+                uphill_flag=wp_uphill_flag,
                 vf=wp_vf,
                 vv=wp_vv,
                 ff=wp_ff,
@@ -2487,7 +2501,8 @@ class NvalchemiOpsBenchmark:
         wp_velocities = wp.from_torch(velocities, dtype=self.wp_vec_dtype)
 
         # Pre-compute cell inverse
-        wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.wp_device)
+        wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
 
         # batch_idx: use existing or create single-system index
         if self.wp_batch_idx is not None:
@@ -2628,6 +2643,7 @@ class NvalchemiOpsBenchmark:
             stress shape (M, 3, 3) in eV/A^3.
         """
         from nvalchemiops.dynamics.utils.cell_filter import stress_to_cell_force
+        from nvalchemiops.dynamics.utils.cell_utils import compute_cell_volume
 
         M = self.num_systems
         virial_torch = wp.to_torch(wp_virial)
@@ -2636,9 +2652,14 @@ class NvalchemiOpsBenchmark:
         stress_torch = virial_mat / volume.reshape(-1, 1, 1)
         stress_wp = wp.from_torch(stress_torch.contiguous(), dtype=self.wp_mat_dtype)
         wp_cell_cur = wp.from_torch(cell_torch.contiguous(), dtype=self.wp_mat_dtype)
-        cell_force_wp = stress_to_cell_force(
+        wp_volume = wp.empty(M, dtype=self.wp_dtype, device=self.wp_device)
+        compute_cell_volume(wp_cell_cur, wp_volume, device=self.wp_device)
+        cell_force_wp = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        stress_to_cell_force(
             stress_wp,
             wp_cell_cur,
+            wp_volume,
+            cell_force_wp,
             keep_aligned=True,
             device=self.wp_device,
         )
@@ -2719,7 +2740,8 @@ class NvalchemiOpsBenchmark:
             wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
 
         # Align cell (one-time preprocessing)
-        align_cell(wp_positions, wp_cell, wp_bidx, device=self.wp_device)
+        wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        align_cell(wp_positions, wp_cell, wp_transform, batch_idx=wp_bidx, device=self.wp_device)
         self.wp_cell = wp_cell
         self.model.wp_cell = self.wp_cell
         wp.synchronize()
@@ -2729,17 +2751,21 @@ class NvalchemiOpsBenchmark:
 
         # Extended batch_idx: atoms + 2 extra DOFs per system
         N_ext = N + 2 * M
-        ext_bidx = extend_batch_idx(
+        ext_bidx = wp.empty(N_ext, dtype=wp.int32, device=self.wp_device)
+        extend_batch_idx(
             wp_bidx,
             N,
             M,
+            ext_bidx,
             device=self.wp_device,
         )
 
         # Pack initial positions into extended array
-        ext_positions = pack_positions_with_cell(
+        ext_positions = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        pack_positions_with_cell(
             wp_positions,
             wp_cell,
+            ext_positions,
             device=self.wp_device,
         )
         ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
@@ -2812,6 +2838,7 @@ class NvalchemiOpsBenchmark:
         wp_vf = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
         wp_vv = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
         wp_ff = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_uphill_flag = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
 
         # Initial forces + virial
         _, wp_forces, wp_virial = self._compute_forces(
@@ -2828,11 +2855,18 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pack forces into extended array
-        ext_forces = pack_forces_with_cell(
+        ext_forces = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        pack_forces_with_cell(
             wp_forces,
             cell_force_wp,
+            ext_forces,
             device=self.wp_device,
         )
+
+        # Pre-allocate scratch buffers for unpack/repack in the loop
+        wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_positions_scratch = wp.empty(N, dtype=self.wp_vec_dtype, device=self.wp_device)
+        wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
 
         # Timed loop
         import time
@@ -2875,6 +2909,7 @@ class NvalchemiOpsBenchmark:
                 n_min=wp_n_min,
                 f_dec=wp_f_dec,
                 f_inc=wp_f_inc,
+                uphill_flag=wp_uphill_flag,
                 vf=wp_vf,
                 vv=wp_vv,
                 ff=wp_ff,
@@ -2883,16 +2918,20 @@ class NvalchemiOpsBenchmark:
             )
 
             # Unpack extended positions → atom positions + cell
-            wp_positions, wp_cell = unpack_positions_with_cell(
+            unpack_positions_with_cell(
                 ext_positions,
+                wp_positions_scratch,
+                wp_cell_scratch,
                 num_atoms=N,
                 device=self.wp_device,
             )
+            wp_positions = wp_positions_scratch
+            wp_cell = wp_cell_scratch
             self.wp_cell = wp_cell
             self.model.wp_cell = self.wp_cell
 
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cell, device=self.wp_device)
+            compute_cell_inverse(wp_cell, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cell,
@@ -2901,9 +2940,10 @@ class NvalchemiOpsBenchmark:
             )
 
             # Repack wrapped positions into extended array
-            ext_positions = pack_positions_with_cell(
+            pack_positions_with_cell(
                 wp_positions,
                 wp_cell,
+                ext_positions,
                 device=self.wp_device,
             )
 
@@ -2922,9 +2962,10 @@ class NvalchemiOpsBenchmark:
                 cell_force.contiguous(),
                 dtype=self.wp_mat_dtype,
             )
-            ext_forces = pack_forces_with_cell(
+            pack_forces_with_cell(
                 wp_forces,
                 cell_force_wp,
+                ext_forces,
                 device=self.wp_device,
             )
 
@@ -3042,7 +3083,8 @@ class NvalchemiOpsBenchmark:
             wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
 
         # Align cell (one-time preprocessing)
-        align_cell(wp_positions, wp_cell, wp_bidx, device=self.wp_device)
+        wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        align_cell(wp_positions, wp_cell, wp_transform, batch_idx=wp_bidx, device=self.wp_device)
         self.wp_cell = wp_cell
         self.model.wp_cell = self.wp_cell
         wp.synchronize()
@@ -3052,17 +3094,21 @@ class NvalchemiOpsBenchmark:
 
         # Extended batch_idx: atoms + 2 extra DOFs per system
         N_ext = N + 2 * M
-        ext_bidx = extend_batch_idx(
+        ext_bidx = wp.empty(N_ext, dtype=wp.int32, device=self.wp_device)
+        extend_batch_idx(
             wp_bidx,
             N,
             M,
+            ext_bidx,
             device=self.wp_device,
         )
 
         # Pack initial positions into extended array
-        ext_positions = pack_positions_with_cell(
+        ext_positions = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        pack_positions_with_cell(
             wp_positions,
             wp_cell,
+            ext_positions,
             device=self.wp_device,
         )
         ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
@@ -3101,11 +3147,18 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pack forces into extended array
-        ext_forces = pack_forces_with_cell(
+        ext_forces = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        pack_forces_with_cell(
             wp_forces,
             cell_force_wp,
+            ext_forces,
             device=self.wp_device,
         )
+
+        # Pre-allocate scratch buffers for unpack/repack in the loop
+        wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_positions_scratch = wp.empty(N, dtype=self.wp_vec_dtype, device=self.wp_device)
+        wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
 
         # Timed loop
         import time
@@ -3156,16 +3209,20 @@ class NvalchemiOpsBenchmark:
             )
 
             # Unpack extended positions -> atom positions + cell
-            wp_positions, wp_cell = unpack_positions_with_cell(
+            unpack_positions_with_cell(
                 ext_positions,
+                wp_positions_scratch,
+                wp_cell_scratch,
                 num_atoms=N,
                 device=self.wp_device,
             )
+            wp_positions = wp_positions_scratch
+            wp_cell = wp_cell_scratch
             self.wp_cell = wp_cell
             self.model.wp_cell = self.wp_cell
 
             # Wrap positions
-            wp_cell_inv = compute_cell_inverse(wp_cell, device=self.wp_device)
+            compute_cell_inverse(wp_cell, wp_cell_inv, device=self.wp_device)
             wrap_positions_to_cell(
                 wp_positions,
                 cells=wp_cell,
@@ -3174,9 +3231,10 @@ class NvalchemiOpsBenchmark:
             )
 
             # Repack wrapped positions into extended array
-            ext_positions = pack_positions_with_cell(
+            pack_positions_with_cell(
                 wp_positions,
                 wp_cell,
+                ext_positions,
                 device=self.wp_device,
             )
 
@@ -3195,9 +3253,10 @@ class NvalchemiOpsBenchmark:
                 cell_force.contiguous(),
                 dtype=self.wp_mat_dtype,
             )
-            ext_forces = pack_forces_with_cell(
+            pack_forces_with_cell(
                 wp_forces,
                 cell_force_wp,
+                ext_forces,
                 device=self.wp_device,
             )
 

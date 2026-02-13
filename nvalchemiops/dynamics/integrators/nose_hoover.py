@@ -26,21 +26,17 @@ References
 - Tuckerman et al. J Phys A: Math Gen, 39, 5629 (2006)
 
 The Nosé-Hoover chain equations of motion:
-
-.. math::
-
-    \\dot{\\mathbf{r}}_i &= \\mathbf{v}_i \\\\
-    \\dot{\\mathbf{v}}_i &= \\frac{\\mathbf{F}_i}{m_i} - \\dot{\\eta}_1 \\cdot \\mathbf{v}_i \\\\
-    \\dot{\\eta}_1 &= \\frac{2 \\cdot KE - N_{\\text{dof}} \\cdot k_B T}{Q_1} \\\\
-    \\dot{\\eta}_k &= \\frac{Q_{k-1} \\dot{\\eta}_{k-1}^2 - k_B T}{Q_k} \\quad \\text{for } k > 1
+    ṙᵢ = vᵢ
+    v̇ᵢ = Fᵢ/mᵢ - η̇₁·vᵢ
+    η̇₁ = (2·KE - Ndof·kT) / Q₁
+    η̇ₖ = (Qₖ₋₁·η̇²ₖ₋₁ - kT) / Qₖ   for k > 1
 
 Where:
-
-- :math:`\\eta`: thermostat chain positions (unitless)
-- :math:`\\dot{\\eta}`: thermostat chain velocities (1/time)
-- :math:`Q`: thermostat chain masses (energy·time²)
-- :math:`N_{\\text{dof}}`: degrees of freedom (typically 3N - 3)
-- :math:`k_B T`: target temperature in energy units
+    η   : thermostat chain positions (unitless)
+    η̇   : thermostat chain velocities (1/time)
+    Q   : thermostat chain masses (energy·time²)
+    Ndof: degrees of freedom (typically 3N - 3)
+    kT  : target temperature in energy units (k_B = 1)
 
 BATCH MODE
 ==========
@@ -75,13 +71,10 @@ from typing import Any
 
 import warp as wp
 
-from ...segment_ops import _compute_ept
-from ..utils.kernel_functions import (
-    compute_acceleration_from_force,
-    position_update_from_velocity,
-    scale_vector_by_scalar,
-    velocity_half_step_from_acceleration,
-)
+from nvalchemiops.warp_dispatch import validate_out_array
+
+from ..utils.launch_helpers import dispatch_family
+from ..utils.shared_kernels import position_update_families, velocity_kick_families
 
 __all__ = [
     # Mutating (in-place) APIs
@@ -184,76 +177,27 @@ def _compute_2ke_tiled_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def _batch_compute_2ke_rle_kernel(
+def _batch_compute_2ke_kernel(
     velocities: wp.array(dtype=Any),
     masses: wp.array(dtype=Any),
     batch_idx: wp.array(dtype=wp.int32),
     ke2: wp.array(dtype=Any),
-    N: wp.int32,
-    elems_per_thread: wp.int32,
 ):
-    """Compute 2*KE per system using run-length encoded reduction.
-
-    Minimizes atomic operations by accumulating locally within runs of
-    identical batch_idx values, only emitting atomic adds at segment
-    boundaries.
-
-    Provides O(M) atomic operations instead of O(N), typically 100-1000x
-    fewer atomics than naive approach.
-
-    **CRITICAL**: batch_idx **MUST** be sorted in non-decreasing order.
+    """Compute 2*KE per system for batched simulations.
 
     Launch Grid
     -----------
-    dim = [(N + elems_per_thread - 1) // elems_per_thread]
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=vec3f/vec3d), shape (N,)
-        Atomic velocities.
-    masses : wp.array(dtype=float32/float64), shape (N,)
-        Atomic masses.
-    batch_idx : wp.array(dtype=int32), shape (N,)
-        **SORTED** segment indices. **MUST BE SORTED** for correctness.
-    ke2 : wp.array(dtype=float32/float64), shape (M,)
-        Output 2*KE per system. **Must be zero-initialized**.
-    N : int32
-        Total number of atoms.
-    elems_per_thread : int32
-        Elements per thread (auto-tuned for performance).
+    dim = [num_atoms_total]
     """
-    t = wp.tid()
-    start = t * elems_per_thread
-    end = wp.min(start + elems_per_thread, N)
+    atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
 
-    if start >= N:
-        return
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
 
-    # Initialize accumulator with first element
-    current_sys = batch_idx[start]
-    v = velocities[start]
-    m = masses[start]
-    accum = type(ke2[0])(m * wp.dot(v, v))
+    v_sq = wp.dot(v, v)
 
-    # Accumulate within run
-    for i in range(start + 1, end):
-        sys = batch_idx[i]
-
-        if sys != current_sys:
-            # Segment boundary: emit accumulated value
-            wp.atomic_add(ke2, current_sys, accum)
-
-            # Reset accumulator for new segment
-            current_sys = sys
-            accum = type(ke2[0])(0.0)
-
-        # Accumulate
-        v_i = velocities[i]
-        m_i = masses[i]
-        accum += type(accum)(m_i * wp.dot(v_i, v_i))
-
-    # Emit final accumulated value
-    wp.atomic_add(ke2, current_sys, accum)
+    wp.atomic_add(ke2, system_id, type(ke2[system_id])(m * v_sq))
 
 
 @wp.kernel
@@ -773,7 +717,11 @@ def _scale_velocities_kernel(
     v = velocities[atom_idx]
     s = type(v[0])(scale_factor[0])
 
-    velocities[atom_idx] = scale_vector_by_scalar(v, s)
+    new_vx = type(v[0])(v[0] * s)
+    new_vy = type(v[1])(v[1] * s)
+    new_vz = type(v[2])(v[2] * s)
+
+    velocities[atom_idx] = type(v)(new_vx, new_vy, new_vz)
 
 
 @wp.kernel
@@ -789,10 +737,15 @@ def _batch_scale_velocities_kernel(
     dim = [num_atoms_total]
     """
     atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
     v = velocities[atom_idx]
-    s = type(v[0])(scale_factors[batch_idx[atom_idx]])
+    s = type(v[0])(scale_factors[system_id])
 
-    velocities[atom_idx] = scale_vector_by_scalar(v, s)
+    new_vx = type(v[0])(v[0] * s)
+    new_vy = type(v[1])(v[1] * s)
+    new_vz = type(v[2])(v[2] * s)
+
+    velocities[atom_idx] = type(v)(new_vx, new_vy, new_vz)
 
 
 @wp.kernel
@@ -811,7 +764,11 @@ def _scale_velocities_out_kernel(
     v = velocities[atom_idx]
     s = type(v[0])(scale_factor[0])
 
-    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
+    new_vx = type(v[0])(v[0] * s)
+    new_vy = type(v[1])(v[1] * s)
+    new_vz = type(v[2])(v[2] * s)
+
+    velocities_out[atom_idx] = type(v)(new_vx, new_vy, new_vz)
 
 
 @wp.kernel
@@ -828,402 +785,15 @@ def _batch_scale_velocities_out_kernel(
     dim = [num_atoms_total]
     """
     atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
     v = velocities[atom_idx]
-    s = type(v[0])(scale_factors[batch_idx[atom_idx]])
+    s = type(v[0])(scale_factors[system_id])
 
-    velocities_out[atom_idx] = scale_vector_by_scalar(v, s)
+    new_vx = type(v[0])(v[0] * s)
+    new_vy = type(v[1])(v[1] * s)
+    new_vz = type(v[2])(v[2] * s)
 
-
-# ==============================================================================
-# Velocity Half-Step Kernels (with thermostat coupling)
-# ==============================================================================
-
-
-@wp.kernel
-def _nhc_velocity_half_step_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    dt: wp.array(dtype=Any),
-):
-    """Half-step velocity update: v += 0.5 * (F/m) * dt
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-    """
-    atom_idx = wp.tid()
-
-    v = velocities[atom_idx]
-    f = forces[atom_idx]
-    m = masses[atom_idx]
-    dt_val = dt[0]
-
-    acc = compute_acceleration_from_force(f, m)
-    v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-    velocities[atom_idx] = v_new
-
-
-@wp.kernel
-def _batch_nhc_velocity_half_step_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-):
-    """Batched half-step velocity update.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-    """
-    atom_idx = wp.tid()
-
-    v = velocities[atom_idx]
-    f = forces[atom_idx]
-    m = masses[atom_idx]
-    dt_val = dt[batch_idx[atom_idx]]
-
-    acc = compute_acceleration_from_force(f, m)
-    v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-    velocities[atom_idx] = v_new
-
-
-@wp.kernel
-def _nhc_velocity_half_step_out_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    dt: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Half-step velocity update to output array.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-    """
-    atom_idx = wp.tid()
-
-    v = velocities[atom_idx]
-    f = forces[atom_idx]
-    m = masses[atom_idx]
-    dt_val = dt[0]
-
-    acc = compute_acceleration_from_force(f, m)
-    v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-    velocities_out[atom_idx] = v_new
-
-
-@wp.kernel
-def _batch_nhc_velocity_half_step_out_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Batched half-step velocity update to output array.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-    """
-    atom_idx = wp.tid()
-
-    v = velocities[atom_idx]
-    f = forces[atom_idx]
-    m = masses[atom_idx]
-    dt_val = dt[batch_idx[atom_idx]]
-
-    acc = compute_acceleration_from_force(f, m)
-    v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-    velocities_out[atom_idx] = v_new
-
-
-# ==============================================================================
-# Position Update Kernels
-# ==============================================================================
-
-
-@wp.kernel
-def _nhc_position_update_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    dt: wp.array(dtype=Any),
-):
-    """Full-step position update: r += v * dt
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-    """
-    atom_idx = wp.tid()
-
-    r = positions[atom_idx]
-    v = velocities[atom_idx]
-    dt_val = dt[0]
-
-    r_new = position_update_from_velocity(r, v, dt_val)
-
-    positions[atom_idx] = r_new
-
-
-@wp.kernel
-def _batch_nhc_position_update_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-):
-    """Batched full-step position update.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-    """
-    atom_idx = wp.tid()
-
-    r = positions[atom_idx]
-    v = velocities[atom_idx]
-    dt_val = dt[batch_idx[atom_idx]]
-
-    r_new = position_update_from_velocity(r, v, dt_val)
-
-    positions[atom_idx] = r_new
-
-
-@wp.kernel
-def _nhc_position_update_out_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    dt: wp.array(dtype=Any),
-    positions_out: wp.array(dtype=Any),
-):
-    """Full-step position update to output array.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms]
-    """
-    atom_idx = wp.tid()
-
-    r = positions[atom_idx]
-    v = velocities[atom_idx]
-    dt_val = dt[0]
-
-    r_new = position_update_from_velocity(r, v, dt_val)
-
-    positions_out[atom_idx] = r_new
-
-
-@wp.kernel
-def _batch_nhc_position_update_out_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-    positions_out: wp.array(dtype=Any),
-):
-    """Batched full-step position update to output array.
-
-    Launch Grid
-    -----------
-    dim = [num_atoms_total]
-    """
-    atom_idx = wp.tid()
-
-    r = positions[atom_idx]
-    v = velocities[atom_idx]
-    dt_val = dt[batch_idx[atom_idx]]
-
-    r_new = position_update_from_velocity(r, v, dt_val)
-
-    positions_out[atom_idx] = r_new
-
-
-# ==============================================================================
-# Pointer-Based (CSR) Velocity Half-Step Kernels
-# ==============================================================================
-
-
-@wp.kernel
-def _nhc_velocity_half_step_ptr_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-):
-    """Half-step velocity update using atom_ptr (in-place).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,). MODIFIED in-place.
-    forces : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Forces on atoms. Shape (num_atoms_total,).
-    masses : wp.array(dtype=wp.float32 or wp.float64)
-        Atomic masses. Shape (num_atoms_total,).
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-    dt : wp.array(dtype=wp.float32 or wp.float64)
-        Time step per system. Shape (num_systems,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    dt_val = dt[sys_id]
-
-    for i in range(a0, a1):
-        v = velocities[i]
-        f = forces[i]
-        m = masses[i]
-
-        acc = compute_acceleration_from_force(f, m)
-        v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-        velocities[i] = v_new
-
-
-@wp.kernel
-def _nhc_velocity_half_step_ptr_out_kernel(
-    velocities: wp.array(dtype=Any),
-    forces: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-    velocities_out: wp.array(dtype=Any),
-):
-    """Half-step velocity update using atom_ptr (non-mutating).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,).
-    forces : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Forces on atoms. Shape (num_atoms_total,).
-    masses : wp.array(dtype=wp.float32 or wp.float64)
-        Atomic masses. Shape (num_atoms_total,).
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-    dt : wp.array(dtype=wp.float32 or wp.float64)
-        Time step per system. Shape (num_systems,).
-    velocities_out : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Output velocities. Shape (num_atoms_total,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    dt_val = dt[sys_id]
-
-    for i in range(a0, a1):
-        v = velocities[i]
-        f = forces[i]
-        m = masses[i]
-
-        acc = compute_acceleration_from_force(f, m)
-        v_new = velocity_half_step_from_acceleration(v, acc, dt_val)
-
-        velocities_out[i] = v_new
-
-
-# ==============================================================================
-# Pointer-Based (CSR) Position Update Kernels
-# ==============================================================================
-
-
-@wp.kernel
-def _nhc_position_update_ptr_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-):
-    """Full-step position update using atom_ptr (in-place).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    positions : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic positions. Shape (num_atoms_total,). MODIFIED in-place.
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,).
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-    dt : wp.array(dtype=wp.float32 or wp.float64)
-        Time step per system. Shape (num_systems,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    dt_val = dt[sys_id]
-
-    for i in range(a0, a1):
-        r = positions[i]
-        v = velocities[i]
-        r_new = position_update_from_velocity(r, v, dt_val)
-        positions[i] = r_new
-
-
-@wp.kernel
-def _nhc_position_update_ptr_out_kernel(
-    positions: wp.array(dtype=Any),
-    velocities: wp.array(dtype=Any),
-    atom_ptr: wp.array(dtype=wp.int32),
-    dt: wp.array(dtype=Any),
-    positions_out: wp.array(dtype=Any),
-):
-    """Full-step position update using atom_ptr (non-mutating).
-
-    Each thread processes one system's atoms sequentially.
-
-    Parameters
-    ----------
-    positions : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic positions. Shape (num_atoms_total,).
-    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Atomic velocities. Shape (num_atoms_total,).
-    atom_ptr : wp.array(dtype=wp.int32)
-        CSR-style pointers. Shape (num_systems + 1,).
-    dt : wp.array(dtype=wp.float32 or wp.float64)
-        Time step per system. Shape (num_systems,).
-    positions_out : wp.array(dtype=wp.vec3f or wp.vec3d)
-        Output positions. Shape (num_atoms_total,).
-
-    Launch Grid
-    -----------
-    dim = [num_systems]
-    """
-    sys_id = wp.tid()
-    a0, a1 = atom_ptr[sys_id], atom_ptr[sys_id + 1]
-    dt_val = dt[sys_id]
-
-    for i in range(a0, a1):
-        r = positions[i]
-        v = velocities[i]
-        r_new = position_update_from_velocity(r, v, dt_val)
-        positions_out[i] = r_new
+    velocities_out[atom_idx] = type(v)(new_vx, new_vy, new_vz)
 
 
 # ==============================================================================
@@ -1267,29 +837,13 @@ _V = [wp.vec3f, wp.vec3d]  # Vector types
 # Diagnostic kernel overloads
 _compute_2ke_kernel_overload = {}
 _compute_2ke_tiled_kernel_overload = {}
-_batch_compute_2ke_rle_kernel_overload = {}
+_batch_compute_2ke_kernel_overload = {}
 
 # Velocity scaling kernel overloads
 _scale_velocities_kernel_overload = {}
 _batch_scale_velocities_kernel_overload = {}
 _scale_velocities_out_kernel_overload = {}
 _batch_scale_velocities_out_kernel_overload = {}
-
-# Velocity half-step kernel overloads
-_nhc_velocity_half_step_kernel_overload = {}
-_batch_nhc_velocity_half_step_kernel_overload = {}
-_nhc_velocity_half_step_ptr_kernel_overload = {}
-_nhc_velocity_half_step_out_kernel_overload = {}
-_batch_nhc_velocity_half_step_out_kernel_overload = {}
-_nhc_velocity_half_step_ptr_out_kernel_overload = {}
-
-# Position update kernel overloads
-_nhc_position_update_kernel_overload = {}
-_batch_nhc_position_update_kernel_overload = {}
-_nhc_position_update_ptr_kernel_overload = {}
-_nhc_position_update_out_kernel_overload = {}
-_batch_nhc_position_update_out_kernel_overload = {}
-_nhc_position_update_ptr_out_kernel_overload = {}
 
 # Compute masses kernel overloads (keyed by scalar type)
 _nhc_compute_masses_kernel_overload = {}
@@ -1320,15 +874,13 @@ for v in _V:
             _compute_2ke_tiled_kernel,
             [wp.array(dtype=v), wp.array(dtype=t_mass), wp.array(dtype=t_out)],
         )
-        _batch_compute_2ke_rle_kernel_overload[(v, t_out)] = wp.overload(
-            _batch_compute_2ke_rle_kernel,
+        _batch_compute_2ke_kernel_overload[(v, t_out)] = wp.overload(
+            _batch_compute_2ke_kernel,
             [
                 wp.array(dtype=v),
                 wp.array(dtype=t_mass),
                 wp.array(dtype=wp.int32),
                 wp.array(dtype=t_out),
-                wp.int32,
-                wp.int32,
             ],
         )
 
@@ -1357,113 +909,6 @@ for v in _V:
                 wp.array(dtype=v),
             ],
         )
-
-for t, v in zip(_T, _V):
-    # Velocity half-step kernels (keyed by vector type)
-    _nhc_velocity_half_step_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
-    )
-    _batch_nhc_velocity_half_step_kernel_overload[v] = wp.overload(
-        _batch_nhc_velocity_half_step_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_velocity_half_step_out_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _batch_nhc_velocity_half_step_out_kernel_overload[v] = wp.overload(
-        _batch_nhc_velocity_half_step_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _nhc_velocity_half_step_ptr_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_velocity_half_step_ptr_out_kernel_overload[v] = wp.overload(
-        _nhc_velocity_half_step_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-
-    # Position update kernels (keyed by vector type)
-    _nhc_position_update_kernel_overload[v] = wp.overload(
-        _nhc_position_update_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t)],
-    )
-    _batch_nhc_position_update_kernel_overload[v] = wp.overload(
-        _batch_nhc_position_update_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_position_update_out_kernel_overload[v] = wp.overload(
-        _nhc_position_update_out_kernel,
-        [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v)],
-    )
-    _batch_nhc_position_update_out_kernel_overload[v] = wp.overload(
-        _batch_nhc_position_update_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
-    _nhc_position_update_ptr_kernel_overload[v] = wp.overload(
-        _nhc_position_update_ptr_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-        ],
-    )
-    _nhc_position_update_ptr_out_kernel_overload[v] = wp.overload(
-        _nhc_position_update_ptr_out_kernel,
-        [
-            wp.array(dtype=v),
-            wp.array(dtype=v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=t),
-            wp.array(dtype=v),
-        ],
-    )
 
 # NHC chain propagation kernels - keyed by scalar type
 _nhc_chain_propagate_single_kernel_overload = {}
@@ -1525,6 +970,7 @@ def nhc_compute_masses(
     target_temp: float,
     tau: float,
     chain_length: int,
+    masses: wp.array,
     num_systems: int = 1,
     device: str = None,
     dtype=wp.float64,
@@ -1545,6 +991,10 @@ def nhc_compute_masses(
         Time constant.
     chain_length : int
         Number of thermostats in the chain.
+    masses : wp.array
+        Chain masses output. Caller must pre-allocate.
+        Shape (chain_length,) for single system,
+        (num_systems, chain_length) for batched.
     num_systems : int, optional
         Number of systems for batched mode. Default: 1.
     device : str, optional
@@ -1577,7 +1027,6 @@ def nhc_compute_masses(
     scalar_type = dtype
 
     if is_batched:
-        masses = wp.zeros((num_systems, chain_length), dtype=dtype, device=device)
         wp.launch(
             _batch_nhc_compute_masses_kernel_overload[scalar_type],
             dim=(num_systems, chain_length),
@@ -1585,7 +1034,6 @@ def nhc_compute_masses(
             device=device,
         )
     else:
-        masses = wp.zeros(chain_length, dtype=dtype, device=device)
         wp.launch(
             _nhc_compute_masses_kernel_overload[scalar_type],
             dim=chain_length,
@@ -1605,6 +1053,10 @@ def nhc_thermostat_chain_update(
     target_temp: wp.array,
     dt: wp.array,
     ndof: wp.array,
+    ke2: wp.array,
+    total_scale: wp.array,
+    step_scale: wp.array,
+    dt_chain: wp.array,
     nloops: int = 1,
     batch_idx: wp.array = None,
     num_systems: int = 1,
@@ -1637,6 +1089,19 @@ def nhc_thermostat_chain_update(
         Time step. Shape (1,) or (num_systems,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (num_systems,).
+    ke2 : wp.array
+        Scratch array for 2*KE computation. Zeroed internally before each use.
+        Shape (1,) for single system, (num_systems,) for batched.
+    total_scale : wp.array
+        Scratch array for accumulated velocity scale factor.
+        Must be initialized to ones by caller (wp.ones).
+        Shape (1,) for single system, (num_systems,) for batched.
+    step_scale : wp.array
+        Scratch array for per-step velocity scale factor.
+        Shape (1,) for single system, (num_systems,) for batched.
+    dt_chain : wp.array
+        Scratch array for weighted time steps.
+        Shape (1,) for single system, (num_systems,) for batched.
     nloops : int, optional
         Number of Yoshida-Suzuki integration sub-steps. Default: 1.
         Use nloops=3 or 5 for higher accuracy.
@@ -1675,35 +1140,25 @@ def nhc_thermostat_chain_update(
             f"Chain length {chain_length} exceeds maximum {MAX_CHAIN_LENGTH}"
         )
 
-    # Compute 2*KE - output dtype should match chain state dtype for consistency
+    # Compute 2*KE - ke2 is zeroed internally before each use
     vec_dtype = velocities.dtype
     chain_dtype = eta.dtype
+    n_scale = num_systems if is_batched else 1
+    ke2.zero_()
     if is_batched:
-        ke2 = wp.zeros(num_systems, dtype=chain_dtype, device=device)
-        # Use RLE-based reduction for batched systems (O(M) atomics vs O(N))
-        ept = _compute_ept(num_atoms, max(device.sm_count, 1), is_vec=True)
-        dim = (num_atoms + ept - 1) // ept
         wp.launch(
-            _batch_compute_2ke_rle_kernel_overload[(vec_dtype, chain_dtype)],
-            dim=dim,
-            inputs=[velocities, masses, batch_idx, ke2, num_atoms, ept],
+            _batch_compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
+            dim=num_atoms,
+            inputs=[velocities, masses, batch_idx, ke2],
             device=device,
         )
     else:
-        ke2 = wp.zeros(1, dtype=chain_dtype, device=device)
         wp.launch(
             _compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
             dim=num_atoms,
             inputs=[velocities, masses, ke2],
             device=device,
         )
-    # Allocate total velocity scale factor - use chain state dtype for consistency
-    n_scale = num_systems if is_batched else 1
-    total_scale = wp.ones(n_scale, dtype=chain_dtype, device=device)
-    step_scale = wp.zeros(n_scale, dtype=chain_dtype, device=device)
-
-    # Create dt_chain array for weighted time steps - use chain state dtype
-    dt_chain = wp.zeros(n_scale, dtype=chain_dtype, device=device)
 
     # Run Yoshida-Suzuki sub-steps
     for w in weights:
@@ -1833,9 +1288,13 @@ def nhc_thermostat_chain_update_out(
     target_temp: wp.array,
     dt: wp.array,
     ndof: wp.array,
-    velocities_out: wp.array = None,
-    eta_out: wp.array = None,
-    eta_dot_out: wp.array = None,
+    ke2: wp.array,
+    total_scale: wp.array,
+    step_scale: wp.array,
+    dt_chain: wp.array,
+    velocities_out: wp.array,
+    eta_out: wp.array,
+    eta_dot_out: wp.array,
     nloops: int = 1,
     batch_idx: wp.array = None,
     num_systems: int = 1,
@@ -1862,12 +1321,25 @@ def nhc_thermostat_chain_update_out(
         Time step. Shape (1,) or (B,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
-    velocities_out : wp.array, optional
-        Output velocities. If None, allocated internally.
-    eta_out : wp.array, optional
-        Output eta. If None, allocated internally.
-    eta_dot_out : wp.array, optional
-        Output eta_dot. If None, allocated internally.
+    ke2 : wp.array
+        Scratch array for 2*KE computation. Zeroed internally before each use.
+        Shape (1,) for single system, (num_systems,) for batched.
+    total_scale : wp.array
+        Scratch array for accumulated velocity scale factor.
+        Must be initialized to ones by caller (wp.ones).
+        Shape (1,) for single system, (num_systems,) for batched.
+    step_scale : wp.array
+        Scratch array for per-step velocity scale factor.
+        Shape (1,) for single system, (num_systems,) for batched.
+    dt_chain : wp.array
+        Scratch array for weighted time steps.
+        Shape (1,) for single system, (num_systems,) for batched.
+    velocities_out : wp.array
+        Output velocities. Must be pre-allocated with same shape/dtype/device as velocities.
+    eta_out : wp.array
+        Output eta. Must be pre-allocated with same shape/dtype/device as eta.
+    eta_dot_out : wp.array
+        Output eta_dot. Must be pre-allocated with same shape/dtype/device as eta_dot.
     nloops : int, optional
         Number of Yoshida-Suzuki integration sub-steps. Default: 1.
     batch_idx : wp.array(dtype=wp.int32), optional
@@ -1885,15 +1357,9 @@ def nhc_thermostat_chain_update_out(
     if device is None:
         device = velocities.device
 
-    num_atoms = velocities.shape[0]
-
-    # Allocate outputs if needed
-    if velocities_out is None:
-        velocities_out = wp.zeros(num_atoms, dtype=velocities.dtype, device=device)
-    if eta_out is None:
-        eta_out = wp.zeros_like(eta)
-    if eta_dot_out is None:
-        eta_dot_out = wp.zeros_like(eta_dot)
+    validate_out_array(velocities_out, velocities, "velocities_out")
+    validate_out_array(eta_out, eta, "eta_out")
+    validate_out_array(eta_dot_out, eta_dot, "eta_dot_out")
 
     # Copy inputs to outputs
     wp.copy(velocities_out, velocities)
@@ -1910,6 +1376,10 @@ def nhc_thermostat_chain_update_out(
         target_temp,
         dt,
         ndof,
+        ke2,
+        total_scale,
+        step_scale,
+        dt_chain,
         nloops=nloops,
         batch_idx=batch_idx,
         num_systems=num_systems,
@@ -1950,40 +1420,16 @@ def nhc_velocity_half_step(
     device : str, optional
         Warp device. If None, inferred from velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
-
-    if device is None:
-        device = velocities.device
-
-    num_atoms = velocities.shape[0]
-    vec_dtype = velocities.dtype
-
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_velocity_half_step_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces, masses, atom_ptr, dt],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_velocity_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, batch_idx, dt],
-            device=device,
-        )
-    else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_velocity_half_step_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, dt],
-            device=device,
-        )
+    dispatch_family(
+        velocity_kick_families,
+        velocities,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
+        device=device,
+        inputs_single=[velocities, forces, masses, dt, velocities],
+        inputs_batch=[velocities, forces, masses, batch_idx, dt, velocities],
+        inputs_ptr=[velocities, forces, masses, atom_ptr, dt, velocities],
+    )
 
 
 def nhc_velocity_half_step_out(
@@ -1991,7 +1437,7 @@ def nhc_velocity_half_step_out(
     forces: wp.array,
     masses: wp.array,
     dt: wp.array,
-    velocities_out: wp.array = None,
+    velocities_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -2009,8 +1455,8 @@ def nhc_velocity_half_step_out(
         Atomic masses. Shape (N,).
     dt : wp.array(dtype=wp.float32 or wp.float64)
         Time step. Shape (1,) or (B,).
-    velocities_out : wp.array, optional
-        Output velocities. If None, allocated internally.
+    velocities_out : wp.array
+        Output velocities. Must be pre-allocated with same shape/dtype/device as velocities.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -2023,45 +1469,17 @@ def nhc_velocity_half_step_out(
     wp.array
         Updated velocities.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
-
-    if device is None:
-        device = velocities.device
-
-    num_atoms = velocities.shape[0]
-
-    if velocities_out is None:
-        velocities_out = wp.zeros(num_atoms, dtype=velocities.dtype, device=device)
-
-    vec_dtype = velocities.dtype
-
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_velocity_half_step_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[velocities, forces, masses, atom_ptr, dt, velocities_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_velocity_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, batch_idx, dt, velocities_out],
-            device=device,
-        )
-    else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_velocity_half_step_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[velocities, forces, masses, dt, velocities_out],
-            device=device,
-        )
-
+    validate_out_array(velocities_out, velocities, "velocities_out")
+    dispatch_family(
+        velocity_kick_families,
+        velocities,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
+        device=device,
+        inputs_single=[velocities, forces, masses, dt, velocities_out],
+        inputs_batch=[velocities, forces, masses, batch_idx, dt, velocities_out],
+        inputs_ptr=[velocities, forces, masses, atom_ptr, dt, velocities_out],
+    )
     return velocities_out
 
 
@@ -2093,47 +1511,23 @@ def nhc_position_update(
     device : str, optional
         Warp device. If None, inferred from positions.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
-
-    if device is None:
-        device = positions.device
-
-    num_atoms = positions.shape[0]
-    vec_dtype = positions.dtype
-
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_position_update_ptr_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[positions, velocities, atom_ptr, dt],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_position_update_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, batch_idx, dt],
-            device=device,
-        )
-    else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_position_update_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, dt],
-            device=device,
-        )
+    dispatch_family(
+        position_update_families,
+        positions,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
+        device=device,
+        inputs_single=[positions, velocities, dt, positions],
+        inputs_batch=[positions, velocities, batch_idx, dt, positions],
+        inputs_ptr=[positions, velocities, atom_ptr, dt, positions],
+    )
 
 
 def nhc_position_update_out(
     positions: wp.array,
     velocities: wp.array,
     dt: wp.array,
-    positions_out: wp.array = None,
+    positions_out: wp.array,
     batch_idx: wp.array = None,
     atom_ptr: wp.array = None,
     device: str = None,
@@ -2149,8 +1543,8 @@ def nhc_position_update_out(
         Atomic velocities. Shape (N,).
     dt : wp.array(dtype=wp.float32 or wp.float64)
         Time step. Shape (1,) or (B,).
-    positions_out : wp.array, optional
-        Output positions. If None, allocated internally.
+    positions_out : wp.array
+        Output positions. Must be pre-allocated with same shape/dtype/device as positions.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. For batched mode (atomic operations).
     atom_ptr : wp.array(dtype=wp.int32), optional
@@ -2163,45 +1557,17 @@ def nhc_position_update_out(
     wp.array
         Updated positions.
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
-
-    if device is None:
-        device = positions.device
-
-    num_atoms = positions.shape[0]
-
-    if positions_out is None:
-        positions_out = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-
-    vec_dtype = positions.dtype
-
-    if atom_ptr is not None:
-        # Use atom_ptr mode - launch with dim=num_systems
-        num_systems = atom_ptr.shape[0] - 1
-        wp.launch(
-            _nhc_position_update_ptr_out_kernel_overload[vec_dtype],
-            dim=num_systems,
-            inputs=[positions, velocities, atom_ptr, dt, positions_out],
-            device=device,
-        )
-    elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
-        wp.launch(
-            _batch_nhc_position_update_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, batch_idx, dt, positions_out],
-            device=device,
-        )
-    else:
-        # Single system - launch with dim=num_atoms
-        wp.launch(
-            _nhc_position_update_out_kernel_overload[vec_dtype],
-            dim=num_atoms,
-            inputs=[positions, velocities, dt, positions_out],
-            device=device,
-        )
-
+    validate_out_array(positions_out, positions, "positions_out")
+    dispatch_family(
+        position_update_families,
+        positions,
+        batch_idx=batch_idx,
+        atom_ptr=atom_ptr,
+        device=device,
+        inputs_single=[positions, velocities, dt, positions_out],
+        inputs_batch=[positions, velocities, batch_idx, dt, positions_out],
+        inputs_ptr=[positions, velocities, atom_ptr, dt, positions_out],
+    )
     return positions_out
 
 
@@ -2211,6 +1577,8 @@ def nhc_compute_chain_energy(
     eta_mass: wp.array,
     target_temp: wp.array,
     ndof: wp.array,
+    ke_chain: wp.array,
+    pe_chain: wp.array,
     batch_idx: wp.array = None,
     num_systems: int = 1,
     device: str = None,
@@ -2237,6 +1605,12 @@ def nhc_compute_chain_energy(
         Target temperature (kT). Shape (1,) or (B,).
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
+    ke_chain : wp.array
+        Output kinetic energy of the chain.
+        Shape (1,) for single system, (num_systems,) for batched.
+    pe_chain : wp.array
+        Output potential energy of the chain.
+        Shape (1,) for single system, (num_systems,) for batched.
     batch_idx : wp.array(dtype=wp.int32), optional
         Not used directly, but included for API consistency.
     num_systems : int, optional
@@ -2260,11 +1634,7 @@ def nhc_compute_chain_energy(
     else:
         chain_length = eta.shape[0]
 
-    # Allocate output arrays - use chain state dtype for consistency
-    n_out = num_systems if is_batched else 1
     chain_dtype = eta.dtype
-    ke_chain = wp.zeros(n_out, dtype=chain_dtype, device=device)
-    pe_chain = wp.zeros(n_out, dtype=chain_dtype, device=device)
 
     if is_batched:
         wp.launch(

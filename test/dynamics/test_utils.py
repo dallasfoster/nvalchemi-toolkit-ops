@@ -77,7 +77,8 @@ class TestKineticEnergy:
             device=device,
         )
 
-        ke = compute_kinetic_energy(velocities, masses, device=device)
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        ke = compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         wp.synchronize_device(device)
 
         assert ke.shape[0] == 1
@@ -104,7 +105,8 @@ class TestKineticEnergy:
         )
 
         # Call without explicit device
-        ke = compute_kinetic_energy(velocities, masses)
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        ke = compute_kinetic_energy(velocities, masses, kinetic_energy)
         wp.synchronize_device(device)
 
         assert ke.shape[0] == 1
@@ -130,7 +132,7 @@ class TestKineticEnergy:
         kinetic_energy_out = wp.zeros(1, dtype=dtype_scalar, device=device)
 
         ke = compute_kinetic_energy(
-            velocities, masses, kinetic_energy=kinetic_energy_out, device=device
+            velocities, masses, kinetic_energy_out, device=device
         )
 
         wp.synchronize_device(device)
@@ -148,7 +150,8 @@ class TestKineticEnergy:
         velocities = wp.array(vel, dtype=dtype_vec, device=device)
         masses = wp.array(mass, dtype=dtype_scalar, device=device)
 
-        ke = compute_kinetic_energy(velocities, masses, device=device)
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        ke = compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         wp.synchronize_device(device)
 
         expected_ke = 0.5 * (1.0 * 1.0 + 1.0 * 4.0)
@@ -181,9 +184,11 @@ class TestKineticEnergy:
             device=device,
         )
 
+        kinetic_energy = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
         ke = compute_kinetic_energy(
             velocities,
             masses,
+            kinetic_energy,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
@@ -224,9 +229,9 @@ class TestKineticEnergy:
         ke = compute_kinetic_energy(
             velocities,
             masses,
+            kinetic_energy_out,
             batch_idx=batch_idx,
             num_systems=num_systems,
-            kinetic_energy=kinetic_energy_out,
             device=device,
         )
 
@@ -261,8 +266,11 @@ class TestTemperatureComputation:
             device=device,
         )
 
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
+        temperature = wp.empty(1, dtype=dtype_scalar, device=device)
         temp = compute_temperature(
-            velocities, masses, num_atoms, dof=dof, device=device
+            kinetic_energy, temperature, num_atoms, dof=dof, device=device
         )
         wp.synchronize_device(device)
 
@@ -290,8 +298,11 @@ class TestTemperatureComputation:
             device=device,
         )
 
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
+        temperature = wp.empty(1, dtype=dtype_scalar, device=device)
         # Call without explicit device
-        temp = compute_temperature(velocities, masses, num_atoms, dof=dof)
+        temp = compute_temperature(kinetic_energy, temperature, num_atoms, dof=dof)
         wp.synchronize_device(device)
 
         assert temp.shape[0] == 1
@@ -316,11 +327,11 @@ class TestTemperatureComputation:
             device=device,
         )
         # Pre-compute kinetic energy
-        ke = compute_kinetic_energy(velocities, masses, device=device)
+        ke = wp.zeros(1, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(velocities, masses, ke, device=device)
 
-        temp = compute_temperature(
-            velocities, masses, num_atoms, dof=dof, kinetic_energy=ke, device=device
-        )
+        temperature = wp.empty(1, dtype=dtype_scalar, device=device)
+        temp = compute_temperature(ke, temperature, num_atoms, dof=dof, device=device)
 
         wp.synchronize_device(device)
         assert temp.shape[0] == 1
@@ -339,8 +350,11 @@ class TestTemperatureComputation:
         velocities = wp.array(vel, dtype=dtype_vec, device=device)
         masses = wp.array(mass, dtype=dtype_scalar, device=device)
 
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
+        temperature = wp.empty(1, dtype=dtype_scalar, device=device)
         temp = compute_temperature(
-            velocities, masses, num_atoms, dof=dof, device=device
+            kinetic_energy, temperature, num_atoms, dof=dof, device=device
         )
         wp.synchronize_device(device)
 
@@ -377,9 +391,19 @@ class TestTemperatureComputation:
             device=device,
         )
 
-        temp = compute_temperature(
+        kinetic_energy = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(
             velocities,
             masses,
+            kinetic_energy,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
+        temperature = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        temp = compute_temperature(
+            kinetic_energy,
+            temperature,
             atoms_per_system,
             dof=dof_per_system,
             batch_idx=batch_idx,
@@ -417,20 +441,22 @@ class TestTemperatureComputation:
             device=device,
         )
         # Pre-compute kinetic energy
-        ke = compute_kinetic_energy(
+        ke = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(
             velocities,
             masses,
+            ke,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
         )
 
+        temperature = wp.empty(num_systems, dtype=dtype_scalar, device=device)
         temp = compute_temperature(
-            velocities,
-            masses,
+            ke,
+            temperature,
             atoms_per_system,
             dof=dof_per_system,
-            kinetic_energy=ke,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
@@ -456,16 +482,26 @@ class TestVelocityInitialization:
         """Test that initialize_velocities executes without error."""
         num_atoms = 100
 
-        velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        velocities = wp.empty(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.array(
             np.ones(num_atoms, dtype=np_dtype),
             dtype=dtype_scalar,
             device=device,
         )
         temperature = wp.array([1.0], dtype=dtype_scalar, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         initialize_velocities(
-            velocities, masses, temperature, random_seed=42, device=device
+            velocities,
+            masses,
+            temperature,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            random_seed=42,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -480,16 +516,27 @@ class TestVelocityInitialization:
         """Test velocity initialization with device inferred from arrays."""
         num_atoms = 50
 
-        velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        velocities = wp.empty(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.array(
             np.ones(num_atoms, dtype=np_dtype),
             dtype=dtype_scalar,
             device=device,
         )
         temperature = wp.array([1.0], dtype=dtype_scalar, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         # Call without explicit device
-        initialize_velocities(velocities, masses, temperature, random_seed=42)
+        initialize_velocities(
+            velocities,
+            masses,
+            temperature,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            random_seed=42,
+        )
         wp.synchronize_device(device)
 
         vel_np = velocities.numpy()
@@ -509,9 +556,20 @@ class TestVelocityInitialization:
             device=device,
         )
         temperature = wp.array([1.0], dtype=dtype_scalar, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         velocities = initialize_velocities_out(
-            masses, temperature, random_seed=42, device=device
+            masses,
+            temperature,
+            velocities_out,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            random_seed=42,
+            device=device,
         )
         wp.synchronize_device(device)
 
@@ -533,13 +591,19 @@ class TestVelocityInitialization:
             device=device,
         )
         temperature = wp.array([1.0], dtype=dtype_scalar, device=device)
-        velocities_out = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         # Disable COM removal to get the same array back
         vel = initialize_velocities_out(
             masses,
             temperature,
-            velocities_out=velocities_out,
+            velocities_out,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             remove_com=False,
             device=device,
@@ -559,20 +623,33 @@ class TestVelocityInitialization:
         target_temp = 1.0
         dof = 3 * num_atoms
 
-        velocities = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
+        velocities = wp.empty(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.array(
             np.ones(num_atoms, dtype=np_dtype),
             dtype=dtype_scalar,
             device=device,
         )
         temperature = wp.array([target_temp], dtype=dtype_scalar, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         initialize_velocities(
-            velocities, masses, temperature, random_seed=42, device=device
+            velocities,
+            masses,
+            temperature,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            random_seed=42,
+            device=device,
         )
 
+        kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
+        measured_temp_arr = wp.empty(1, dtype=dtype_scalar, device=device)
         measured_temp = compute_temperature(
-            velocities, masses, num_atoms, dof=dof, device=device
+            kinetic_energy, measured_temp_arr, num_atoms, dof=dof, device=device
         )
         wp.synchronize_device(device)
 
@@ -588,7 +665,7 @@ class TestVelocityInitialization:
         atoms_per_system = 100
         total_atoms = num_systems * atoms_per_system
 
-        velocities = wp.zeros(total_atoms, dtype=dtype_vec, device=device)
+        velocities = wp.empty(total_atoms, dtype=dtype_vec, device=device)
         masses = wp.array(
             np.ones(total_atoms, dtype=np_dtype),
             dtype=dtype_scalar,
@@ -600,11 +677,17 @@ class TestVelocityInitialization:
             dtype=wp.int32,
             device=device,
         )
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
 
         initialize_velocities(
             velocities,
             masses,
             temperatures,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             batch_idx=batch_idx,
             device=device,
@@ -624,6 +707,7 @@ class TestVelocityInitialization:
     ):
         """Test non-mutating batched velocity initialization."""
         num_atoms = 40
+        num_systems = 2
 
         masses = wp.array(
             np.ones(num_atoms, dtype=np_dtype),
@@ -636,9 +720,21 @@ class TestVelocityInitialization:
             device=device,
         )
         temperature = wp.array([1.0, 1.0], dtype=dtype_scalar, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
 
         vel_out = initialize_velocities_out(
-            masses, temperature, random_seed=42, batch_idx=batch_idx, device=device
+            masses,
+            temperature,
+            velocities_out,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            random_seed=42,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -672,10 +768,17 @@ class TestVelocityInitialization:
             device=device,
         )
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         initialize_velocities(
             velocities,
             masses,
             temperatures,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             batch_idx=batch_idx,
             device=device,
@@ -721,8 +824,18 @@ class TestCOMMotionRemoval:
             dtype=dtype_scalar,
             device=device,
         )
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
-        remove_com_motion(velocities, masses, device=device)
+        remove_com_motion(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
+            device=device,
+        )
         wp.synchronize_device(device)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -743,9 +856,18 @@ class TestCOMMotionRemoval:
             dtype=dtype_scalar,
             device=device,
         )
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
 
         # Call without explicit device
-        remove_com_motion(velocities, masses)
+        remove_com_motion(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
+        )
         wp.synchronize_device(device)
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -767,8 +889,20 @@ class TestCOMMotionRemoval:
             dtype=dtype_scalar,
             device=device,
         )
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities_scratch = wp.empty(1, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
 
-        vel_out = remove_com_motion_out(velocities, masses, device=device)
+        vel_out = remove_com_motion_out(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass,
+            com_velocities_scratch,
+            velocities_out,
+            device=device,
+        )
         wp.synchronize_device(device)
 
         assert vel_out.shape[0] == num_atoms
@@ -794,7 +928,20 @@ class TestCOMMotionRemoval:
 
         vel_orig = velocities.numpy().copy()
 
-        vel_out = remove_com_motion_out(velocities, masses, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities_scratch = wp.empty(1, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
+
+        vel_out = remove_com_motion_out(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass,
+            com_velocities_scratch,
+            velocities_out,
+            device=device,
+        )
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(velocities.numpy(), vel_orig)
@@ -818,10 +965,19 @@ class TestCOMMotionRemoval:
             dtype=dtype_scalar,
             device=device,
         )
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities_scratch = wp.empty(1, dtype=dtype_vec, device=device)
         velocities_out = wp.empty_like(velocities)
 
         vel_out = remove_com_motion_out(
-            velocities, masses, velocities_out=velocities_out, device=device
+            velocities,
+            masses,
+            total_momentum,
+            total_mass,
+            com_velocities_scratch,
+            velocities_out,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -843,7 +999,18 @@ class TestCOMMotionRemoval:
         initial_com = np.sum(mass[:, np.newaxis] * vel, axis=0) / np.sum(mass)
         assert np.linalg.norm(initial_com) > 0.01
 
-        remove_com_motion(velocities, masses, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass_arr = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
+
+        remove_com_motion(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass_arr,
+            com_velocities,
+            device=device,
+        )
         wp.synchronize_device(device)
 
         vel_result = velocities.numpy()
@@ -874,10 +1041,16 @@ class TestCOMMotionRemoval:
             dtype=wp.int32,
             device=device,
         )
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
 
         remove_com_motion(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
@@ -920,10 +1093,18 @@ class TestCOMMotionRemoval:
             dtype=wp.int32,
             device=device,
         )
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities_scratch = wp.empty(num_systems, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(num_atoms, dtype=dtype_vec, device=device)
 
         vel_out = remove_com_motion_out(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities_scratch,
+            velocities_out,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
@@ -957,7 +1138,18 @@ class TestCOMMotionRemoval:
         initial_com = initial_momentum / total_mass
         assert np.linalg.norm(initial_com) > 0.01
 
-        remove_com_motion(velocities, masses, device=device)
+        total_momentum = wp.zeros(1, dtype=dtype_vec, device=device)
+        total_mass_arr = wp.zeros(1, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(1, dtype=dtype_vec, device=device)
+
+        remove_com_motion(
+            velocities,
+            masses,
+            total_momentum,
+            total_mass_arr,
+            com_velocities,
+            device=device,
+        )
         wp.synchronize_device(device)
 
         vel_result = velocities.numpy()
@@ -998,9 +1190,11 @@ class TestKineticEnergyAtomPtr:
             device=device,
         )
 
+        kinetic_energy = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
         ke = compute_kinetic_energy(
             velocities,
             masses,
+            kinetic_energy,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,
@@ -1041,18 +1235,22 @@ class TestKineticEnergyAtomPtr:
         atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
 
         # Execute with batch_idx
+        ke_batch_arr = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
         ke_batch = compute_kinetic_energy(
             velocities_batch,
             masses_batch,
+            ke_batch_arr,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
         )
 
         # Execute with atom_ptr
+        ke_ptr_arr = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
         ke_ptr = compute_kinetic_energy(
             velocities_ptr,
             masses_ptr,
+            ke_ptr_arr,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,
@@ -1093,9 +1291,19 @@ class TestTemperatureAtomPtr:
             device=device,
         )
 
-        temp = compute_temperature(
+        kinetic_energy = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(
             velocities,
             masses,
+            kinetic_energy,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        temperature = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        temp = compute_temperature(
+            kinetic_energy,
+            temperature,
             num_atoms=50,
             dof=dof_per_system,
             atom_ptr=atom_ptr,
@@ -1139,9 +1347,19 @@ class TestTemperatureAtomPtr:
         atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
 
         # Execute with batch_idx
-        temp_batch = compute_temperature(
+        ke_batch = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(
             velocities_batch,
             masses_batch,
+            ke_batch,
+            batch_idx=batch_idx,
+            num_systems=num_systems,
+            device=device,
+        )
+        temp_batch_arr = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        temp_batch = compute_temperature(
+            ke_batch,
+            temp_batch_arr,
             num_atoms=atoms_per_system,
             dof=dof_per_system,
             batch_idx=batch_idx,
@@ -1150,9 +1368,19 @@ class TestTemperatureAtomPtr:
         )
 
         # Execute with atom_ptr
-        temp_ptr = compute_temperature(
+        ke_ptr = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        compute_kinetic_energy(
             velocities_ptr,
             masses_ptr,
+            ke_ptr,
+            atom_ptr=atom_ptr,
+            num_systems=num_systems,
+            device=device,
+        )
+        temp_ptr_arr = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        temp_ptr = compute_temperature(
+            ke_ptr,
+            temp_ptr_arr,
             num_atoms=atoms_per_system,
             dof=dof_per_system,
             atom_ptr=atom_ptr,
@@ -1190,10 +1418,17 @@ class TestInitializeVelocitiesAtomPtr:
         )
         temperatures = wp.array([0.5, 1.0, 2.0], dtype=dtype_scalar, device=device)
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         initialize_velocities(
             velocities,
             masses,
             temperatures,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             atom_ptr=atom_ptr,
             device=device,
@@ -1226,9 +1461,19 @@ class TestInitializeVelocitiesAtomPtr:
         )
         temperatures = wp.array([1.0, 1.5, 0.5], dtype=dtype_scalar, device=device)
 
+        num_systems = len(atom_counts)
+        velocities_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         velocities = initialize_velocities_out(
             masses,
             temperatures,
+            velocities_out,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             atom_ptr=atom_ptr,
             device=device,
@@ -1262,10 +1507,17 @@ class TestInitializeVelocitiesAtomPtr:
         )
         temperatures = wp.array([1.0, 2.0, 1.5, 0.8], dtype=dtype_scalar, device=device)
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         initialize_velocities(
             velocities,
             masses,
             temperatures,
+            total_momentum,
+            total_mass,
+            com_velocities,
             random_seed=42,
             atom_ptr=atom_ptr,
             device=device,
@@ -1313,9 +1565,16 @@ class TestRemoveCOMMotionAtomPtr:
             device=device,
         )
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         remove_com_motion(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,
@@ -1363,9 +1622,18 @@ class TestRemoveCOMMotionAtomPtr:
 
         vel_orig = velocities.numpy().copy()
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities_scratch = wp.empty(num_systems, dtype=dtype_vec, device=device)
+        velocities_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+
         vel_out = remove_com_motion_out(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities_scratch,
+            velocities_out,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,
@@ -1419,18 +1687,32 @@ class TestRemoveCOMMotionAtomPtr:
         atom_ptr = wp.array([0, 20, 40, 60], dtype=wp.int32, device=device)
 
         # Execute with batch_idx
+        total_momentum_batch = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass_batch = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities_batch = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         remove_com_motion(
             velocities_batch,
             masses_batch,
+            total_momentum_batch,
+            total_mass_batch,
+            com_velocities_batch,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
         )
 
         # Execute with atom_ptr
+        total_momentum_ptr = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass_ptr = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities_ptr = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         remove_com_motion(
             velocities_ptr,
             masses_ptr,
+            total_momentum_ptr,
+            total_mass_ptr,
+            com_velocities_ptr,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,
@@ -1469,9 +1751,16 @@ class TestRemoveCOMMotionAtomPtr:
             device=device,
         )
 
+        total_momentum = wp.zeros(num_systems, dtype=dtype_vec, device=device)
+        total_mass = wp.zeros(num_systems, dtype=dtype_scalar, device=device)
+        com_velocities = wp.empty(num_systems, dtype=dtype_vec, device=device)
+
         remove_com_motion(
             velocities,
             masses,
+            total_momentum,
+            total_mass,
+            com_velocities,
             atom_ptr=atom_ptr,
             num_systems=num_systems,
             device=device,

@@ -20,21 +20,51 @@ import pytest
 import warp as wp
 
 from nvalchemiops.segment_ops import (
+    segment_div,
     segmented_add,
     segmented_axpby,
     segmented_axpy,
+    segmented_broadcast,
     segmented_component_sum,
+    segmented_count,
     segmented_dot,
     segmented_inner_products,
     segmented_matvec,
+    segmented_max,
     segmented_max_norm,
+    segmented_mean,
+    segmented_min,
     segmented_mul,
+    segmented_rms_norm,
     segmented_sum,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Map numpy scalar dtype to the corresponding warp scalar dtype.
+NP_TO_WP_SCALAR = {
+    np.float16: wp.float16,
+    np.float32: wp.float32,
+    np.float64: wp.float64,
+}
+
+
+def _half_atol(np_dtype):
+    """Return a suitable absolute tolerance for the given numpy dtype."""
+    return 5e-2 if np_dtype == np.float16 else 0
+
+
+def _randn(rng, shape, np_dtype):
+    """Generate random test data safe for the given dtype.
+
+    Uses ``uniform(-2, 2)`` for float16 to avoid overflow, and
+    ``standard_normal`` for wider types.
+    """
+    if np_dtype == np.float16:
+        return rng.uniform(-2, 2, size=shape).astype(np_dtype)
+    return rng.standard_normal(shape).astype(np_dtype)
 
 
 def _numpy_segmented_sum(x_np: np.ndarray, idx_np: np.ndarray, M: int) -> np.ndarray:
@@ -70,9 +100,16 @@ def _make_segments(N, M, rng):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def device():
-    return wp.get_device()
+def _available_devices():
+    devices = ["cpu"]
+    if wp.is_cuda_available():
+        devices.append("cuda:0")
+    return devices
+
+
+@pytest.fixture(scope="module", params=_available_devices())
+def device(request):
+    return request.param
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +226,27 @@ class TestScalarSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=1e-4)
 
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-4),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_remainder(self, device, wp_dtype, np_dtype, rtol):
+        """M=1 with N=8500 -- exercises tile fast path + remainder tail."""
+        N, M = 8500, 1
+        rng = np.random.default_rng(78)
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = _numpy_segmented_sum(x_np, idx_np, M)
+        x, idx, out = _make_arrays(x_np, idx_np, M, wp_dtype, device)
+
+        segmented_sum(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
     def test_empty_input(self, device):
         M = 5
         x = wp.zeros(0, dtype=wp.float32, device=device)
@@ -276,6 +334,29 @@ class TestVectorSegmentReduce:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_remainder(self, device, wp_dtype, np_dtype, rtol):
+        """M=1 with N=8500 -- tile fast path + remainder tail for vec3."""
+        N, M = 8500, 1
+        rng = np.random.default_rng(89)
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = _numpy_segmented_sum(x_np, idx_np, M)
+        x = wp.array([tuple(r) for r in x_np], dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_sum(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
 
 # ---------------------------------------------------------------------------
 # segmented_component_sum tests
@@ -301,7 +382,7 @@ class TestSegmentedComponentSum:
 
         x = _wp_vec_array(x_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
-        out_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
         out = wp.zeros(M, dtype=out_dtype, device=device)
 
         segmented_component_sum(x, idx, out)
@@ -330,12 +411,71 @@ class TestSegmentedComponentSum:
 
         x = _wp_vec_array(x_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
-        out_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
         out = wp.zeros(M, dtype=out_dtype, device=device)
 
         segmented_component_sum(x, idx, out)
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_large(self, device, wp_vec, np_dtype, rtol):
+        """M=1, N=10000 -- exercises tile fast path."""
+        N, M = 10_000, 1
+        rng = np.random.default_rng(21)
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = np.array([x_np.sum()], dtype=np_dtype)  # sum of all components
+
+        x = _wp_vec_array(x_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
+        out = wp.zeros(M, dtype=out_dtype, device=device)
+
+        segmented_component_sum(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_remainder(self, device, wp_vec, np_dtype, rtol):
+        """M=1, N=8500 -- tile fast path + remainder."""
+        N, M = 8500, 1
+        rng = np.random.default_rng(22)
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = np.array([x_np.sum()], dtype=np_dtype)
+
+        x = _wp_vec_array(x_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
+        out = wp.zeros(M, dtype=out_dtype, device=device)
+
+        segmented_component_sum(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.vec3f, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(3, dtype=wp.float32, device=device)
+
+        segmented_component_sum(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(3, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -390,12 +530,101 @@ class TestSegmentedDot:
         x = _wp_vec_array(x_np, wp_vec, device)
         y = _wp_vec_array(y_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
-        out_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
         out = wp.zeros(M, dtype=out_dtype, device=device)
 
         segmented_dot(x, y, idx, out)
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-3),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar_single_segment_large(self, device, wp_dtype, np_dtype, rtol):
+        """M=1, N=10000 scalar -- exercises tile fast path."""
+        N, M = 10_000, 1
+        rng = np.random.default_rng(32)
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = np.array([(x_np * y_np).sum()], dtype=np_dtype)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_dot(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype,rtol",
+        [
+            (wp.vec3f, np.float32, 1e-3),
+            (wp.vec3d, np.float64, 1e-12),
+        ],
+    )
+    def test_vec3_single_segment_large(self, device, wp_vec, np_dtype, rtol):
+        """M=1, N=10000 vec3 -- exercises tile fast path."""
+        N, M = 10_000, 1
+        rng = np.random.default_rng(33)
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        y_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = np.array([(x_np * y_np).sum()], dtype=np_dtype)
+
+        x = _wp_vec_array(x_np, wp_vec, device)
+        y = _wp_vec_array(y_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
+        out = wp.zeros(M, dtype=out_dtype, device=device)
+
+        segmented_dot(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-3),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_remainder(self, device, wp_dtype, np_dtype, rtol):
+        """M=1, N=8500 -- tile + remainder."""
+        N, M = 8500, 1
+        rng = np.random.default_rng(34)
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        ref = np.array([(x_np * y_np).sum()], dtype=np_dtype)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_dot(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        y = wp.zeros(0, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(3, dtype=wp.float32, device=device)
+
+        segmented_dot(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(3, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +655,7 @@ class TestSegmentedMaxNorm:
 
         x = _wp_vec_array(x_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
-        out_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
         out = wp.zeros(M, dtype=out_dtype, device=device)
 
         segmented_max_norm(x, idx, out)
@@ -476,7 +705,7 @@ class TestSegmentedMaxNorm:
 
         x = _wp_vec_array(x_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
-        out_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        out_dtype = NP_TO_WP_SCALAR[np_dtype]
         out = wp.zeros(M, dtype=out_dtype, device=device)
 
         segmented_max_norm(x, idx, out)
@@ -493,6 +722,7 @@ class TestSegmentedMul:
     @pytest.mark.parametrize(
         "wp_dtype,np_dtype,rtol",
         [
+            (wp.float16, np.float16, 5e-2),
             (wp.float32, np.float32, 1e-5),
             (wp.float64, np.float64, 1e-12),
         ],
@@ -518,6 +748,7 @@ class TestSegmentedMul:
     @pytest.mark.parametrize(
         "wp_vec,wp_scalar,np_dtype,rtol",
         [
+            (wp.vec3h, wp.float16, np.float16, 5e-2),
             (wp.vec3f, wp.float32, np.float32, 1e-5),
             (wp.vec3d, wp.float64, np.float64, 1e-12),
         ],
@@ -541,6 +772,16 @@ class TestSegmentedMul:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
 
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        y = wp.zeros(3, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(0, dtype=wp.float32, device=device)
+
+        segmented_mul(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(0, dtype=np.float32))
+
 
 # ---------------------------------------------------------------------------
 # segmented_add tests
@@ -551,6 +792,7 @@ class TestSegmentedAdd:
     @pytest.mark.parametrize(
         "wp_dtype,np_dtype,rtol",
         [
+            (wp.float16, np.float16, 5e-2),
             (wp.float32, np.float32, 1e-5),
             (wp.float64, np.float64, 1e-12),
         ],
@@ -576,6 +818,7 @@ class TestSegmentedAdd:
     @pytest.mark.parametrize(
         "wp_vec,np_dtype,rtol",
         [
+            (wp.vec3h, np.float16, 5e-2),
             (wp.vec3f, np.float32, 1e-5),
             (wp.vec3d, np.float64, 1e-12),
         ],
@@ -602,6 +845,7 @@ class TestSegmentedAdd:
     @pytest.mark.parametrize(
         "wp_vec,np_dtype,rtol",
         [
+            (wp.vec3h, np.float16, 5e-2),
             (wp.vec3f, np.float32, 1e-5),
             (wp.vec3d, np.float64, 1e-12),
         ],
@@ -617,7 +861,7 @@ class TestSegmentedAdd:
         ref = x_np + y_np[idx_np, None]
 
         x = _wp_vec_array(x_np, wp_vec, device)
-        scalar_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        scalar_dtype = NP_TO_WP_SCALAR[np_dtype]
         y = wp.array(y_np, dtype=scalar_dtype, device=device)
         idx = wp.array(idx_np, device=device)
         out = wp.zeros(N, dtype=wp_vec, device=device)
@@ -629,6 +873,7 @@ class TestSegmentedAdd:
     @pytest.mark.parametrize(
         "wp_vec,np_dtype,rtol",
         [
+            (wp.vec3h, np.float16, 5e-2),
             (wp.vec3f, np.float32, 1e-5),
             (wp.vec3d, np.float64, 1e-12),
         ],
@@ -643,7 +888,7 @@ class TestSegmentedAdd:
 
         ref = x_np[:, None] + y_np[idx_np]
 
-        scalar_dtype = wp.float32 if np_dtype == np.float32 else wp.float64
+        scalar_dtype = NP_TO_WP_SCALAR[np_dtype]
         x = wp.array(x_np, dtype=scalar_dtype, device=device)
         y = _wp_vec_array(y_np, wp_vec, device)
         idx = wp.array(idx_np, device=device)
@@ -652,6 +897,16 @@ class TestSegmentedAdd:
         segmented_add(x, y, idx, out)
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        y = wp.zeros(3, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(0, dtype=wp.float32, device=device)
+
+        segmented_add(x, y, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(0, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +918,7 @@ class TestSegmentedMatvec:
     @pytest.mark.parametrize(
         "wp_vec,wp_mat,np_dtype,rtol",
         [
+            (wp.vec3h, wp.mat33h, np.float16, 5e-2),
             (wp.vec3f, wp.mat33f, np.float32, 1e-4),
             (wp.vec3d, wp.mat33d, np.float64, 1e-12),
         ],
@@ -671,8 +927,8 @@ class TestSegmentedMatvec:
         N, M = 500, 5
         rng = np.random.default_rng(70)
         idx_np = _make_segments(N, M, rng)
-        v_np = rng.standard_normal((N, 3)).astype(np_dtype)
-        m_np = rng.standard_normal((M, 3, 3)).astype(np_dtype)
+        v_np = _randn(rng, (N, 3), np_dtype)
+        m_np = _randn(rng, (M, 3, 3), np_dtype)
 
         # Reference: M^T @ v
         ref = np.zeros((N, 3), dtype=np_dtype)
@@ -687,11 +943,14 @@ class TestSegmentedMatvec:
 
         segmented_matvec(v, m, idx, out)
         wp.synchronize()
-        np.testing.assert_allclose(out.numpy(), ref, rtol=rtol)
+        np.testing.assert_allclose(
+            out.numpy(), ref, rtol=rtol, atol=_half_atol(np_dtype)
+        )
 
     @pytest.mark.parametrize(
         "wp_vec,wp_mat,np_dtype,rtol",
         [
+            (wp.vec3h, wp.mat33h, np.float16, 5e-2),
             (wp.vec3f, wp.mat33f, np.float32, 1e-4),
             (wp.vec3d, wp.mat33d, np.float64, 1e-12),
         ],
@@ -714,6 +973,16 @@ class TestSegmentedMatvec:
         wp.synchronize()
         np.testing.assert_allclose(out.numpy(), v_np, rtol=rtol)
 
+    def test_empty_input(self, device):
+        v = wp.zeros(0, dtype=wp.vec3f, device=device)
+        m = wp.zeros(3, dtype=wp.mat33f, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(0, dtype=wp.vec3f, device=device)
+
+        segmented_matvec(v, m, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy().shape, (0, 3))
+
 
 # ---------------------------------------------------------------------------
 # segmented_axpy tests
@@ -726,16 +995,17 @@ class TestSegmentedAxpy:
     @pytest.mark.parametrize(
         "wp_vec,wp_scalar,np_dtype,rtol",
         [
+            (wp.vec3h, wp.float16, np.float16, 5e-2),
             (wp.vec3f, wp.float32, np.float32, 1e-5),
             (wp.vec3d, wp.float64, np.float64, 1e-12),
         ],
     )
-    def test_basic(self, device, wp_vec, wp_scalar, np_dtype, rtol):
+    def test_vec(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         rng = np.random.default_rng(0)
         N, M = 100, 4
-        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
-        y_np = rng.standard_normal((N, 3)).astype(np_dtype)
-        a_np = rng.standard_normal(M).astype(np_dtype)
+        x_np = _randn(rng, (N, 3), np_dtype)
+        y_np = _randn(rng, (N, 3), np_dtype)
+        a_np = _randn(rng, M, np_dtype)
         idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
 
         x = wp.array(x_np, dtype=wp_vec, device=device)
@@ -748,7 +1018,46 @@ class TestSegmentedAxpy:
 
         expected = y_np + x_np * a_np[idx_np, None]
         result = y.numpy()
+        np.testing.assert_allclose(
+            result, expected, rtol=rtol, atol=_half_atol(np_dtype)
+        )
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-4),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar(self, device, wp_dtype, np_dtype, rtol):
+        rng = np.random.default_rng(4)
+        N, M = 100, 4
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        a_np = rng.standard_normal(M).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np.copy(), dtype=wp_dtype, device=device)
+        a = wp.array(a_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, dtype=wp.int32, device=device)
+
+        segmented_axpy(y, x, a, idx)
+        wp.synchronize()
+
+        expected = y_np + x_np * a_np[idx_np]
+        result = y.numpy()
         np.testing.assert_allclose(result, expected, rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.vec3f, device=device)
+        y = wp.zeros(0, dtype=wp.vec3f, device=device)
+        a = wp.zeros(3, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+
+        segmented_axpy(y, x, a, idx)
+        wp.synchronize()
+        np.testing.assert_array_equal(y.numpy().shape, (0, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -796,35 +1105,146 @@ class TestSegmentedInnerProducts:
         np.testing.assert_allclose(out_xx.numpy(), ref_xx, rtol=rtol)
         np.testing.assert_allclose(out_yy.numpy(), ref_yy, rtol=rtol)
 
-    def test_scalar(self, device):
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-4),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar(self, device, wp_dtype, np_dtype, rtol):
         rng = np.random.default_rng(2)
         N, M = 150, 5
-        x_np = rng.standard_normal(N).astype(np.float32)
-        y_np = rng.standard_normal(N).astype(np.float32)
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
         idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
 
-        x = wp.array(x_np, dtype=wp.float32, device=device)
-        y = wp.array(y_np, dtype=wp.float32, device=device)
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
         idx = wp.array(idx_np, dtype=wp.int32, device=device)
-        out_xy = wp.zeros(M, dtype=wp.float32, device=device)
-        out_xx = wp.zeros(M, dtype=wp.float32, device=device)
-        out_yy = wp.zeros(M, dtype=wp.float32, device=device)
+        out_xy = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_xx = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_yy = wp.zeros(M, dtype=wp_dtype, device=device)
 
         segmented_inner_products(x, y, idx, out_xy, out_xx, out_yy)
         wp.synchronize()
 
-        ref_xy = np.zeros(M, dtype=np.float32)
-        ref_xx = np.zeros(M, dtype=np.float32)
-        ref_yy = np.zeros(M, dtype=np.float32)
+        ref_xy = np.zeros(M, dtype=np_dtype)
+        ref_xx = np.zeros(M, dtype=np_dtype)
+        ref_yy = np.zeros(M, dtype=np_dtype)
         for i in range(N):
             s = idx_np[i]
             ref_xy[s] += x_np[i] * y_np[i]
             ref_xx[s] += x_np[i] * x_np[i]
             ref_yy[s] += y_np[i] * y_np[i]
 
-        np.testing.assert_allclose(out_xy.numpy(), ref_xy, rtol=1e-4)
-        np.testing.assert_allclose(out_xx.numpy(), ref_xx, rtol=1e-4)
-        np.testing.assert_allclose(out_yy.numpy(), ref_yy, rtol=1e-4)
+        np.testing.assert_allclose(out_xy.numpy(), ref_xy, rtol=rtol)
+        np.testing.assert_allclose(out_xx.numpy(), ref_xx, rtol=rtol)
+        np.testing.assert_allclose(out_yy.numpy(), ref_yy, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-3),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar_single_segment_large(self, device, wp_dtype, np_dtype, rtol):
+        """M=1, N=10000 scalar -- exercises tile fast path."""
+        rng = np.random.default_rng(5)
+        N, M = 10_000, 1
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, dtype=wp.int32, device=device)
+        out_xy = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_xx = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_yy = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_inner_products(x, y, idx, out_xy, out_xx, out_yy)
+        wp.synchronize()
+
+        np.testing.assert_allclose(out_xy.numpy(), [(x_np * y_np).sum()], rtol=rtol)
+        np.testing.assert_allclose(out_xx.numpy(), [(x_np * x_np).sum()], rtol=rtol)
+        np.testing.assert_allclose(out_yy.numpy(), [(y_np * y_np).sum()], rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-3),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_vec_single_segment_large(self, device, wp_vec, wp_scalar, np_dtype, rtol):
+        """M=1, N=10000 vec3 -- exercises tile fast path."""
+        rng = np.random.default_rng(6)
+        N, M = 10_000, 1
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        y_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        x = wp.array(x_np, dtype=wp_vec, device=device)
+        y = wp.array(y_np, dtype=wp_vec, device=device)
+        idx = wp.array(idx_np, dtype=wp.int32, device=device)
+        out_xy = wp.zeros(M, dtype=wp_scalar, device=device)
+        out_xx = wp.zeros(M, dtype=wp_scalar, device=device)
+        out_yy = wp.zeros(M, dtype=wp_scalar, device=device)
+
+        segmented_inner_products(x, y, idx, out_xy, out_xx, out_yy)
+        wp.synchronize()
+
+        ref_xy = (x_np * y_np).sum()
+        ref_xx = (x_np * x_np).sum()
+        ref_yy = (y_np * y_np).sum()
+        np.testing.assert_allclose(out_xy.numpy(), [ref_xy], rtol=rtol)
+        np.testing.assert_allclose(out_xx.numpy(), [ref_xx], rtol=rtol)
+        np.testing.assert_allclose(out_yy.numpy(), [ref_yy], rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-3),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_single_segment_remainder(self, device, wp_dtype, np_dtype, rtol):
+        """M=1, N=8500 -- tile + remainder."""
+        rng = np.random.default_rng(7)
+        N, M = 8500, 1
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, dtype=wp.int32, device=device)
+        out_xy = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_xx = wp.zeros(M, dtype=wp_dtype, device=device)
+        out_yy = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_inner_products(x, y, idx, out_xy, out_xx, out_yy)
+        wp.synchronize()
+
+        np.testing.assert_allclose(out_xy.numpy(), [(x_np * y_np).sum()], rtol=rtol)
+        np.testing.assert_allclose(out_xx.numpy(), [(x_np * x_np).sum()], rtol=rtol)
+        np.testing.assert_allclose(out_yy.numpy(), [(y_np * y_np).sum()], rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        y = wp.zeros(0, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out_xy = wp.zeros(3, dtype=wp.float32, device=device)
+        out_xx = wp.zeros(3, dtype=wp.float32, device=device)
+        out_yy = wp.zeros(3, dtype=wp.float32, device=device)
+
+        segmented_inner_products(x, y, idx, out_xy, out_xx, out_yy)
+        wp.synchronize()
+        np.testing.assert_array_equal(out_xy.numpy(), np.zeros(3, dtype=np.float32))
+        np.testing.assert_array_equal(out_xx.numpy(), np.zeros(3, dtype=np.float32))
+        np.testing.assert_array_equal(out_yy.numpy(), np.zeros(3, dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -838,17 +1258,18 @@ class TestSegmentedAxpby:
     @pytest.mark.parametrize(
         "wp_vec,wp_scalar,np_dtype,rtol",
         [
+            (wp.vec3h, wp.float16, np.float16, 5e-2),
             (wp.vec3f, wp.float32, np.float32, 1e-5),
             (wp.vec3d, wp.float64, np.float64, 1e-12),
         ],
     )
-    def test_basic(self, device, wp_vec, wp_scalar, np_dtype, rtol):
+    def test_vec(self, device, wp_vec, wp_scalar, np_dtype, rtol):
         rng = np.random.default_rng(3)
         N, M = 120, 4
-        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
-        y_np = rng.standard_normal((N, 3)).astype(np_dtype)
-        a_np = rng.standard_normal(M).astype(np_dtype)
-        b_np = rng.standard_normal(M).astype(np_dtype)
+        x_np = _randn(rng, (N, 3), np_dtype)
+        y_np = _randn(rng, (N, 3), np_dtype)
+        a_np = _randn(rng, M, np_dtype)
+        b_np = _randn(rng, M, np_dtype)
         idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
 
         x = wp.array(x_np, dtype=wp_vec, device=device)
@@ -866,4 +1287,524 @@ class TestSegmentedAxpby:
             out.numpy(),
             expected,
             rtol=rtol,
+            atol=_half_atol(np_dtype),
         )
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar(self, device, wp_dtype, np_dtype, rtol):
+        rng = np.random.default_rng(8)
+        N, M = 120, 4
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        y_np = rng.standard_normal(N).astype(np_dtype)
+        a_np = rng.standard_normal(M).astype(np_dtype)
+        b_np = rng.standard_normal(M).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        y = wp.array(y_np, dtype=wp_dtype, device=device)
+        a = wp.array(a_np, dtype=wp_dtype, device=device)
+        b = wp.array(b_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, dtype=wp.int32, device=device)
+        out = wp.zeros(N, dtype=wp_dtype, device=device)
+
+        segmented_axpby(out, a, x, b, y, idx)
+        wp.synchronize()
+
+        expected = a_np[idx_np] * x_np + b_np[idx_np] * y_np
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    def test_empty_input(self, device):
+        x = wp.zeros(0, dtype=wp.vec3f, device=device)
+        y = wp.zeros(0, dtype=wp.vec3f, device=device)
+        a = wp.zeros(3, dtype=wp.float32, device=device)
+        b = wp.zeros(3, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(0, dtype=wp.vec3f, device=device)
+
+        segmented_axpby(out, a, x, b, y, idx)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy().shape, (0, 3))
+
+
+# ---------------------------------------------------------------------------
+# segmented_max tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedMax:
+    """Tests for segmented_max: scalar max per segment."""
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-6),
+            (wp.float64, np.float64, 1e-14),
+        ],
+    )
+    def test_basic(self, device, wp_dtype, np_dtype, rtol):
+        rng = np.random.default_rng(70)
+        N, M = 200, 5
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+
+        # Initialize to -inf
+        neg_inf = np.finfo(np_dtype).min
+        out = wp.full(M, value=wp_dtype(neg_inf), dtype=wp_dtype, device=device)
+
+        segmented_max(x, idx, out)
+        wp.synchronize()
+
+        expected = np.full(M, neg_inf, dtype=np_dtype)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].max()
+
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    def test_single_segment(self, device):
+        """M=1 fast path."""
+        rng = np.random.default_rng(72)
+        N, M = 500, 1
+        x_np = rng.standard_normal(N).astype(np.float32)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        x = wp.array(x_np, dtype=wp.float32, device=device)
+        idx = wp.array(idx_np, device=device)
+        neg_inf = np.finfo(np.float32).min
+        out = wp.full(M, value=wp.float32(neg_inf), dtype=wp.float32, device=device)
+
+        segmented_max(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), [x_np.max()], rtol=1e-6)
+
+    def test_skewed_segments(self, device):
+        rng = np.random.default_rng(73)
+        lengths = [200, 1, 3, 100, 50]
+        M = len(lengths)
+        idx_np = np.concatenate(
+            [np.full(length, s, dtype=np.int32) for s, length in enumerate(lengths)]
+        )
+        N = len(idx_np)
+        x_np = rng.standard_normal(N).astype(np.float32)
+
+        x = wp.array(x_np, dtype=wp.float32, device=device)
+        idx = wp.array(idx_np, device=device)
+        neg_inf = np.finfo(np.float32).min
+        out = wp.full(M, value=wp.float32(neg_inf), dtype=wp.float32, device=device)
+
+        segmented_max(x, idx, out)
+        wp.synchronize()
+
+        expected = np.full(M, neg_inf, dtype=np.float32)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].max()
+        np.testing.assert_allclose(out.numpy(), expected, rtol=1e-6)
+
+    def test_empty_input(self, device):
+        M = 3
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        out = wp.zeros(M, dtype=wp.float32, device=device)
+
+        segmented_max(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segmented_min tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedMin:
+    """Tests for segmented_min: scalar min per segment."""
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-6),
+            (wp.float64, np.float64, 1e-14),
+        ],
+    )
+    def test_basic(self, device, wp_dtype, np_dtype, rtol):
+        rng = np.random.default_rng(71)
+        N, M = 200, 5
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+
+        # Initialize to +inf
+        pos_inf = np.finfo(np_dtype).max
+        out = wp.full(M, value=wp_dtype(pos_inf), dtype=wp_dtype, device=device)
+
+        segmented_min(x, idx, out)
+        wp.synchronize()
+
+        expected = np.full(M, pos_inf, dtype=np_dtype)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].min()
+
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    def test_single_segment(self, device):
+        """M=1 fast path."""
+        rng = np.random.default_rng(74)
+        N, M = 500, 1
+        x_np = rng.standard_normal(N).astype(np.float32)
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        x = wp.array(x_np, dtype=wp.float32, device=device)
+        idx = wp.array(idx_np, device=device)
+        pos_inf = np.finfo(np.float32).max
+        out = wp.full(M, value=wp.float32(pos_inf), dtype=wp.float32, device=device)
+
+        segmented_min(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_allclose(out.numpy(), [x_np.min()], rtol=1e-6)
+
+    def test_skewed_segments(self, device):
+        rng = np.random.default_rng(75)
+        lengths = [200, 1, 3, 100, 50]
+        M = len(lengths)
+        idx_np = np.concatenate(
+            [np.full(length, s, dtype=np.int32) for s, length in enumerate(lengths)]
+        )
+        N = len(idx_np)
+        x_np = rng.standard_normal(N).astype(np.float32)
+
+        x = wp.array(x_np, dtype=wp.float32, device=device)
+        idx = wp.array(idx_np, device=device)
+        pos_inf = np.finfo(np.float32).max
+        out = wp.full(M, value=wp.float32(pos_inf), dtype=wp.float32, device=device)
+
+        segmented_min(x, idx, out)
+        wp.synchronize()
+
+        expected = np.full(M, pos_inf, dtype=np.float32)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].min()
+        np.testing.assert_allclose(out.numpy(), expected, rtol=1e-6)
+
+    def test_empty_input(self, device):
+        M = 3
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        out = wp.zeros(M, dtype=wp.float32, device=device)
+
+        segmented_min(x, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segmented_broadcast tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedBroadcast:
+    """Tests for segmented_broadcast: out[i] = values[idx[i]]."""
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype",
+        [
+            (wp.float16, np.float16),
+            (wp.float32, np.float32),
+            (wp.float64, np.float64),
+        ],
+    )
+    def test_scalar(self, device, wp_dtype, np_dtype):
+        rng = np.random.default_rng(72)
+        N, M = 100, 4
+        values_np = rng.standard_normal(M).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        values = wp.array(values_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(N, dtype=wp_dtype, device=device)
+
+        segmented_broadcast(values, idx, out)
+        wp.synchronize()
+
+        expected = values_np[idx_np]
+        np.testing.assert_allclose(out.numpy(), expected)
+
+    @pytest.mark.parametrize(
+        "wp_vec,np_dtype",
+        [
+            (wp.vec3h, np.float16),
+            (wp.vec3f, np.float32),
+            (wp.vec3d, np.float64),
+        ],
+    )
+    def test_vector(self, device, wp_vec, np_dtype):
+        rng = np.random.default_rng(73)
+        N, M = 100, 4
+        values_np = rng.standard_normal((M, 3)).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        values = _wp_vec_array(values_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(N, dtype=wp_vec, device=device)
+
+        segmented_broadcast(values, idx, out)
+        wp.synchronize()
+
+        expected = values_np[idx_np]
+        np.testing.assert_allclose(out.numpy(), expected)
+
+    def test_empty_input(self, device):
+        values = wp.zeros(3, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(0, dtype=wp.float32, device=device)
+
+        segmented_broadcast(values, idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(0, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segment_div tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentDiv:
+    """Tests for segment_div: element-wise divide with zero guard."""
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,atol",
+        [
+            (wp.float16, np.float16, 5e-2),
+            (wp.float32, np.float32, 0),
+            (wp.float64, np.float64, 0),
+        ],
+    )
+    def test_basic(self, device, wp_dtype, np_dtype, atol):
+        num_np = np.array([10.0, 20.0, 30.0, 40.0], dtype=np_dtype)
+        denom_np = np.array([2, 5, 0, 4], dtype=np.int32)
+
+        num = wp.array(num_np, dtype=wp_dtype, device=device)
+        denom = wp.array(denom_np, device=device)
+        result = wp.zeros(4, dtype=wp_dtype, device=device)
+
+        segment_div(num, denom, result)
+        wp.synchronize()
+
+        expected = np.array([5.0, 4.0, 0.0, 10.0], dtype=np_dtype)
+        np.testing.assert_allclose(result.numpy(), expected, atol=atol)
+
+    def test_empty_input(self, device):
+        num = wp.zeros(0, dtype=wp.float32, device=device)
+        denom = wp.zeros(0, dtype=wp.int32, device=device)
+        result = wp.zeros(0, dtype=wp.float32, device=device)
+
+        segment_div(num, denom, result)
+        wp.synchronize()
+        np.testing.assert_array_equal(result.numpy(), np.zeros(0, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segmented_mean tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedMean:
+    """Tests for segmented_mean: mean per segment."""
+
+    @pytest.mark.parametrize(
+        "wp_dtype,np_dtype,rtol",
+        [
+            (wp.float32, np.float32, 1e-5),
+            (wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_scalar(self, device, wp_dtype, np_dtype, rtol):
+        rng = np.random.default_rng(74)
+        N, M = 200, 5
+        x_np = rng.standard_normal(N).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = wp.array(x_np, dtype=wp_dtype, device=device)
+        idx = wp.array(idx_np, device=device)
+        sums = wp.zeros(M, dtype=wp_dtype, device=device)
+        counts = wp.zeros(M, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp_dtype, device=device)
+
+        segmented_mean(x, idx, sums, counts, out)
+        wp.synchronize()
+
+        expected = np.zeros(M, dtype=np_dtype)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].mean()
+
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-5),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_vector(self, device, wp_vec, wp_scalar, np_dtype, rtol):
+        rng = np.random.default_rng(75)
+        N, M = 200, 5
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = _wp_vec_array(x_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        sums = wp.zeros(M, dtype=wp_vec, device=device)
+        counts = wp.zeros(M, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp_vec, device=device)
+
+        segmented_mean(x, idx, sums, counts, out)
+        wp.synchronize()
+
+        expected = np.zeros((M, 3), dtype=np_dtype)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                expected[s] = x_np[mask].mean(axis=0)
+
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    def test_empty_input(self, device):
+        M = 3
+        x = wp.zeros(0, dtype=wp.float32, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        sums = wp.zeros(M, dtype=wp.float32, device=device)
+        counts = wp.zeros(M, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp.float32, device=device)
+
+        segmented_mean(x, idx, sums, counts, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segmented_rms_norm tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedRmsNorm:
+    """Tests for segmented_rms_norm: sqrt(mean(|v|^2)) per segment."""
+
+    @pytest.mark.parametrize(
+        "wp_vec,wp_scalar,np_dtype,rtol",
+        [
+            (wp.vec3f, wp.float32, np.float32, 1e-5),
+            (wp.vec3d, wp.float64, np.float64, 1e-12),
+        ],
+    )
+    def test_basic(self, device, wp_vec, wp_scalar, np_dtype, rtol):
+        rng = np.random.default_rng(76)
+        N, M = 200, 5
+        x_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        x = _wp_vec_array(x_np, wp_vec, device)
+        idx = wp.array(idx_np, device=device)
+        sum_sq = wp.zeros(M, dtype=wp_scalar, device=device)
+        counts = wp.zeros(M, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp_scalar, device=device)
+
+        segmented_rms_norm(x, idx, sum_sq, counts, out)
+        wp.synchronize()
+
+        expected = np.zeros(M, dtype=np_dtype)
+        for s in range(M):
+            mask = idx_np == s
+            if mask.any():
+                norms_sq = (x_np[mask] ** 2).sum(axis=1)
+                expected[s] = np.sqrt(norms_sq.mean())
+
+        np.testing.assert_allclose(out.numpy(), expected, rtol=rtol)
+
+    def test_empty_input(self, device):
+        M = 3
+        x = wp.zeros(0, dtype=wp.vec3f, device=device)
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        sum_sq = wp.zeros(M, dtype=wp.float32, device=device)
+        counts = wp.zeros(M, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp.float32, device=device)
+
+        segmented_rms_norm(x, idx, sum_sq, counts, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# segmented_count tests
+# ---------------------------------------------------------------------------
+
+
+class TestSegmentedCount:
+    """Tests for segmented_count: count elements per segment."""
+
+    def test_basic(self, device):
+        idx_np = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2], dtype=np.int32)
+        M = 3
+
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp.int32, device=device)
+
+        segmented_count(idx, out)
+        wp.synchronize()
+
+        expected = np.array([3, 2, 4], dtype=np.int32)
+        np.testing.assert_array_equal(out.numpy(), expected)
+
+    def test_many_segments(self, device):
+        rng = np.random.default_rng(77)
+        N, M = 500, 20
+        idx_np = np.sort(rng.integers(0, M, N)).astype(np.int32)
+
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp.int32, device=device)
+
+        segmented_count(idx, out)
+        wp.synchronize()
+
+        expected = np.bincount(idx_np, minlength=M).astype(np.int32)
+        np.testing.assert_array_equal(out.numpy(), expected)
+
+    def test_single_segment(self, device):
+        """M=1 fast path."""
+        N, M = 500, 1
+        idx_np = np.zeros(N, dtype=np.int32)
+
+        idx = wp.array(idx_np, device=device)
+        out = wp.zeros(M, dtype=wp.int32, device=device)
+
+        segmented_count(idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), [N])
+
+    def test_empty_input(self, device):
+        M = 3
+        idx = wp.zeros(0, dtype=wp.int32, device=device)
+        out = wp.zeros(M, dtype=wp.int32, device=device)
+
+        segmented_count(idx, out)
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.int32))

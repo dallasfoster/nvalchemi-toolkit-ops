@@ -36,8 +36,9 @@ Key concepts:
 - Position remapping: Maintain fractional coordinates when cell changes
 
 All kernels are dtype-agnostic and support both float32 and float64 cell matrices.
-Functions that require cell_inv accept it as an optional parameter to avoid
-redundant inverse computations in MD loops.
+Functions that require cell_inv accept it as a required parameter; callers
+must pre-compute via ``compute_cell_inverse`` to avoid redundant inverse
+computations in MD loops.
 """
 
 from __future__ import annotations
@@ -657,7 +658,7 @@ for t, v, m in zip(_T, _V, _M):
 
 def compute_cell_volume(
     cells: wp.array,
-    volumes: wp.array = None,
+    volumes: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -668,8 +669,8 @@ def compute_cell_volume(
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,) where B is number of systems.
         Even single systems use shape (1,).
-    volumes : wp.array, optional
-        Output array for volumes. Shape (B,). If None, allocated.
+    volumes : wp.array
+        Output array for volumes. Shape (B,). Caller must pre-allocate.
     device : str, optional
         Warp device. If None, inferred from cells.
 
@@ -682,18 +683,6 @@ def compute_cell_volume(
         device = cells.device
 
     num_systems = cells.shape[0]
-
-    # Determine scalar dtype from matrix dtype
-    if cells.dtype == wp.mat33f:
-        scalar_dtype = wp.float32
-    elif cells.dtype == wp.mat33d:
-        scalar_dtype = wp.float64
-    else:
-        # Fallback
-        scalar_dtype = wp.float64
-
-    if volumes is None:
-        volumes = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
 
     mat_dtype = cells.dtype
     wp.launch(
@@ -708,7 +697,7 @@ def compute_cell_volume(
 
 def compute_cell_inverse(
     cells: wp.array,
-    cells_inv: wp.array = None,
+    cells_inv: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -718,8 +707,8 @@ def compute_cell_inverse(
     ----------
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-    cells_inv : wp.array, optional
-        Output array for inverses. Shape (B,). If None, allocated.
+    cells_inv : wp.array
+        Output array for inverses. Shape (B,). Caller must pre-allocate.
     device : str, optional
         Warp device. If None, inferred from cells.
 
@@ -732,9 +721,6 @@ def compute_cell_inverse(
         device = cells.device
 
     num_systems = cells.shape[0]
-
-    if cells_inv is None:
-        cells_inv = wp.zeros(num_systems, dtype=cells.dtype, device=device)
 
     mat_dtype = cells.dtype
     wp.launch(
@@ -749,9 +735,8 @@ def compute_cell_inverse(
 
 def compute_strain_tensor(
     cells: wp.array,
-    cells_ref: wp.array = None,
-    cells_ref_inv: wp.array = None,
-    strains: wp.array = None,
+    cells_ref_inv: wp.array,
+    strains: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -764,14 +749,11 @@ def compute_strain_tensor(
     ----------
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Current cell matrices. Shape (B,).
-    cells_ref : wp.array
-        Reference cell matrices. Shape (B,).
-        Optional, required if cells_ref_inv is not provided.
-    cells_ref_inv : wp.array, optional
-        Pre-computed inverse of cells_ref. If None, computed internally.
-        Optional, required if cells_ref is not provided.
-    strains : wp.array, optional
-        Output strain tensors. Shape (B,). If None, allocated.
+    cells_ref_inv : wp.array
+        Pre-computed inverse of reference cells. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
+    strains : wp.array
+        Output strain tensors. Shape (B,). Caller must pre-allocate.
     device : str, optional
         Warp device. If None, inferred from cells.
 
@@ -784,15 +766,6 @@ def compute_strain_tensor(
         device = cells.device
 
     num_systems = cells.shape[0]
-
-    if strains is None:
-        strains = wp.zeros(num_systems, dtype=cells.dtype, device=device)
-
-    # Compute reference inverse if not provided
-    if cells_ref_inv is None:
-        if cells_ref is None:
-            raise ValueError("Either cells_ref or cells_ref_inv must be provided")
-        cells_ref_inv = compute_cell_inverse(cells_ref, device=device)
 
     mat_dtype = cells.dtype
     wp.launch(
@@ -808,7 +781,7 @@ def compute_strain_tensor(
 def apply_strain_to_cell(
     cells: wp.array,
     strains: wp.array,
-    cells_out: wp.array = None,
+    cells_out: wp.array,
     device: str = None,
 ) -> wp.array:
     """
@@ -820,8 +793,8 @@ def apply_strain_to_cell(
         Current cell matrices. Shape (B,).
     strains : wp.array
         Strain tensors to apply. Shape (B,).
-    cells_out : wp.array, optional
-        Output cell matrices. Shape (B,). If None, allocated internally.
+    cells_out : wp.array
+        Output cell matrices. Shape (B,). Caller must pre-allocate.
     device : str, optional
         Warp device. If None, inferred from cells.
 
@@ -834,9 +807,6 @@ def apply_strain_to_cell(
         device = cells.device
 
     num_systems = cells.shape[0]
-
-    if cells_out is None:
-        cells_out = wp.zeros(num_systems, dtype=cells.dtype, device=device)
 
     mat_dtype = cells.dtype
     wp.launch(
@@ -852,9 +822,8 @@ def apply_strain_to_cell(
 def scale_positions_with_cell(
     positions: wp.array,
     cells_new: wp.array,
+    cells_old_inv: wp.array,
     batch_idx: wp.array = None,
-    cells_old: wp.array = None,
-    cells_old_inv: wp.array = None,
     device: str = None,
 ) -> None:
     """
@@ -868,13 +837,11 @@ def scale_positions_with_cell(
         Atomic positions. Shape (N,). MODIFIED in-place.
     cells_new : wp.array
         New cell matrices. Shape (B,).
+    cells_old_inv : wp.array
+        Pre-computed inverse of old cell matrices. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Shape (N,). If None, assumes single system.
-    cells_old : wp.array(dtype=wp.mat33f or wp.mat33d), optional
-        Old cell matrices. Shape (B,).
-        Optional, required if cells_old_inv is not provided.
-    cells_old_inv : wp.array, optional
-        Pre-computed inverse of cells_old. If None, computed internally.
     device : str, optional
         Warp device. If None, inferred from positions.
     """
@@ -882,11 +849,6 @@ def scale_positions_with_cell(
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if cells_old_inv is None:
-        if cells_old is None:
-            raise ValueError("Either cells_old or cells_old_inv must be provided")
-        cells_old_inv = compute_cell_inverse(cells_old, device=device)
 
     vec_dtype = positions.dtype
     if batch_idx is None:
@@ -910,10 +872,9 @@ def scale_positions_with_cell(
 def scale_positions_with_cell_out(
     positions: wp.array,
     cells_new: wp.array,
-    positions_out: wp.array = None,
+    cells_old_inv: wp.array,
+    positions_out: wp.array,
     batch_idx: wp.array = None,
-    cells_old: wp.array = None,
-    cells_old_inv: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -925,15 +886,13 @@ def scale_positions_with_cell_out(
         Atomic positions. Shape (N,).
     cells_new : wp.array
         New cell matrices. Shape (B,).
-    positions_out : wp.array, optional
-        Output positions. If None, allocated internally.
+    cells_old_inv : wp.array
+        Pre-computed inverse of old cell matrices. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
+    positions_out : wp.array
+        Output positions. Shape (N,). Caller must pre-allocate.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Shape (N,). If None, assumes single system.
-    cells_old : wp.array(dtype=wp.mat33f or wp.mat33d), optional
-        Old cell matrices. Shape (B,).
-        Optional, required if cells_old_inv is not provided.
-    cells_old_inv : wp.array, optional
-        Pre-computed inverse of cells_old. If None, computed internally.
     device : str, optional
         Warp device.
 
@@ -946,14 +905,6 @@ def scale_positions_with_cell_out(
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if positions_out is None:
-        positions_out = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-
-    if cells_old_inv is None:
-        if cells_old is None:
-            raise ValueError("Either cells_old or cells_old_inv must be provided")
-        cells_old_inv = compute_cell_inverse(cells_old, device=device)
 
     vec_dtype = positions.dtype
     if batch_idx is None:
@@ -976,9 +927,9 @@ def scale_positions_with_cell_out(
 
 def wrap_positions_to_cell(
     positions: wp.array,
+    cells: wp.array,
+    cells_inv: wp.array,
     batch_idx: wp.array = None,
-    cells: wp.array = None,
-    cells_inv: wp.array = None,
     device: str = None,
 ) -> None:
     """
@@ -988,14 +939,13 @@ def wrap_positions_to_cell(
     ----------
     positions : wp.array(dtype=wp.vec3f or wp.vec3d)
         Atomic positions. Shape (N,). MODIFIED in-place.
-    batch_idx : wp.array(dtype=wp.int32), optional
-        System index for each atom. Shape (N,). If None, assumes single system.
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-        Optional, required if cells_inv is not provided.
-    cells_inv : wp.array, optional
-        Pre-computed inverse of cells. If None, computed internally.
-        Optional, required if cells is not provided.
+    cells_inv : wp.array
+        Pre-computed inverse of cells. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. Shape (N,). If None, assumes single system.
     device : str, optional
         Warp device.
     """
@@ -1003,11 +953,6 @@ def wrap_positions_to_cell(
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if cells_inv is None:
-        if cells is None:
-            raise ValueError("Either cells or cells_inv must be provided")
-        cells_inv = compute_cell_inverse(cells, device=device)
 
     vec_dtype = positions.dtype
     if batch_idx is None:
@@ -1028,10 +973,10 @@ def wrap_positions_to_cell(
 
 def wrap_positions_to_cell_out(
     positions: wp.array,
-    positions_out: wp.array = None,
+    cells: wp.array,
+    cells_inv: wp.array,
+    positions_out: wp.array,
     batch_idx: wp.array = None,
-    cells: wp.array = None,
-    cells_inv: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1041,16 +986,15 @@ def wrap_positions_to_cell_out(
     ----------
     positions : wp.array(dtype=wp.vec3f or wp.vec3d)
         Atomic positions. Shape (N,).
-    positions_out : wp.array, optional
-        Output positions. If None, allocated internally.
-    batch_idx : wp.array(dtype=wp.int32), optional
-        System index for each atom. Shape (N,). If None, assumes single system.
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-        Optional, required if cells_inv is not provided.
-    cells_inv : wp.array, optional
-        Pre-computed inverse of cells. If None, computed internally.
-        Optional, required if cells is not provided.
+    cells_inv : wp.array
+        Pre-computed inverse of cells. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
+    positions_out : wp.array
+        Output positions. Shape (N,). Caller must pre-allocate.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. Shape (N,). If None, assumes single system.
     device : str, optional
         Warp device.
 
@@ -1063,14 +1007,6 @@ def wrap_positions_to_cell_out(
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if positions_out is None:
-        positions_out = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-
-    if cells_inv is None:
-        if cells is None:
-            raise ValueError("Either cells or cells_inv must be provided")
-        cells_inv = compute_cell_inverse(cells, device=device)
 
     vec_dtype = positions.dtype
     if batch_idx is None:
@@ -1093,10 +1029,9 @@ def wrap_positions_to_cell_out(
 
 def cartesian_to_fractional(
     positions: wp.array,
-    fractional: wp.array = None,
+    cells_inv: wp.array,
+    fractional: wp.array,
     batch_idx: wp.array = None,
-    cells: wp.array = None,
-    cells_inv: wp.array = None,
     device: str = None,
 ) -> wp.array:
     """
@@ -1108,16 +1043,13 @@ def cartesian_to_fractional(
     ----------
     positions : wp.array(dtype=wp.vec3f or wp.vec3d)
         Cartesian positions. Shape (N,).
-    fractional : wp.array, optional
-        Output fractional coordinates. If None, allocated internally.
+    cells_inv : wp.array
+        Pre-computed inverse of cells. Shape (B,).
+        Caller must pre-compute via ``compute_cell_inverse``.
+    fractional : wp.array
+        Output fractional coordinates. Shape (N,). Caller must pre-allocate.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Shape (N,). If None, assumes single system.
-    cells : wp.array(dtype=wp.mat33f or wp.mat33d), optional
-        Cell matrices. Shape (B,).
-        Optional, required if cells_inv is not provided.
-    cells_inv : wp.array, optional
-        Pre-computed inverse of cells. If None, computed internally.
-        Optional, required if cells is not provided.
     device : str, optional
         Warp device.
 
@@ -1130,14 +1062,6 @@ def cartesian_to_fractional(
         device = positions.device
 
     num_atoms = positions.shape[0]
-
-    if fractional is None:
-        fractional = wp.zeros(num_atoms, dtype=positions.dtype, device=device)
-
-    if cells_inv is None:
-        if cells is None:
-            raise ValueError("Either cells or cells_inv must be provided")
-        cells_inv = compute_cell_inverse(cells, device=device)
 
     vec_dtype = positions.dtype
     if batch_idx is None:
@@ -1161,7 +1085,7 @@ def cartesian_to_fractional(
 def fractional_to_cartesian(
     fractional: wp.array,
     cells: wp.array,
-    positions: wp.array = None,
+    positions: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
 ) -> wp.array:
@@ -1176,8 +1100,8 @@ def fractional_to_cartesian(
         Fractional coordinates. Shape (N,).
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
-    positions : wp.array, optional
-        Output Cartesian positions. If None, allocated internally.
+    positions : wp.array
+        Output Cartesian positions. Shape (N,). Caller must pre-allocate.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Shape (N,). If None, assumes single system.
     device : str, optional
@@ -1192,9 +1116,6 @@ def fractional_to_cartesian(
         device = fractional.device
 
     num_atoms = fractional.shape[0]
-
-    if positions is None:
-        positions = wp.zeros(num_atoms, dtype=fractional.dtype, device=device)
 
     vec_dtype = fractional.dtype
     if batch_idx is None:

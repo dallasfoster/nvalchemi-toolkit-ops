@@ -125,7 +125,8 @@ md_system = MDSystem(
 # ------------------
 
 print("\n--- Step 1: Align cell to upper-triangular form ---")
-positions, cell = align_cell(positions, cell, device=device)
+transform = wp.empty(1, dtype=wp.mat33d, device=device)
+positions, cell = align_cell(positions, cell, transform=transform, device=device)
 
 wp.synchronize()
 print(f"Aligned cell:\n{cell.numpy()[0]}")
@@ -143,11 +144,16 @@ atom_masses = wp.array(atom_masses_np, dtype=wp.float64, device=device)
 # Cell DOF mass (controls how fast cell responds vs atoms)
 # Larger mass = slower cell dynamics, more stable
 cell_mass = 5000.0
+cell_mass_arr = wp.array([cell_mass], dtype=wp.float64, device=device)
 
 # Pack into extended arrays
-ext_positions = pack_positions_with_cell(positions, cell, device=device)
-ext_velocities = wp.zeros(num_atoms + 2, dtype=wp.vec3d, device=device)
-ext_masses = pack_masses_with_cell(atom_masses, cell_mass, device=device)
+N_ext = num_atoms + 2
+ext_positions = wp.empty(N_ext, dtype=wp.vec3d, device=device)
+pack_positions_with_cell(positions, cell, extended=ext_positions, device=device)
+ext_velocities = wp.zeros(N_ext, dtype=wp.vec3d, device=device)
+ext_masses = wp.empty(N_ext, dtype=wp.float64, device=device)
+pack_masses_with_cell(atom_masses, cell_mass_arr, extended=ext_masses, device=device)
+ext_forces = wp.empty(N_ext, dtype=wp.vec3d, device=device)
 
 print(
     f"Extended array size: {ext_positions.shape[0]} ({num_atoms} atoms + 2 cell DOFs)"
@@ -185,6 +191,13 @@ f_inc_arr = wp.array([f_inc], dtype=wp.float64, device=device)
 vf = wp.zeros(1, dtype=wp.float64, device=device)
 vv = wp.zeros(1, dtype=wp.float64, device=device)
 ff = wp.zeros(1, dtype=wp.float64, device=device)
+uphill_flag = wp.zeros(1, dtype=wp.int32, device=device)
+
+# Scratch arrays for unpack/stress/volume
+pos_scratch = wp.empty(num_atoms, dtype=wp.vec3d, device=device)
+cell_scratch = wp.empty(1, dtype=wp.mat33d, device=device)
+cell_force_scratch = wp.empty(1, dtype=wp.mat33d, device=device)
+volume_scratch = wp.empty(1, dtype=wp.float64, device=device)
 
 # %%
 # Step 4: Optimization Loop
@@ -215,7 +228,8 @@ converged = False
 for step in range(max_steps):
     # Unpack current state
     pos_current, cell_current = unpack_positions_with_cell(
-        ext_positions, num_atoms=num_atoms, device=device
+        ext_positions, positions=pos_scratch, cell=cell_scratch,
+        num_atoms=num_atoms, device=device,
     )
 
     # Update MD system with current geometry
@@ -237,16 +251,18 @@ for step in range(max_steps):
     stress = virial_to_stress(virial, md_system.wp_cell, target_pressure, device)
 
     # Convert stress to cell force (for optimization)
-    cell_force = stress_to_cell_force(
-        stress, md_system.wp_cell, keep_aligned=True, device=device
+    compute_cell_volume(md_system.wp_cell, volumes=volume_scratch, device=device)
+    stress_to_cell_force(
+        stress, md_system.wp_cell, volume=volume_scratch,
+        cell_force=cell_force_scratch, keep_aligned=True, device=device,
     )
 
     # Pack forces into extended array
-    ext_forces = pack_forces_with_cell(forces, cell_force, device=device)
+    pack_forces_with_cell(forces, cell_force_scratch, extended=ext_forces, device=device)
 
     # Re-pack positions (after wrapping)
-    ext_positions = pack_positions_with_cell(
-        md_system.wp_positions, md_system.wp_cell, device=device
+    pack_positions_with_cell(
+        md_system.wp_positions, md_system.wp_cell, extended=ext_positions, device=device,
     )
 
     # Zero accumulators before FIRE step
@@ -271,6 +287,7 @@ for step in range(max_steps):
         n_min=n_min_arr,
         f_dec=f_dec_arr,
         f_inc=f_inc_arr,
+        uphill_flag=uphill_flag,
         vf=vf,
         vv=vv,
         ff=ff,
@@ -284,7 +301,8 @@ for step in range(max_steps):
         max_force = np.max(np.abs(ext_forces_np))
 
         total_energy = float(energies.numpy().sum())
-        volume = float(compute_cell_volume(md_system.wp_cell, device=device).numpy()[0])
+        compute_cell_volume(md_system.wp_cell, volumes=volume_scratch, device=device)
+        volume = float(volume_scratch.numpy()[0])
 
         # Compute deviation from target pressure (trace of stress / 3)
         stress_np = stress.numpy()[0]
@@ -318,7 +336,8 @@ for step in range(max_steps):
 
 wp.synchronize()
 final_pos, final_cell = unpack_positions_with_cell(
-    ext_positions, num_atoms=num_atoms, device=device
+    ext_positions, positions=pos_scratch, cell=cell_scratch,
+    num_atoms=num_atoms, device=device,
 )
 
 wp.synchronize()

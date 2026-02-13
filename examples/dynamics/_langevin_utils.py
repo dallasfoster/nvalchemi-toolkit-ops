@@ -39,8 +39,8 @@ from nvalchemiops.dynamics.utils import (
     wrap_positions_to_cell,
 )
 from nvalchemiops.interactions import lj_energy_forces, lj_energy_forces_virial
-from nvalchemiops.neighborlist import cell_list
-from nvalchemiops.neighborlist.rebuild_detection import neighbor_list_needs_rebuild
+from nvalchemiops.torch.neighbors import cell_list
+from nvalchemiops.torch.neighbors.rebuild_detection import neighbor_list_needs_rebuild
 
 # ==============================================================================
 # Physical Constants
@@ -188,7 +188,8 @@ def virial_to_stress(
     stress : wp.array, shape (1,), dtype=mat33d
         Stress tensor for cell optimization.
     """
-    volume = compute_cell_volume(cell, device=device)
+    volume = wp.empty(1, dtype=wp.float64, device=device)
+    compute_cell_volume(cell, volumes=volume, device=device)
     stress = wp.zeros(1, dtype=wp.mat33d, device=device)
     wp.launch(
         _virial_to_stress_kernel,
@@ -580,7 +581,8 @@ class MDSystem:
         self.wp_cell = wp.array(cell_reshaped, dtype=self.wp_mat_dtype, device=device)
 
         # Compute cell inverse for position wrapping
-        self.wp_cell_inv = compute_cell_inverse(self.wp_cell, device=device)
+        self.wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=device)
 
         # Set up neighbor list manager
         self.neighbor_manager = NeighborListManager(
@@ -697,7 +699,7 @@ class MDSystem:
             New cell matrix.
         """
         wp.copy(self.wp_cell, cell)
-        self.wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.device)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.device)
         # Update torch cell for neighbor list
         self.torch_cell = wp.to_torch(self.wp_cell).squeeze(0)
         # Force neighbor rebuild on next force computation
@@ -705,20 +707,26 @@ class MDSystem:
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""
-        return compute_kinetic_energy(
+        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
+            kinetic_energy=ke,
             device=self.device,
         )
+        return ke
 
     def temperature_kT(self) -> wp.array:
         """Compute instantaneous temperature on device (kB*T in eV, shape (1,))."""
-        return compute_temperature(
-            velocities=self.wp_velocities,
-            masses=self.wp_masses,
+        ke = self.kinetic_energy()
+        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_temperature(
+            kinetic_energy=ke,
+            temperature=temp,
             num_atoms=self.num_atoms,
             device=self.device,
         )
+        return temp
 
     def initialize_temperature(self, temperature: float, seed: int = 42) -> None:
         """Initialize velocities to target temperature.
@@ -736,11 +744,19 @@ class MDSystem:
         # Create temperature array (shape (1,) for single system)
         wp_temperature = wp.array([kT], dtype=self.wp_dtype, device=self.device)
 
+        # Scratch arrays for COM removal
+        wp_total_momentum = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+        wp_total_mass = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        wp_com_velocities = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+
         # Initialize velocities from Maxwell-Boltzmann distribution
         initialize_velocities(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
             temperature=wp_temperature,
+            total_momentum=wp_total_momentum,
+            total_mass=wp_total_mass,
+            com_velocities=wp_com_velocities,
             random_seed=seed,
             remove_com=True,
             device=self.device,

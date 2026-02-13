@@ -125,11 +125,11 @@ def _fire2_reduce_only_kernel(
     batch_idx : wp.array, shape (N,), dtype int32
         Sorted system index per atom in [0, M).
     vf : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: v_upd·f per segment. Must be zero-initialized by caller.
+        OUTPUT: v_upd·f per segment. Zeroed internally before each use.
     v_sumsq : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: v_upd·v_upd per segment. Must be zero-initialized by caller.
+        OUTPUT: v_upd·v_upd per segment. Zeroed internally before each use.
     f_sumsq : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: f·f per segment. Must be zero-initialized by caller.
+        OUTPUT: f·f per segment. Zeroed internally before each use.
     N : int32
         Total number of atoms.
     elems_per_thread : int32
@@ -308,7 +308,7 @@ def _fire2_fused_mix_maxnorm_kernel(
     nsteps_inc : wp.array, shape (M,), dtype int32
         Consecutive positive-power step counter. Modified by first atom per segment.
     max_norm : wp.array, shape (M,), dtype float32/float64
-        OUTPUT: Maximum step norm per segment. Must be zero-initialized by caller.
+        OUTPUT: Maximum step norm per segment. Zeroed internally before each use.
     N : int32
         Total number of atoms.
     elems_per_thread : int32
@@ -662,7 +662,7 @@ def fire2_step(
     nsteps_inc : wp.array, shape (M,), dtype int32
         Consecutive positive-power step counter.
     vf, v_sumsq, f_sumsq, max_norm : wp.array, shape (M,), dtype float*
-        Scratch buffers for reductions. Must be zero-initialized.
+        Scratch buffers for reductions. Zeroed internally before each use.
     delaystep : int
         Minimum positive steps before dt growth.
     dtgrow, dtshrink : float
@@ -682,8 +682,6 @@ def fire2_step(
     -----
     - ``batch_idx`` must be sorted; segment reductions assume contiguous
       atom ranges per system.
-    - Scratch buffers must be zeroed before each call.
-
     Examples
     --------
     >>> fire2_step(positions, velocities, forces, batch_idx,
@@ -718,6 +716,11 @@ def fire2_step(
         device = positions.device
     elif isinstance(device, str):
         device = wp.get_device(device)
+
+    vf.zero_()
+    v_sumsq.zero_()
+    f_sumsq.zero_()
+    max_norm.zero_()
     sm = max(device.sm_count, 1)
 
     # Kernel 1: reduce only (no velocity write, deferred to fused kernel)

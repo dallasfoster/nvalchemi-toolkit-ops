@@ -47,15 +47,14 @@ from _dynamics_utils import (
     mass_amu_to_internal,
 )
 
-from nvalchemiops.batch_utils import (
-    create_atom_ptr,
-    create_batch_idx,
-    max_norm_per_system,
-    sum_per_system,
-)
+from nvalchemiops.batch_utils import create_atom_ptr, create_batch_idx
 from nvalchemiops.dynamics.optimizers import fire_step
 from nvalchemiops.interactions import lj_energy_forces
-from nvalchemiops.neighborlist import batch_cell_list
+from nvalchemiops.torch.neighbors import batch_cell_list
+from nvalchemiops.segment_ops import (
+    segmented_max_norm,
+    segmented_sum,
+)
 
 # ==============================================================================
 # Batched LJ Force Computation
@@ -206,8 +205,10 @@ masses = wp.array(masses_np, dtype=wp.float64, device=device)
 
 # Create batching arrays using nvalchemiops.batch_utils
 atom_counts_wp = wp.array(np.array(atom_counts, dtype=np.int32), device=device)
-batch_idx = create_batch_idx(atom_counts_wp, device=device)
-atom_ptr = create_atom_ptr(atom_counts_wp, device=device)
+atom_ptr = wp.zeros(num_systems + 1, dtype=wp.int32, device=device)
+create_atom_ptr(atom_counts_wp, atom_ptr)
+batch_idx = wp.zeros(total_atoms, dtype=wp.int32, device=device)
+create_batch_idx(atom_ptr, batch_idx)
 
 print(f"  batch_idx shape: {batch_idx.shape}")
 print(f"  atom_ptr shape: {atom_ptr.shape}")
@@ -255,6 +256,7 @@ f_inc_arr = wp.array([f_inc] * num_systems, dtype=wp.float64, device=device)
 vf = wp.zeros(num_systems, dtype=wp.float64, device=device)
 vv = wp.zeros(num_systems, dtype=wp.float64, device=device)
 ff = wp.zeros(num_systems, dtype=wp.float64, device=device)
+uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
 
 
 # %%
@@ -320,6 +322,7 @@ for step in range(max_steps):
         n_min=n_min_arr,
         f_dec=f_dec_arr,
         f_inc=f_inc_arr,
+        uphill_flag=uphill_flag,
         vf=vf,
         vv=vv,
         ff=ff,
@@ -329,11 +332,11 @@ for step in range(max_steps):
 
     # Check convergence at intervals
     if step % check_interval == 0 or step == max_steps - 1:
-        # Use GPU-accelerated batch utilities for reductions
-        system_energies = sum_per_system(energies, atom_ptr=atom_ptr, device=device)
-        max_forces = max_norm_per_system(
-            lj_system.wp_forces, atom_ptr=atom_ptr, device=device
-        )
+        # Use GPU-accelerated segmented ops for reductions
+        system_energies = wp.zeros(num_systems, dtype=wp.float64, device=device)
+        segmented_sum(energies, batch_idx, system_energies)
+        max_forces = wp.zeros(num_systems, dtype=wp.float64, device=device)
+        segmented_max_norm(lj_system.wp_forces, batch_idx, max_forces)
 
         # Sync and convert to numpy for logging
         wp.synchronize()
@@ -411,17 +414,18 @@ for step in range(max_steps):
         n_min=n_min_arr,
         f_dec=f_dec_arr,
         f_inc=f_inc_arr,
+        uphill_flag=uphill_flag,
         atom_ptr=atom_ptr,  # Use atom_ptr instead of batch_idx
         device=device,
     )
 
     # Check convergence at intervals
     if step % check_interval == 0 or step == max_steps - 1:
-        # Use GPU-accelerated batch utilities for reductions
-        system_energies = sum_per_system(energies, atom_ptr=atom_ptr, device=device)
-        max_forces = max_norm_per_system(
-            lj_system.wp_forces, atom_ptr=atom_ptr, device=device
-        )
+        # Use GPU-accelerated segmented ops for reductions
+        system_energies = wp.zeros(num_systems, dtype=wp.float64, device=device)
+        segmented_sum(energies, batch_idx, system_energies)
+        max_forces = wp.zeros(num_systems, dtype=wp.float64, device=device)
+        segmented_max_norm(lj_system.wp_forces, batch_idx, max_forces)
 
         # Sync and convert to numpy for logging
         wp.synchronize()
