@@ -43,7 +43,7 @@ import warp as wp
 from shared_utils import get_gpu_sku, load_config
 
 from nvalchemiops.dynamics.optimizers import fire2_step, fire_step
-from nvalchemiops.torch.fire2 import fire2_step_coord
+from nvalchemiops.torch.fire2 import fire2_step_coord, fire2_step_coord_cell
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -274,6 +274,69 @@ def bench_fire2_torch_adapter(N, M, device, dtype, hyper, warmup, runs):
 
 
 # ---------------------------------------------------------------------------
+# Benchmark: PyTorch adapter (fire2_step_coord_cell)
+# ---------------------------------------------------------------------------
+
+
+def bench_fire2_torch_adapter_cell(N, M, device, dtype, hyper, warmup, runs):
+    """Benchmark PyTorch adapter fire2_step_coord_cell (variable-cell)."""
+    pos, vel, forces, bidx = _make_data(N, M, device, dtype)
+
+    # Cell data: identity cell per system, zero cell velocities, random cell force
+    rng = np.random.default_rng(123)
+    np_dtype = np.float32 if dtype == torch.float32 else np.float64
+    cell = (
+        torch.eye(3, dtype=dtype, device=device)
+        .unsqueeze(0)
+        .expand(M, -1, -1)
+        .contiguous()
+    )
+    cell_vel = torch.zeros(M, 3, 3, dtype=dtype, device=device)
+    cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+    cell_force = torch.tensor(cell_force_np, dtype=dtype, device=device)
+
+    alpha = torch.full((M,), hyper["alpha0"], dtype=dtype, device=device)
+    dt = torch.full((M,), 0.05, dtype=dtype, device=device)
+    nsteps_inc = torch.zeros(M, dtype=torch.int32, device=device)
+
+    # Pre-allocate scratch buffers
+    N_ext = N + 2 * M
+    ext_pos = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_vel = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_forces = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_bidx = torch.empty(N_ext, dtype=torch.int32, device=device)
+    vf = torch.zeros(M, dtype=dtype, device=device)
+    v_sumsq = torch.zeros(M, dtype=dtype, device=device)
+    f_sumsq = torch.zeros(M, dtype=dtype, device=device)
+    max_norm = torch.zeros(M, dtype=dtype, device=device)
+
+    def run():
+        fire2_step_coord_cell(
+            pos,
+            vel,
+            forces,
+            cell,
+            cell_vel,
+            cell_force,
+            bidx,
+            alpha,
+            dt,
+            nsteps_inc,
+            ext_positions=ext_pos,
+            ext_velocities=ext_vel,
+            ext_forces=ext_forces,
+            ext_batch_idx=ext_bidx,
+            vf=vf,
+            v_sumsq=v_sumsq,
+            f_sumsq=f_sumsq,
+            max_norm=max_norm,
+            **hyper,
+        )
+
+    return _bench_cuda(run, warmup, runs, device)
+
+
+# ---------------------------------------------------------------------------
 # Benchmark: Pure PyTorch reference FIRE2
 # ---------------------------------------------------------------------------
 
@@ -424,6 +487,17 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
                 "FIRE2(adapt)",
                 "F2ad",
                 lambda N, M, dev, dt, w, r: bench_fire2_torch_adapter(
+                    N, M, dev, dt, hyper, w, r
+                ),
+            )
+        )
+    if methods_cfg.get("torch_adapter_cell", True):
+        method_registry.append(
+            (
+                "torch_adapter_cell",
+                "FIRE2(cell)",
+                "F2cl",
+                lambda N, M, dev, dt, w, r: bench_fire2_torch_adapter_cell(
                     N, M, dev, dt, hyper, w, r
                 ),
             )

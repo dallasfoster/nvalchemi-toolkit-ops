@@ -24,7 +24,8 @@ PyTorch's CUDA caching allocator.
 Submodules
 ----------
 fire2
-    PyTorch adapter for the FIRE2 optimizer (coordinate-only).
+    PyTorch adapter for the FIRE2 optimizer
+    (coordinate-only and variable-cell).
 """
 
 import importlib
@@ -35,6 +36,6 @@ if importlib.util.find_spec("torch") is None:
         " Please install via `pip install 'nvalchemiops[torch]'`."
     )
 
-from .fire2 import fire2_step_coord
+from .fire2 import fire2_step_coord, fire2_step_coord_cell
 
-__all__ = ["fire2_step_coord"]
+__all__ = ["fire2_step_coord", "fire2_step_coord_cell"]

@@ -37,7 +37,7 @@ import torch
 import warp as wp
 
 from nvalchemiops.dynamics.optimizers import fire2_step
-from nvalchemiops.torch.fire2 import fire2_step_coord
+from nvalchemiops.torch.fire2 import fire2_step_coord, fire2_step_coord_cell
 
 # ==============================================================================
 # Configuration
@@ -2203,3 +2203,495 @@ class TestFire2TorchCoordErrors:
                 nsteps_inc,
                 **FIRE2_DEFAULTS,
             )
+
+
+# ==============================================================================
+# Tests: PyTorch Adapter – Variable-Cell (fire2_step_coord_cell)
+# ==============================================================================
+
+
+def _make_upper_triangular_cell(M, np_dtype, *, rng=None, scale=5.0):
+    """Create random upper-triangular cell matrices (M, 3, 3)."""
+    if rng is None:
+        rng = np.random.default_rng(99)
+    cells = np.zeros((M, 3, 3), dtype=np_dtype)
+    for i in range(M):
+        # a, b*cos(gamma), b*sin(gamma), c1, c2, c3
+        a = scale + rng.random() * 0.5
+        cells[i, 0, 0] = a
+        cells[i, 1, 0] = rng.random() * 0.1
+        cells[i, 1, 1] = scale + rng.random() * 0.5
+        cells[i, 2, 0] = rng.random() * 0.1
+        cells[i, 2, 1] = rng.random() * 0.1
+        cells[i, 2, 2] = scale + rng.random() * 0.5
+    return cells
+
+
+class TestFire2TorchCoordCell:
+    """Tests for the PyTorch adapter fire2_step_coord_cell."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.float64])
+    def test_cell_step_basic(self, device, torch_dtype):
+        """Positions, cell, and velocities should change; all outputs finite."""
+        rng = np.random.default_rng(50)
+        N, M = 60, 2
+        np_dtype = np.float32 if torch_dtype == torch.float32 else np.float64
+
+        (pos, vel, forces, batch_idx, alpha, dt, nsteps_inc, *_) = (
+            make_fire2_torch_state(N, M, torch_dtype, device, rng=rng)
+        )
+
+        cell_np = _make_upper_triangular_cell(M, np_dtype, rng=rng)
+        cell = torch.tensor(cell_np, dtype=torch_dtype, device=device)
+        cell_vel = torch.zeros(M, 3, 3, dtype=torch_dtype, device=device)
+        cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+        cell_force = torch.tensor(cell_force_np, dtype=torch_dtype, device=device)
+
+        pos_before = pos.clone()
+        cell_before = cell.clone()
+
+        fire2_step_coord_cell(
+            pos,
+            vel,
+            forces,
+            cell,
+            cell_vel,
+            cell_force,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            **FIRE2_DEFAULTS,
+        )
+        torch.cuda.synchronize()
+
+        assert not torch.allclose(pos, pos_before), "Positions should be updated"
+        assert not torch.allclose(cell, cell_before), "Cell should be updated"
+        assert torch.isfinite(pos).all(), "Positions should be finite"
+        assert torch.isfinite(vel).all(), "Velocities should be finite"
+        assert torch.isfinite(cell).all(), "Cell should be finite"
+        assert torch.isfinite(cell_vel).all(), "Cell velocities should be finite"
+        assert torch.isfinite(alpha).all(), "Alpha should be finite"
+        assert torch.isfinite(dt).all(), "dt should be finite"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.float64])
+    def test_cell_step_matches_manual_pack(self, device, torch_dtype):
+        """fire2_step_coord_cell must match manually packed fire2_step_coord."""
+        rng = np.random.default_rng(51)
+        N, M = 60, 2
+        np_dtype = np.float32 if torch_dtype == torch.float32 else np.float64
+        vec_type = wp.vec3f if torch_dtype == torch.float32 else wp.vec3d
+        mat_type = wp.mat33f if torch_dtype == torch.float32 else wp.mat33d
+
+        # Create identical state for both methods
+        pos_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        vel_np = rng.standard_normal((N, 3)).astype(np_dtype) * 0.01
+        forces_np = rng.standard_normal((N, 3)).astype(np_dtype)
+        bidx_np = np.repeat(np.arange(M, dtype=np.int32), N // M)
+        alpha_np = np.full(M, 0.09, dtype=np_dtype)
+        dt_np = np.full(M, 0.05, dtype=np_dtype)
+        nsteps_np = np.zeros(M, dtype=np.int32)
+        cell_np = _make_upper_triangular_cell(M, np_dtype, rng=rng)
+        cell_vel_np = np.zeros((M, 3, 3), dtype=np_dtype)
+        cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+
+        # --- Method A: fire2_step_coord_cell ---
+        pos_a = torch.tensor(pos_np.copy(), dtype=torch_dtype, device=device)
+        vel_a = torch.tensor(vel_np.copy(), dtype=torch_dtype, device=device)
+        forces_a = torch.tensor(forces_np.copy(), dtype=torch_dtype, device=device)
+        bidx_a = torch.tensor(bidx_np.copy(), dtype=torch.int32, device=device)
+        alpha_a = torch.tensor(alpha_np.copy(), dtype=torch_dtype, device=device)
+        dt_a = torch.tensor(dt_np.copy(), dtype=torch_dtype, device=device)
+        nsteps_a = torch.tensor(nsteps_np.copy(), dtype=torch.int32, device=device)
+        cell_a = torch.tensor(cell_np.copy(), dtype=torch_dtype, device=device)
+        cell_vel_a = torch.tensor(cell_vel_np.copy(), dtype=torch_dtype, device=device)
+        cell_force_a = torch.tensor(
+            cell_force_np.copy(), dtype=torch_dtype, device=device
+        )
+
+        fire2_step_coord_cell(
+            pos_a,
+            vel_a,
+            forces_a,
+            cell_a,
+            cell_vel_a,
+            cell_force_a,
+            bidx_a,
+            alpha_a,
+            dt_a,
+            nsteps_a,
+            **FIRE2_DEFAULTS,
+        )
+        torch.cuda.synchronize()
+
+        # --- Method B: manual pack + fire2_step (Warp) + unpack ---
+        from nvalchemiops.batch_utils import (
+            atom_ptr_to_batch_idx,
+            batch_idx_to_atom_ptr,
+        )
+        from nvalchemiops.dynamics.utils.cell_filter import (
+            extend_atom_ptr,
+            pack_forces_with_cell,
+            pack_positions_with_cell,
+            pack_velocities_with_cell,
+            unpack_positions_with_cell,
+            unpack_velocities_with_cell,
+        )
+
+        wp_device = wp.device_from_torch(torch.device(device))
+
+        wp_pos = wp.array(pos_np.copy(), dtype=vec_type, device=wp_device)
+        wp_vel = wp.array(vel_np.copy(), dtype=vec_type, device=wp_device)
+        wp_forces = wp.array(forces_np.copy(), dtype=vec_type, device=wp_device)
+        wp_bidx = wp.array(bidx_np.copy(), dtype=wp.int32, device=wp_device)
+        wp_cell = wp.array(cell_np.copy(), dtype=mat_type, device=wp_device)
+        wp_cell_vel = wp.array(cell_vel_np.copy(), dtype=mat_type, device=wp_device)
+        wp_cell_force = wp.array(cell_force_np.copy(), dtype=mat_type, device=wp_device)
+        scalar_dtype = wp.float32 if torch_dtype == torch.float32 else wp.float64
+        wp_alpha = wp.array(alpha_np.copy(), dtype=scalar_dtype, device=wp_device)
+        wp_dt = wp.array(dt_np.copy(), dtype=scalar_dtype, device=wp_device)
+        wp_nsteps = wp.array(nsteps_np.copy(), dtype=wp.int32, device=wp_device)
+
+        N_ext = N + 2 * M
+
+        # Compute atom_ptr / ext_atom_ptr for batched pack/unpack
+        wp_atom_counts = wp.zeros(M, dtype=wp.int32, device=wp_device)
+        wp_atom_ptr = wp.zeros(M + 1, dtype=wp.int32, device=wp_device)
+        batch_idx_to_atom_ptr(wp_bidx, wp_atom_counts, wp_atom_ptr)
+        wp_ext_atom_ptr = wp.zeros(M + 1, dtype=wp.int32, device=wp_device)
+        extend_atom_ptr(wp_atom_ptr, wp_ext_atom_ptr, device=wp_device)
+
+        # Pre-allocate extended arrays
+        ext_pos = wp.zeros(N_ext, dtype=vec_type, device=wp_device)
+        ext_vel = wp.zeros(N_ext, dtype=vec_type, device=wp_device)
+        ext_forces_b = wp.zeros(N_ext, dtype=vec_type, device=wp_device)
+        ext_bidx = wp.zeros(N_ext, dtype=wp.int32, device=wp_device)
+
+        pack_positions_with_cell(
+            wp_pos,
+            wp_cell,
+            ext_pos,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
+        )
+        pack_velocities_with_cell(
+            wp_vel,
+            wp_cell_vel,
+            ext_vel,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
+        )
+        pack_forces_with_cell(
+            wp_forces,
+            wp_cell_force,
+            ext_forces_b,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
+        )
+        atom_ptr_to_batch_idx(wp_ext_atom_ptr, ext_bidx)
+
+        vf, v_sumsq, f_sumsq, max_norm_buf = make_fire2_scratch(
+            M, scalar_dtype, wp_device
+        )
+
+        fire2_step(
+            ext_pos,
+            ext_vel,
+            ext_forces_b,
+            ext_bidx,
+            wp_alpha,
+            wp_dt,
+            wp_nsteps,
+            vf,
+            v_sumsq,
+            f_sumsq,
+            max_norm_buf,
+            **FIRE2_DEFAULTS,
+        )
+
+        # Pre-allocate unpack outputs
+        wp_pos_b = wp.zeros(N, dtype=vec_type, device=wp_device)
+        wp_cell_b = wp.zeros(M, dtype=mat_type, device=wp_device)
+        wp_vel_b = wp.zeros(N, dtype=vec_type, device=wp_device)
+        wp_cell_vel_b = wp.zeros(M, dtype=mat_type, device=wp_device)
+
+        unpack_positions_with_cell(
+            ext_pos,
+            wp_pos_b,
+            wp_cell_b,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device,
+        )
+        unpack_velocities_with_cell(
+            ext_vel,
+            wp_vel_b,
+            wp_cell_vel_b,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device,
+        )
+        wp.synchronize()
+
+        pos_b = wp.to_torch(wp_pos_b).reshape(-1, 3)
+        vel_b = wp.to_torch(wp_vel_b).reshape(-1, 3)
+        cell_b = wp.to_torch(wp_cell_b).reshape(M, 3, 3)
+        cell_vel_b = wp.to_torch(wp_cell_vel_b).reshape(M, 3, 3)
+        alpha_b = wp.to_torch(wp_alpha)
+        dt_b = wp.to_torch(wp_dt)
+        nsteps_b = wp.to_torch(wp_nsteps)
+
+        # --- Compare ---
+        rtol = 1e-4 if np_dtype == np.float32 else 1e-10
+        np.testing.assert_allclose(
+            pos_a.cpu().numpy(),
+            pos_b.cpu().numpy(),
+            rtol=rtol,
+            atol=1e-7,
+            err_msg="Positions mismatch",
+        )
+        np.testing.assert_allclose(
+            vel_a.cpu().numpy(),
+            vel_b.cpu().numpy(),
+            rtol=rtol,
+            atol=1e-7,
+            err_msg="Velocities mismatch",
+        )
+        np.testing.assert_allclose(
+            cell_a.cpu().numpy(),
+            cell_b.cpu().numpy(),
+            rtol=rtol,
+            atol=1e-7,
+            err_msg="Cell mismatch",
+        )
+        np.testing.assert_allclose(
+            cell_vel_a.cpu().numpy(),
+            cell_vel_b.cpu().numpy(),
+            rtol=rtol,
+            atol=1e-7,
+            err_msg="Cell velocities mismatch",
+        )
+        np.testing.assert_allclose(
+            alpha_a.cpu().numpy(),
+            alpha_b.cpu().numpy(),
+            rtol=rtol,
+            err_msg="Alpha mismatch",
+        )
+        np.testing.assert_allclose(
+            dt_a.cpu().numpy(),
+            dt_b.cpu().numpy(),
+            rtol=rtol,
+            err_msg="dt mismatch",
+        )
+        np.testing.assert_array_equal(
+            nsteps_a.cpu().numpy(),
+            nsteps_b.cpu().numpy(),
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_cell_step_with_scratch_buffers(self, device):
+        """fire2_step_coord_cell works with pre-allocated scratch buffers."""
+        rng = np.random.default_rng(52)
+        N, M = 60, 2
+        torch_dtype = torch.float64
+        np_dtype = np.float64
+
+        (pos, vel, forces, batch_idx, alpha, dt, nsteps_inc, *_) = (
+            make_fire2_torch_state(N, M, torch_dtype, device, rng=rng)
+        )
+        cell_np = _make_upper_triangular_cell(M, np_dtype, rng=rng)
+        cell = torch.tensor(cell_np, dtype=torch_dtype, device=device)
+        cell_vel = torch.zeros(M, 3, 3, dtype=torch_dtype, device=device)
+        cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+        cell_force = torch.tensor(cell_force_np, dtype=torch_dtype, device=device)
+
+        N_ext = N + 2 * M
+        ext_pos = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        ext_vel = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        ext_forces = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        vf = torch.ones(M, dtype=torch_dtype, device=device) * 999.0
+        v_sumsq = torch.ones(M, dtype=torch_dtype, device=device) * 999.0
+        f_sumsq = torch.ones(M, dtype=torch_dtype, device=device) * 999.0
+        max_norm_buf = torch.ones(M, dtype=torch_dtype, device=device) * 999.0
+
+        pos_before = pos.clone()
+        fire2_step_coord_cell(
+            pos,
+            vel,
+            forces,
+            cell,
+            cell_vel,
+            cell_force,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            ext_positions=ext_pos,
+            ext_velocities=ext_vel,
+            ext_forces=ext_forces,
+            vf=vf,
+            v_sumsq=v_sumsq,
+            f_sumsq=f_sumsq,
+            max_norm=max_norm_buf,
+            **FIRE2_DEFAULTS,
+        )
+        torch.cuda.synchronize()
+
+        assert not torch.allclose(pos, pos_before), "Positions should be updated"
+        assert torch.isfinite(pos).all()
+        assert torch.isfinite(cell).all()
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_cell_step_scratch_reuse(self, device):
+        """Scratch buffers and static metadata can be reused across steps."""
+        rng = np.random.default_rng(53)
+        N, M = 40, 2
+        torch_dtype = torch.float64
+        np_dtype = np.float64
+
+        (pos, vel, forces, batch_idx, alpha, dt, nsteps_inc, *_) = (
+            make_fire2_torch_state(N, M, torch_dtype, device, rng=rng)
+        )
+        cell_np = _make_upper_triangular_cell(M, np_dtype, rng=rng)
+        cell = torch.tensor(cell_np, dtype=torch_dtype, device=device)
+        cell_vel = torch.zeros(M, 3, 3, dtype=torch_dtype, device=device)
+        cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+        cell_force = torch.tensor(cell_force_np, dtype=torch_dtype, device=device)
+
+        N_ext = N + 2 * M
+        ext_pos = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        ext_vel = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        ext_forces = torch.empty(N_ext, 3, dtype=torch_dtype, device=device)
+        vf = torch.empty(M, dtype=torch_dtype, device=device)
+        v_sumsq = torch.empty(M, dtype=torch_dtype, device=device)
+        f_sumsq = torch.empty(M, dtype=torch_dtype, device=device)
+        max_norm_buf = torch.empty(M, dtype=torch_dtype, device=device)
+
+        # First call: let the function compute atom_ptr, ext_atom_ptr,
+        # ext_batch_idx internally (pass None).
+        fire2_step_coord_cell(
+            pos,
+            vel,
+            forces,
+            cell,
+            cell_vel,
+            cell_force,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            ext_positions=ext_pos,
+            ext_velocities=ext_vel,
+            ext_forces=ext_forces,
+            vf=vf,
+            v_sumsq=v_sumsq,
+            f_sumsq=f_sumsq,
+            max_norm=max_norm_buf,
+            **FIRE2_DEFAULTS,
+        )
+
+        # Pre-compute static metadata for subsequent reuse.
+        from nvalchemiops.batch_utils import (
+            atom_ptr_to_batch_idx as _a2b,
+        )
+        from nvalchemiops.batch_utils import (
+            batch_idx_to_atom_ptr as _b2a,
+        )
+        from nvalchemiops.dynamics.utils.cell_filter import (
+            extend_atom_ptr as _eap,
+        )
+
+        atom_ptr_t = torch.zeros(M + 1, dtype=torch.int32, device=device)
+        atom_counts_t = torch.zeros(M, dtype=torch.int32, device=device)
+        _b2a(
+            wp.from_torch(batch_idx, dtype=wp.int32),
+            wp.from_torch(atom_counts_t, dtype=wp.int32),
+            wp.from_torch(atom_ptr_t, dtype=wp.int32),
+        )
+        ext_atom_ptr_t = torch.zeros(M + 1, dtype=torch.int32, device=device)
+        _eap(
+            wp.from_torch(atom_ptr_t, dtype=wp.int32),
+            wp.from_torch(ext_atom_ptr_t, dtype=wp.int32),
+        )
+        ext_bidx = torch.empty(N_ext, dtype=torch.int32, device=device)
+        _a2b(
+            wp.from_torch(ext_atom_ptr_t, dtype=wp.int32),
+            wp.from_torch(ext_bidx, dtype=wp.int32),
+        )
+
+        # Remaining 4 calls reuse all pre-computed metadata.
+        for _ in range(4):
+            fire2_step_coord_cell(
+                pos,
+                vel,
+                forces,
+                cell,
+                cell_vel,
+                cell_force,
+                batch_idx,
+                alpha,
+                dt,
+                nsteps_inc,
+                atom_ptr=atom_ptr_t,
+                ext_atom_ptr=ext_atom_ptr_t,
+                ext_positions=ext_pos,
+                ext_velocities=ext_vel,
+                ext_forces=ext_forces,
+                ext_batch_idx=ext_bidx,
+                vf=vf,
+                v_sumsq=v_sumsq,
+                f_sumsq=f_sumsq,
+                max_norm=max_norm_buf,
+                **FIRE2_DEFAULTS,
+            )
+
+        torch.cuda.synchronize()
+        assert torch.isfinite(pos).all(), "Positions should stay finite over 5 steps"
+        assert torch.isfinite(cell).all(), "Cell should stay finite over 5 steps"
+        assert torch.isfinite(vel).all(), "Velocities should stay finite"
+        assert torch.isfinite(cell_vel).all(), "Cell velocities should stay finite"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_cell_step_single_system(self, device):
+        """fire2_step_coord_cell works for a single-system (M=1) case."""
+        rng = np.random.default_rng(54)
+        N, M = 30, 1
+        torch_dtype = torch.float64
+        np_dtype = np.float64
+
+        (pos, vel, forces, batch_idx, alpha, dt, nsteps_inc, *_) = (
+            make_fire2_torch_state(N, M, torch_dtype, device, rng=rng)
+        )
+        cell_np = _make_upper_triangular_cell(M, np_dtype, rng=rng)
+        cell = torch.tensor(cell_np, dtype=torch_dtype, device=device)
+        cell_vel = torch.zeros(M, 3, 3, dtype=torch_dtype, device=device)
+        cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+        cell_force = torch.tensor(cell_force_np, dtype=torch_dtype, device=device)
+
+        pos_before = pos.clone()
+        cell_before = cell.clone()
+
+        fire2_step_coord_cell(
+            pos,
+            vel,
+            forces,
+            cell,
+            cell_vel,
+            cell_force,
+            batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            **FIRE2_DEFAULTS,
+        )
+        torch.cuda.synchronize()
+
+        assert not torch.allclose(pos, pos_before)
+        assert not torch.allclose(cell, cell_before)
+        assert torch.isfinite(pos).all()
+        assert torch.isfinite(cell).all()
