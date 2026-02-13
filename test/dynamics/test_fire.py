@@ -2170,6 +2170,303 @@ class TestPackUnpack:
         np.testing.assert_allclose(cell_to_numpy(cell_vel_out), cell_vel_np, rtol=1e-5)
 
 
+class TestBatchedPackUnpackParity:
+    """Test batched pack/unpack kernel parity and edge cases."""
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_positions_pack_batched_parity(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Atom-parallel pack produces identical results to legacy batched pack."""
+        num_systems = 3
+        atoms_per_system = [4, 6, 5]
+        total_atoms = sum(atoms_per_system)
+
+        np.random.seed(200)
+        positions_np = np.random.randn(total_atoms, 3).astype(np_dtype)
+        cells_np = np.zeros((num_systems, 3, 3), dtype=np_dtype)
+        for i in range(num_systems):
+            cells_np[i] = np.eye(3, dtype=np_dtype) * (8.0 + i)
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
+
+        # Create atom_ptr, ext_atom_ptr, batch_idx
+        atom_ptr_np = np.array(
+            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
+        )
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
+        extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
+
+        batch_idx_np = np.repeat(
+            np.arange(num_systems, dtype=np.int32),
+            atoms_per_system,
+        )
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        ext_size = total_atoms + 2 * num_systems
+
+        # Batched pack (auto-compute batch_idx)
+        ext_legacy = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(
+            positions, cells, ext_legacy,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device,
+        )
+
+        # Batched pack (pre-computed batch_idx)
+        ext_parallel = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(
+            positions, cells, ext_parallel,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(
+            ext_parallel.numpy(), ext_legacy.numpy(), rtol=1e-6,
+            err_msg="Atom-parallel pack positions does not match legacy batched",
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_positions_unpack_batched_parity(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Atom-parallel unpack produces identical results to legacy batched unpack."""
+        num_systems = 3
+        atoms_per_system = [4, 6, 5]
+        total_atoms = sum(atoms_per_system)
+
+        np.random.seed(201)
+        positions_np = np.random.randn(total_atoms, 3).astype(np_dtype)
+        cells_np = np.zeros((num_systems, 3, 3), dtype=np_dtype)
+        for i in range(num_systems):
+            cells_np[i] = np.eye(3, dtype=np_dtype) * (8.0 + i)
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
+
+        atom_ptr_np = np.array(
+            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
+        )
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
+        extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
+
+        batch_idx_np = np.repeat(
+            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+        )
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        ext_size = total_atoms + 2 * num_systems
+        extended = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(
+            positions, cells, extended,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+        )
+
+        # Batched unpack (auto-compute batch_idx)
+        pos_legacy = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cell_legacy = wp.empty(num_systems, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            extended, pos_legacy, cell_legacy,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+        )
+
+        # Batched unpack (pre-computed batch_idx)
+        pos_parallel = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cell_parallel = wp.empty(num_systems, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            extended, pos_parallel, cell_parallel,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(
+            pos_parallel.numpy(), pos_legacy.numpy(), rtol=1e-6,
+            err_msg="Atom-parallel unpack positions mismatch",
+        )
+        np.testing.assert_allclose(
+            cell_parallel.numpy().reshape(-1),
+            cell_legacy.numpy().reshape(-1),
+            rtol=1e-6,
+            err_msg="Atom-parallel unpack cells mismatch",
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_forces_pack_batched_parity(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Atom-parallel force pack produces identical results to legacy batched pack."""
+        num_systems = 3
+        atoms_per_system = [4, 6, 5]
+        total_atoms = sum(atoms_per_system)
+
+        np.random.seed(202)
+        forces_np = np.random.randn(total_atoms, 3).astype(np_dtype)
+        cell_forces_np = np.zeros((num_systems, 3, 3), dtype=np_dtype)
+        for i in range(num_systems):
+            cell_forces_np[i] = np.random.randn(3, 3).astype(np_dtype) * 0.1
+
+        forces = wp.array(forces_np, dtype=dtype_vec, device=device)
+        cell_forces = wp.array(cell_forces_np.reshape(-1), dtype=dtype_mat, device=device)
+
+        atom_ptr_np = np.array(
+            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
+        )
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
+        extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
+
+        batch_idx_np = np.repeat(
+            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+        )
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        ext_size = total_atoms + 2 * num_systems
+
+        # Batched pack (auto-compute batch_idx)
+        ext_legacy = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_forces_with_cell(
+            forces, cell_forces, ext_legacy,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+        )
+
+        # Batched pack (pre-computed batch_idx)
+        ext_parallel = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_forces_with_cell(
+            forces, cell_forces, ext_parallel,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(
+            ext_parallel.numpy(), ext_legacy.numpy(), rtol=1e-6,
+            err_msg="Pre-computed batch_idx pack forces does not match auto-computed",
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
+    def test_pack_unpack_roundtrip_uneven_systems(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """Pack/unpack roundtrip with highly uneven system sizes (10, 100, 1000)."""
+        atoms_per_system = [10, 100, 1000]
+        num_systems = len(atoms_per_system)
+        total_atoms = sum(atoms_per_system)
+
+        np.random.seed(203)
+        positions_np = np.random.randn(total_atoms, 3).astype(np_dtype)
+        cells_np = np.zeros((num_systems, 3, 3), dtype=np_dtype)
+        for i in range(num_systems):
+            cells_np[i] = np.diag(np.random.uniform(5, 15, 3).astype(np_dtype))
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
+
+        atom_ptr_np = np.array(
+            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
+        )
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
+        extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
+
+        batch_idx_np = np.repeat(
+            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+        )
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        ext_size = total_atoms + 2 * num_systems
+
+        # Pack with batched kernels
+        ext_packed = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(
+            positions, cells, ext_packed,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        # Unpack with batched kernels
+        pos_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
+        cell_out = wp.empty(num_systems, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            ext_packed, pos_out, cell_out,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(
+            pos_out.numpy(), positions_np, rtol=1e-5,
+            err_msg="Positions not recovered after pack/unpack roundtrip",
+        )
+        recovered_cells = cell_out.numpy().reshape(num_systems, 3, 3)
+        np.testing.assert_allclose(
+            recovered_cells, cells_np, rtol=1e-5,
+            err_msg="Cells not recovered after pack/unpack roundtrip",
+        )
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_large_n_small_m_stress(self, device):
+        """Stress test: N=100000, M=1 with batched kernels."""
+        N = 100000
+        M = 1
+        np_dtype = np.float64
+        dtype_vec = wp.vec3d
+        dtype_mat = wp.mat33d
+
+        np.random.seed(204)
+        positions_np = np.random.randn(N, 3).astype(np_dtype)
+        cells_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype).reshape(1, 3, 3)
+
+        positions = wp.array(positions_np, dtype=dtype_vec, device=device)
+        cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
+
+        atom_ptr_np = np.array([0, N], dtype=np.int32)
+        atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
+        ext_atom_ptr = wp.empty(M + 1, dtype=wp.int32, device=device)
+        extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
+
+        batch_idx_np = np.zeros(N, dtype=np.int32)
+        batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+
+        ext_size = N + 2 * M
+
+        # Pack
+        ext_packed = wp.empty(ext_size, dtype=dtype_vec, device=device)
+        pack_positions_with_cell(
+            positions, cells, ext_packed,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        # Unpack
+        pos_out = wp.empty(N, dtype=dtype_vec, device=device)
+        cell_out = wp.empty(M, dtype=dtype_mat, device=device)
+        unpack_positions_with_cell(
+            ext_packed, pos_out, cell_out,
+            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            device=device, batch_idx=batch_idx,
+        )
+
+        wp.synchronize_device(device)
+        np.testing.assert_allclose(
+            pos_out.numpy(), positions_np, rtol=1e-10,
+            err_msg="Large-N/small-M pack/unpack mismatch",
+        )
+        recovered_cells = cell_out.numpy().reshape(M, 3, 3)
+        np.testing.assert_allclose(
+            recovered_cells, cells_np, rtol=1e-10,
+            err_msg="Large-N/small-M cell mismatch",
+        )
+
+
 class TestStressToCellForce:
     """Test stress to cell force conversion."""
 

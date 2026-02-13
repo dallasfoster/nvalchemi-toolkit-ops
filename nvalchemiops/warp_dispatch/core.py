@@ -236,9 +236,7 @@ def dispatch(
             f"No kernel registered for dispatch key {key!r}. "
             f"Available keys: {sorted(table.keys(), key=str)}"
         ) from None
-    wp.launch(
-        kernel, dim=dim, inputs=inputs, outputs=outputs or [], device=device
-    )
+    wp.launch(kernel, dim=dim, inputs=inputs, outputs=outputs or [], device=device)
 
 
 # =============================================================================

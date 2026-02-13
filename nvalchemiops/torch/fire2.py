@@ -26,6 +26,8 @@ Entry points:
 - :func:`fire2_step_coord_cell` -- variable-cell optimization
   (coordinates + cell DOFs).  Packs atomic and cell DOFs into an
   interleaved extended array, runs FIRE2, and unpacks results.
+- :func:`fire2_step_extended` -- run FIRE2 directly on caller-managed
+  extended arrays (no per-step pack/unpack overhead).
 
 Modifies inputs in-place. Scratch buffers and static metadata
 (``atom_ptr``, ``ext_atom_ptr``, ``ext_batch_idx``) can be passed in
@@ -452,31 +454,33 @@ def fire2_step_coord_cell(
         )
     wp_ext_atom_ptr = wp.from_torch(ext_atom_ptr, dtype=wp.int32)
 
-    # --- Pack into extended arrays (interleaved layout) ---
-    pack_positions_with_cell(
-        wp_pos,
-        wp_cell,
-        wp_ext_pos,
-        wp_atom_ptr,
-        wp_ext_atom_ptr,
-        device=wp_device,
-    )
-    pack_velocities_with_cell(
-        wp_vel,
-        wp_cell_vel,
-        wp_ext_vel,
-        wp_atom_ptr,
-        wp_ext_atom_ptr,
-        device=wp_device,
-    )
-    pack_forces_with_cell(
-        wp_forces,
-        wp_cell_force,
-        wp_ext_forces,
-        wp_atom_ptr,
-        wp_ext_atom_ptr,
-        device=wp_device,
-    )
+    # --- Pack into extended arrays ---
+    if M == 1:
+        pack_positions_with_cell(
+            wp_pos, wp_cell, wp_ext_pos, device=wp_device,
+        )
+        pack_velocities_with_cell(
+            wp_vel, wp_cell_vel, wp_ext_vel, device=wp_device,
+        )
+        pack_forces_with_cell(
+            wp_forces, wp_cell_force, wp_ext_forces, device=wp_device,
+        )
+    else:
+        pack_positions_with_cell(
+            wp_pos, wp_cell, wp_ext_pos,
+            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            batch_idx=wp_bidx,
+        )
+        pack_velocities_with_cell(
+            wp_vel, wp_cell_vel, wp_ext_vel,
+            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            batch_idx=wp_bidx,
+        )
+        pack_forces_with_cell(
+            wp_forces, wp_cell_force, wp_ext_forces,
+            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            batch_idx=wp_bidx,
+        )
 
     # --- Extended batch_idx: compute sorted index from ext_atom_ptr if not provided ---
     if ext_batch_idx is None:
@@ -511,19 +515,117 @@ def fire2_step_coord_cell(
     )
 
     # --- Unpack extended arrays back to original tensors ---
-    unpack_positions_with_cell(
-        wp_ext_pos,
-        wp_pos,
-        wp_cell,
-        atom_ptr=wp_atom_ptr,
-        ext_atom_ptr=wp_ext_atom_ptr,
-        device=wp_device,
-    )
-    unpack_velocities_with_cell(
-        wp_ext_vel,
-        wp_vel,
-        wp_cell_vel,
-        atom_ptr=wp_atom_ptr,
-        ext_atom_ptr=wp_ext_atom_ptr,
+    if M == 1:
+        unpack_positions_with_cell(
+            wp_ext_pos, wp_pos, wp_cell,
+            num_atoms=N, device=wp_device,
+        )
+        unpack_velocities_with_cell(
+            wp_ext_vel, wp_vel, wp_cell_vel,
+            num_atoms=N, device=wp_device,
+        )
+    else:
+        unpack_positions_with_cell(
+            wp_ext_pos, wp_pos, wp_cell,
+            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device, batch_idx=wp_bidx,
+        )
+        unpack_velocities_with_cell(
+            wp_ext_vel, wp_vel, wp_cell_vel,
+            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device, batch_idx=wp_bidx,
+        )
+
+
+def fire2_step_extended(
+    ext_positions: torch.Tensor,
+    ext_velocities: torch.Tensor,
+    ext_forces: torch.Tensor,
+    ext_batch_idx: torch.Tensor,
+    alpha: torch.Tensor,
+    dt: torch.Tensor,
+    nsteps_inc: torch.Tensor,
+    *,
+    vf: torch.Tensor | None = None,
+    v_sumsq: torch.Tensor | None = None,
+    f_sumsq: torch.Tensor | None = None,
+    max_norm: torch.Tensor | None = None,
+    delaystep: int = 60,
+    dtgrow: float = 1.05,
+    dtshrink: float = 0.75,
+    alphashrink: float = 0.985,
+    alpha0: float = 0.09,
+    tmax: float = 0.08,
+    tmin: float = 0.005,
+    maxstep: float = 0.1,
+) -> None:
+    """Run FIRE2 directly on pre-packed extended arrays (no pack/unpack).
+
+    This is a lower-level API for callers that maintain persistent extended
+    arrays (positions + cell DOFs interleaved).  The caller is responsible
+    for packing data into the extended layout before the first call and
+    unpacking results after the last call (or as needed).
+
+    This eliminates the per-step pack/unpack overhead that
+    ``fire2_step_coord_cell`` incurs.
+
+    Parameters
+    ----------
+    ext_positions : torch.Tensor, shape (N_ext, 3)
+        Extended position array (atoms + cell DOFs interleaved).
+    ext_velocities : torch.Tensor, shape (N_ext, 3)
+        Extended velocity array.
+    ext_forces : torch.Tensor, shape (N_ext, 3)
+        Extended force array.
+    ext_batch_idx : torch.Tensor, shape (N_ext,), dtype=int32
+        System index for each element in the extended arrays.
+    alpha : torch.Tensor, shape (M,)
+        FIRE2 mixing parameter per system.
+    dt : torch.Tensor, shape (M,)
+        Timestep per system.
+    nsteps_inc : torch.Tensor, shape (M,), dtype=int32
+        Consecutive positive-power step counter per system.
+    vf, v_sumsq, f_sumsq, max_norm : torch.Tensor or None
+        Per-system scratch buffers, shape (M,). Allocated internally if None.
+    delaystep, dtgrow, dtshrink, alphashrink, alpha0, tmax, tmin, maxstep :
+        FIRE2 hyperparameters.  See ``fire2_step_coord_cell`` for details.
+
+    Notes
+    -----
+    Modifies ``ext_positions``, ``ext_velocities``, ``alpha``, ``dt``,
+    and ``nsteps_inc`` in-place.
+    """
+    dtype = ext_positions.dtype
+    device = ext_positions.device
+    M = alpha.shape[0]
+    vec_type = _TORCH_TO_WP_VEC[dtype]
+    wp_device = wp.device_from_torch(device)
+
+    # Reduction scratch buffers
+    vf = _alloc_or_zero(vf, M, dtype, device)
+    v_sumsq = _alloc_or_zero(v_sumsq, M, dtype, device)
+    f_sumsq = _alloc_or_zero(f_sumsq, M, dtype, device)
+    max_norm = _alloc_or_zero(max_norm, M, dtype, device)
+
+    fire2_step(
+        wp.from_torch(ext_positions.detach(), dtype=vec_type),
+        wp.from_torch(ext_velocities.detach(), dtype=vec_type),
+        wp.from_torch(ext_forces.detach(), dtype=vec_type),
+        wp.from_torch(ext_batch_idx.detach(), dtype=wp.int32),
+        wp.from_torch(alpha.detach()),
+        wp.from_torch(dt.detach()),
+        wp.from_torch(nsteps_inc.detach(), dtype=wp.int32),
+        wp.from_torch(vf),
+        wp.from_torch(v_sumsq),
+        wp.from_torch(f_sumsq),
+        wp.from_torch(max_norm),
+        delaystep=delaystep,
+        dtgrow=dtgrow,
+        dtshrink=dtshrink,
+        alphashrink=alphashrink,
+        alpha0=alpha0,
+        tmax=tmax,
+        tmin=tmin,
+        maxstep=maxstep,
         device=wp_device,
     )
