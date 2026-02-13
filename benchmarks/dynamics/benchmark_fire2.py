@@ -42,8 +42,21 @@ import torch
 import warp as wp
 from shared_utils import get_gpu_sku, load_config
 
+from nvalchemiops.batch_utils import atom_ptr_to_batch_idx, batch_idx_to_atom_ptr
 from nvalchemiops.dynamics.optimizers import fire2_step, fire_step
-from nvalchemiops.torch.fire2 import fire2_step_coord, fire2_step_coord_cell
+from nvalchemiops.dynamics.utils.cell_filter import (
+    extend_atom_ptr,
+    pack_forces_with_cell,
+    pack_positions_with_cell,
+    pack_velocities_with_cell,
+    unpack_positions_with_cell,
+    unpack_velocities_with_cell,
+)
+from nvalchemiops.torch.fire2 import (
+    fire2_step_coord,
+    fire2_step_coord_cell,
+    fire2_step_extended,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -202,6 +215,7 @@ def bench_fire1_warp(N, M, device, dtype, warmup, runs):
     )
 
     # Pre-allocate scratch buffers
+    uphill_flag = wp.zeros(M, dtype=wp.int32, device=wp_device)
     vf = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
     vv = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
     ff = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
@@ -210,6 +224,7 @@ def bench_fire1_warp(N, M, device, dtype, warmup, runs):
         vf.zero_()
         vv.zero_()
         ff.zero_()
+        uphill_flag.zero_()
         fire_step(
             pos_wp,
             vel_wp,
@@ -226,11 +241,209 @@ def bench_fire1_warp(N, M, device, dtype, warmup, runs):
             nmin_wp,
             f_dec_wp,
             f_inc_wp,
+            uphill_flag,
             vf,
             vv,
             ff,
             batch_idx=bidx_wp,
         )
+
+    return _bench_cuda(run, warmup, runs, device)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: FIRE1 (Warp, batch_idx, variable-cell)
+# ---------------------------------------------------------------------------
+
+
+def bench_fire1_warp_cell(N, M, device, dtype, warmup, runs):
+    """Benchmark Warp FIRE1 with variable-cell DOFs (pack/unpack + fire_step)."""
+    pos, vel, forces, bidx = _make_data(N, M, device, dtype)
+    wp_device = wp.device_from_torch(device)
+    vec_dtype = wp.vec3f if dtype == torch.float32 else wp.vec3d
+    mat_dtype = wp.mat33f if dtype == torch.float32 else wp.mat33d
+    scalar_dtype = wp.float32 if dtype == torch.float32 else wp.float64
+    np_dtype = np.float32 if dtype == torch.float32 else np.float64
+
+    # Cell data: identity cell per system, zero cell velocities, random cell force
+    rng = np.random.default_rng(123)
+    cell = (
+        torch.eye(3, dtype=dtype, device=device)
+        .unsqueeze(0)
+        .expand(M, -1, -1)
+        .contiguous()
+    )
+    cell_vel = torch.zeros(M, 3, 3, dtype=dtype, device=device)
+    cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+    cell_force = torch.tensor(cell_force_np, dtype=dtype, device=device)
+
+    # Warp views of original arrays
+    wp_pos = wp.from_torch(pos, dtype=vec_dtype)
+    wp_vel = wp.from_torch(vel.clone(), dtype=vec_dtype)
+    wp_forces = wp.from_torch(forces, dtype=vec_dtype)
+    wp_cell = wp.from_torch(cell, dtype=mat_dtype)
+    wp_cell_vel = wp.from_torch(cell_vel, dtype=mat_dtype)
+    wp_cell_force = wp.from_torch(cell_force, dtype=mat_dtype)
+
+    # Pre-compute static index metadata
+    atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    atom_counts = torch.zeros(M, dtype=torch.int32, device=device)
+    batch_idx_to_atom_ptr(
+        wp.from_torch(bidx, dtype=wp.int32),
+        wp.from_torch(atom_counts, dtype=wp.int32),
+        wp.from_torch(atom_ptr, dtype=wp.int32),
+    )
+    wp_atom_ptr = wp.from_torch(atom_ptr, dtype=wp.int32)
+
+    ext_atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    extend_atom_ptr(
+        wp_atom_ptr,
+        wp.from_torch(ext_atom_ptr, dtype=wp.int32),
+        device=wp_device,
+    )
+    wp_ext_atom_ptr = wp.from_torch(ext_atom_ptr, dtype=wp.int32)
+
+    N_ext = N + 2 * M
+    ext_batch_idx = torch.empty(N_ext, dtype=torch.int32, device=device)
+    atom_ptr_to_batch_idx(
+        wp_ext_atom_ptr,
+        wp.from_torch(ext_batch_idx, dtype=wp.int32),
+    )
+    ext_bidx_wp = wp.from_torch(ext_batch_idx, dtype=wp.int32)
+    wp_bidx = wp.from_torch(bidx, dtype=wp.int32)
+
+    # Extended working arrays
+    ext_pos = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_vel = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_forces = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    wp_ext_pos = wp.from_torch(ext_pos, dtype=vec_dtype)
+    wp_ext_vel = wp.from_torch(ext_vel, dtype=vec_dtype)
+    wp_ext_forces = wp.from_torch(ext_forces, dtype=vec_dtype)
+
+    # Extended masses (unit mass for all DOFs including cell)
+    ext_masses_wp = wp.array(
+        np.ones(N_ext, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+
+    # FIRE1 per-system control parameters
+    alpha_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_wp = wp.array(
+        np.full(M, 0.01, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    alpha_start_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    f_alpha_wp = wp.array(
+        np.full(M, 0.99, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_min_wp = wp.array(
+        np.full(M, 0.001, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    dt_max_wp = wp.array(
+        np.full(M, 1.0, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    maxstep_wp = wp.array(
+        np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    nsteps_wp = wp.array(
+        np.zeros(M, dtype=np.int32), dtype=wp.int32, device=wp_device
+    )
+    nmin_wp = wp.array(
+        np.full(M, 5, dtype=np.int32), dtype=wp.int32, device=wp_device
+    )
+    f_dec_wp = wp.array(
+        np.full(M, 0.5, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+    f_inc_wp = wp.array(
+        np.full(M, 1.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
+    )
+
+    # Scratch buffers
+    uphill_flag = wp.zeros(M, dtype=wp.int32, device=wp_device)
+    vf = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
+    vv = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
+    ff = wp.zeros(M, dtype=scalar_dtype, device=wp_device)
+
+    def run():
+        # Pack into extended arrays
+        if M == 1:
+            pack_positions_with_cell(
+                wp_pos, wp_cell, wp_ext_pos, device=wp_device,
+            )
+            pack_velocities_with_cell(
+                wp_vel, wp_cell_vel, wp_ext_vel, device=wp_device,
+            )
+            pack_forces_with_cell(
+                wp_forces, wp_cell_force, wp_ext_forces, device=wp_device,
+            )
+        else:
+            pack_positions_with_cell(
+                wp_pos, wp_cell, wp_ext_pos,
+                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                batch_idx=wp_bidx,
+            )
+            pack_velocities_with_cell(
+                wp_vel, wp_cell_vel, wp_ext_vel,
+                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                batch_idx=wp_bidx,
+            )
+            pack_forces_with_cell(
+                wp_forces, wp_cell_force, wp_ext_forces,
+                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                batch_idx=wp_bidx,
+            )
+
+        # FIRE1 step on extended arrays
+        vf.zero_()
+        vv.zero_()
+        ff.zero_()
+        uphill_flag.zero_()
+        fire_step(
+            wp_ext_pos,
+            wp_ext_vel,
+            wp_ext_forces,
+            ext_masses_wp,
+            alpha_wp,
+            dt_wp,
+            alpha_start_wp,
+            f_alpha_wp,
+            dt_min_wp,
+            dt_max_wp,
+            maxstep_wp,
+            nsteps_wp,
+            nmin_wp,
+            f_dec_wp,
+            f_inc_wp,
+            uphill_flag,
+            vf,
+            vv,
+            ff,
+            batch_idx=ext_bidx_wp,
+        )
+
+        # Unpack back to original arrays
+        if M == 1:
+            unpack_positions_with_cell(
+                wp_ext_pos, wp_pos, wp_cell,
+                num_atoms=N, device=wp_device,
+            )
+            unpack_velocities_with_cell(
+                wp_ext_vel, wp_vel, wp_cell_vel,
+                num_atoms=N, device=wp_device,
+            )
+        else:
+            unpack_positions_with_cell(
+                wp_ext_pos, wp_pos, wp_cell,
+                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device, batch_idx=wp_bidx,
+            )
+            unpack_velocities_with_cell(
+                wp_ext_vel, wp_vel, wp_cell_vel,
+                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device, batch_idx=wp_bidx,
+            )
 
     return _bench_cuda(run, warmup, runs, device)
 
@@ -299,12 +512,34 @@ def bench_fire2_torch_adapter_cell(N, M, device, dtype, hyper, warmup, runs):
     dt = torch.full((M,), 0.05, dtype=dtype, device=device)
     nsteps_inc = torch.zeros(M, dtype=torch.int32, device=device)
 
-    # Pre-allocate scratch buffers
+    # Pre-compute static index metadata (batch_idx is constant across steps)
+    wp_device = wp.device_from_torch(device)
+    atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    atom_counts = torch.zeros(M, dtype=torch.int32, device=device)
+    batch_idx_to_atom_ptr(
+        wp.from_torch(bidx, dtype=wp.int32),
+        wp.from_torch(atom_counts, dtype=wp.int32),
+        wp.from_torch(atom_ptr, dtype=wp.int32),
+    )
+
+    ext_atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    extend_atom_ptr(
+        wp.from_torch(atom_ptr, dtype=wp.int32),
+        wp.from_torch(ext_atom_ptr, dtype=wp.int32),
+        device=wp_device,
+    )
+
     N_ext = N + 2 * M
+    ext_batch_idx = torch.empty(N_ext, dtype=torch.int32, device=device)
+    atom_ptr_to_batch_idx(
+        wp.from_torch(ext_atom_ptr, dtype=wp.int32),
+        wp.from_torch(ext_batch_idx, dtype=wp.int32),
+    )
+
+    # Pre-allocate scratch buffers
     ext_pos = torch.empty(N_ext, 3, dtype=dtype, device=device)
     ext_vel = torch.empty(N_ext, 3, dtype=dtype, device=device)
     ext_forces = torch.empty(N_ext, 3, dtype=dtype, device=device)
-    ext_bidx = torch.empty(N_ext, dtype=torch.int32, device=device)
     vf = torch.zeros(M, dtype=dtype, device=device)
     v_sumsq = torch.zeros(M, dtype=dtype, device=device)
     f_sumsq = torch.zeros(M, dtype=dtype, device=device)
@@ -322,14 +557,124 @@ def bench_fire2_torch_adapter_cell(N, M, device, dtype, hyper, warmup, runs):
             alpha,
             dt,
             nsteps_inc,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
             ext_positions=ext_pos,
             ext_velocities=ext_vel,
             ext_forces=ext_forces,
-            ext_batch_idx=ext_bidx,
+            ext_batch_idx=ext_batch_idx,
             vf=vf,
             v_sumsq=v_sumsq,
             f_sumsq=f_sumsq,
             max_norm=max_norm,
+            **hyper,
+        )
+
+    return _bench_cuda(run, warmup, runs, device)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: FIRE2 on persistent extended arrays (no pack/unpack in loop)
+# ---------------------------------------------------------------------------
+
+
+def bench_fire2_extended(N, M, device, dtype, hyper, warmup, runs):
+    """Benchmark fire2_step_extended on pre-packed extended arrays."""
+    pos, vel, forces, bidx = _make_data(N, M, device, dtype)
+
+    # Cell data
+    rng = np.random.default_rng(124)
+    np_dtype = np.float32 if dtype == torch.float32 else np.float64
+    cell = (
+        torch.eye(3, dtype=dtype, device=device)
+        .unsqueeze(0)
+        .expand(M, -1, -1)
+        .contiguous()
+    )
+    cell_vel = torch.zeros(M, 3, 3, dtype=dtype, device=device)
+    cell_force_np = rng.standard_normal((M, 3, 3)).astype(np_dtype) * 0.01
+    cell_force = torch.tensor(cell_force_np, dtype=dtype, device=device)
+
+    alpha = torch.full((M,), hyper["alpha0"], dtype=dtype, device=device)
+    dt = torch.full((M,), 0.05, dtype=dtype, device=device)
+    nsteps_inc = torch.zeros(M, dtype=torch.int32, device=device)
+
+    # Pre-compute static index metadata
+    wp_device = wp.device_from_torch(device)
+    vec_type = {torch.float32: wp.vec3f, torch.float64: wp.vec3d}[dtype]
+    mat_type = {torch.float32: wp.mat33f, torch.float64: wp.mat33d}[dtype]
+
+    atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    atom_counts = torch.zeros(M, dtype=torch.int32, device=device)
+    batch_idx_to_atom_ptr(
+        wp.from_torch(bidx, dtype=wp.int32),
+        wp.from_torch(atom_counts, dtype=wp.int32),
+        wp.from_torch(atom_ptr, dtype=wp.int32),
+    )
+
+    ext_atom_ptr = torch.zeros(M + 1, dtype=torch.int32, device=device)
+    extend_atom_ptr(
+        wp.from_torch(atom_ptr, dtype=wp.int32),
+        wp.from_torch(ext_atom_ptr, dtype=wp.int32),
+        device=wp_device,
+    )
+
+    N_ext = N + 2 * M
+    ext_batch_idx = torch.empty(N_ext, dtype=torch.int32, device=device)
+    atom_ptr_to_batch_idx(
+        wp.from_torch(ext_atom_ptr, dtype=wp.int32),
+        wp.from_torch(ext_batch_idx, dtype=wp.int32),
+    )
+
+    # Pre-allocate and pack extended arrays ONCE (before timing loop)
+    ext_pos = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_vel = torch.empty(N_ext, 3, dtype=dtype, device=device)
+    ext_forces = torch.empty(N_ext, 3, dtype=dtype, device=device)
+
+    wp_atom_ptr = wp.from_torch(atom_ptr, dtype=wp.int32)
+    wp_ext_atom_ptr = wp.from_torch(ext_atom_ptr, dtype=wp.int32)
+    wp_bidx = wp.from_torch(bidx, dtype=wp.int32)
+
+    pack_positions_with_cell(
+        wp.from_torch(pos, dtype=vec_type),
+        wp.from_torch(cell, dtype=mat_type),
+        wp.from_torch(ext_pos, dtype=vec_type),
+        wp_atom_ptr, wp_ext_atom_ptr,
+        device=wp_device, batch_idx=wp_bidx,
+    )
+    pack_velocities_with_cell(
+        wp.from_torch(vel, dtype=vec_type),
+        wp.from_torch(cell_vel, dtype=mat_type),
+        wp.from_torch(ext_vel, dtype=vec_type),
+        wp_atom_ptr, wp_ext_atom_ptr,
+        device=wp_device, batch_idx=wp_bidx,
+    )
+    pack_forces_with_cell(
+        wp.from_torch(forces, dtype=vec_type),
+        wp.from_torch(cell_force, dtype=mat_type),
+        wp.from_torch(ext_forces, dtype=vec_type),
+        wp_atom_ptr, wp_ext_atom_ptr,
+        device=wp_device, batch_idx=wp_bidx,
+    )
+
+    vf = torch.zeros(M, dtype=dtype, device=device)
+    v_sumsq = torch.zeros(M, dtype=dtype, device=device)
+    f_sumsq = torch.zeros(M, dtype=dtype, device=device)
+    max_norm_buf = torch.zeros(M, dtype=dtype, device=device)
+
+    def run():
+        fire2_step_extended(
+            ext_pos,
+            ext_vel,
+            ext_forces,
+            ext_batch_idx,
+            alpha,
+            dt,
+            nsteps_inc,
+            vf=vf,
+            v_sumsq=v_sumsq,
+            f_sumsq=f_sumsq,
+            max_norm=max_norm_buf,
             **hyper,
         )
 
@@ -498,6 +843,28 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
                 "FIRE2(cell)",
                 "F2cl",
                 lambda N, M, dev, dt, w, r: bench_fire2_torch_adapter_cell(
+                    N, M, dev, dt, hyper, w, r
+                ),
+            )
+        )
+    if methods_cfg.get("warp_fire1_cell", True):
+        method_registry.append(
+            (
+                "warp_fire1_cell",
+                "FIRE1(cell)",
+                "F1cl",
+                lambda N, M, dev, dt, w, r: bench_fire1_warp_cell(
+                    N, M, dev, dt, w, r
+                ),
+            )
+        )
+    if methods_cfg.get("fire2_extended", True):
+        method_registry.append(
+            (
+                "fire2_extended",
+                "FIRE2(ext)",
+                "F2ex",
+                lambda N, M, dev, dt, w, r: bench_fire2_extended(
                     N, M, dev, dt, hyper, w, r
                 ),
             )

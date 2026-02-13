@@ -580,7 +580,8 @@ class MDSystem:
         self.wp_cell = wp.array(cell_reshaped, dtype=self.wp_mat_dtype, device=device)
 
         # Compute cell inverse for position wrapping
-        self.wp_cell_inv = compute_cell_inverse(self.wp_cell, device=device)
+        self.wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=device)
 
         # Set up neighbor list manager
         self.neighbor_manager = NeighborListManager(
@@ -697,7 +698,7 @@ class MDSystem:
             New cell matrix.
         """
         wp.copy(self.wp_cell, cell)
-        self.wp_cell_inv = compute_cell_inverse(self.wp_cell, device=self.device)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.device)
         # Update torch cell for neighbor list
         self.torch_cell = wp.to_torch(self.wp_cell).squeeze(0)
         # Force neighbor rebuild on next force computation

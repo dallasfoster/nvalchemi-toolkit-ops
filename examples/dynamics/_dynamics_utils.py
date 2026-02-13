@@ -730,7 +730,8 @@ class MDSystem:
         self.wp_cell = wp.array(cell_reshaped, dtype=self.wp_mat_dtype, device=device)
 
         # Compute cell inverse for position wrapping
-        self.wp_cell_inv = compute_cell_inverse(self.wp_cell, device=device)
+        self.wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=device)
 
         # Set up neighbor list manager
         self.neighbor_manager = NeighborListManager(
@@ -962,7 +963,8 @@ class BatchedMDSystem:
         self.wp_cells = wp.array(
             cells.astype(dtype), dtype=self.wp_mat_dtype, device=device
         )
-        self.wp_cells_inv = compute_cell_inverse(self.wp_cells, device=device)
+        self.wp_cells_inv = wp.empty_like(self.wp_cells)
+        compute_cell_inverse(self.wp_cells, self.wp_cells_inv, device=device)
 
         self.wp_batch_idx = wp.array(
             batch_idx.astype(np.int32), dtype=wp.int32, device=device
