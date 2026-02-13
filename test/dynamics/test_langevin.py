@@ -409,7 +409,9 @@ class TestLangevinAPI:
 
         # Call without explicit device
         velocities_out = wp.empty_like(velocities)
-        vel_out = langevin_baoab_finalize_out(velocities, forces_new, masses, dt, velocities_out)
+        vel_out = langevin_baoab_finalize_out(
+            velocities, forces_new, masses, dt, velocities_out
+        )
 
         wp.synchronize_device(device)
         assert vel_out.shape[0] == num_atoms
@@ -585,7 +587,13 @@ class TestLangevinBatched:
 
         velocities_out = wp.empty_like(velocities)
         velocities_out = langevin_baoab_finalize_out(
-            velocities, forces_new, masses, dt, velocities_out, batch_idx=batch_idx, device=device
+            velocities,
+            forces_new,
+            masses,
+            dt,
+            velocities_out,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert velocities_out.shape[0] == num_atoms
@@ -1187,7 +1195,13 @@ class TestLangevinAtomPtr:
 
         velocities_out = wp.empty_like(velocities)
         vel_out = langevin_baoab_finalize_out(
-            velocities, forces, masses, dt, velocities_out, atom_ptr=atom_ptr, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)

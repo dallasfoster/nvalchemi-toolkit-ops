@@ -606,7 +606,13 @@ class TestVelocityVerletBatched:
         velocities_out = wp.empty_like(velocities)
 
         vel_out = velocity_verlet_velocity_finalize_out(
-            velocities, forces_new, masses, dt, velocities_out, batch_idx=batch_idx, device=device
+            velocities,
+            forces_new,
+            masses,
+            dt,
+            velocities_out,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         assert vel_out.shape[0] == num_atoms
@@ -1106,8 +1112,15 @@ class TestVelocityVerletAtomPtr:
         velocities_out = wp.empty_like(velocities)
 
         pos_out, vel_out = velocity_verlet_position_update_out(
-            positions, velocities, forces, masses, dt, positions_out, velocities_out,
-            atom_ptr=atom_ptr, device=device
+            positions,
+            velocities,
+            forces,
+            masses,
+            dt,
+            positions_out,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1155,7 +1168,13 @@ class TestVelocityVerletAtomPtr:
         velocities_out = wp.empty_like(velocities)
 
         vel_out = velocity_verlet_velocity_finalize_out(
-            velocities, forces_new, masses, dt, velocities_out, atom_ptr=atom_ptr, device=device
+            velocities,
+            forces_new,
+            masses,
+            dt,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)

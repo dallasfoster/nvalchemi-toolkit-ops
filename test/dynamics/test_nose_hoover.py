@@ -263,7 +263,9 @@ class TestNHCAPI:
         dt = wp.array([0.001], dtype=dtype_scalar, device=device)
 
         velocities_out = wp.empty_like(velocities)
-        vel_out = nhc_velocity_half_step_out(velocities, forces, masses, dt, velocities_out)
+        vel_out = nhc_velocity_half_step_out(
+            velocities, forces, masses, dt, velocities_out
+        )
         wp.synchronize_device(device)
 
         np.testing.assert_array_equal(velocities.numpy(), vel_np)
@@ -518,9 +520,7 @@ class TestNHCAPI:
         positions_out = wp.empty_like(positions)
         velocities_out = wp.empty_like(velocities)
 
-        nhc_position_update_out(
-            positions, velocities, dt, positions_out, device=device
-        )
+        nhc_position_update_out(positions, velocities, dt, positions_out, device=device)
 
         forces = wp.zeros(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.ones(num_atoms, dtype=dtype_scalar, device=device)
@@ -598,7 +598,13 @@ class TestNHCBatched:
 
         velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, velocities_out, batch_idx=batch_idx, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            batch_idx=batch_idx,
+            device=device,
         )
 
         wp.synchronize_device(device)
@@ -1266,7 +1272,13 @@ class TestNHCAtomPtr:
 
         velocities_out = wp.empty_like(velocities)
         vel_out = nhc_velocity_half_step_out(
-            velocities, forces, masses, dt, velocities_out, atom_ptr=atom_ptr, device=device
+            velocities,
+            forces,
+            masses,
+            dt,
+            velocities_out,
+            atom_ptr=atom_ptr,
+            device=device,
         )
 
         wp.synchronize_device(device)
