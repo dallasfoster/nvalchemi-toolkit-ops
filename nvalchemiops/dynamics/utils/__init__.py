@@ -120,6 +120,17 @@ is_first_atom_of_system
 
 langevin_noise_amplitude
     Compute Ornstein-Uhlenbeck noise amplitude coefficient.
+
+Native CUDA Tile Reduction Utilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+shared_indexed_accumulate_vec3_f32 / shared_indexed_accumulate_vec3_f64
+    Shared memory indexed accumulation for vec3 (reduces global atomic contention).
+
+indexed_tile_sum_f32 / indexed_tile_sum_f64
+    Per-system indexed reductions for batched operations.
+
+warp_reduce_vec3_f32 / warp_reduce_vec3_f64
+    Warp-level shuffle reductions (no shared memory needed).
 """
 
 from .cell_filter import (
@@ -194,6 +205,14 @@ from .thermostat_utils import (
     remove_com_motion,
     remove_com_motion_out,
 )
+from .tile_reductions import (
+    indexed_tile_sum_f32,
+    indexed_tile_sum_f64,
+    shared_indexed_accumulate_vec3_f32,
+    shared_indexed_accumulate_vec3_f64,
+    warp_reduce_vec3_f32,
+    warp_reduce_vec3_f64,
+)
 
 __all__ = [
     # Thermostat utilities
@@ -246,4 +265,11 @@ __all__ = [
     "clamp_displacement",
     "is_first_atom_of_system",
     "langevin_noise_amplitude",
+    # Native CUDA tile reduction utilities
+    "shared_indexed_accumulate_vec3_f32",
+    "shared_indexed_accumulate_vec3_f64",
+    "indexed_tile_sum_f32",
+    "indexed_tile_sum_f64",
+    "warp_reduce_vec3_f32",
+    "warp_reduce_vec3_f64",
 ]

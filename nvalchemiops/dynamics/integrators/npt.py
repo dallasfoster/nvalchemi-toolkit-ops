@@ -109,6 +109,9 @@ vec3d = wp.vec3d
 # Pressure Calculation Kernels
 # ==============================================================================
 
+# Tile block size for cooperative reductions
+TILE_THREADS = 256
+
 
 @wp.kernel
 def _compute_kinetic_tensor_single_kernel(
@@ -140,6 +143,79 @@ def _compute_kinetic_tensor_single_kernel(
 
 
 @wp.kernel
+def _compute_kinetic_tensor_single_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    kinetic_tensors: wp.array2d(dtype=Any),
+):
+    """Compute kinetic contribution to pressure tensor with tile reductions (single system).
+
+    P_kin[i,j] = sum_k m_k * v_k[i] * v_k[j]
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+
+    # Compute local outer product components
+    p_xx = m * v[0] * v[0]
+    p_xy = m * v[0] * v[1]
+    p_xz = m * v[0] * v[2]
+    p_yx = m * v[1] * v[0]
+    p_yy = m * v[1] * v[1]
+    p_yz = m * v[1] * v[2]
+    p_zx = m * v[2] * v[0]
+    p_zy = m * v[2] * v[1]
+    p_zz = m * v[2] * v[2]
+
+    # Convert to tiles for block-level reduction
+    t_xx = wp.tile(p_xx)
+    t_xy = wp.tile(p_xy)
+    t_xz = wp.tile(p_xz)
+    t_yx = wp.tile(p_yx)
+    t_yy = wp.tile(p_yy)
+    t_yz = wp.tile(p_yz)
+    t_zx = wp.tile(p_zx)
+    t_zy = wp.tile(p_zy)
+    t_zz = wp.tile(p_zz)
+
+    # Cooperative sum within block
+    s_xx = wp.tile_sum(t_xx)
+    s_xy = wp.tile_sum(t_xy)
+    s_xz = wp.tile_sum(t_xz)
+    s_yx = wp.tile_sum(t_yx)
+    s_yy = wp.tile_sum(t_yy)
+    s_yz = wp.tile_sum(t_yz)
+    s_zx = wp.tile_sum(t_zx)
+    s_zy = wp.tile_sum(t_zy)
+    s_zz = wp.tile_sum(t_zz)
+
+    # Extract scalar values from tile sums
+    sum_xx = s_xx[0]
+    sum_xy = s_xy[0]
+    sum_xz = s_xz[0]
+    sum_yx = s_yx[0]
+    sum_yy = s_yy[0]
+    sum_yz = s_yz[0]
+    sum_zx = s_zx[0]
+    sum_zy = s_zy[0]
+    sum_zz = s_zz[0]
+
+    # Only first thread in block writes (9 atomics per block)
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(kinetic_tensors, 0, 0, sum_xx)
+        wp.atomic_add(kinetic_tensors, 0, 1, sum_xy)
+        wp.atomic_add(kinetic_tensors, 0, 2, sum_xz)
+        wp.atomic_add(kinetic_tensors, 0, 3, sum_yx)
+        wp.atomic_add(kinetic_tensors, 0, 4, sum_yy)
+        wp.atomic_add(kinetic_tensors, 0, 5, sum_yz)
+        wp.atomic_add(kinetic_tensors, 0, 6, sum_zx)
+        wp.atomic_add(kinetic_tensors, 0, 7, sum_zy)
+        wp.atomic_add(kinetic_tensors, 0, 8, sum_zz)
+
+
+@wp.kernel
 def _compute_kinetic_tensor_kernel(
     velocities: wp.array(dtype=Any),
     masses: wp.array(dtype=Any),
@@ -164,6 +240,79 @@ def _compute_kinetic_tensor_kernel(
     wp.atomic_add(kinetic_tensors, sys_id, 6, m * v[2] * v[0])
     wp.atomic_add(kinetic_tensors, sys_id, 7, m * v[2] * v[1])
     wp.atomic_add(kinetic_tensors, sys_id, 8, m * v[2] * v[2])
+
+
+@wp.kernel
+def _compute_kinetic_tensor_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    kinetic_tensors: wp.array2d(dtype=Any),
+):
+    """Compute kinetic contribution to pressure tensor with tile reductions (batched).
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+    sys_id = batch_idx[atom_idx]
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+
+    # Compute local outer product components
+    p_xx = m * v[0] * v[0]
+    p_xy = m * v[0] * v[1]
+    p_xz = m * v[0] * v[2]
+    p_yx = m * v[1] * v[0]
+    p_yy = m * v[1] * v[1]
+    p_yz = m * v[1] * v[2]
+    p_zx = m * v[2] * v[0]
+    p_zy = m * v[2] * v[1]
+    p_zz = m * v[2] * v[2]
+
+    # Convert to tiles for block-level reduction
+    t_xx = wp.tile(p_xx)
+    t_xy = wp.tile(p_xy)
+    t_xz = wp.tile(p_xz)
+    t_yx = wp.tile(p_yx)
+    t_yy = wp.tile(p_yy)
+    t_yz = wp.tile(p_yz)
+    t_zx = wp.tile(p_zx)
+    t_zy = wp.tile(p_zy)
+    t_zz = wp.tile(p_zz)
+
+    # Cooperative sum within block
+    s_xx = wp.tile_sum(t_xx)
+    s_xy = wp.tile_sum(t_xy)
+    s_xz = wp.tile_sum(t_xz)
+    s_yx = wp.tile_sum(t_yx)
+    s_yy = wp.tile_sum(t_yy)
+    s_yz = wp.tile_sum(t_yz)
+    s_zx = wp.tile_sum(t_zx)
+    s_zy = wp.tile_sum(t_zy)
+    s_zz = wp.tile_sum(t_zz)
+
+    # Extract scalar values from tile sums
+    sum_xx = s_xx[0]
+    sum_xy = s_xy[0]
+    sum_xz = s_xz[0]
+    sum_yx = s_yx[0]
+    sum_yy = s_yy[0]
+    sum_yz = s_yz[0]
+    sum_zx = s_zx[0]
+    sum_zy = s_zy[0]
+    sum_zz = s_zz[0]
+
+    # Only first thread in block writes (9 atomics per block per system)
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(kinetic_tensors, sys_id, 0, sum_xx)
+        wp.atomic_add(kinetic_tensors, sys_id, 1, sum_xy)
+        wp.atomic_add(kinetic_tensors, sys_id, 2, sum_xz)
+        wp.atomic_add(kinetic_tensors, sys_id, 3, sum_yx)
+        wp.atomic_add(kinetic_tensors, sys_id, 4, sum_yy)
+        wp.atomic_add(kinetic_tensors, sys_id, 5, sum_yz)
+        wp.atomic_add(kinetic_tensors, sys_id, 6, sum_zx)
+        wp.atomic_add(kinetic_tensors, sys_id, 7, sum_zy)
+        wp.atomic_add(kinetic_tensors, sys_id, 8, sum_zz)
 
 
 @wp.kernel
@@ -2072,17 +2221,19 @@ def compute_pressure_tensor(
 
     if batch_idx is None:
         wp.launch(
-            _compute_kinetic_tensor_single_kernel,
+            _compute_kinetic_tensor_single_tiled_kernel,
             dim=num_atoms,
             inputs=[velocities, masses, kinetic_tensors],
             device=device,
+            block_dim=TILE_THREADS,
         )
     else:
         wp.launch(
-            _compute_kinetic_tensor_kernel,
+            _compute_kinetic_tensor_tiled_kernel,
             dim=num_atoms,
             inputs=[velocities, masses, batch_idx, kinetic_tensors],
             device=device,
+            block_dim=TILE_THREADS,
         )
 
     if pressure_tensors is None:

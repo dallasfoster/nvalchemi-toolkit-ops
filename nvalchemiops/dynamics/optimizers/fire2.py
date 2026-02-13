@@ -80,6 +80,9 @@ from ..utils.kernel_functions import compute_vf_vv_ff
 # Kernel 1: Triple inner-product reduction (deferred half-step)
 # =============================================================================
 
+# Tile block size for cooperative reductions
+TILE_THREADS = 256
+
 
 @wp.kernel(enable_backward=False)
 def _fire2_reduce_only_kernel(
@@ -170,6 +173,64 @@ def _fire2_reduce_only_kernel(
     wp.atomic_add(vf, s_cur, acc_vf)
     wp.atomic_add(v_sumsq, s_cur, acc_vv)
     wp.atomic_add(f_sumsq, s_cur, acc_ff)
+
+
+@wp.kernel(enable_backward=False)
+def _fire2_reduce_only_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    forces: wp.array(dtype=Any),
+    dt: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    vf: wp.array(dtype=Any),
+    v_sumsq: wp.array(dtype=Any),
+    f_sumsq: wp.array(dtype=Any),
+):
+    """Triple inner-product reduction with tile reductions (per-atom processing).
+
+    Computes three inner products per system using block-level tile reductions:
+    - vf[s] = sum(dot(v_upd[i], f[i]) for i where batch_idx[i] == s)
+    - v_sumsq[s] = sum(dot(v_upd[i], v_upd[i]) for i where batch_idx[i] == s)
+    - f_sumsq[s] = sum(dot(f[i], f[i]) for i where batch_idx[i] == s)
+
+    where v_upd[i] = velocities[i] + forces[i] * dt[batch_idx[i]].
+
+    Launch Grid: dim = [N_atoms], block_dim = TILE_THREADS
+
+    Notes
+    -----
+    - Simpler per-atom processing (no RLE complexity)
+    - Uses wp.tile() and wp.tile_sum() for cooperative reduction
+    - Reduces atomics from N to N/TILE_THREADS per system
+    """
+    atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
+
+    # Compute deferred half-step in register only
+    v_upd = velocities[atom_idx] + forces[atom_idx] * dt[system_id]
+
+    # Compute local contributions
+    local_vf, local_vv, local_ff = compute_vf_vv_ff(v_upd, forces[atom_idx])
+
+    # Convert to tiles for block-level reduction
+    t_vf = wp.tile(local_vf)
+    t_vv = wp.tile(local_vv)
+    t_ff = wp.tile(local_ff)
+
+    # Cooperative sum within block
+    s_vf = wp.tile_sum(t_vf)
+    s_vv = wp.tile_sum(t_vv)
+    s_ff = wp.tile_sum(t_ff)
+
+    # Extract scalar values from tile sums
+    sum_vf = s_vf[0]
+    sum_vv = s_vv[0]
+    sum_ff = s_ff[0]
+
+    # Only first thread in block writes (3 atomics per block)
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(vf, system_id, sum_vf)
+        wp.atomic_add(v_sumsq, system_id, sum_vv)
+        wp.atomic_add(f_sumsq, system_id, sum_ff)
 
 
 # =============================================================================
@@ -476,6 +537,7 @@ _T = [wp.float32, wp.float64]
 _V = [wp.vec3f, wp.vec3d]
 
 _fire2_reduce_only_overloads = {}
+_fire2_reduce_only_tiled_overloads = {}
 _fire2_fused_mix_maxnorm_overloads = {}
 _fire2_clamp_apply_recompute_overloads = {}
 
@@ -492,6 +554,19 @@ for _t, _v in zip(_T, _V):
             wp.array(dtype=_t),  # f_sumsq
             wp.int32,  # N
             wp.int32,  # elems_per_thread
+        ],
+    )
+
+    _fire2_reduce_only_tiled_overloads[_v] = wp.overload(
+        _fire2_reduce_only_tiled_kernel,
+        [
+            wp.array(dtype=_v),  # velocities
+            wp.array(dtype=_v),  # forces
+            wp.array(dtype=_t),  # dt
+            wp.array(dtype=wp.int32),  # batch_idx
+            wp.array(dtype=_t),  # vf
+            wp.array(dtype=_t),  # v_sumsq
+            wp.array(dtype=_t),  # f_sumsq
         ],
     )
 

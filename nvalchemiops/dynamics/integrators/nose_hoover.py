@@ -125,6 +125,9 @@ YOSHIDA_SUZUKI_5 = [_YS5_W0, _YS5_W1, _YS5_W2, _YS5_W1, _YS5_W0]
 # Diagnostic Kernels
 # ==============================================================================
 
+# Tile block size for cooperative reductions
+TILE_THREADS = 256
+
 
 @wp.kernel
 def _compute_2ke_kernel(
@@ -146,6 +149,38 @@ def _compute_2ke_kernel(
     v_sq = wp.dot(v, v)
 
     wp.atomic_add(ke2, 0, type(ke2[0])(m * v_sq))
+
+
+@wp.kernel
+def _compute_2ke_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    ke2: wp.array(dtype=Any),
+):
+    """Compute 2*KE with tile reductions (single system).
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+
+    v = velocities[atom_idx]
+    m = masses[atom_idx]
+
+    v_sq = wp.dot(v, v)
+    local_2ke = type(ke2[0])(m * v_sq)
+
+    # Convert to tile for block-level reduction
+    t = wp.tile(local_2ke)
+
+    # Cooperative sum within block
+    s = wp.tile_sum(t)
+
+    # Extract scalar from tile sum
+    sum_2ke = s[0]
+
+    # Only first thread in block writes
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(ke2, 0, sum_2ke)
 
 
 @wp.kernel(enable_backward=False)
@@ -1231,6 +1266,7 @@ _V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Diagnostic kernel overloads
 _compute_2ke_kernel_overload = {}
+_compute_2ke_tiled_kernel_overload = {}
 _batch_compute_2ke_rle_kernel_overload = {}
 
 # Velocity scaling kernel overloads
@@ -1278,6 +1314,10 @@ for v in _V:
         # Key by (velocity_type, output_type)
         _compute_2ke_kernel_overload[(v, t_out)] = wp.overload(
             _compute_2ke_kernel,
+            [wp.array(dtype=v), wp.array(dtype=t_mass), wp.array(dtype=t_out)],
+        )
+        _compute_2ke_tiled_kernel_overload[(v, t_out)] = wp.overload(
+            _compute_2ke_tiled_kernel,
             [wp.array(dtype=v), wp.array(dtype=t_mass), wp.array(dtype=t_out)],
         )
         _batch_compute_2ke_rle_kernel_overload[(v, t_out)] = wp.overload(

@@ -99,6 +99,9 @@ __all__ = [
 # Kinetic Energy Kernels
 # ==============================================================================
 
+# Tile block size for cooperative reductions
+TILE_THREADS = 128
+
 
 @wp.kernel
 def _compute_kinetic_energy_kernel(
@@ -136,6 +139,40 @@ def _compute_kinetic_energy_kernel(
 
 
 @wp.kernel
+def _compute_kinetic_energy_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    kinetic_energy: wp.array(dtype=Any),
+):
+    """Compute kinetic energy with tile reductions (single system).
+
+    Accumulates KE = 0.5 * sum_i(m_i * v_i · v_i) using block-level reductions.
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+
+    vel = velocities[atom_idx]
+    mass = masses[atom_idx]
+
+    v_sq = wp.dot(vel, vel)
+    ke_contribution = type(mass)(0.5) * mass * v_sq
+
+    # Convert to tile for block-level reduction
+    t_ke = wp.tile(ke_contribution)
+
+    # Cooperative sum within block
+    s_ke = wp.tile_sum(t_ke)
+
+    # Extract scalar from tile sum
+    sum_ke = s_ke[0]
+
+    # Only first thread in block writes
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(kinetic_energy, 0, sum_ke)
+
+
+@wp.kernel
 def _batch_compute_kinetic_energy_kernel(
     velocities: wp.array(dtype=Any),
     masses: wp.array(dtype=Any),
@@ -170,6 +207,40 @@ def _batch_compute_kinetic_energy_kernel(
     ke_contribution = type(mass)(0.5) * mass * v_sq
 
     wp.atomic_add(kinetic_energies, system_id, ke_contribution)
+
+
+@wp.kernel
+def _batch_compute_kinetic_energy_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    kinetic_energies: wp.array(dtype=Any),
+):
+    """Compute per-system kinetic energy with tile reductions (batched).
+
+    Launch Grid: dim = [num_atoms_total], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
+
+    vel = velocities[atom_idx]
+    mass = masses[atom_idx]
+
+    v_sq = wp.dot(vel, vel)
+    ke_contribution = type(mass)(0.5) * mass * v_sq
+
+    # Convert to tile for block-level reduction
+    t_ke = wp.tile(ke_contribution)
+
+    # Cooperative sum within block
+    s_ke = wp.tile_sum(t_ke)
+
+    # Extract scalar from tile sum
+    sum_ke = s_ke[0]
+
+    # Only first thread in block writes
+    if atom_idx % TILE_THREADS == 0:
+        wp.atomic_add(kinetic_energies, system_id, sum_ke)
 
 
 @wp.kernel
@@ -255,6 +326,49 @@ def _compute_com_velocity_kernel(
 
 
 @wp.kernel
+def _compute_com_velocity_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    total_momentum: wp.array(dtype=Any),
+    total_mass: wp.array(dtype=Any),
+):
+    """Compute center of mass momentum and total mass with tile reductions (single system).
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+
+    vel = velocities[atom_idx]
+    mass = masses[atom_idx]
+
+    mom = mass * vel
+
+    # Convert to tiles for block-level reduction
+    t_mom_x = wp.tile(mom[0])
+    t_mom_y = wp.tile(mom[1])
+    t_mom_z = wp.tile(mom[2])
+    t_mass = wp.tile(mass)
+
+    # Cooperative sum within block
+    s_mom_x = wp.tile_sum(t_mom_x)
+    s_mom_y = wp.tile_sum(t_mom_y)
+    s_mom_z = wp.tile_sum(t_mom_z)
+    s_mass = wp.tile_sum(t_mass)
+
+    # Extract scalar values from tile sums
+    sum_mom_x = s_mom_x[0]
+    sum_mom_y = s_mom_y[0]
+    sum_mom_z = s_mom_z[0]
+    sum_mass = s_mass[0]
+
+    # Only first thread in block writes
+    if atom_idx % TILE_THREADS == 0:
+        sum_mom = type(vel)(sum_mom_x, sum_mom_y, sum_mom_z)
+        wp.atomic_add(total_momentum, 0, sum_mom)
+        wp.atomic_add(total_mass, 0, sum_mass)
+
+
+@wp.kernel
 def _batch_compute_com_velocity_kernel(
     velocities: wp.array(dtype=Any),
     masses: wp.array(dtype=Any),
@@ -290,6 +404,50 @@ def _batch_compute_com_velocity_kernel(
     mom = mass * vel
     wp.atomic_add(total_momentum, system_id, mom)
     wp.atomic_add(total_mass, system_id, mass)
+
+
+@wp.kernel
+def _batch_compute_com_velocity_tiled_kernel(
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    total_momentum: wp.array(dtype=Any),
+    total_mass: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+):
+    """Compute center of mass momentum and total mass with tile reductions (batched).
+
+    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    """
+    atom_idx = wp.tid()
+    system_id = batch_idx[atom_idx]
+    vel = velocities[atom_idx]
+    mass = masses[atom_idx]
+
+    mom = mass * vel
+
+    # Convert to tiles for block-level reduction
+    t_mom_x = wp.tile(mom[0])
+    t_mom_y = wp.tile(mom[1])
+    t_mom_z = wp.tile(mom[2])
+    t_mass = wp.tile(mass)
+
+    # Cooperative sum within block
+    s_mom_x = wp.tile_sum(t_mom_x)
+    s_mom_y = wp.tile_sum(t_mom_y)
+    s_mom_z = wp.tile_sum(t_mom_z)
+    s_mass = wp.tile_sum(t_mass)
+
+    # Extract scalar values from tile sums
+    sum_mom_x = s_mom_x[0]
+    sum_mom_y = s_mom_y[0]
+    sum_mom_z = s_mom_z[0]
+    sum_mass = s_mass[0]
+
+    # Only first thread in block writes
+    if atom_idx % TILE_THREADS == 0:
+        sum_mom = type(vel)(sum_mom_x, sum_mom_y, sum_mom_z)
+        wp.atomic_add(total_momentum, system_id, sum_mom)
+        wp.atomic_add(total_mass, system_id, sum_mass)
 
 
 @wp.kernel
@@ -945,7 +1103,9 @@ _V = [wp.vec3f, wp.vec3d]  # Vector types
 
 # Kinetic energy kernel overloads
 _compute_kinetic_energy_kernel_overload = {}
+_compute_kinetic_energy_tiled_kernel_overload = {}
 _batch_compute_kinetic_energy_kernel_overload = {}
+_batch_compute_kinetic_energy_tiled_kernel_overload = {}
 _compute_kinetic_energy_ptr_kernel_overload = {}
 
 # Temperature kernel overloads
@@ -954,7 +1114,9 @@ _batch_compute_temperature_from_ke_kernel_overload = {}
 
 # COM velocity kernel overloads
 _compute_com_velocity_kernel_overload = {}
+_compute_com_velocity_tiled_kernel_overload = {}
 _batch_compute_com_velocity_kernel_overload = {}
+_batch_compute_com_velocity_tiled_kernel_overload = {}
 _compute_com_velocity_ptr_kernel_overload = {}
 
 # Remove COM motion kernel overloads
@@ -979,8 +1141,21 @@ for t, v in zip(_T, _V):
         _compute_kinetic_energy_kernel,
         [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
     )
+    _compute_kinetic_energy_tiled_kernel_overload[v] = wp.overload(
+        _compute_kinetic_energy_tiled_kernel,
+        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=t)],
+    )
     _batch_compute_kinetic_energy_kernel_overload[v] = wp.overload(
         _batch_compute_kinetic_energy_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+        ],
+    )
+    _batch_compute_kinetic_energy_tiled_kernel_overload[v] = wp.overload(
+        _batch_compute_kinetic_energy_tiled_kernel,
         [
             wp.array(dtype=v),
             wp.array(dtype=t),
@@ -1013,8 +1188,22 @@ for t, v in zip(_T, _V):
         _compute_com_velocity_kernel,
         [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=t)],
     )
+    _compute_com_velocity_tiled_kernel_overload[v] = wp.overload(
+        _compute_com_velocity_tiled_kernel,
+        [wp.array(dtype=v), wp.array(dtype=t), wp.array(dtype=v), wp.array(dtype=t)],
+    )
     _batch_compute_com_velocity_kernel_overload[v] = wp.overload(
         _batch_compute_com_velocity_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+        ],
+    )
+    _batch_compute_com_velocity_tiled_kernel_overload[v] = wp.overload(
+        _batch_compute_com_velocity_tiled_kernel,
         [
             wp.array(dtype=v),
             wp.array(dtype=t),
@@ -1223,7 +1412,7 @@ def compute_kinetic_energy(
             device=device,
         )
     elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
+        # Use batch_idx mode (no tiles - threads in block belong to different systems)
         wp.launch(
             _batch_compute_kinetic_energy_kernel_overload[vec_dtype],
             dim=num_atoms,
@@ -1231,12 +1420,13 @@ def compute_kinetic_energy(
             device=device,
         )
     else:
-        # Single system - launch with dim=num_atoms
+        # Single system with tiles - launch with dim=num_atoms
         wp.launch(
-            _compute_kinetic_energy_kernel_overload[vec_dtype],
+            _compute_kinetic_energy_tiled_kernel_overload[vec_dtype],
             dim=num_atoms,
             inputs=[velocities, masses, kinetic_energy],
             device=device,
+            block_dim=TILE_THREADS,
         )
 
     return kinetic_energy
@@ -1633,7 +1823,7 @@ def remove_com_motion(
             device=device,
         )
     elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
+        # Use batch_idx mode (no tiles - threads in block belong to different systems)
         total_momentum = wp.zeros(num_systems, dtype=vec_dtype, device=device)
         total_mass = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
 
@@ -1660,15 +1850,16 @@ def remove_com_motion(
             device=device,
         )
     else:
-        # Single system - launch with dim=num_atoms
+        # Single system with tiles - launch with dim=num_atoms
         total_momentum = wp.zeros(1, dtype=vec_dtype, device=device)
         total_mass = wp.zeros(1, dtype=scalar_dtype, device=device)
 
         wp.launch(
-            _compute_com_velocity_kernel_overload[vec_dtype],
+            _compute_com_velocity_tiled_kernel_overload[vec_dtype],
             dim=num_atoms,
             inputs=[velocities, masses, total_momentum, total_mass],
             device=device,
+            block_dim=TILE_THREADS,
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
@@ -1766,7 +1957,7 @@ def remove_com_motion_out(
             device=device,
         )
     elif batch_idx is not None:
-        # Use batch_idx mode - launch with dim=num_atoms
+        # Use batch_idx mode (no tiles - threads in block belong to different systems)
         total_momentum = wp.zeros(num_systems, dtype=vec_dtype, device=device)
         total_mass = wp.zeros(num_systems, dtype=scalar_dtype, device=device)
 
@@ -1793,15 +1984,16 @@ def remove_com_motion_out(
             device=device,
         )
     else:
-        # Single system - launch with dim=num_atoms
+        # Single system with tiles - launch with dim=num_atoms
         total_momentum = wp.zeros(1, dtype=vec_dtype, device=device)
         total_mass = wp.zeros(1, dtype=scalar_dtype, device=device)
 
         wp.launch(
-            _compute_com_velocity_kernel_overload[vec_dtype],
+            _compute_com_velocity_tiled_kernel_overload[vec_dtype],
             dim=num_atoms,
             inputs=[velocities, masses, total_momentum, total_mass],
             device=device,
+            block_dim=TILE_THREADS,
         )
 
         # Compute COM velocity using Warp kernel (no numpy)

@@ -103,6 +103,9 @@ __all__ = [
 # SHAKE Kernels
 # ==============================================================================
 
+# Tile block size for cooperative reductions
+TILE_THREADS = 128
+
 
 @wp.kernel
 def _shake_iteration_kernel(
@@ -194,6 +197,87 @@ def _shake_iteration_kernel(
 
 
 @wp.kernel
+def _shake_iteration_tiled_kernel(
+    positions: wp.array(dtype=Any),
+    positions_old: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    bond_atom_i: wp.array(dtype=wp.int32),
+    bond_atom_j: wp.array(dtype=wp.int32),
+    bond_lengths_sq: wp.array(dtype=Any),
+    max_error: wp.array(dtype=wp.float64),
+):
+    """Single SHAKE iteration with tile reductions for error tracking.
+
+    Updates positions to satisfy bond length constraint using atomic operations
+    for position corrections. Uses tile reductions for max error computation.
+
+    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+
+    Notes
+    -----
+    - Atomic operations on positions still required due to data dependencies
+    - Tile reductions reduce atomic contention for max_error tracking
+    - Data dependencies (atoms in multiple bonds) limit parallelization
+    """
+    bond_idx = wp.tid()
+
+    i = bond_atom_i[bond_idx]
+    j = bond_atom_j[bond_idx]
+
+    r_i = positions[i]
+    r_j = positions[j]
+    r_i_old = positions_old[i]
+    r_j_old = positions_old[j]
+    m_i = masses[i]
+    m_j = masses[j]
+    d_sq = bond_lengths_sq[bond_idx]
+
+    # Current bond vector
+    r_ij = r_i - r_j
+
+    # Old bond vector
+    r_ij_old = r_i_old - r_j_old
+
+    # Current distance squared
+    r_sq = wp.dot(r_ij, r_ij)
+
+    # Constraint violation
+    sigma = r_sq - d_sq
+
+    # Compute local error
+    local_error = wp.abs(wp.float64(sigma))
+
+    # Tile reduction for max error
+    t_error = wp.tile(local_error)
+    max_tile_error = wp.tile_reduce(wp.max, t_error)
+    block_max_error = max_tile_error[0]
+
+    # Only first thread in block updates max error
+    if bond_idx % TILE_THREADS == 0:
+        wp.atomic_max(max_error, 0, block_max_error)
+
+    # Dot product r_ij · r_ij_old
+    dot = wp.dot(r_ij, r_ij_old)
+
+    # Inverse masses
+    inv_m_i = type(m_i)(1.0) / m_i
+    inv_m_j = type(m_j)(1.0) / m_j
+
+    # Lagrange multiplier
+    denom = type(dot)(2.0) * (inv_m_i + inv_m_j) * dot
+    if wp.abs(denom) > type(denom)(1e-30):
+        lam = sigma / denom
+
+        # Position corrections
+        corr_i = lam * r_ij_old * inv_m_i
+        corr_j = lam * r_ij_old * inv_m_j
+
+        # Apply corrections atomically (required due to data dependencies)
+        wp.atomic_sub(positions, i, corr_i)
+        wp.atomic_add(positions, j, corr_j)
+
+
+@wp.kernel
 def _shake_iteration_out_kernel(
     positions: wp.array(dtype=Any),
     positions_old: wp.array(dtype=Any),
@@ -264,6 +348,69 @@ def _shake_iteration_out_kernel(
         corr_i = -lam * r_ij_old * inv_m_i
         corr_j = lam * r_ij_old * inv_m_j
 
+        wp.atomic_add(position_corrections, i, corr_i)
+        wp.atomic_add(position_corrections, j, corr_j)
+
+
+@wp.kernel
+def _shake_iteration_out_tiled_kernel(
+    positions: wp.array(dtype=Any),
+    positions_old: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    bond_atom_i: wp.array(dtype=wp.int32),
+    bond_atom_j: wp.array(dtype=wp.int32),
+    bond_lengths_sq: wp.array(dtype=Any),
+    position_corrections: wp.array(dtype=Any),
+    max_error: wp.array(dtype=wp.float64),
+):
+    """Single SHAKE iteration with tile reductions (non-mutating).
+
+    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    """
+    bond_idx = wp.tid()
+
+    i = bond_atom_i[bond_idx]
+    j = bond_atom_j[bond_idx]
+
+    r_i = positions[i]
+    r_j = positions[j]
+    r_i_old = positions_old[i]
+    r_j_old = positions_old[j]
+    m_i = masses[i]
+    m_j = masses[j]
+    d_sq = bond_lengths_sq[bond_idx]
+
+    r_ij = r_i - r_j
+    r_ij_old = r_i_old - r_j_old
+
+    r_sq = wp.dot(r_ij, r_ij)
+    sigma = r_sq - d_sq
+
+    # Compute local error
+    local_error = wp.abs(wp.float64(sigma))
+
+    # Tile reduction for max error
+    t_error = wp.tile(local_error)
+    max_tile_error = wp.tile_reduce(wp.max, t_error)
+    block_max_error = max_tile_error[0]
+
+    # Only first thread in block updates max error
+    if bond_idx % TILE_THREADS == 0:
+        wp.atomic_max(max_error, 0, block_max_error)
+
+    dot = wp.dot(r_ij, r_ij_old)
+
+    inv_m_i = type(m_i)(1.0) / m_i
+    inv_m_j = type(m_j)(1.0) / m_j
+
+    denom = type(dot)(2.0) * (inv_m_i + inv_m_j) * dot
+    if wp.abs(denom) > type(denom)(1e-30):
+        lam = sigma / denom
+
+        corr_i = -lam * r_ij_old * inv_m_i
+        corr_j = lam * r_ij_old * inv_m_j
+
+        # Atomic operations still required due to data dependencies
         wp.atomic_add(position_corrections, i, corr_i)
         wp.atomic_add(position_corrections, j, corr_j)
 
@@ -401,6 +548,142 @@ def _rattle_iteration_out_kernel(
         wp.atomic_add(velocity_corrections, j, corr_j)
 
 
+@wp.kernel
+def _rattle_iteration_tiled_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    bond_atom_i: wp.array(dtype=wp.int32),
+    bond_atom_j: wp.array(dtype=wp.int32),
+    max_error: wp.array(dtype=wp.float64),
+):
+    """Single RATTLE iteration with tile reductions for error tracking.
+
+    Updates velocities to satisfy velocity constraints using atomic operations
+    for velocity corrections. Uses tile reductions for max error computation.
+
+    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+
+    Notes
+    -----
+    - Atomic operations on velocities still required due to data dependencies
+    - Tile reductions reduce atomic contention for max_error tracking
+    - Data dependencies (atoms in multiple bonds) limit parallelization
+    """
+    bond_idx = wp.tid()
+
+    i = bond_atom_i[bond_idx]
+    j = bond_atom_j[bond_idx]
+
+    r_i = positions[i]
+    r_j = positions[j]
+    v_i = velocities[i]
+    v_j = velocities[j]
+    m_i = masses[i]
+    m_j = masses[j]
+
+    # Bond vector
+    r_ij = r_i - r_j
+
+    # Relative velocity
+    v_ij = v_i - v_j
+
+    # Velocity constraint: v_ij · r_ij = 0
+    kappa = wp.dot(v_ij, r_ij)
+
+    # Compute local error
+    local_error = wp.abs(wp.float64(kappa))
+
+    # Tile reduction for max error
+    t_error = wp.tile(local_error)
+    max_tile_error = wp.tile_reduce(wp.max, t_error)
+    block_max_error = max_tile_error[0]
+
+    # Only first thread in block updates max error
+    if bond_idx % TILE_THREADS == 0:
+        wp.atomic_max(max_error, 0, block_max_error)
+
+    # Bond length squared
+    r_sq = wp.dot(r_ij, r_ij)
+
+    # Inverse masses
+    inv_m_i = type(m_i)(1.0) / m_i
+    inv_m_j = type(m_j)(1.0) / m_j
+
+    # Lagrange multiplier
+    denom = (inv_m_i + inv_m_j) * r_sq
+    if wp.abs(denom) > type(denom)(1e-30):
+        mu = kappa / denom
+
+        # Velocity corrections
+        corr_i = -mu * r_ij * inv_m_i
+        corr_j = mu * r_ij * inv_m_j
+
+        # Apply corrections atomically (required due to data dependencies)
+        wp.atomic_sub(velocities, i, corr_i)
+        wp.atomic_add(velocities, j, corr_j)
+
+
+@wp.kernel
+def _rattle_iteration_out_tiled_kernel(
+    positions: wp.array(dtype=Any),
+    velocities: wp.array(dtype=Any),
+    masses: wp.array(dtype=Any),
+    bond_atom_i: wp.array(dtype=wp.int32),
+    bond_atom_j: wp.array(dtype=wp.int32),
+    velocity_corrections: wp.array(dtype=Any),
+    max_error: wp.array(dtype=wp.float64),
+):
+    """Single RATTLE iteration with tile reductions (non-mutating).
+
+    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    """
+    bond_idx = wp.tid()
+
+    i = bond_atom_i[bond_idx]
+    j = bond_atom_j[bond_idx]
+
+    r_i = positions[i]
+    r_j = positions[j]
+    v_i = velocities[i]
+    v_j = velocities[j]
+    m_i = masses[i]
+    m_j = masses[j]
+
+    r_ij = r_i - r_j
+    v_ij = v_i - v_j
+
+    kappa = wp.dot(v_ij, r_ij)
+
+    # Compute local error
+    local_error = wp.abs(wp.float64(kappa))
+
+    # Tile reduction for max error
+    t_error = wp.tile(local_error)
+    max_tile_error = wp.tile_reduce(wp.max, t_error)
+    block_max_error = max_tile_error[0]
+
+    # Only first thread in block updates max error
+    if bond_idx % TILE_THREADS == 0:
+        wp.atomic_max(max_error, 0, block_max_error)
+
+    r_sq = wp.dot(r_ij, r_ij)
+
+    inv_m_i = type(m_i)(1.0) / m_i
+    inv_m_j = type(m_j)(1.0) / m_j
+
+    denom = (inv_m_i + inv_m_j) * r_sq
+    if wp.abs(denom) > type(denom)(1e-30):
+        mu = kappa / denom
+
+        corr_i = -mu * r_ij * inv_m_i
+        corr_j = mu * r_ij * inv_m_j
+
+        # Atomic operations still required due to data dependencies
+        wp.atomic_add(velocity_corrections, i, corr_i)
+        wp.atomic_add(velocity_corrections, j, corr_j)
+
+
 # ==============================================================================
 # Kernel Overloads for Explicit Typing
 # ==============================================================================
@@ -410,8 +693,12 @@ _V = [wp.vec3f, wp.vec3d]  # Vector types
 
 _shake_iteration_kernel_overload = {}
 _shake_iteration_out_kernel_overload = {}
+_shake_iteration_tiled_kernel_overload = {}
+_shake_iteration_out_tiled_kernel_overload = {}
 _rattle_iteration_kernel_overload = {}
 _rattle_iteration_out_kernel_overload = {}
+_rattle_iteration_tiled_kernel_overload = {}
+_rattle_iteration_out_tiled_kernel_overload = {}
 
 for t, v in zip(_T, _V):
     _shake_iteration_kernel_overload[v] = wp.overload(
@@ -452,6 +739,54 @@ for t, v in zip(_T, _V):
     )
     _rattle_iteration_out_kernel_overload[v] = wp.overload(
         _rattle_iteration_out_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.float64),
+        ],
+    )
+    _shake_iteration_tiled_kernel_overload[v] = wp.overload(
+        _shake_iteration_tiled_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.float64),
+        ],
+    )
+    _shake_iteration_out_tiled_kernel_overload[v] = wp.overload(
+        _shake_iteration_out_tiled_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=t),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.float64),
+        ],
+    )
+    _rattle_iteration_tiled_kernel_overload[v] = wp.overload(
+        _rattle_iteration_tiled_kernel,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=t),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.float64),
+        ],
+    )
+    _rattle_iteration_out_tiled_kernel_overload[v] = wp.overload(
+        _rattle_iteration_out_tiled_kernel,
         [
             wp.array(dtype=v),
             wp.array(dtype=v),
@@ -518,7 +853,7 @@ def shake_iteration(
 
     vec_dtype = positions.dtype
     wp.launch(
-        _shake_iteration_kernel_overload[vec_dtype],
+        _shake_iteration_tiled_kernel_overload[vec_dtype],
         dim=num_bonds,
         inputs=[
             positions,
@@ -530,6 +865,7 @@ def shake_iteration(
             max_error,
         ],
         device=device,
+        block_dim=TILE_THREADS,
     )
 
     return max_error
@@ -666,7 +1002,7 @@ def shake_iteration_out(
 
     vec_dtype = positions.dtype
     wp.launch(
-        _shake_iteration_out_kernel_overload[vec_dtype],
+        _shake_iteration_out_tiled_kernel_overload[vec_dtype],
         dim=num_bonds,
         inputs=[
             positions,
@@ -679,6 +1015,7 @@ def shake_iteration_out(
             max_error,
         ],
         device=device,
+        block_dim=TILE_THREADS,
     )
 
     return position_corrections, max_error
@@ -798,10 +1135,11 @@ def rattle_iteration(
 
     vec_dtype = positions.dtype
     wp.launch(
-        _rattle_iteration_kernel_overload[vec_dtype],
+        _rattle_iteration_tiled_kernel_overload[vec_dtype],
         dim=num_bonds,
         inputs=[positions, velocities, masses, bond_atom_i, bond_atom_j, max_error],
         device=device,
+        block_dim=TILE_THREADS,
     )
 
     return max_error
@@ -917,7 +1255,7 @@ def rattle_iteration_out(
 
     vec_dtype = positions.dtype
     wp.launch(
-        _rattle_iteration_out_kernel_overload[vec_dtype],
+        _rattle_iteration_out_tiled_kernel_overload[vec_dtype],
         dim=num_bonds,
         inputs=[
             positions,
@@ -929,6 +1267,7 @@ def rattle_iteration_out(
             max_error,
         ],
         device=device,
+        block_dim=TILE_THREADS,
     )
 
     return velocity_corrections, max_error
