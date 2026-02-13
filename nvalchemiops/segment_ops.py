@@ -31,6 +31,8 @@ from typing import Any
 
 import warp as wp
 
+from nvalchemiops.warp_dispatch import register_overloads
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -38,12 +40,34 @@ import warp as wp
 _TILE_SIZE = wp.constant(256)
 _BLOCK_DIM = 256
 
+# Types that support atomic_add / atomic_max / atomic_min (used in reductions)
 _SCALAR_TYPES = [wp.float32, wp.float64]
 _VEC_TYPES = [wp.vec3f, wp.vec3d]
-_MAT_TYPES = [wp.mat33f, wp.mat33d]
-_VEC_TO_SCALAR = {wp.vec3f: wp.float32, wp.vec3d: wp.float64}
-_SCALAR_TO_VEC = {wp.float32: wp.vec3f, wp.float64: wp.vec3d}
+
+# All scalar/vec/mat types including float16 (element-wise / broadcast only)
+_ALL_SCALAR_TYPES = [wp.float16, wp.float32, wp.float64]
+_ALL_VEC_TYPES = [wp.vec3h, wp.vec3f, wp.vec3d]
+_MAT_TYPES = [wp.mat33h, wp.mat33f, wp.mat33d]
+
+_VEC_TO_SCALAR = {wp.vec3h: wp.float16, wp.vec3f: wp.float32, wp.vec3d: wp.float64}
+_SCALAR_TO_VEC = {wp.float16: wp.vec3h, wp.float32: wp.vec3f, wp.float64: wp.vec3d}
+
+# Dtype pairs for register_overloads (pair mode)
+_VEC_SCALAR_PAIRS = tuple(zip(_VEC_TYPES, _SCALAR_TYPES))
+_ALL_VEC_SCALAR_PAIRS = tuple(zip(_ALL_VEC_TYPES, _ALL_SCALAR_TYPES))
+_VEC_MAT_PAIRS = tuple(zip(_ALL_VEC_TYPES, _MAT_TYPES))
+
+# Reduction-safe types (atomic ops work)
 _SUPPORTED_TYPES = [wp.float32, wp.float64, wp.vec3f, wp.vec3d]
+# All types including float16/vec3h (for element-wise/broadcast ops)
+_ALL_SUPPORTED_TYPES = [
+    wp.float16,
+    wp.float32,
+    wp.float64,
+    wp.vec3h,
+    wp.vec3f,
+    wp.vec3d,
+]
 
 
 def _compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
@@ -58,6 +82,20 @@ def _compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
     if p > 1 and (p - ept) > (ept - (p >> 1)):
         p >>= 1
     return max(ept_min, min(p, ept_max))
+
+
+def _launch_rle(
+    overloads: dict, key, N: int, device, *args, is_vec: bool = False
+) -> None:
+    """Launch an RLE-style reduction kernel with auto-tuned elements-per-thread.
+
+    All RLE kernels share the convention that their last two arguments are
+    ``(N, elems_per_thread)``.  This helper computes the optimal EPT,
+    derives the grid dimension, and calls ``wp.launch``.
+    """
+    ept = _compute_ept(N, max(device.sm_count, 1), is_vec)
+    dim = (N + ept - 1) // ept
+    wp.launch(overloads[key], dim=dim, inputs=[*args, N, ept], device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +259,44 @@ def _segmented_component_sum_kernel(
     wp.atomic_add(out, s_cur, acc)
 
 
+@wp.func
+def _component_sum(v: wp.vec3f) -> wp.float32:
+    return v[0] + v[1] + v[2]
+
+
+@wp.func
+def _component_sum(v: wp.vec3d) -> wp.float64:
+    return v[0] + v[1] + v[2]
+
+
+@wp.kernel(enable_backward=False)
+def _total_component_sum_tile_kernel(
+    x: wp.array(dtype=Any),
+    out: wp.array(dtype=Any),
+):
+    """Block-cooperative total component sum for M=1 specialization.
+
+    Computes ``out[0] += sum(x[i][0] + x[i][1] + x[i][2])`` for one block
+    of _TILE_SIZE elements using tile_map and tile operations.
+
+    Launch Grid
+    -----------
+    dim = [num_blocks], block_dim = _BLOCK_DIM
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype vec3f/vec3d
+        Input vector array.
+    out : wp.array, shape (1,), dtype float32/float64
+        Accumulated component sum. Must be zero-initialized by caller.
+    """
+    i = wp.tid()
+    t = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    comps = wp.tile_map(_component_sum, t)
+    s = wp.tile_sum(comps)
+    wp.tile_atomic_add(out, s, 0)
+
+
 # ---------------------------------------------------------------------------
 # Kernels -- segmented_dot
 # ---------------------------------------------------------------------------
@@ -335,6 +411,65 @@ def _segmented_dot_vec_kernel(
             s_cur = s
             acc = val
     wp.atomic_add(out, s_cur, acc)
+
+
+@wp.kernel(enable_backward=False)
+def _total_dot_scalar_tile_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    out: wp.array(dtype=Any),
+):
+    """Block-cooperative total scalar dot product for M=1 specialization.
+
+    Computes ``out[0] += sum(x[i] * y[i])`` for one block of _TILE_SIZE
+    elements using tile operations.
+
+    Launch Grid
+    -----------
+    dim = [num_blocks], block_dim = _BLOCK_DIM
+
+    Parameters
+    ----------
+    x, y : wp.array, shape (N,), dtype float32/float64
+        Input scalar arrays.
+    out : wp.array, shape (1,), dtype matches x
+        Accumulated dot product. Must be zero-initialized by caller.
+    """
+    i = wp.tid()
+    tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    ty = wp.tile_load(y, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    s = wp.tile_sum(wp.tile_map(wp.mul, tx, ty))
+    wp.tile_atomic_add(out, s, 0)
+
+
+@wp.kernel(enable_backward=False)
+def _total_dot_vec_tile_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    out: wp.array(dtype=Any),
+):
+    """Block-cooperative total vector dot product for M=1 specialization.
+
+    Computes ``out[0] += sum(dot(x[i], y[i]))`` for one block of _TILE_SIZE
+    elements using tile_map(wp.dot, ...) and tile operations.
+
+    Launch Grid
+    -----------
+    dim = [num_blocks], block_dim = _BLOCK_DIM
+
+    Parameters
+    ----------
+    x, y : wp.array, shape (N,), dtype vec3f/vec3d
+        Input vector arrays.
+    out : wp.array, shape (1,), dtype float32/float64
+        Accumulated dot product sum. Must be zero-initialized by caller.
+    """
+    i = wp.tid()
+    tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    ty = wp.tile_load(y, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    dots = wp.tile_map(wp.dot, tx, ty)
+    s = wp.tile_sum(dots)
+    wp.tile_atomic_add(out, s, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +777,70 @@ def _segmented_inner_products_vec_kernel(
     wp.atomic_add(out_yy, s_cur, acc_yy)
 
 
+@wp.kernel(enable_backward=False)
+def _total_inner_products_scalar_tile_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    out_xy: wp.array(dtype=Any),
+    out_xx: wp.array(dtype=Any),
+    out_yy: wp.array(dtype=Any),
+):
+    """Block-cooperative total scalar triple dot for M=1 specialization.
+
+    Computes x*y, x*x, y*y sums for one block of _TILE_SIZE elements
+    using tile operations.
+
+    Launch Grid
+    -----------
+    dim = [num_blocks], block_dim = _BLOCK_DIM
+
+    Parameters
+    ----------
+    x, y : wp.array, shape (N,), dtype float32/float64
+        Input scalar arrays.
+    out_xy, out_xx, out_yy : wp.array, shape (1,), dtype matches x
+        Accumulated triple dot products. Must be zero-initialized.
+    """
+    i = wp.tid()
+    tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    ty = wp.tile_load(y, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    wp.tile_atomic_add(out_xy, wp.tile_sum(wp.tile_map(wp.mul, tx, ty)), 0)
+    wp.tile_atomic_add(out_xx, wp.tile_sum(wp.tile_map(wp.mul, tx, tx)), 0)
+    wp.tile_atomic_add(out_yy, wp.tile_sum(wp.tile_map(wp.mul, ty, ty)), 0)
+
+
+@wp.kernel(enable_backward=False)
+def _total_inner_products_vec_tile_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
+    out_xy: wp.array(dtype=Any),
+    out_xx: wp.array(dtype=Any),
+    out_yy: wp.array(dtype=Any),
+):
+    """Block-cooperative total vector triple dot for M=1 specialization.
+
+    Computes x*y, x*x, y*y dot-product sums for one block of _TILE_SIZE
+    elements using tile_map(wp.dot, ...) and tile operations.
+
+    Launch Grid
+    -----------
+    dim = [num_blocks], block_dim = _BLOCK_DIM
+
+    Parameters
+    ----------
+    x, y : wp.array, shape (N,), dtype vec3f/vec3d
+        Input vector arrays.
+    out_xy, out_xx, out_yy : wp.array, shape (1,), dtype float32/float64
+        Accumulated triple dot products. Must be zero-initialized.
+    """
+    i = wp.tid()
+    tx = wp.tile_load(x, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    ty = wp.tile_load(y, shape=_TILE_SIZE, offset=i * _TILE_SIZE)
+    wp.tile_atomic_add(out_xy, wp.tile_sum(wp.tile_map(wp.dot, tx, ty)), 0)
+    wp.tile_atomic_add(out_xx, wp.tile_sum(wp.tile_map(wp.dot, tx, tx)), 0)
+    wp.tile_atomic_add(out_yy, wp.tile_sum(wp.tile_map(wp.dot, ty, ty)), 0)
+
+
 # ---------------------------------------------------------------------------
 # Kernels -- segmented_axpby (broadcast linear combination)
 # ---------------------------------------------------------------------------
@@ -764,21 +963,22 @@ def _segmented_add_kernel(
 
     Notes
     -----
-    - This variant requires x and y to have the same dtype
-    - See _segmented_add_vec_scalar_* for mixed-type variants
+    - This variant requires x and y to have the same dtype.
+    - See _segmented_add_vec_scalar_kernel / _segmented_add_scalar_vec_kernel
+      for mixed-type variants (vec + scalar or scalar + vec).
     """
     tid = wp.tid()
     out[tid] = x[tid] + y[idx[tid]]
 
 
 @wp.kernel(enable_backward=False)
-def _segmented_add_vec_scalar_f32_kernel(
-    x: wp.array(dtype=wp.vec3f),
-    y: wp.array(dtype=wp.float32),
+def _segmented_add_vec_scalar_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
     idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3f),
+    out: wp.array(dtype=Any),
 ):
-    """Broadcast add: out[i] = x[i] + y[idx[i]] (vec3f + float32 variant).
+    """Broadcast add: out[i] = x[i] + y[idx[i]] (vec + scalar variant).
 
     Adds a per-segment scalar to each component of a vector.
 
@@ -788,71 +988,29 @@ def _segmented_add_vec_scalar_f32_kernel(
 
     Parameters
     ----------
-    x : wp.array, shape (N,), dtype vec3f
+    x : wp.array, shape (N,), dtype vec3h/vec3f/vec3d
         Per-element input vectors.
-    y : wp.array, shape (M,), dtype float32
+    y : wp.array, shape (M,), dtype float16/float32/float64
         Per-segment scalar values to broadcast.
     idx : wp.array, shape (N,), dtype int32
         Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3f
-        OUTPUT: out[i] = [x[i][0] + y[s], x[i][1] + y[s], x[i][2] + y[s]].
-
-    Notes
-    -----
-    - Scalar is broadcast to all three vector components
-    - Float32 precision variant
+    out : wp.array, shape (N,), dtype matches x
+        Output: out[i] = [x[i][0] + y[s], x[i][1] + y[s], x[i][2] + y[s]].
     """
     tid = wp.tid()
     _x = x[tid]
     _y = y[idx[tid]]
-    out[tid] = wp.vec3f(_x[0] + _y, _x[1] + _y, _x[2] + _y)
+    out[tid] = type(_x)(_x[0] + _y, _x[1] + _y, _x[2] + _y)
 
 
 @wp.kernel(enable_backward=False)
-def _segmented_add_vec_scalar_f64_kernel(
-    x: wp.array(dtype=wp.vec3d),
-    y: wp.array(dtype=wp.float64),
+def _segmented_add_scalar_vec_kernel(
+    x: wp.array(dtype=Any),
+    y: wp.array(dtype=Any),
     idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3d),
+    out: wp.array(dtype=Any),
 ):
-    """Broadcast add: out[i] = x[i] + y[idx[i]] (vec3d + float64 variant).
-
-    Adds a per-segment scalar to each component of a vector.
-
-    Launch Grid
-    -----------
-    dim = N (total elements)
-
-    Parameters
-    ----------
-    x : wp.array, shape (N,), dtype vec3d
-        Per-element input vectors.
-    y : wp.array, shape (M,), dtype float64
-        Per-segment scalar values to broadcast.
-    idx : wp.array, shape (N,), dtype int32
-        Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3d
-        OUTPUT: out[i] = [x[i][0] + y[s], x[i][1] + y[s], x[i][2] + y[s]].
-
-    Notes
-    -----
-    - Scalar is broadcast to all three vector components
-    - Float64 precision variant
-    """
-    tid = wp.tid()
-    _x = x[tid]
-    _y = y[idx[tid]]
-    out[tid] = wp.vec3d(_x[0] + _y, _x[1] + _y, _x[2] + _y)
-
-
-@wp.kernel(enable_backward=False)
-def _segmented_add_scalar_vec_f32_kernel(
-    x: wp.array(dtype=wp.float32),
-    y: wp.array(dtype=wp.vec3f),
-    idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3f),
-):
-    """Broadcast add: out[i] = x[i] + y[idx[i]] (float32 + vec3f variant).
+    """Broadcast add: out[i] = x[i] + y[idx[i]] (scalar + vec variant).
 
     Adds per-element scalars to per-segment vectors component-wise.
 
@@ -862,121 +1020,139 @@ def _segmented_add_scalar_vec_f32_kernel(
 
     Parameters
     ----------
-    x : wp.array, shape (N,), dtype float32
+    x : wp.array, shape (N,), dtype float16/float32/float64
         Per-element scalar values.
-    y : wp.array, shape (M,), dtype vec3f
+    y : wp.array, shape (M,), dtype vec3h/vec3f/vec3d
         Per-segment vectors to broadcast.
     idx : wp.array, shape (N,), dtype int32
         Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3f
-        OUTPUT: out[i] = [x[i] + y[s][0], x[i] + y[s][1], x[i] + y[s][2]].
-
-    Notes
-    -----
-    - Scalar is added to each vector component
-    - Float32 precision variant
+    out : wp.array, shape (N,), dtype matches y
+        Output: out[i] = [x[i] + y[s][0], x[i] + y[s][1], x[i] + y[s][2]].
     """
     tid = wp.tid()
     _x = x[tid]
     _y = y[idx[tid]]
-    out[tid] = wp.vec3f(_x + _y[0], _x + _y[1], _x + _y[2])
-
-
-@wp.kernel(enable_backward=False)
-def _segmented_add_scalar_vec_f64_kernel(
-    x: wp.array(dtype=wp.float64),
-    y: wp.array(dtype=wp.vec3d),
-    idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3d),
-):
-    """Broadcast add: out[i] = x[i] + y[idx[i]] (float64 + vec3d variant).
-
-    Adds per-element scalars to per-segment vectors component-wise.
-
-    Launch Grid
-    -----------
-    dim = N (total elements)
-
-    Parameters
-    ----------
-    x : wp.array, shape (N,), dtype float64
-        Per-element scalar values.
-    y : wp.array, shape (M,), dtype vec3d
-        Per-segment vectors to broadcast.
-    idx : wp.array, shape (N,), dtype int32
-        Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3d
-        OUTPUT: out[i] = [x[i] + y[s][0], x[i] + y[s][1], x[i] + y[s][2]].
-
-    Notes
-    -----
-    - Scalar is added to each vector component
-    - Float64 precision variant
-    """
-    tid = wp.tid()
-    _x = x[tid]
-    _y = y[idx[tid]]
-    out[tid] = wp.vec3d(_x + _y[0], _x + _y[1], _x + _y[2])
+    out[tid] = type(_y)(_x + _y[0], _x + _y[1], _x + _y[2])
 
 
 # ---------------------------------------------------------------------------
-# Kernels -- segmented_matvec (broadcast)
+# Kernels -- segmented_max (scalar)
 # ---------------------------------------------------------------------------
 
 
 @wp.kernel(enable_backward=False)
-def _segmented_matvec_f32_kernel(
-    v: wp.array(dtype=wp.vec3f),
-    m: wp.array(dtype=wp.mat33f),
+def _segmented_max_kernel(
+    x: wp.array(dtype=Any),
     idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3f),
+    out: wp.array(dtype=Any),
+    N: wp.int32,
+    elems_per_thread: wp.int32,
 ):
-    """Per-segment matrix-vector multiply: out[i] = M[idx[i]]^T @ v[i] (float32).
+    """Maximum scalar value per segment using run-length encoding.
 
-    Applies a per-segment 3x3 matrix transformation to each vector.
-    Uses transpose convention (column-major multiply).
+    Computes ``out[s] = max(x[i] for i where idx[i] == s)``.
 
     Launch Grid
     -----------
-    dim = N (total elements)
+    dim = ceil(N / elems_per_thread)
 
     Parameters
     ----------
-    v : wp.array, shape (N,), dtype vec3f
-        Per-element input vectors.
-    m : wp.array, shape (M,), dtype mat33f
-        Per-segment 3x3 transformation matrices.
+    x : wp.array, shape (N,), dtype float32/float64
+        Input scalar values.
     idx : wp.array, shape (N,), dtype int32
-        Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3f
-        OUTPUT: Transformed vectors.
-
-    Notes
-    -----
-    - Uses transpose convention: M^T @ v (column vectors)
-    - Useful for coordinate transformations in NPT barostats
-    - Float32 precision variant
+        Sorted segment indices in [0, M).
+    out : wp.array, shape (M,), dtype matches x
+        OUTPUT: Maximum value per segment. Must be initialized to -inf by caller.
+    N : int32
+        Total number of elements.
+    elems_per_thread : int32
+        Number of elements processed per thread.
     """
-    tid = wp.tid()
-    _v = v[tid]
-    _m = m[idx[tid]]
-    c0 = wp.vec3f(_m[0, 0], _m[1, 0], _m[2, 0])
-    c1 = wp.vec3f(_m[0, 1], _m[1, 1], _m[2, 1])
-    c2 = wp.vec3f(_m[0, 2], _m[1, 2], _m[2, 2])
-    out[tid] = wp.vec3f(wp.dot(c0, _v), wp.dot(c1, _v), wp.dot(c2, _v))
+    t = wp.tid()
+    start = t * elems_per_thread
+    if start >= N:
+        return
+    end = wp.min(start + elems_per_thread, N)
+
+    s_cur = idx[start]
+    max_val = x[start]
+    for i in range(start + 1, end):
+        s = idx[i]
+        if s == s_cur:
+            max_val = wp.max(max_val, x[i])
+        else:
+            wp.atomic_max(out, s_cur, max_val)
+            s_cur = s
+            max_val = x[i]
+    wp.atomic_max(out, s_cur, max_val)
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- segmented_min (scalar)
+# ---------------------------------------------------------------------------
 
 
 @wp.kernel(enable_backward=False)
-def _segmented_matvec_f64_kernel(
-    v: wp.array(dtype=wp.vec3d),
-    m: wp.array(dtype=wp.mat33d),
+def _segmented_min_kernel(
+    x: wp.array(dtype=Any),
     idx: wp.array(dtype=wp.int32),
-    out: wp.array(dtype=wp.vec3d),
+    out: wp.array(dtype=Any),
+    N: wp.int32,
+    elems_per_thread: wp.int32,
 ):
-    """Per-segment matrix-vector multiply: out[i] = M[idx[i]]^T @ v[i] (float64).
+    """Minimum scalar value per segment using run-length encoding.
 
-    Applies a per-segment 3x3 matrix transformation to each vector.
-    Uses transpose convention (column-major multiply).
+    Computes ``out[s] = min(x[i] for i where idx[i] == s)``.
+
+    Launch Grid
+    -----------
+    dim = ceil(N / elems_per_thread)
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype float32/float64
+        Input scalar values.
+    idx : wp.array, shape (N,), dtype int32
+        Sorted segment indices in [0, M).
+    out : wp.array, shape (M,), dtype matches x
+        OUTPUT: Minimum value per segment. Must be initialized to +inf by caller.
+    N : int32
+        Total number of elements.
+    elems_per_thread : int32
+        Number of elements processed per thread.
+    """
+    t = wp.tid()
+    start = t * elems_per_thread
+    if start >= N:
+        return
+    end = wp.min(start + elems_per_thread, N)
+
+    s_cur = idx[start]
+    min_val = x[start]
+    for i in range(start + 1, end):
+        s = idx[i]
+        if s == s_cur:
+            min_val = wp.min(min_val, x[i])
+        else:
+            wp.atomic_min(out, s_cur, min_val)
+            s_cur = s
+            min_val = x[i]
+    wp.atomic_min(out, s_cur, min_val)
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- segmented_broadcast (pure gather)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _segmented_broadcast_kernel(
+    values: wp.array(dtype=Any),
+    idx: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=Any),
+):
+    """Pure gather broadcast: out[i] = values[idx[i]].
 
     Launch Grid
     -----------
@@ -984,233 +1160,451 @@ def _segmented_matvec_f64_kernel(
 
     Parameters
     ----------
-    v : wp.array, shape (N,), dtype vec3d
-        Per-element input vectors.
-    m : wp.array, shape (M,), dtype mat33d
-        Per-segment 3x3 transformation matrices.
+    values : wp.array, shape (M,), dtype any supported type
+        Per-segment values to broadcast.
     idx : wp.array, shape (N,), dtype int32
-        Segment indices in [0, M).
-    out : wp.array, shape (N,), dtype vec3d
-        OUTPUT: Transformed vectors.
-
-    Notes
-    -----
-    - Uses transpose convention: M^T @ v (column vectors)
-    - Useful for coordinate transformations in NPT barostats
-    - Float64 precision variant
+        Segment indices in [0, M). Need not be sorted.
+    out : wp.array, shape (N,), dtype matches values
+        OUTPUT: Broadcast values.
     """
     tid = wp.tid()
-    _v = v[tid]
-    _m = m[idx[tid]]
-    c0 = wp.vec3d(_m[0, 0], _m[1, 0], _m[2, 0])
-    c1 = wp.vec3d(_m[0, 1], _m[1, 1], _m[2, 1])
-    c2 = wp.vec3d(_m[0, 2], _m[1, 2], _m[2, 2])
-    out[tid] = wp.vec3d(wp.dot(c0, _v), wp.dot(c1, _v), wp.dot(c2, _v))
+    out[tid] = values[idx[tid]]
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- segment_div (element-wise divide with zero guard)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _segment_div_kernel(
+    numerator: wp.array(dtype=Any),
+    denominator: wp.array(dtype=wp.int32),
+    result: wp.array(dtype=Any),
+):
+    """Element-wise division with zero-denominator guard.
+
+    Computes ``result[i] = numerator[i] / denominator[i]`` where zero
+    denominators produce zero results.
+
+    Launch Grid
+    -----------
+    dim = N
+
+    Parameters
+    ----------
+    numerator : wp.array, shape (N,), dtype float16/float32/float64
+        Numerator values.
+    denominator : wp.array, shape (N,), dtype int32
+        Denominator values (e.g., segment counts).
+    result : wp.array, shape (N,), dtype matches numerator
+        OUTPUT: Division results. Zero denominators yield 0.0.
+    """
+    i = wp.tid()
+    if denominator[i] > 0:
+        result[i] = numerator[i] / type(numerator[0])(denominator[i])
+    else:
+        result[i] = type(numerator[0])(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- _segmented_rms_norm_finalize (sqrt(sum_sq / count))
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _segmented_rms_norm_finalize_kernel(
+    sum_sq: wp.array(dtype=Any),
+    counts: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=Any),
+):
+    """Finalize RMS norm: out[s] = sqrt(sum_sq[s] / counts[s]).
+
+    Launch Grid
+    -----------
+    dim = M (number of segments)
+
+    Parameters
+    ----------
+    sum_sq : wp.array, shape (M,), dtype float32/float64
+        Sum of squared norms per segment.
+    counts : wp.array, shape (M,), dtype int32
+        Number of elements per segment.
+    out : wp.array, shape (M,), dtype matches sum_sq
+        OUTPUT: RMS norm per segment. Zero counts yield 0.0.
+    """
+    i = wp.tid()
+    if counts[i] > 0:
+        out[i] = wp.sqrt(sum_sq[i] / type(sum_sq[0])(counts[i]))
+    else:
+        out[i] = type(sum_sq[0])(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- vector divide-by-count (for segmented_mean vec path)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _segmented_vec_div_by_count_kernel(
+    sums: wp.array(dtype=Any),
+    counts: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=Any),
+):
+    """Divide vector sums by integer counts: out[i] = sums[i] / counts[i].
+
+    Launch Grid
+    -----------
+    dim = M (number of segments)
+
+    Parameters
+    ----------
+    sums : wp.array, shape (M,), dtype vec3f/vec3d
+        Per-segment vector sums.
+    counts : wp.array, shape (M,), dtype int32
+        Per-segment element counts.
+    out : wp.array, shape (M,), dtype matches sums
+        Output mean vectors. Zero counts yield zero vector.
+    """
+    i = wp.tid()
+    c = counts[i]
+    if c > 0:
+        out[i] = sums[i] / type(sums[0][0])(c)
+    else:
+        out[i] = type(sums[0])()
+
+
+# ---------------------------------------------------------------------------
+# Kernels -- segmented_count (count elements per segment)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def _segmented_count_kernel(
+    idx: wp.array(dtype=wp.int32),
+    out: wp.array(dtype=wp.int32),
+    N: wp.int32,
+    elems_per_thread: wp.int32,
+):
+    """Count elements per segment using run-length encoding.
+
+    Launch Grid
+    -----------
+    dim = ceil(N / elems_per_thread)
+
+    Parameters
+    ----------
+    idx : wp.array, shape (N,), dtype int32
+        Sorted segment indices in [0, M).
+    out : wp.array, shape (M,), dtype int32
+        OUTPUT: Element counts per segment. Must be zero-initialized.
+    N : int32
+        Total number of elements.
+    elems_per_thread : int32
+        Number of elements processed per thread.
+    """
+    t = wp.tid()
+    start = t * elems_per_thread
+    if start >= N:
+        return
+    end = wp.min(start + elems_per_thread, N)
+
+    s_cur = idx[start]
+    count = wp.int32(1)
+    for i in range(start + 1, end):
+        s = idx[i]
+        if s == s_cur:
+            count = count + wp.int32(1)
+        else:
+            wp.atomic_add(out, s_cur, count)
+            s_cur = s
+            count = wp.int32(1)
+    wp.atomic_add(out, s_cur, count)
 
 
 # ---------------------------------------------------------------------------
 # Overloads (module-level, keyed by dtype)
 # ---------------------------------------------------------------------------
 
-_total_sum_tile_overloads = {}
-for _t in _SUPPORTED_TYPES:
-    _total_sum_tile_overloads[_t] = wp.overload(
-        _total_sum_tile_kernel,
-        [wp.array(dtype=_t), wp.array(dtype=_t)],
-    )
+# -- Reduction overloads (atomic-safe types: float32/float64, vec3f/vec3d) ---
 
-_segmented_sum_overloads = {}
-for _t in _SUPPORTED_TYPES:
-    _segmented_sum_overloads[_t] = wp.overload(
-        _segmented_sum_kernel,
-        [
-            wp.array(dtype=_t),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_t),
-            wp.int32,
-            wp.int32,
-        ],
-    )
+_total_sum_tile_overloads = register_overloads(
+    _total_sum_tile_kernel,
+    lambda t: [wp.array(dtype=t), wp.array(dtype=t)],
+    dtypes=_SUPPORTED_TYPES,
+)
 
-_segmented_component_sum_overloads = {}
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_component_sum_overloads[_v] = wp.overload(
-        _segmented_component_sum_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
-            wp.int32,
-            wp.int32,
-        ],
-    )
+_segmented_sum_overloads = register_overloads(
+    _segmented_sum_kernel,
+    lambda t: [
+        wp.array(dtype=t),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=t),
+        wp.int32,
+        wp.int32,
+    ],
+    dtypes=_SUPPORTED_TYPES,
+)
 
-_segmented_dot_overloads = {}
-for _s in _SCALAR_TYPES:
-    _segmented_dot_overloads[_s] = wp.overload(
-        _segmented_dot_scalar_kernel,
-        [
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
-            wp.int32,
-            wp.int32,
-        ],
-    )
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_dot_overloads[_v] = wp.overload(
+_segmented_component_sum_overloads = register_overloads(
+    _segmented_component_sum_kernel,
+    lambda v, s: [
+        wp.array(dtype=v),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=s),
+        wp.int32,
+        wp.int32,
+    ],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
+
+_total_component_sum_tile_overloads = register_overloads(
+    _total_component_sum_tile_kernel,
+    lambda v, s: [wp.array(dtype=v), wp.array(dtype=s)],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
+
+_total_dot_scalar_tile_overloads = register_overloads(
+    _total_dot_scalar_tile_kernel,
+    lambda t: [wp.array(dtype=t), wp.array(dtype=t), wp.array(dtype=t)],
+    dtypes=_SCALAR_TYPES,
+)
+
+_total_dot_vec_tile_overloads = register_overloads(
+    _total_dot_vec_tile_kernel,
+    lambda v, s: [wp.array(dtype=v), wp.array(dtype=v), wp.array(dtype=s)],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
+
+_segmented_dot_overloads = register_overloads(
+    _segmented_dot_scalar_kernel,
+    lambda t: [
+        wp.array(dtype=t),
+        wp.array(dtype=t),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=t),
+        wp.int32,
+        wp.int32,
+    ],
+    dtypes=_SCALAR_TYPES,
+)
+_segmented_dot_overloads.update(
+    register_overloads(
         _segmented_dot_vec_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=_v),
+        lambda v, s: [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
             wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
+            wp.array(dtype=s),
             wp.int32,
             wp.int32,
         ],
+        dtype_pairs=_VEC_SCALAR_PAIRS,
     )
+)
 
-_segmented_max_norm_overloads = {}
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_max_norm_overloads[_v] = wp.overload(
-        _segmented_max_norm_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
-            wp.int32,
-            wp.int32,
-        ],
-    )
+_segmented_max_norm_overloads = register_overloads(
+    _segmented_max_norm_kernel,
+    lambda v, s: [
+        wp.array(dtype=v),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=s),
+        wp.int32,
+        wp.int32,
+    ],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
 
-_total_max_norm_overloads = {}
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _total_max_norm_overloads[_v] = wp.overload(
-        _total_max_norm_kernel,
-        [wp.array(dtype=_v), wp.array(dtype=_s), wp.int32, wp.int32],
-    )
+_total_max_norm_overloads = register_overloads(
+    _total_max_norm_kernel,
+    lambda v, s: [wp.array(dtype=v), wp.array(dtype=s), wp.int32, wp.int32],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
 
-_segmented_axpy_overloads = {}
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_axpy_overloads[_v] = wp.overload(
-        _segmented_axpy_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=_v),
-            wp.array(dtype=_s),
-            wp.array(dtype=wp.int32),
-        ],
-    )
-for _s in _SCALAR_TYPES:
-    _segmented_axpy_overloads[_s] = wp.overload(
-        _segmented_axpy_kernel,
-        [
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=wp.int32),
-        ],
-    )
+_total_inner_products_scalar_tile_overloads = register_overloads(
+    _total_inner_products_scalar_tile_kernel,
+    lambda t: [wp.array(dtype=t)] * 2 + [wp.array(dtype=t)] * 3,
+    dtypes=_SCALAR_TYPES,
+)
 
-_segmented_inner_products_overloads = {}
-for _s in _SCALAR_TYPES:
-    _segmented_inner_products_overloads[_s] = wp.overload(
-        _segmented_inner_products_scalar_kernel,
-        [
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.int32,
-            wp.int32,
-        ],
-    )
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_inner_products_overloads[_v] = wp.overload(
+_total_inner_products_vec_tile_overloads = register_overloads(
+    _total_inner_products_vec_tile_kernel,
+    lambda v, s: [wp.array(dtype=v)] * 2 + [wp.array(dtype=s)] * 3,
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
+
+_segmented_inner_products_overloads = register_overloads(
+    _segmented_inner_products_scalar_kernel,
+    lambda t: [wp.array(dtype=t)] * 2
+    + [wp.array(dtype=wp.int32)]
+    + [wp.array(dtype=t)] * 3
+    + [wp.int32, wp.int32],
+    dtypes=_SCALAR_TYPES,
+)
+_segmented_inner_products_overloads.update(
+    register_overloads(
         _segmented_inner_products_vec_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=_v),
-            wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.int32,
-            wp.int32,
-        ],
+        lambda v, s: [wp.array(dtype=v)] * 2
+        + [wp.array(dtype=wp.int32)]
+        + [wp.array(dtype=s)] * 3
+        + [wp.int32, wp.int32],
+        dtype_pairs=_VEC_SCALAR_PAIRS,
     )
+)
 
-_segmented_axpby_overloads = {}
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_axpby_overloads[_v] = wp.overload(
+_segmented_max_overloads = register_overloads(
+    _segmented_max_kernel,
+    lambda t: [
+        wp.array(dtype=t),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=t),
+        wp.int32,
+        wp.int32,
+    ],
+    dtypes=_SCALAR_TYPES,
+)
+
+_segmented_min_overloads = register_overloads(
+    _segmented_min_kernel,
+    lambda t: [
+        wp.array(dtype=t),
+        wp.array(dtype=wp.int32),
+        wp.array(dtype=t),
+        wp.int32,
+        wp.int32,
+    ],
+    dtypes=_SCALAR_TYPES,
+)
+
+_segmented_rms_norm_finalize_overloads = register_overloads(
+    _segmented_rms_norm_finalize_kernel,
+    lambda t: [wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+    dtypes=_SCALAR_TYPES,
+)
+
+_segmented_vec_div_by_count_overloads = register_overloads(
+    _segmented_vec_div_by_count_kernel,
+    lambda v, s: [wp.array(dtype=v), wp.array(dtype=wp.int32), wp.array(dtype=v)],
+    dtype_pairs=_VEC_SCALAR_PAIRS,
+)
+
+# -- Element-wise / broadcast overloads (include float16/vec3h) -------------
+
+_segmented_axpy_overloads = register_overloads(
+    _segmented_axpy_kernel,
+    lambda v, s: [
+        wp.array(dtype=v),
+        wp.array(dtype=v),
+        wp.array(dtype=s),
+        wp.array(dtype=wp.int32),
+    ],
+    dtype_pairs=_ALL_VEC_SCALAR_PAIRS,
+)
+_segmented_axpy_overloads.update(
+    register_overloads(
+        _segmented_axpy_kernel,
+        lambda t: [wp.array(dtype=t)] * 3 + [wp.array(dtype=wp.int32)],
+        dtypes=_ALL_SCALAR_TYPES,
+    )
+)
+
+_segmented_axpby_overloads = register_overloads(
+    _segmented_axpby_kernel,
+    lambda v, s: [
+        wp.array(dtype=v),
+        wp.array(dtype=s),
+        wp.array(dtype=v),
+        wp.array(dtype=s),
+        wp.array(dtype=v),
+        wp.array(dtype=wp.int32),
+    ],
+    dtype_pairs=_ALL_VEC_SCALAR_PAIRS,
+)
+_segmented_axpby_overloads.update(
+    register_overloads(
         _segmented_axpby_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=_s),
-            wp.array(dtype=_v),
-            wp.array(dtype=_s),
-            wp.array(dtype=_v),
-            wp.array(dtype=wp.int32),
-        ],
+        lambda t: [wp.array(dtype=t)] * 5 + [wp.array(dtype=wp.int32)],
+        dtypes=_ALL_SCALAR_TYPES,
     )
-for _s in _SCALAR_TYPES:
-    _segmented_axpby_overloads[_s] = wp.overload(
-        _segmented_axpby_kernel,
-        [
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
-            wp.array(dtype=wp.int32),
-        ],
-    )
+)
 
-_segmented_mul_overloads = {}
-for _s in _SCALAR_TYPES:
-    _segmented_mul_overloads[(_s, _s)] = wp.overload(
+_segmented_mul_overloads = register_overloads(
+    _segmented_mul_kernel,
+    lambda t: [wp.array(dtype=t)] * 2 + [wp.array(dtype=wp.int32), wp.array(dtype=t)],
+    dtypes=_ALL_SCALAR_TYPES,
+    key_fn=lambda t: (t, t),
+)
+_segmented_mul_overloads.update(
+    register_overloads(
         _segmented_mul_kernel,
-        [
-            wp.array(dtype=_s),
-            wp.array(dtype=_s),
+        lambda v, s: [
+            wp.array(dtype=v),
+            wp.array(dtype=s),
             wp.array(dtype=wp.int32),
-            wp.array(dtype=_s),
+            wp.array(dtype=v),
         ],
+        dtype_pairs=_ALL_VEC_SCALAR_PAIRS,
+        key_fn=lambda v, s: (v, s),
     )
-for _v, _s in zip(_VEC_TYPES, _SCALAR_TYPES):
-    _segmented_mul_overloads[(_v, _s)] = wp.overload(
+)
+_segmented_mul_overloads.update(
+    register_overloads(
         _segmented_mul_kernel,
-        [
-            wp.array(dtype=_v),
-            wp.array(dtype=_s),
+        lambda v, m: [
+            wp.array(dtype=v),
+            wp.array(dtype=m),
             wp.array(dtype=wp.int32),
-            wp.array(dtype=_v),
+            wp.array(dtype=v),
         ],
+        dtype_pairs=_VEC_MAT_PAIRS,
+        key_fn=lambda v, m: (v, m),
     )
+)
 
-_segmented_add_overloads = {}
-for _t in _SUPPORTED_TYPES:
-    _segmented_add_overloads[(_t, _t)] = wp.overload(
-        _segmented_add_kernel,
-        [
-            wp.array(dtype=_t),
-            wp.array(dtype=_t),
+_segmented_add_overloads = register_overloads(
+    _segmented_add_kernel,
+    lambda t: [wp.array(dtype=t)] * 2 + [wp.array(dtype=wp.int32), wp.array(dtype=t)],
+    dtypes=_ALL_SUPPORTED_TYPES,
+    key_fn=lambda t: (t, t),
+)
+_segmented_add_overloads.update(
+    register_overloads(
+        _segmented_add_vec_scalar_kernel,
+        lambda v, s: [
+            wp.array(dtype=v),
+            wp.array(dtype=s),
             wp.array(dtype=wp.int32),
-            wp.array(dtype=_t),
+            wp.array(dtype=v),
         ],
+        dtype_pairs=_ALL_VEC_SCALAR_PAIRS,
+        key_fn=lambda v, s: (v, s),
     )
-_segmented_add_overloads[(wp.vec3f, wp.float32)] = _segmented_add_vec_scalar_f32_kernel
-_segmented_add_overloads[(wp.vec3d, wp.float64)] = _segmented_add_vec_scalar_f64_kernel
-_segmented_add_overloads[(wp.float32, wp.vec3f)] = _segmented_add_scalar_vec_f32_kernel
-_segmented_add_overloads[(wp.float64, wp.vec3d)] = _segmented_add_scalar_vec_f64_kernel
+)
+_segmented_add_overloads.update(
+    register_overloads(
+        _segmented_add_scalar_vec_kernel,
+        lambda v, s: [
+            wp.array(dtype=s),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=v),
+        ],
+        dtype_pairs=_ALL_VEC_SCALAR_PAIRS,
+        key_fn=lambda v, s: (s, v),
+    )
+)
 
-_segmented_matvec_overloads = {
-    wp.float32: _segmented_matvec_f32_kernel,
-    wp.float64: _segmented_matvec_f64_kernel,
-}
+_segmented_broadcast_overloads = register_overloads(
+    _segmented_broadcast_kernel,
+    lambda t: [wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+    dtypes=_ALL_SUPPORTED_TYPES,
+)
+
+_segment_div_overloads = register_overloads(
+    _segment_div_kernel,
+    lambda t: [wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
+    dtypes=_ALL_SCALAR_TYPES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1225,45 +1619,19 @@ def segmented_sum(
 ) -> None:
     """Compute per-segment sum using run-length encoded reduction.
 
-    Performs a segmented reduction that sums all elements belonging to each
-    segment: ``out[s] = sum(x[i] for i where idx[i] == s)``.
+    ``out[s] = sum(x[i] for i where idx[i] == s)``
 
-    **IMPORTANT:** The caller must zero-initialize ``out`` before calling
-    (e.g., ``out.zero_()`` or ``wp.zeros``). This avoids a redundant kernel
-    launch when the caller already provides a fresh array.
-
-    **CRITICAL:** The ``idx`` array **MUST** be sorted in non-decreasing
-    order for correctness. Unsorted indices will produce incorrect results.
+    The caller must zero-initialize ``out`` before calling (e.g. via
+    ``out.zero_()``).  Requires sorted ``idx`` in non-decreasing order.
 
     Parameters
     ----------
     x : wp.array, shape (N,)
-        Input values to sum per segment.
-        Supported dtypes: ``float32``, ``float64``, ``vec3f``, ``vec3d``.
+        Input values. Supported dtypes: float32, float64, vec3f, vec3d.
     idx : wp.array(dtype=int32), shape (N,)
-        **Sorted** segment indices in ``[0, M)``. Each ``idx[i]`` indicates
-        which segment element ``x[i]`` belongs to. **MUST BE SORTED**.
-    out : wp.array, shape (M,)
-        Output array containing per-segment sums, same dtype as ``x``.
-        **Must be zero-initialized by caller before calling this function.**
-
-    Examples
-    --------
-    Sum per-atom forces to per-system totals:
-
-    >>> import warp as wp
-    >>> # 8 atoms in 3 systems: [0,0,0,1,1,2,2,2]
-    >>> batch_idx = wp.array([0,0,0,1,1,2,2,2], dtype=wp.int32)
-    >>> forces = wp.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=wp.float32)
-    >>> system_forces = wp.zeros(3, dtype=wp.float32)
-    >>> segmented_sum(forces, batch_idx, system_forces)
-    >>> print(system_forces.numpy())  # [6.0, 9.0, 21.0]
-
-    See Also
-    --------
-    segmented_dot : Dot product reduction per segment
-    segmented_component_sum : Sum vector components to scalar per segment
-    segmented_max_norm : Maximum vector norm per segment
+        Sorted segment indices in ``[0, M)``.
+    out : wp.array, shape (M,), dtype matches x
+        Per-segment sums. Must be zero-initialized by caller.
     """
     N = x.shape[0]
     if N == 0:
@@ -1280,6 +1648,7 @@ def segmented_sum(
             dim=full_blocks,
             inputs=[x, out],
             block_dim=_BLOCK_DIM,
+            device=device,
         )
         remainder = N - full_blocks * _BLOCK_DIM
         if remainder > 0:
@@ -1311,40 +1680,19 @@ def segmented_component_sum(
 ) -> None:
     """Sum all vector components to scalar per segment using RLE reduction.
 
-    Computes the total sum of all x, y, z components within each segment:
-
     ``out[s] = sum(x[i][0] + x[i][1] + x[i][2] for i where idx[i] == s)``
 
-    This is useful for computing total magnitudes across all dimensions,
-    such as summing all force components or all velocity components per system.
-
-    Uses run-length encoding to minimize atomic operations (O(M) instead of O(N)).
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    zero-initialize ``out``.
 
     Parameters
     ----------
     x : wp.array, shape (N,), dtype vec3f / vec3d
-        Input 3D vectors. Each vector's components will be summed.
+        Input 3D vectors.
     idx : wp.array(dtype=int32), shape (N,)
-        **Sorted** segment indices in ``[0, M)``. **MUST BE SORTED**.
+        Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Output scalar sums per segment. Precision matches ``x``.
-        **Must be zero-initialized by caller.**
-
-    Examples
-    --------
-    Sum all velocity components per system:
-
-    >>> velocities = wp.array([[1,2,3], [4,5,6]], dtype=wp.vec3f)  # 2 atoms
-    >>> batch_idx = wp.array([0, 0], dtype=wp.int32)  # same system
-    >>> total = wp.zeros(1, dtype=wp.float32)
-    >>> segmented_component_sum(velocities, batch_idx, total)
-    >>> print(total.numpy())  # [21.0] = (1+2+3) + (4+5+6)
-
-    Notes
-    -----
-    - Output dtype is scalar (float32/float64) matching input precision
-    - Requires sorted ``idx`` array for correctness
-    - Caller must zero-initialize ``out`` before calling
+        Per-segment scalar sums. Must be zero-initialized by caller.
 
     See Also
     --------
@@ -1355,6 +1703,31 @@ def segmented_component_sum(
     if N == 0:
         return
     device = x.device
+    M = out.shape[0]
+
+    # -- M=1 fast path: tile-based block reduction --------------------------
+    if M == 1 and N >= 8192:
+        full_blocks = N // _BLOCK_DIM
+        wp.launch_tiled(
+            _total_component_sum_tile_overloads[x.dtype],
+            dim=full_blocks,
+            inputs=[x, out],
+            block_dim=_BLOCK_DIM,
+            device=device,
+        )
+        remainder = N - full_blocks * _BLOCK_DIM
+        if remainder > 0:
+            x_tail = x[full_blocks * _BLOCK_DIM :]
+            idx_tail = idx[full_blocks * _BLOCK_DIM :]
+            wp.launch(
+                _segmented_component_sum_overloads[x.dtype],
+                dim=remainder,
+                inputs=[x_tail, idx_tail, out, remainder, 1],
+                device=device,
+            )
+        return
+
+    # -- General path: run-length segmented component sum -------------------
     ept = _compute_ept(N, max(device.sm_count, 1), True)
     dim = (N + ept - 1) // ept
     wp.launch(
@@ -1373,52 +1746,21 @@ def segmented_dot(
 ) -> None:
     """Compute per-segment dot product reduction using RLE.
 
-    Performs segmented dot product that handles both scalar and vector types:
+    - Scalar types: ``out[s] = sum(x[i] * y[i] for i where idx[i] == s)``
+    - Vector types: ``out[s] = sum(dot(x[i], y[i]) for i where idx[i] == s)``
 
-    - **Scalar types**: ``out[s] = sum(x[i] * y[i] for i where idx[i] == s)``
-    - **Vector types**: ``out[s] = sum(dot(x[i], y[i]) for i where idx[i] == s)``
-
-    Common use cases include computing kinetic energy (v·v per system),
-    power (F·v per system), or any pairwise inner product reduction.
-
-    Uses run-length encoding to minimize atomic operations.
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    zero-initialize ``out``.
 
     Parameters
     ----------
     x, y : wp.array, shape (N,)
-        Input arrays for dot product. Must have same dtype.
-        Supported: ``float32``, ``float64``, ``vec3f``, ``vec3d``.
+        Input arrays. Must have same dtype.
+        Supported: float32, float64, vec3f, vec3d.
     idx : wp.array(dtype=int32), shape (N,)
-        **Sorted** segment indices in ``[0, M)``. **MUST BE SORTED**.
+        Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Output scalar dot products per segment. Precision matches ``x``/``y``.
-        **Must be zero-initialized by caller.**
-
-    Examples
-    --------
-    Compute kinetic energy per system (v·v):
-
-    >>> velocities = wp.array([[1,0,0], [0,2,0], [3,0,0]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 0, 1], dtype=wp.int32)  # 2 atoms in sys 0, 1 in sys 1
-    >>> v_dot_v = wp.zeros(2, dtype=wp.float32)
-    >>> segmented_dot(velocities, velocities, batch_idx, v_dot_v)
-    >>> print(v_dot_v.numpy())  # [5.0, 9.0] = (1^2 + 2^2), (3^2)
-
-    Compute power per system (F·v):
-
-    >>> forces = wp.array([[1,1,1], [2,2,2]], dtype=wp.vec3f)
-    >>> velocities = wp.array([[1,0,0], [0,1,0]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 0], dtype=wp.int32)
-    >>> power = wp.zeros(1, dtype=wp.float32)
-    >>> segmented_dot(forces, velocities, batch_idx, power)
-    >>> print(power.numpy())  # [3.0] = (1*1 + 0*1 + 0*1) + (0*2 + 1*2 + 0*2)
-
-    Notes
-    -----
-    - For vectors, computes standard 3D dot product per element
-    - Output is always scalar type matching input precision
-    - Requires sorted ``idx`` for correctness
-    - Caller must zero-initialize ``out``
+        Per-segment dot products. Must be zero-initialized by caller.
 
     See Also
     --------
@@ -1429,6 +1771,37 @@ def segmented_dot(
     if N == 0:
         return
     device = x.device
+    M = out.shape[0]
+
+    # -- M=1 fast path: tile-based block reduction --------------------------
+    if M == 1 and N >= 8192:
+        tile_overloads = (
+            _total_dot_scalar_tile_overloads
+            if x.dtype in _SCALAR_TYPES
+            else _total_dot_vec_tile_overloads
+        )
+        full_blocks = N // _BLOCK_DIM
+        wp.launch_tiled(
+            tile_overloads[x.dtype],
+            dim=full_blocks,
+            inputs=[x, y, out],
+            block_dim=_BLOCK_DIM,
+            device=device,
+        )
+        remainder = N - full_blocks * _BLOCK_DIM
+        if remainder > 0:
+            x_tail = x[full_blocks * _BLOCK_DIM :]
+            y_tail = y[full_blocks * _BLOCK_DIM :]
+            idx_tail = idx[full_blocks * _BLOCK_DIM :]
+            wp.launch(
+                _segmented_dot_overloads[x.dtype],
+                dim=remainder,
+                inputs=[x_tail, y_tail, idx_tail, out, remainder, 1],
+                device=device,
+            )
+        return
+
+    # -- General path: run-length segmented dot -----------------------------
     ept = _compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
     dim = (N + ept - 1) // ept
     wp.launch(
@@ -1444,54 +1817,26 @@ def segmented_max_norm(
     idx: wp.array,
     out: wp.array,
 ) -> None:
-    """Compute maximum vector norm (length) per segment using RLE reduction.
-
-    Finds the maximum Euclidean norm across all vectors in each segment:
+    """Compute maximum vector norm per segment using RLE reduction.
 
     ``out[s] = max(length(x[i]) for i where idx[i] == s)``
 
-    where ``length(x[i]) = sqrt(x[i][0]^2 + x[i][1]^2 + x[i][2]^2)``.
-
-    This is commonly used for convergence checking in geometry optimization
-    (e.g., FIRE optimizer) by finding the maximum force magnitude per system.
-
-    Uses run-length encoding with atomic max operations. For single-segment
-    cases (M=1) with large arrays (N≥8192), uses optimized large elements-per-thread
-    to minimize atomic contention.
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    zero-initialize ``out``.  For single-segment cases (M=1) with
+    N >= 8192, an optimized fast path reduces atomic contention.
 
     Parameters
     ----------
     x : wp.array, shape (N,), dtype vec3f / vec3d
-        Input 3D vectors. Norm is computed for each vector.
+        Input 3D vectors.
     idx : wp.array(dtype=int32), shape (N,)
-        **Sorted** segment indices in ``[0, M)``. **MUST BE SORTED**.
+        Sorted segment indices in ``[0, M)``.
     out : wp.array, shape (M,), dtype float32 / float64
-        Output maximum norms per segment. Precision matches ``x``.
-        **Must be zero-initialized by caller.**
-
-    Examples
-    --------
-    Find maximum force magnitude per system (for convergence check):
-
-    >>> forces = wp.array([[3,4,0], [1,0,0], [0,5,12]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 0, 1], dtype=wp.int32)
-    >>> max_forces = wp.zeros(2, dtype=wp.float32)
-    >>> segmented_max_norm(forces, batch_idx, max_forces)
-    >>> print(max_forces.numpy())  # [5.0, 13.0] = max(5.0, 1.0), max(13.0)
-    >>> # Check convergence: system 0 converged if max_forces[0] < threshold
-
-    Notes
-    -----
-    - Computes Euclidean norm (L2 norm) for each vector
-    - Uses ``atomic_max`` for segment reduction
-    - Special optimization for M=1 (single segment) with N≥8192
-    - Requires sorted ``idx`` for correctness
-    - Caller must zero-initialize ``out``
+        Maximum norms per segment. Must be zero-initialized by caller.
 
     See Also
     --------
-    segmented_dot : For computing squared norms (v·v) per segment
-    segmented_component_sum : For L1-like component sums
+    segmented_dot : Squared norms (v·v) per segment
     """
     N = x.shape[0]
     if N == 0:
@@ -1529,49 +1874,22 @@ def segmented_axpy(
     a: wp.array,
     idx: wp.array,
 ) -> None:
-    """In-place segmented broadcast FMA (fused multiply-add): ``y[i] += x[i] * a[idx[i]]``.
+    """In-place segmented broadcast FMA: ``y[i] += x[i] * a[idx[i]]``.
 
-    Broadcasts per-segment scalar values to per-atom vectors and accumulates:
-    for each atom ``i``, multiplies ``x[i]`` by the scalar ``a[idx[i]]``
-    and adds the result to ``y[i]``.
-
-    This is the BLAS AXPY operation generalized to segmented/batched contexts,
-    useful for applying per-system scalars (like timesteps, learning rates,
-    or temperature factors) to per-atom quantities.
-
-    **IMPORTANT**: This operation modifies ``y`` in-place.
+    Modifies ``y`` in-place.  ``idx`` need not be sorted.
 
     Parameters
     ----------
     y : wp.array, shape (N,)
-        Accumulator array, **modified in-place**.
-        Supported dtypes: ``vec3f``, ``vec3d``, ``float32``, ``float64``.
-    x : wp.array, shape (N,)
-        Input array to scale and add. Must have same dtype as ``y``.
+        Accumulator, modified in-place.
+        Supported dtypes: vec3f, vec3d, float32, float64
+        (also vec3h, float16 for half-precision).
+    x : wp.array, shape (N,), dtype matches y
+        Input array to scale and add.
     a : wp.array, shape (M,)
-        Per-segment scalar multipliers. Dtype is scalar precision matching ``y``
-        (``float32`` for ``vec3f``/``float32``, ``float64`` for ``vec3d``/``float64``).
+        Per-segment scalar multipliers (precision matches y).
     idx : wp.array(dtype=int32), shape (N,)
-        Segment indices in ``[0, M)`` for broadcast. Need not be sorted.
-
-    Examples
-    --------
-    Apply per-system timestep scaling to velocities:
-
-    >>> velocities = wp.array([[1,0,0], [0,1,0]], dtype=wp.vec3f)  # 2 atoms
-    >>> accelerations = wp.array([[2,0,0], [0,3,0]], dtype=wp.vec3f)
-    >>> dt_per_system = wp.array([0.5, 0.1], dtype=wp.float32)  # different dt
-    >>> batch_idx = wp.array([0, 1], dtype=wp.int32)
-    >>> segmented_axpy(velocities, accelerations, dt_per_system, batch_idx)
-    >>> # velocities[0] = [1,0,0] + [2,0,0]*0.5 = [2,0,0]
-    >>> # velocities[1] = [0,1,0] + [0,3,0]*0.1 = [0,1.3,0]
-
-    Notes
-    -----
-    - Operation is in-place on ``y``
-    - ``idx`` need not be sorted (no RLE optimization needed for broadcast)
-    - Common use: velocity updates, gradient descent steps, scaled accumulation
-    - Named "axpy" after BLAS convention: alpha*x + y
+        Segment indices in ``[0, M)``.
 
     See Also
     --------
@@ -1599,62 +1917,62 @@ def segmented_inner_products(
 ) -> None:
     """Compute three inner products per segment in one fused pass using RLE.
 
-    Efficiently computes all three combinations of dot products in a single
-    kernel launch:
+    Computes ``out_xy[s]``, ``out_xx[s]``, ``out_yy[s]`` (the x·y, x·x, y·y
+    inner products) in a single kernel launch, roughly 3x faster than three
+    separate ``segmented_dot`` calls.
 
-    - **Scalar types**: ``out_xy[s] = sum(x[i]*y[i])``, ``out_xx[s] = sum(x[i]*x[i])``, ``out_yy[s] = sum(y[i]*y[i])``
-    - **Vector types**: ``out_xy[s] = sum(dot(x[i],y[i]))``, ``out_xx[s] = sum(dot(x[i],x[i]))``, ``out_yy[s] = sum(dot(y[i],y[i]))``
-
-    This is significantly more efficient than calling ``segmented_dot`` three
-    times separately, as it reuses loads and performs all reductions in one pass.
-
-    Common use case: FIRE optimizer diagnostics where you need v·f, v·v, and f·f
-    simultaneously for parameter updates.
-
-    Uses run-length encoding to minimize atomic operations.
+    Requires sorted ``idx`` in non-decreasing order.  All output arrays must
+    be zero-initialized by the caller.
 
     Parameters
     ----------
     x, y : wp.array, shape (N,)
-        Input arrays for inner products. Must have same dtype.
-        Supported: ``float32``, ``float64``, ``vec3f``, ``vec3d``.
+        Input arrays. Must have same dtype.
+        Supported: float32, float64, vec3f, vec3d.
     idx : wp.array(dtype=int32), shape (N,)
-        **Sorted** segment indices in ``[0, M)``. **MUST BE SORTED**.
+        Sorted segment indices in ``[0, M)``.
     out_xy, out_xx, out_yy : wp.array, shape (M,), dtype float32 / float64
-        Output inner products per segment. Precision matches ``x``/``y``.
-        **All three arrays must be zero-initialized by caller.**
-
-    Examples
-    --------
-    Compute FIRE optimizer diagnostics (v·f, v·v, f·f):
-
-    >>> velocities = wp.array([[1,0,0], [0,2,0]], dtype=wp.vec3f)
-    >>> forces = wp.array([[1,1,0], [2,0,0]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 0], dtype=wp.int32)
-    >>> vf = wp.zeros(1, dtype=wp.float32)
-    >>> vv = wp.zeros(1, dtype=wp.float32)
-    >>> ff = wp.zeros(1, dtype=wp.float32)
-    >>> segmented_inner_products(velocities, forces, batch_idx, vf, vv, ff)
-    >>> # vf[0] = 1.0 (1*1 + 0*2)
-    >>> # vv[0] = 5.0 (1^2 + 2^2)
-    >>> # ff[0] = 6.0 (1^2 + 1^2 + 2^2)
-
-    Notes
-    -----
-    - **Performance**: ~3x faster than three separate ``segmented_dot`` calls
-    - All output arrays must be zero-initialized
-    - Requires sorted ``idx`` for RLE optimization
-    - Commonly used in optimization algorithms (FIRE, conjugate gradient)
+        Per-segment inner products. Must be zero-initialized by caller.
 
     See Also
     --------
     segmented_dot : Single dot product per segment
-    segmented_sum : Element-wise sum per segment
     """
     N = x.shape[0]
     if N == 0:
         return
     device = x.device
+    M = out_xy.shape[0]
+
+    # -- M=1 fast path: tile-based block reduction --------------------------
+    if M == 1 and N >= 8192:
+        tile_overloads = (
+            _total_inner_products_scalar_tile_overloads
+            if x.dtype in _SCALAR_TYPES
+            else _total_inner_products_vec_tile_overloads
+        )
+        full_blocks = N // _BLOCK_DIM
+        wp.launch_tiled(
+            tile_overloads[x.dtype],
+            dim=full_blocks,
+            inputs=[x, y, out_xy, out_xx, out_yy],
+            block_dim=_BLOCK_DIM,
+            device=device,
+        )
+        remainder = N - full_blocks * _BLOCK_DIM
+        if remainder > 0:
+            x_tail = x[full_blocks * _BLOCK_DIM :]
+            y_tail = y[full_blocks * _BLOCK_DIM :]
+            idx_tail = idx[full_blocks * _BLOCK_DIM :]
+            wp.launch(
+                _segmented_inner_products_overloads[x.dtype],
+                dim=remainder,
+                inputs=[x_tail, y_tail, idx_tail, out_xy, out_xx, out_yy, remainder, 1],
+                device=device,
+            )
+        return
+
+    # -- General path: run-length segmented inner products ------------------
     ept = _compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
     dim = (N + ept - 1) // ept
     wp.launch(
@@ -1675,57 +1993,27 @@ def segmented_axpby(
 ) -> None:
     """Broadcast linear combination: ``out[i] = a[idx[i]] * x[i] + b[idx[i]] * y[i]``.
 
-    Generalization of BLAS AXPBY to segmented/batched contexts. Broadcasts
-    per-segment scalars ``a`` and ``b`` to per-atom arrays, computing a
-    two-term linear combination.
-
-    This is useful for operations like velocity updates with multiple force
-    components, gradient blending in optimization, or any operation requiring
-    weighted combination of per-atom quantities with per-system weights.
-
-    **Memory**: Writes output to separate array (does not modify inputs).
+    ``idx`` need not be sorted.
 
     Parameters
     ----------
     out : wp.array, shape (N,)
-        Output array for results. Must have same dtype as ``x``/``y``.
-        Supported: ``vec3f``, ``vec3d``, ``float32``, ``float64``.
-    a : wp.array, shape (M,), dtype float32 / float64
-        Per-segment scalar multipliers for ``x``. Precision matches ``out``.
-    x : wp.array, shape (N,)
-        First input array. Must have same dtype as ``y`` and ``out``.
-    b : wp.array, shape (M,), dtype float32 / float64
-        Per-segment scalar multipliers for ``y``. Precision matches ``out``.
-    y : wp.array, shape (N,)
-        Second input array. Must have same dtype as ``x`` and ``out``.
+        Output array.  Supported dtypes: vec3f, vec3d, float32, float64
+        (also vec3h, float16).
+    a : wp.array, shape (M,)
+        Per-segment scalar multipliers for ``x``.
+    x : wp.array, shape (N,), dtype matches out
+        First input array.
+    b : wp.array, shape (M,)
+        Per-segment scalar multipliers for ``y``.
+    y : wp.array, shape (N,), dtype matches out
+        Second input array.
     idx : wp.array(dtype=int32), shape (N,)
-        Segment indices in ``[0, M)`` for broadcast. Need not be sorted.
-
-    Examples
-    --------
-    Blend two force contributions with per-system weights:
-
-    >>> forces_lj = wp.array([[1,0,0], [2,0,0]], dtype=wp.vec3f)
-    >>> forces_coul = wp.array([[0,1,0], [0,2,0]], dtype=wp.vec3f)
-    >>> weight_lj = wp.array([0.8, 1.0], dtype=wp.float32)
-    >>> weight_coul = wp.array([0.2, 1.0], dtype=wp.float32)
-    >>> batch_idx = wp.array([0, 1], dtype=wp.int32)
-    >>> forces_total = wp.zeros(2, dtype=wp.vec3f)
-    >>> segmented_axpby(forces_total, weight_lj, forces_lj,
-    ...                 weight_coul, forces_coul, batch_idx)
-    >>> # forces_total[0] = 0.8*[1,0,0] + 0.2*[0,1,0] = [0.8, 0.2, 0]
-    >>> # forces_total[1] = 1.0*[2,0,0] + 1.0*[0,2,0] = [2, 2, 0]
-
-    Notes
-    -----
-    - ``idx`` need not be sorted (broadcast operation, no RLE optimization)
-    - All arrays (``x``, ``y``, ``out``) must have same dtype
-    - Scalar precision of ``a``/``b`` must match vector precision of ``x``/``y``/``out``
-    - Common special case: ``a=dt``, ``b=1`` for velocity Verlet-style updates
+        Segment indices in ``[0, M)``.
 
     See Also
     --------
-    segmented_axpy : Simpler one-term version (out = y + a*x)
+    segmented_axpy : Simpler one-term version (y += a*x)
     segmented_mul : Broadcast multiply only
     segmented_add : Broadcast add only
     """
@@ -1748,63 +2036,25 @@ def segmented_mul(
 ) -> None:
     """Broadcast multiply: ``out[i] = x[i] * y[idx[i]]``.
 
-    Broadcasts per-segment scalar values to per-atom arrays and multiplies.
-    Supports mixed-type operations (vector × scalar, scalar × scalar).
-
-    Common use cases include:
-    - Applying per-system scaling factors (timesteps, learning rates, temperature)
-    - Mass-weighting force calculations
-    - Applying per-system unit conversions
-
-    **Supports mixed types**: ``vec3 × scalar``, ``scalar × scalar``.
+    Supports mixed types (vec3 * scalar) as well as same-type (scalar * scalar).
+    ``idx`` need not be sorted.
 
     Parameters
     ----------
     x : wp.array, shape (N,)
-        Per-atom input values to scale.
-        Supported: ``vec3f``, ``vec3d``, ``float32``, ``float64``.
+        Per-atom input values.
+        Supported: vec3h, vec3f, vec3d, float16, float32, float64.
     y : wp.array, shape (M,)
-        Per-segment scalar multipliers.
-        Supported: ``float32`` (for ``vec3f``/``float32``), ``float64`` (for ``vec3d``/``float64``).
+        Per-segment scalar multipliers (precision matches x).
     idx : wp.array(dtype=int32), shape (N,)
-        Segment indices in ``[0, M)`` for broadcast. Need not be sorted.
-    out : wp.array, shape (N,)
-        Output array for scaled results. Dtype matches ``x`` for vec3 types,
-        or result precision for scalar types.
-
-    Examples
-    --------
-    Apply per-system timestep scaling to forces:
-
-    >>> forces = wp.array([[1,2,3], [4,5,6]], dtype=wp.vec3f)
-    >>> dt_per_system = wp.array([0.5, 0.1], dtype=wp.float32)
-    >>> batch_idx = wp.array([0, 1], dtype=wp.int32)
-    >>> scaled_forces = wp.zeros(2, dtype=wp.vec3f)
-    >>> segmented_mul(forces, dt_per_system, batch_idx, scaled_forces)
-    >>> # scaled_forces[0] = [1,2,3] * 0.5 = [0.5, 1.0, 1.5]
-    >>> # scaled_forces[1] = [4,5,6] * 0.1 = [0.4, 0.5, 0.6]
-
-    Mass-weighting scalar quantities:
-
-    >>> energies = wp.array([100.0, 200.0, 150.0], dtype=wp.float32)
-    >>> masses = wp.array([1.0, 2.0], dtype=wp.float32)
-    >>> batch_idx = wp.array([0, 1, 1], dtype=wp.int32)
-    >>> weighted = wp.zeros(3, dtype=wp.float32)
-    >>> segmented_mul(energies, masses, batch_idx, weighted)
-    >>> # weighted = [100.0, 400.0, 300.0]
-
-    Notes
-    -----
-    - ``idx`` need not be sorted (broadcast operation)
-    - For vector × scalar: broadcasts scalar to all components
-    - For scalar × scalar: standard element-wise multiply with broadcast
-    - Does not modify inputs
+        Segment indices in ``[0, M)``.
+    out : wp.array, shape (N,), dtype matches x
+        Scaled output.
 
     See Also
     --------
     segmented_add : Broadcast addition
-    segmented_axpy : Fused multiply-add (y += a*x with broadcast)
-    segmented_axpby : Linear combination with broadcast
+    segmented_axpy : Fused multiply-add (y += a*x)
     """
     N = x.shape[0]
     if N == 0:
@@ -1825,73 +2075,25 @@ def segmented_add(
 ) -> None:
     """Broadcast add: ``out[i] = x[i] + y[idx[i]]``.
 
-    Broadcasts per-segment values to per-atom arrays and adds.
-    Supports mixed-type operations (vector + scalar, scalar + scalar).
-
-    Common use cases include:
-    - Adding per-system offsets or biases to per-atom quantities
-    - Shifting coordinates by per-system origin vectors
-    - Adding per-system baseline energies to per-atom energies
-
-    **Supports mixed types**: ``vec3 + scalar``, ``scalar + vec3``, ``scalar + scalar``.
+    Supports mixed types (vec3 + scalar, scalar + vec3) as well as same-type.
+    ``idx`` need not be sorted.
 
     Parameters
     ----------
     x : wp.array, shape (N,)
         Per-atom input values.
-        Supported: ``vec3f``, ``vec3d``, ``float32``, ``float64``.
+        Supported: vec3h, vec3f, vec3d, float16, float32, float64.
     y : wp.array, shape (M,)
         Per-segment values to broadcast and add.
-        - For ``x`` with vec3 type: ``y`` can be scalar (broadcasts to all components) or vec3
-        - For ``x`` with scalar type: ``y`` must be scalar
     idx : wp.array(dtype=int32), shape (N,)
-        Segment indices in ``[0, M)`` for broadcast. Need not be sorted.
+        Segment indices in ``[0, M)``.
     out : wp.array, shape (N,)
-        Output array for results. Dtype typically matches ``x``
-        (or promoted type for mixed operations).
-
-    Examples
-    --------
-    Add per-system offset to per-atom positions:
-
-    >>> positions = wp.array([[0,0,0], [1,0,0]], dtype=wp.vec3f)
-    >>> offsets = wp.array([[10,20,30], [5,5,5]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 1], dtype=wp.int32)
-    >>> shifted_positions = wp.zeros(2, dtype=wp.vec3f)
-    >>> segmented_add(positions, offsets, batch_idx, shifted_positions)
-    >>> # shifted_positions[0] = [0,0,0] + [10,20,30] = [10,20,30]
-    >>> # shifted_positions[1] = [1,0,0] + [5,5,5] = [6,5,5]
-
-    Add per-system baseline energy to per-atom energies:
-
-    >>> atom_energies = wp.array([1.0, 2.0, 3.0], dtype=wp.float32)
-    >>> baseline_per_system = wp.array([100.0, 200.0], dtype=wp.float32)
-    >>> batch_idx = wp.array([0, 0, 1], dtype=wp.int32)
-    >>> total_energies = wp.zeros(3, dtype=wp.float32)
-    >>> segmented_add(atom_energies, baseline_per_system, batch_idx, total_energies)
-    >>> # total_energies = [101.0, 102.0, 203.0]
-
-    Mixed type: add scalar offset to all vector components:
-
-    >>> vectors = wp.array([[1,2,3]], dtype=wp.vec3f)
-    >>> scalar_offset = wp.array([10.0], dtype=wp.float32)
-    >>> batch_idx = wp.array([0], dtype=wp.int32)
-    >>> result = wp.zeros(1, dtype=wp.vec3f)
-    >>> segmented_add(vectors, scalar_offset, batch_idx, result)
-    >>> # result[0] = [1,2,3] + [10,10,10] = [11,12,13]
-
-    Notes
-    -----
-    - ``idx`` need not be sorted (broadcast operation)
-    - For vec3 + scalar: broadcasts scalar to all three components
-    - For scalar operations: standard broadcast addition
-    - Does not modify inputs
+        Output array.
 
     See Also
     --------
     segmented_mul : Broadcast multiplication
-    segmented_axpy : Fused multiply-add with broadcast
-    segmented_axpby : Linear combination with broadcast
+    segmented_axpy : Fused multiply-add
     """
     N = x.shape[0]
     if N == 0:
@@ -1912,70 +2114,26 @@ def segmented_matvec(
 ) -> None:
     """Per-segment matrix-vector multiply: ``out[i] = M[idx[i]]^T @ v[i]``.
 
-    Broadcasts per-segment 3×3 matrices to per-atom 3D vectors and performs
-    matrix-vector multiplication. Each atom is transformed by its segment's matrix.
+    Computes the transpose matrix-vector product for each element using
+    its segment's matrix.  ``idx`` need not be sorted.
 
-    **Note**: Uses **transpose** of the matrix: ``M^T @ v`` (row-major multiplication).
-
-    Common use cases:
-    - Coordinate transformations (rotation, reflection, scaling)
-    - Applying per-system cell transformations to per-atom positions
-    - Basis transformations in reciprocal space calculations
-    - Applying per-system strain tensors to per-atom quantities
+    Dispatches through :data:`_segmented_mul_overloads` since Warp's native
+    ``mul(vec, mat)`` computes ``v^T @ M = M^T @ v``.
 
     Parameters
     ----------
-    v : wp.array, shape (N,), dtype vec3f / vec3d
-        Per-atom 3D input vectors to transform.
-    m : wp.array, shape (M,), dtype mat33f / mat33d
-        Per-segment 3×3 transformation matrices. Precision must match ``v``
-        (``mat33f`` for ``vec3f``, ``mat33d`` for ``vec3d``).
+    v : wp.array, shape (N,), dtype vec3h / vec3f / vec3d
+        Per-atom input vectors.
+    m : wp.array, shape (M,), dtype mat33h / mat33f / mat33d
+        Per-segment 3x3 matrices (precision must match v).
     idx : wp.array(dtype=int32), shape (N,)
-        Segment indices in ``[0, M)`` for broadcast. Need not be sorted.
-    out : wp.array, shape (N,), dtype vec3f / vec3d
-        Output transformed vectors. Must have same dtype as ``v``.
-
-    Examples
-    --------
-    Apply per-system rotation to per-atom positions:
-
-    >>> import warp as wp
-    >>> import math
-    >>> # 90-degree rotation around z-axis for system 0
-    >>> theta = math.pi / 2
-    >>> rot_z = wp.mat33f([
-    ...     [math.cos(theta), -math.sin(theta), 0],
-    ...     [math.sin(theta),  math.cos(theta), 0],
-    ...     [0, 0, 1]
-    ... ])
-    >>> # Identity for system 1
-    >>> identity = wp.mat33f([[1,0,0], [0,1,0], [0,0,1]])
-    >>> matrices = wp.array([rot_z, identity], dtype=wp.mat33f)
-    >>> positions = wp.array([[1,0,0], [0,1,0]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 1], dtype=wp.int32)
-    >>> rotated = wp.zeros(2, dtype=wp.vec3f)
-    >>> segmented_matvec(positions, matrices, batch_idx, rotated)
-    >>> # rotated[0] ≈ [0,1,0] (rotated 90° around z)
-    >>> # rotated[1] = [0,1,0] (unchanged by identity)
-
-    Apply periodic boundary cell transformation:
-
-    >>> # Fractional coordinates → Cartesian
-    >>> cell_matrix = wp.mat33f([[10,0,0], [0,10,0], [0,0,10]])  # cubic cell
-    >>> cells = wp.array([cell_matrix], dtype=wp.mat33f)
-    >>> fractional = wp.array([[0.5, 0.5, 0.5], [0.25, 0.25, 0.25]], dtype=wp.vec3f)
-    >>> batch_idx = wp.array([0, 0], dtype=wp.int32)
-    >>> cartesian = wp.zeros(2, dtype=wp.vec3f)
-    >>> segmented_matvec(fractional, cells, batch_idx, cartesian)
-    >>> # cartesian = [[5,5,5], [2.5,2.5,2.5]]
+        Segment indices in ``[0, M)``.
+    out : wp.array, shape (N,), dtype matches v
+        Output transformed vectors.
 
     Notes
     -----
-    - **Transpose convention**: Computes ``M^T @ v``, not ``M @ v``
-    - ``idx`` need not be sorted (broadcast operation)
-    - Matrix and vector precision must match (float32/float64)
-    - Does not modify inputs
-    - Typical use in MD: cell transformations, coordinate basis changes
+    Uses transpose convention: ``M^T @ v``, not ``M @ v``.
 
     See Also
     --------
@@ -1985,10 +2143,307 @@ def segmented_matvec(
     N = v.shape[0]
     if N == 0:
         return
-    scalar_type = _VEC_TO_SCALAR[v.dtype]
     wp.launch(
-        _segmented_matvec_overloads[scalar_type],
+        _segmented_mul_overloads[(v.dtype, m.dtype)],
         dim=N,
         inputs=[v, m, idx, out],
         device=v.device,
+    )
+
+
+def segmented_max(
+    x: wp.array,
+    idx: wp.array,
+    out: wp.array,
+) -> None:
+    """Compute maximum scalar value per segment using RLE reduction.
+
+    ``out[s] = max(x[i] for i where idx[i] == s)``
+
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    initialize ``out`` to ``-inf`` before calling.
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype float32 / float64
+        Input scalar values.
+    idx : wp.array(dtype=int32), shape (N,)
+        Sorted segment indices in ``[0, M)``.
+    out : wp.array, shape (M,), dtype matches x
+        Maximum values per segment. Must be initialized to -inf by caller.
+
+    Notes
+    -----
+    float16 is not supported (Warp atomic_max requires float32/float64).
+    """
+    N = x.shape[0]
+    if N == 0:
+        return
+    device = x.device
+    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    dim = (N + ept - 1) // ept
+    wp.launch(
+        _segmented_max_overloads[x.dtype],
+        dim=dim,
+        inputs=[x, idx, out, N, ept],
+        device=device,
+    )
+
+
+def segmented_min(
+    x: wp.array,
+    idx: wp.array,
+    out: wp.array,
+) -> None:
+    """Compute minimum scalar value per segment using RLE reduction.
+
+    ``out[s] = min(x[i] for i where idx[i] == s)``
+
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    initialize ``out`` to ``+inf`` before calling.
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype float32 / float64
+        Input scalar values.
+    idx : wp.array(dtype=int32), shape (N,)
+        Sorted segment indices in ``[0, M)``.
+    out : wp.array, shape (M,), dtype matches x
+        Minimum values per segment. Must be initialized to +inf by caller.
+
+    Notes
+    -----
+    float16 is not supported (Warp atomic_min requires float32/float64).
+    """
+    N = x.shape[0]
+    if N == 0:
+        return
+    device = x.device
+    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    dim = (N + ept - 1) // ept
+    wp.launch(
+        _segmented_min_overloads[x.dtype],
+        dim=dim,
+        inputs=[x, idx, out, N, ept],
+        device=device,
+    )
+
+
+def segmented_broadcast(
+    values: wp.array,
+    idx: wp.array,
+    out: wp.array,
+) -> None:
+    """Broadcast per-segment values to per-element array: ``out[i] = values[idx[i]]``.
+
+    Pure gather operation that copies a per-segment value to every element
+    belonging to that segment.
+
+    Parameters
+    ----------
+    values : wp.array, shape (M,)
+        Per-segment values to broadcast.
+        Supported dtypes: ``float16``, ``float32``, ``float64``,
+        ``vec3h``, ``vec3f``, ``vec3d``.
+    idx : wp.array(dtype=int32), shape (N,)
+        Segment indices in ``[0, M)``. Need not be sorted.
+    out : wp.array, shape (N,), dtype matches values
+        Output array with broadcast values.
+    """
+    N = out.shape[0]
+    if N == 0:
+        return
+    wp.launch(
+        _segmented_broadcast_overloads[values.dtype],
+        dim=N,
+        inputs=[values, idx, out],
+        device=values.device,
+    )
+
+
+def segment_div(
+    numerator: wp.array,
+    denominator: wp.array,
+    result: wp.array,
+) -> None:
+    """Element-wise division with zero-denominator guard.
+
+    Computes ``result[i] = numerator[i] / denominator[i]`` where zero
+    denominators produce zero results instead of NaN/inf.
+
+    Parameters
+    ----------
+    numerator : wp.array, shape (N,), dtype float16 / float32 / float64
+        Numerator values.
+    denominator : wp.array, shape (N,), dtype int32
+        Denominator values (e.g., segment element counts).
+    result : wp.array, shape (N,), dtype matches numerator
+        Output division results.
+    """
+    N = numerator.shape[0]
+    if N == 0:
+        return
+    wp.launch(
+        _segment_div_overloads[numerator.dtype],
+        dim=N,
+        inputs=[numerator, denominator, result],
+        device=numerator.device,
+    )
+
+
+def segmented_mean(
+    x: wp.array,
+    idx: wp.array,
+    sums: wp.array,
+    counts: wp.array,
+    out: wp.array,
+) -> None:
+    """Compute per-segment mean by composing sum + count + divide.
+
+    ``out[s] = sum(x[i] for i where idx[i] == s) / count(s)``
+
+    For vector types (vec3f/vec3d), computes the mean vector per segment.
+    Requires sorted ``idx`` in non-decreasing order.
+
+    All scratch arrays must be pre-allocated and zero-initialized by the
+    caller. This avoids hidden allocations and allows reuse across calls.
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype float32 / float64 / vec3f / vec3d
+        Input values to average per segment.
+    idx : wp.array(dtype=int32), shape (N,)
+        Sorted segment indices in ``[0, M)``.
+    sums : wp.array, shape (M,), dtype matches x
+        Scratch array for per-segment sums. Must be zero-initialized.
+    counts : wp.array(dtype=int32), shape (M,)
+        Scratch array for per-segment element counts. Must be zero-initialized.
+    out : wp.array, shape (M,), dtype matches x
+        Output mean values per segment.
+
+    Notes
+    -----
+    - float16/vec3h not supported (reduction requires atomics).
+    - Composes ``segmented_sum`` + ``segmented_count`` + divide internally.
+    - ``sums`` and ``counts`` are written to as scratch space.
+    """
+    N = x.shape[0]
+    M = out.shape[0]
+    if N == 0:
+        return
+    device = x.device
+    dtype = x.dtype
+
+    segmented_sum(x, idx, sums)
+    segmented_count(idx, counts)
+
+    if dtype in _VEC_TO_SCALAR:
+        wp.launch(
+            _segmented_vec_div_by_count_overloads[dtype],
+            dim=M,
+            inputs=[sums, counts, out],
+            device=device,
+        )
+    else:
+        segment_div(sums, counts, out)
+
+
+def segmented_rms_norm(
+    x: wp.array,
+    idx: wp.array,
+    sum_sq: wp.array,
+    counts: wp.array,
+    out: wp.array,
+) -> None:
+    """Compute RMS (root mean square) vector norm per segment.
+
+    ``out[s] = sqrt(mean(dot(x[i], x[i]) for i where idx[i] == s))``
+
+    This is ``sqrt(sum_of_squared_norms / count)`` for each segment.
+    Requires sorted ``idx`` in non-decreasing order.
+
+    All scratch arrays must be pre-allocated and zero-initialized by the
+    caller.
+
+    Parameters
+    ----------
+    x : wp.array, shape (N,), dtype vec3f / vec3d
+        Input 3D vectors.
+    idx : wp.array(dtype=int32), shape (N,)
+        Sorted segment indices in ``[0, M)``.
+    sum_sq : wp.array, shape (M,), dtype float32 / float64
+        Scratch array for per-segment sum of squared norms.
+        Must be zero-initialized.
+    counts : wp.array(dtype=int32), shape (M,)
+        Scratch array for per-segment element counts.
+        Must be zero-initialized.
+    out : wp.array, shape (M,), dtype float32 / float64
+        Output RMS norms per segment. Precision matches ``x``.
+
+    Notes
+    -----
+    - float16/vec3h not supported (reduction requires atomics).
+    - Composes ``segmented_dot`` + ``segmented_count`` + finalize internally.
+    - ``sum_sq`` and ``counts`` are written to as scratch space.
+    """
+    N = x.shape[0]
+    M = out.shape[0]
+    if N == 0:
+        return
+    device = x.device
+    scalar_dtype = _VEC_TO_SCALAR[x.dtype]
+
+    segmented_dot(x, x, idx, sum_sq)
+    segmented_count(idx, counts)
+
+    wp.launch(
+        _segmented_rms_norm_finalize_overloads[scalar_dtype],
+        dim=M,
+        inputs=[sum_sq, counts, out],
+        device=device,
+    )
+
+
+def segmented_count(
+    idx: wp.array,
+    out: wp.array,
+) -> None:
+    """Count elements per segment using run-length encoding.
+
+    ``out[s] = count(i where idx[i] == s)``
+
+    Requires sorted ``idx`` in non-decreasing order.  Caller must
+    zero-initialize ``out``.
+
+    Parameters
+    ----------
+    idx : wp.array(dtype=int32), shape (N,)
+        Sorted segment indices in ``[0, M)``.
+    out : wp.array(dtype=int32), shape (M,)
+        Per-segment element counts. Must be zero-initialized by caller.
+    """
+    N = idx.shape[0]
+    if N == 0:
+        return
+    device = idx.device
+    M = out.shape[0]
+
+    # -- M=1 fast path: single thread counts everything ---------------------
+    if M == 1:
+        wp.launch(
+            _segmented_count_kernel,
+            dim=1,
+            inputs=[idx, out, N, N],
+            device=device,
+        )
+        return
+
+    # -- General path: run-length segmented count ---------------------------
+    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    dim = (N + ept - 1) // ept
+    wp.launch(
+        _segmented_count_kernel,
+        dim=dim,
+        inputs=[idx, out, N, ept],
+        device=device,
     )
