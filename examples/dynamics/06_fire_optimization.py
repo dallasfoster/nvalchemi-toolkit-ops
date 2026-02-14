@@ -193,7 +193,7 @@ for step in range(max_steps):
             break
 
 # %%
-# Plot convergence (sphinx-gallery will render)
+# Plot convergence
 
 steps = np.arange(len(energy_hist))
 

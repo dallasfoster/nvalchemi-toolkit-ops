@@ -152,7 +152,7 @@ print(f"  Mean Total Energy:   {total_energies.mean():.4f} eV")
 print(f"  Energy Fluctuation:  {total_energies.std():.4f} eV")
 
 # %%
-# Plot (sphinx-gallery will render matplotlib figures)
+# Plot
 # ---------------------------------------------------
 
 fig, ax = plt.subplots(2, 1, figsize=(7.0, 5.0), sharex=True, constrained_layout=True)

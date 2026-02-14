@@ -24,6 +24,8 @@ ALCHEMI Toolkit-Ops provides integrators for different statistical ensembles:
 | **Velocity Verlet** | NVE | Energy | Testing, production NVE runs |
 | **Langevin (BAOAB)** | NVT | Temperature | Canonical sampling, equilibration |
 | **Nosé-Hoover Chain** | NVT | Temperature | Deterministic thermostat, long runs |
+| **NPT (MTK)** | NPT | Temperature, Pressure | Constant pressure simulations |
+| **NPH (MTK)** | NPH | Enthalpy, Pressure | Adiabatic constant pressure |
 | **Velocity Rescaling** | - | - | Quick equilibration (non-canonical) |
 
 All integrators support:
@@ -103,22 +105,34 @@ for step in range(num_steps):
 :sync: init
 
 ```python
+import warp as wp
 from nvalchemiops.dynamics.utils import (
     initialize_velocities,
+    compute_kinetic_energy,
     compute_temperature
 )
 
-# Initialize velocities from Maxwell-Boltzmann distribution
+# Target temperature (k_B*T in energy units)
 temperature = wp.array([1.0], dtype=wp.float64, device="cuda:0")
+
+# Scratch arrays for COM removal (required when remove_com=True)
+total_momentum = wp.zeros(1, dtype=wp.vec3d, device="cuda:0")
+total_mass = wp.zeros(1, dtype=wp.float64, device="cuda:0")
+com_velocities = wp.zeros(1, dtype=wp.vec3d, device="cuda:0")
+
+# Initialize velocities from Maxwell-Boltzmann distribution
 initialize_velocities(
     velocities, masses, temperature,
+    total_momentum, total_mass, com_velocities,
     random_seed=42,
     remove_com=True  # Remove center-of-mass motion
 )
 
 # Verify temperature
-T_actual = compute_temperature(velocities, masses, num_atoms=100)
-print(f"Target: {temperature.numpy()[0]}, Actual: {T_actual.numpy()[0]}")
+ke = compute_kinetic_energy(velocities, masses)
+T_out = wp.zeros(1, dtype=wp.float64, device="cuda:0")
+compute_temperature(ke, T_out, num_atoms=100)
+print(f"Target: {temperature.numpy()[0]}, Actual: {T_out.numpy()[0]}")
 ```
 
 :::
@@ -273,6 +287,52 @@ $$
 - Useful for initial equilibration before switching to proper thermostat
 - Can cause artifacts if used for production runs
 
+### NPT (Isothermal-Isobaric)
+
+Constant temperature and pressure simulations using Martyna-Tobias-Klein (MTK) equations
+with coupled Nosé-Hoover chains for thermostat and barostat:
+
+```python
+from nvalchemiops.dynamics.integrators import run_npt_step
+
+# Run a complete NPT step
+run_npt_step(
+    positions, velocities, forces, masses, dt,
+    cell, cell_velocities,
+    target_temperature, target_pressure,
+    nhc_positions, nhc_velocities, nhc_masses,
+    barostat_mass, dof
+)
+```
+
+**Key Properties:**
+
+- Maintains constant temperature and pressure
+- Supports isotropic (scalar), orthorhombic (3 components), and fully anisotropic (9 components) pressure control
+- Uses Nosé-Hoover chains for both thermostat and barostat
+
+### NPH (Isenthalpic-Isobaric)
+
+Constant enthalpy and pressure simulations without thermostat:
+
+```python
+from nvalchemiops.dynamics.integrators import run_nph_step
+
+# Run a complete NPH step
+run_nph_step(
+    positions, velocities, forces, masses, dt,
+    cell, cell_velocities,
+    target_pressure,
+    barostat_mass, dof
+)
+```
+
+**Key Properties:**
+
+- Maintains constant pressure without temperature control
+- Useful for adiabatic simulations at fixed pressure
+- Supports isotropic and anisotropic pressure modes
+
 ## Geometry Optimization
 
 ### FIRE (Fast Inertial Relaxation Engine)
@@ -280,22 +340,38 @@ $$
 Accelerated gradient descent for finding energy minima:
 
 ```python
+import warp as wp
 from nvalchemiops.dynamics.optimizers import fire_step
 
-# FIRE parameters
+# FIRE control parameters (per-system arrays)
 alpha = wp.array([0.1], dtype=wp.float64, device="cuda:0")
+dt = wp.array([0.1], dtype=wp.float64, device="cuda:0")
+alpha_start = wp.array([0.1], dtype=wp.float64, device="cuda:0")
+f_alpha = wp.array([0.99], dtype=wp.float64, device="cuda:0")
+dt_min = wp.array([1e-3], dtype=wp.float64, device="cuda:0")
+dt_max = wp.array([1.0], dtype=wp.float64, device="cuda:0")
+maxstep = wp.array([0.1], dtype=wp.float64, device="cuda:0")
 n_steps_positive = wp.array([0], dtype=wp.int32, device="cuda:0")
+n_min = wp.array([5], dtype=wp.int32, device="cuda:0")
+f_dec = wp.array([0.5], dtype=wp.float64, device="cuda:0")
+f_inc = wp.array([1.1], dtype=wp.float64, device="cuda:0")
+
+# Scratch arrays
+uphill_flag = wp.array([0], dtype=wp.int32, device="cuda:0")
+vf = wp.array([0.0], dtype=wp.float64, device="cuda:0")
+vv = wp.array([0.0], dtype=wp.float64, device="cuda:0")
+ff = wp.array([0.0], dtype=wp.float64, device="cuda:0")
 
 for step in range(max_steps):
     # Compute forces
     forces = compute_forces(positions)
 
-    # FIRE step
+    # FIRE step (all parameters are arrays)
     fire_step(
-        positions, velocities, forces, masses, dt,
-        alpha, n_steps_positive,
-        f_inc=1.1, f_dec=0.5, f_alpha=0.99,
-        dt_max=10*dt_init, n_min=5
+        positions, velocities, forces, masses,
+        alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+        maxstep, n_steps_positive, n_min, f_dec, f_inc,
+        uphill_flag, vf, vv, ff
     )
 
     # Check convergence
@@ -309,6 +385,49 @@ for step in range(max_steps):
 - Adaptive timestep and mixing parameter
 - Much faster than steepest descent
 - Suitable for local minimization (not global search)
+
+### FIRE2 (Improved FIRE)
+
+Improved FIRE optimizer with adaptive damping and velocity mixing:
+
+```python
+from nvalchemiops.dynamics.optimizers import fire2_step
+
+# FIRE2 with Warp arrays
+fire2_step(
+    positions, velocities, forces,
+    batch_idx=batch_idx,  # Required for FIRE2
+    alpha=alpha, dt=dt, nsteps_inc=nsteps_inc,
+    vf=vf, v_sumsq=v_sumsq, f_sumsq=f_sumsq, max_norm=max_norm
+)
+```
+
+**PyTorch Interface:**
+
+For PyTorch users, FIRE2 has dedicated high-level adapters:
+
+```python
+from nvalchemiops.torch import fire2_step_coord, fire2_step_coord_cell
+
+# Coordinate-only optimization
+fire2_step_coord(
+    positions, velocities, forces, batch_idx,
+    alpha, dt, nsteps_inc
+)
+
+# Variable-cell optimization (coordinates + cell DOFs)
+fire2_step_coord_cell(
+    positions, velocities, forces, batch_idx,
+    cells, cell_velocities, cell_forces,
+    alpha, dt, nsteps_inc
+)
+```
+
+**Key Properties:**
+
+- Uses `batch_idx` for batched operations (required)
+- Improved convergence compared to original FIRE
+- PyTorch adapters handle tensor conversion automatically
 
 ## Temperature Control Utilities
 
@@ -331,76 +450,50 @@ temperature = compute_temperature(
 )
 ```
 
-### Initializing Velocities
+## Cell Utilities
+
+For periodic boundary conditions and variable-cell simulations:
 
 ```python
-from nvalchemiops.dynamics.utils import initialize_velocities
-
-# Initialize from Maxwell-Boltzmann distribution
-temperature = wp.array([1.0], dtype=wp.float64, device="cuda:0")
-initialize_velocities(
-    velocities, masses, temperature,
-    random_seed=42,
-    remove_com=True  # Remove center-of-mass motion
+from nvalchemiops.dynamics.utils import (
+    compute_cell_volume,
+    compute_cell_inverse,
+    scale_positions_with_cell,
+    wrap_positions_to_cell,
+    cartesian_to_fractional,
+    fractional_to_cartesian,
 )
+
+# Compute cell volume
+volume = compute_cell_volume(cell)
+
+# Wrap positions into primary cell
+wrap_positions_to_cell(positions, cell)
+
+# Scale positions when cell changes (preserving fractional coordinates)
+scale_positions_with_cell(positions, cell_old, cell_new)
 ```
 
-### Removing COM Motion
+## Constraint Utilities (SHAKE/RATTLE)
+
+Holonomic constraints for fixing bond lengths:
 
 ```python
-from nvalchemiops.dynamics.utils import remove_com_motion
+from nvalchemiops.dynamics.utils import shake_constraints, rattle_constraints
 
-# Remove center-of-mass motion (in-place)
-remove_com_motion(velocities, masses)
-```
+# After position update: correct positions to satisfy constraints
+shake_constraints(
+    positions, positions_old,
+    constraint_pairs, constraint_distances,
+    masses, tolerance=1e-8, max_iter=100
+)
 
-## Best Practices
-
-### Timestep Selection
-
-- **Velocity Verlet (NVE)**: Start with $\Delta t \approx 0.5$ fs for typical molecular systems
-- **Langevin**: Can use slightly larger timesteps due to friction damping
-- **Constraints**: Use smaller timesteps (~0.5-1 fs) with bond constraints
-- **Verify**: Monitor energy drift (NVE) or temperature distribution (NVT)
-
-### Equilibration
-
-1. **Initial velocities**: Initialize from Maxwell-Boltzmann at target T
-2. **Quick equilibration**: Use velocity rescaling for 1000-5000 steps
-3. **Switch to proper thermostat**: Use Langevin or Nosé-Hoover for equilibration
-4. **Production**: Continue with chosen thermostat or switch to NVE
-
-### Energy Conservation (NVE)
-
-Monitor relative energy drift:
-
-```python
-# Initial energy
-E0 = compute_total_energy(positions, velocities, masses)
-
-# After N steps
-E = compute_total_energy(positions, velocities, masses)
-drift = abs((E - E0) / E0)
-
-# Good conservation: drift < 1e-5 over 1 ns
-```
-
-### Temperature Control (NVT)
-
-Monitor temperature distribution:
-
-```python
-import numpy as np
-
-temperatures = []
-for step in range(num_steps):
-    # ... MD step ...
-    T = compute_temperature(velocities, masses, num_atoms, dof)
-    temperatures.append(T.numpy()[0])
-
-# Check mean and standard deviation
-T_mean = np.mean(temperatures[equilibration_steps:])
-T_std = np.std(temperatures[equilibration_steps:])
+# After velocity update: correct velocities to satisfy constraints
+rattle_constraints(
+    velocities, positions,
+    constraint_pairs, constraint_distances,
+    masses, tolerance=1e-8, max_iter=100
+)
 ```
 
 ## Common Pitfalls
@@ -458,6 +551,7 @@ velocity_verlet_position_update(
 
 ## Further Reading
 
-- {mod}`nvalchemiops.dynamics` - Full API reference
+- {doc}`/modules/warp/dynamics` - Full Warp API reference
+- {doc}`/modules/torch/dynamics` - PyTorch FIRE2 adapter reference
 - Examples: `examples/dynamics/` in the repository
 - [NVIDIA Warp Documentation](https://nvidia.github.io/warp/)
