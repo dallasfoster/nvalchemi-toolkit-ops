@@ -127,7 +127,7 @@ def create_batched_system(
     # Create batch_idx: [0,0,0,...,1,1,1,...,2,2,2,...]
     batch_idx = torch.repeat_interleave(
         torch.arange(batch_size, device=device), actual_num_atoms
-    )
+    ).to(torch.int32)
 
     # Create atom_ptr: [0, N, 2N, 3N, ..., batch_size*N]
     atom_ptr = torch.arange(
