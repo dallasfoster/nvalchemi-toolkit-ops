@@ -73,6 +73,7 @@ from ..utils.kernel_functions import (
     fire_velocity_mixing,
     is_first_atom_of_system,
 )
+from ..utils.launch_helpers import ExecutionMode, resolve_execution_mode
 
 
 @wp.kernel(enable_backward=False)
@@ -1450,6 +1451,34 @@ for t, v in zip(_T, _V):
 
 
 # =============================================================================
+# Dispatch tables – keyed by ``downhill_enabled`` (bool)
+# =============================================================================
+
+# fire_step: PTR-mode fused kernels
+_FIRE_STEP_PTR_OVERLOADS = {
+    True: _fire_step_downhill_ptr_kernel_overload,
+    False: _fire_step_no_downhill_ptr_kernel_overload,
+}
+
+# fire_update: PTR-mode fused kernels
+_FIRE_UPDATE_PTR_OVERLOADS = {
+    True: _fire_update_params_downhill_ptr_kernel_overload,
+    False: _fire_update_params_no_downhill_ptr_kernel_overload,
+}
+
+# fire_step: batch_idx final-update kernel (with/without MD integration)
+_FIRE_STEP_BATCH_UPDATE_OVERLOADS = {
+    True: _fire_update_downhill_batch_idx_kernel_overload,
+    False: _fire_update_batch_idx_kernel_overload,
+}
+
+# fire_update: batch_idx final-update kernel (velocity mixing only, no MD)
+_FIRE_UPDATE_BATCH_UPDATE_OVERLOADS = {
+    True: _fire_update_only_downhill_batch_idx_kernel_overload,
+    False: _fire_update_only_batch_idx_kernel_overload,
+}
+
+# =============================================================================
 # Public API: Unified FIRE Step Functions
 # =============================================================================
 
@@ -1593,8 +1622,7 @@ def fire_step(
     vec_dtype = positions.dtype
 
     # Determine batching mode
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Cannot specify both batch_idx and atom_ptr")
+    exec_mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     # Determine if downhill check is enabled
     downhill_arrays = [energy, energy_last, positions_last, velocities_last]
@@ -1606,197 +1634,42 @@ def fire_step(
         )
 
     # Dispatch to appropriate kernel
-    if atom_ptr is not None:
-        # PTR mode - one thread per system
+    if exec_mode is ExecutionMode.ATOM_PTR:
+        # PTR mode – one fused kernel per system
         num_systems = atom_ptr.shape[0] - 1
+        kernel = _FIRE_STEP_PTR_OVERLOADS[downhill_enabled][vec_dtype]
         if downhill_enabled:
-            wp.launch(
-                _fire_step_downhill_ptr_kernel_overload[vec_dtype],
-                dim=num_systems,
-                inputs=[
-                    energy,
-                    forces,
-                    positions,
-                    velocities,
-                    masses,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    energy_last,
-                    positions_last,
-                    velocities_last,
-                    atom_ptr,
-                ],
-                device=device,
-            )
+            inputs = [
+                energy, forces, positions, velocities, masses,
+                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                maxstep, n_steps_positive, n_min, f_dec, f_inc,
+                energy_last, positions_last, velocities_last, atom_ptr,
+            ]
         else:
-            wp.launch(
-                _fire_step_no_downhill_ptr_kernel_overload[vec_dtype],
-                dim=num_systems,
-                inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    masses,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    atom_ptr,
-                ],
-                device=device,
-            )
-
-    elif batch_idx is not None:
-        # BATCH_IDX mode - one thread per atom
-        num_systems = dt.shape[0]
-        if vf is None or vv is None or ff is None:
-            raise ValueError("vf, vv, ff accumulators required for batch_idx mode")
-        if downhill_enabled:
-            # Three-kernel RLE approach for downhill batch_idx mode
-
-            # Kernel 1: Uphill check
-            wp.launch(
-                _fire_uphill_check_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[
-                    energy,
-                    energy_last,
-                    batch_idx,
-                    uphill_flag,
-                ],
-                device=device,
-            )
-
-            # Kernel 2: Revert if uphill + RLE reduction
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
-            wp.launch(
-                _fire_revert_and_reduce_kernel_overload[vec_dtype],
-                dim=dim_reduce,
-                inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    positions_last,
-                    velocities_last,
-                    batch_idx,
-                    uphill_flag,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
-                ],
-                device=device,
-            )
-
-            # Kernel 3: Parameter update + velocity mixing
-            wp.launch(
-                _fire_update_downhill_batch_idx_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    masses,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                    uphill_flag,
-                ],
-                device=device,
-            )
-        else:
-            # Two-kernel RLE approach for batch_idx mode
-            # Kernel 1: RLE-based reduction
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
-            wp.launch(
-                _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
-                dim=dim_reduce,
-                inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
-                ],
-                device=device,
-            )
-
-            # Kernel 2: Parameter update + velocity mixing + position update
-            wp.launch(
-                _fire_update_batch_idx_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    masses,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                ],
-                device=device,
-            )
+            inputs = [
+                positions, velocities, forces, masses,
+                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                maxstep, n_steps_positive, n_min, f_dec, f_inc,
+                atom_ptr,
+            ]
+        wp.launch(kernel, dim=num_systems, inputs=inputs, device=device)
 
     else:
-        # SINGLE SYSTEM mode - route through batch_idx RLE path for determinism
+        # BATCH_IDX / SINGLE mode – RLE-based multi-kernel pipeline
         if vf is None or vv is None or ff is None:
-            raise ValueError("vf, vv, ff accumulators required for single system mode")
+            raise ValueError(
+                "vf, vv, ff accumulators required for batch_idx/single mode"
+            )
 
-        # Create synthetic batch_idx (all zeros) to reuse RLE kernels
-        batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+        if exec_mode is ExecutionMode.SINGLE:
+            batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+        sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
+        ept = compute_ept(num_atoms, sm, is_vec3=True)
+        dim_reduce = (num_atoms + ept - 1) // ept
 
         if downhill_enabled:
-            # Three-kernel RLE approach (same as batch_idx downhill)
+            # Kernel 1: Uphill check
             wp.launch(
                 _fire_uphill_check_kernel_overload[vec_dtype],
                 dim=num_atoms,
@@ -1804,102 +1677,52 @@ def fire_step(
                 device=device,
             )
 
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
+            # Kernel 2: Revert if uphill + RLE reduction
             wp.launch(
                 _fire_revert_and_reduce_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    positions_last,
-                    velocities_last,
-                    batch_idx,
-                    uphill_flag,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
+                    positions, velocities, forces,
+                    positions_last, velocities_last,
+                    batch_idx, uphill_flag,
+                    vf, vv, ff, num_atoms, ept,
                 ],
                 device=device,
             )
 
+            # Kernel 3: Parameter update + velocity mixing
             wp.launch(
-                _fire_update_downhill_batch_idx_kernel_overload[vec_dtype],
+                _FIRE_STEP_BATCH_UPDATE_OVERLOADS[True][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    masses,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                    uphill_flag,
+                    positions, velocities, forces, masses,
+                    batch_idx, alpha, dt, alpha_start, f_alpha,
+                    dt_min, dt_max, maxstep, n_steps_positive,
+                    n_min, f_dec, f_inc, vf, vv, ff, uphill_flag,
                 ],
                 device=device,
             )
         else:
-            # Two-kernel RLE approach (same as batch_idx no-downhill)
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
+            # Kernel 1: RLE-based reduction
             wp.launch(
                 _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
+                    velocities, forces, batch_idx,
+                    vf, vv, ff, num_atoms, ept,
                 ],
                 device=device,
             )
 
+            # Kernel 2: Parameter update + velocity mixing + position update
             wp.launch(
-                _fire_update_batch_idx_kernel_overload[vec_dtype],
+                _FIRE_STEP_BATCH_UPDATE_OVERLOADS[False][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    masses,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    maxstep,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
+                    positions, velocities, forces, masses,
+                    batch_idx, alpha, dt, alpha_start, f_alpha,
+                    dt_min, dt_max, maxstep, n_steps_positive,
+                    n_min, f_dec, f_inc, vf, vv, ff,
                 ],
                 device=device,
             )
@@ -2027,8 +1850,7 @@ def fire_update(
     num_atoms = velocities.shape[0]
 
     # Determine batching mode
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Cannot specify both batch_idx and atom_ptr")
+    exec_mode = resolve_execution_mode(batch_idx, atom_ptr)
 
     # Determine if downhill check is enabled
     downhill_arrays = [energy, energy_last, positions, positions_last, velocities_last]
@@ -2042,178 +1864,44 @@ def fire_update(
     vec_dtype = velocities.dtype
 
     # Dispatch to appropriate kernel
-    if atom_ptr is not None:
-        # PTR mode
+    if exec_mode is ExecutionMode.ATOM_PTR:
+        # PTR mode – one fused kernel per system
         num_systems = atom_ptr.shape[0] - 1
+        kernel = _FIRE_UPDATE_PTR_OVERLOADS[downhill_enabled][vec_dtype]
         if downhill_enabled:
-            wp.launch(
-                _fire_update_params_downhill_ptr_kernel_overload[vec_dtype],
-                dim=num_systems,
-                inputs=[
-                    energy,
-                    energy_last,
-                    positions,
-                    positions_last,
-                    velocities,
-                    velocities_last,
-                    forces,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    atom_ptr,
-                ],
-                device=device,
-            )
+            inputs = [
+                energy, energy_last, positions, positions_last,
+                velocities, velocities_last, forces,
+                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                n_steps_positive, n_min, f_dec, f_inc, atom_ptr,
+            ]
         else:
-            wp.launch(
-                _fire_update_params_no_downhill_ptr_kernel_overload[vec_dtype],
-                dim=num_systems,
-                inputs=[
-                    velocities,
-                    forces,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    atom_ptr,
-                ],
-                device=device,
-            )
-
-    elif batch_idx is not None:
-        # BATCH_IDX mode - reduce + update-only kernels
-        if vf is None or vv is None or ff is None:
-            raise ValueError("vf, vv, ff accumulators required for batch_idx mode")
-        num_systems = dt.shape[0]
-
-        if downhill_enabled:
-            # Three-kernel approach: uphill check + revert/reduce + update-only
-            uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
-
-            wp.launch(
-                _fire_uphill_check_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[energy, energy_last, batch_idx, uphill_flag],
-                device=device,
-            )
-
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
-            wp.launch(
-                _fire_revert_and_reduce_kernel_overload[vec_dtype],
-                dim=dim_reduce,
-                inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    positions_last,
-                    velocities_last,
-                    batch_idx,
-                    uphill_flag,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
-                ],
-                device=device,
-            )
-
-            wp.launch(
-                _fire_update_only_downhill_batch_idx_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                    uphill_flag,
-                ],
-                device=device,
-            )
-        else:
-            # Two-kernel approach: RLE reduce + update-only
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
-            wp.launch(
-                _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
-                dim=dim_reduce,
-                inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
-                ],
-                device=device,
-            )
-
-            wp.launch(
-                _fire_update_only_batch_idx_kernel_overload[vec_dtype],
-                dim=num_atoms,
-                inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                ],
-                device=device,
-            )
+            inputs = [
+                velocities, forces,
+                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                n_steps_positive, n_min, f_dec, f_inc, atom_ptr,
+            ]
+        wp.launch(kernel, dim=num_systems, inputs=inputs, device=device)
 
     else:
-        # SINGLE SYSTEM mode - route through batch_idx RLE path for determinism
+        # BATCH_IDX / SINGLE mode – RLE-based multi-kernel pipeline
         if vf is None or vv is None or ff is None:
-            raise ValueError("vf, vv, ff accumulators required for single system mode")
+            raise ValueError(
+                "vf, vv, ff accumulators required for batch_idx/single mode"
+            )
 
-        batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+        if exec_mode is ExecutionMode.SINGLE:
+            batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+        num_systems = dt.shape[0]
+        sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
+        ept = compute_ept(num_atoms, sm, is_vec3=True)
+        dim_reduce = (num_atoms + ept - 1) // ept
 
         if downhill_enabled:
-            uphill_flag = wp.zeros(1, dtype=wp.int32, device=device)
+            uphill_flag = wp.zeros(num_systems, dtype=wp.int32, device=device)
 
+            # Kernel 1: Uphill check
             wp.launch(
                 _fire_uphill_check_kernel_overload[vec_dtype],
                 dim=num_atoms,
@@ -2221,95 +1909,52 @@ def fire_update(
                 device=device,
             )
 
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
+            # Kernel 2: Revert if uphill + RLE reduction
             wp.launch(
                 _fire_revert_and_reduce_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    positions,
-                    velocities,
-                    forces,
-                    positions_last,
-                    velocities_last,
-                    batch_idx,
-                    uphill_flag,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
+                    positions, velocities, forces,
+                    positions_last, velocities_last,
+                    batch_idx, uphill_flag,
+                    vf, vv, ff, num_atoms, ept,
                 ],
                 device=device,
             )
 
+            # Kernel 3: Parameter update + velocity mixing (no MD)
             wp.launch(
-                _fire_update_only_downhill_batch_idx_kernel_overload[vec_dtype],
+                _FIRE_UPDATE_BATCH_UPDATE_OVERLOADS[True][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
-                    uphill_flag,
+                    velocities, forces, batch_idx,
+                    alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                    n_steps_positive, n_min, f_dec, f_inc,
+                    vf, vv, ff, uphill_flag,
                 ],
                 device=device,
             )
         else:
-            sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = compute_ept(num_atoms, sm, is_vec3=True)
-            dim_reduce = (num_atoms + ept - 1) // ept
-
+            # Kernel 1: RLE-based reduction
             wp.launch(
                 _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    vf,
-                    vv,
-                    ff,
-                    num_atoms,
-                    ept,
+                    velocities, forces, batch_idx,
+                    vf, vv, ff, num_atoms, ept,
                 ],
                 device=device,
             )
 
+            # Kernel 2: Parameter update + velocity mixing (no MD)
             wp.launch(
-                _fire_update_only_batch_idx_kernel_overload[vec_dtype],
+                _FIRE_UPDATE_BATCH_UPDATE_OVERLOADS[False][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    velocities,
-                    forces,
-                    batch_idx,
-                    alpha,
-                    dt,
-                    alpha_start,
-                    f_alpha,
-                    dt_min,
-                    dt_max,
-                    n_steps_positive,
-                    n_min,
-                    f_dec,
-                    f_inc,
-                    vf,
-                    vv,
-                    ff,
+                    velocities, forces, batch_idx,
+                    alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
+                    n_steps_positive, n_min, f_dec, f_inc,
+                    vf, vv, ff,
                 ],
                 device=device,
             )

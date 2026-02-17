@@ -898,7 +898,7 @@ class TestFireUpdateErrors:
         del params["uphill_flag"]
 
         with pytest.raises(
-            ValueError, match="Cannot specify both batch_idx and atom_ptr"
+            ValueError, match="batch_idx OR atom_ptr, not both"
         ):
             fire_update(
                 velocities=velocities,
@@ -3417,7 +3417,7 @@ class TestFireStepErrors:
 
         params = make_fire_params(1, dtype_scalar, device, np_dtype)
 
-        with pytest.raises(ValueError, match="Cannot specify both"):
+        with pytest.raises(ValueError, match="batch_idx OR atom_ptr, not both"):
             fire_step(
                 positions=positions,
                 velocities=velocities,
