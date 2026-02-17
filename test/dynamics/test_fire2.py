@@ -2774,6 +2774,8 @@ class TestFire2TorchCoordCell:
         # Run B: Force batched path by providing atom_ptr
         from nvalchemiops.batch_utils import (
             atom_ptr_to_batch_idx as _a2b,
+        )
+        from nvalchemiops.batch_utils import (
             batch_idx_to_atom_ptr as _b2a,
         )
         from nvalchemiops.dynamics.utils.cell_filter import (
@@ -2986,10 +2988,14 @@ class TestFire2TorchCoordCell:
 
         from nvalchemiops.batch_utils import (
             atom_ptr_to_batch_idx as _a2b,
+        )
+        from nvalchemiops.batch_utils import (
             batch_idx_to_atom_ptr as _b2a,
         )
         from nvalchemiops.dynamics.utils.cell_filter import (
             extend_atom_ptr as _eap,
+        )
+        from nvalchemiops.dynamics.utils.cell_filter import (
             pack_forces_with_cell,
             pack_positions_with_cell,
             pack_velocities_with_cell,
