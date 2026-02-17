@@ -40,7 +40,7 @@ import argparse
 from pathlib import Path
 
 import torch
-from shared_utils import (
+from .shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     create_lj_system,

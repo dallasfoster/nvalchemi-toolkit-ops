@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import warp as wp
-from shared_utils import get_gpu_sku, load_config
+from .shared_utils import get_gpu_sku, load_config
 
 from nvalchemiops.batch_utils import atom_ptr_to_batch_idx, batch_idx_to_atom_ptr
 from nvalchemiops.dynamics.optimizers import fire2_step, fire_step
