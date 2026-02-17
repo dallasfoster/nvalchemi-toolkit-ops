@@ -20,6 +20,7 @@ import pytest
 import warp as wp
 
 from nvalchemiops.segment_ops import (
+    compute_ept,
     segment_div,
     segmented_add,
     segmented_axpby,
@@ -1808,3 +1809,99 @@ class TestSegmentedCount:
         segmented_count(idx, out)
         wp.synchronize()
         np.testing.assert_array_equal(out.numpy(), np.zeros(M, dtype=np.int32))
+
+
+# ---------------------------------------------------------------------------
+# compute_ept
+# ---------------------------------------------------------------------------
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+class TestComputeEpt:
+    """Tests for the public compute_ept helper."""
+
+    # -- Small N (below wave-fill) returns ept_min --------------------------
+
+    def test_small_n_vec3_returns_ept_min(self):
+        """N much smaller than sm_count * 512 should return ept_min=2 for vec3."""
+        assert compute_ept(N=10, sm_count=80, is_vec3=True) == 2
+
+    def test_small_n_scalar_returns_ept_min(self):
+        """N much smaller than sm_count * 512 should return ept_min=4 for scalar."""
+        assert compute_ept(N=10, sm_count=80, is_vec3=False) == 4
+
+    # -- Large N returns clamped value within [ept_min, ept_max] ------------
+
+    def test_large_n_vec3_capped_at_8(self):
+        """Very large N with vec3 should cap at ept_max=8."""
+        result = compute_ept(N=10_000_000, sm_count=1, is_vec3=True)
+        assert result == 8
+
+    def test_large_n_scalar_capped_at_16(self):
+        """Very large N with scalar should cap at ept_max=16."""
+        result = compute_ept(N=10_000_000, sm_count=1, is_vec3=False)
+        assert result == 16
+
+    # -- Boundary values ----------------------------------------------------
+
+    def test_n_zero(self):
+        """N=0 should still return ept_min (no crash)."""
+        assert compute_ept(N=0, sm_count=80, is_vec3=True) == 2
+        assert compute_ept(N=0, sm_count=80, is_vec3=False) == 4
+
+    def test_n_one(self):
+        """N=1 should return ept_min."""
+        assert compute_ept(N=1, sm_count=80, is_vec3=True) == 2
+        assert compute_ept(N=1, sm_count=80, is_vec3=False) == 4
+
+    def test_sm_count_one(self):
+        """sm_count=1 means w_fill=512; moderate N should still work."""
+        result = compute_ept(N=1024, sm_count=1, is_vec3=False)
+        assert _is_power_of_two(result)
+        assert 4 <= result <= 16
+
+    def test_large_sm_count(self):
+        """Very large sm_count keeps result within bounds."""
+        result = compute_ept(N=1000, sm_count=10000, is_vec3=True)
+        assert result == 2  # ept_min for vec3
+
+    # -- Result is always a power of two within bounds ----------------------
+
+    @pytest.mark.parametrize("sm_count", [1, 40, 80, 132])
+    @pytest.mark.parametrize("is_vec3", [True, False])
+    def test_result_is_power_of_two(self, sm_count, is_vec3):
+        ept_min = 2 if is_vec3 else 4
+        ept_max = 8 if is_vec3 else 16
+        for N in [0, 1, 100, 512, 1024, 10_000, 100_000, 1_000_000, 50_000_000]:
+            result = compute_ept(N, sm_count, is_vec3)
+            assert _is_power_of_two(result), (
+                f"compute_ept({N}, {sm_count}, {is_vec3}) = {result} is not a power of 2"
+            )
+            assert ept_min <= result <= ept_max, (
+                f"compute_ept({N}, {sm_count}, {is_vec3}) = {result} "
+                f"outside [{ept_min}, {ept_max}]"
+            )
+
+    # -- Power-of-2 rounding (round down on tie) ----------------------------
+
+    def test_rounding_exact_power_of_two(self):
+        """When raw ept is exactly a power of two, result equals that value."""
+        # sm_count=1 => w_fill=512; N=2048 => ept_raw=4 (exact power of 2)
+        assert compute_ept(N=2048, sm_count=1, is_vec3=False) == 4
+
+    def test_rounding_up_on_tie(self):
+        """When ept is equidistant between two powers, round up (keep higher)."""
+        # sm_count=1 => w_fill=512; N=512*3=1536 => ept_raw=3
+        # Nearest powers: 2 and 4. (4-3)==1 is NOT > (3-2)==1, so p stays 4.
+        result = compute_ept(N=1536, sm_count=1, is_vec3=True)
+        assert result == 4
+
+    def test_rounding_up_when_closer(self):
+        """When ept is closer to the higher power of two, round up."""
+        # sm_count=1 => w_fill=512; N=512*7=3584 => ept_raw=7
+        # Nearest powers: 4 and 8. Distance to 8 = 1, distance to 4 = 3 => round up to 8
+        result = compute_ept(N=3584, sm_count=1, is_vec3=True)
+        assert result == 8

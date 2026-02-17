@@ -66,7 +66,7 @@ from typing import Any
 
 import warp as wp
 
-from ...segment_ops import _compute_ept
+from ...segment_ops import compute_ept
 from ..utils.kernel_functions import (
     clamp_displacement,
     compute_vf_vv_ff,
@@ -1685,7 +1685,7 @@ def fire_step(
 
             # Kernel 2: Revert if uphill + RLE reduction
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -1740,7 +1740,7 @@ def fire_step(
             # Two-kernel RLE approach for batch_idx mode
             # Kernel 1: RLE-based reduction
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -1805,7 +1805,7 @@ def fire_step(
             )
 
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -1858,7 +1858,7 @@ def fire_step(
         else:
             # Two-kernel RLE approach (same as batch_idx no-downhill)
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -2111,7 +2111,7 @@ def fire_update(
             )
 
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -2161,7 +2161,7 @@ def fire_update(
         else:
             # Two-kernel approach: RLE reduce + update-only
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -2222,7 +2222,7 @@ def fire_update(
             )
 
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
@@ -2271,7 +2271,7 @@ def fire_update(
             )
         else:
             sm = max(device.sm_count, 1) if hasattr(device, "sm_count") else 1
-            ept = _compute_ept(num_atoms, sm, is_vec3=True)
+            ept = compute_ept(num_atoms, sm, is_vec3=True)
             dim_reduce = (num_atoms + ept - 1) // ept
 
             wp.launch(
