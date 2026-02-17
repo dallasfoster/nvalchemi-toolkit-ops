@@ -44,11 +44,11 @@ from _dynamics_utils import (
 from nvalchemiops.batch_utils import create_atom_ptr, create_batch_idx
 from nvalchemiops.dynamics.optimizers import fire2_step
 from nvalchemiops.interactions import lj_energy_forces
-from nvalchemiops.torch.neighbors import batch_cell_list
 from nvalchemiops.segment_ops import (
     segmented_max_norm,
     segmented_sum,
 )
+from nvalchemiops.torch.neighbors import batch_cell_list
 
 # ==============================================================================
 # Batched LJ Force Computation

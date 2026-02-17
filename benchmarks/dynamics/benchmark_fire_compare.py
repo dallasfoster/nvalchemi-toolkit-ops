@@ -40,6 +40,7 @@ import csv
 from pathlib import Path
 
 import torch
+
 from .shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
