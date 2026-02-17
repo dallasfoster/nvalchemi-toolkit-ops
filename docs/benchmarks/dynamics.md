@@ -255,7 +255,7 @@ python benchmark_md_single.py --config benchmark_config.yaml
 ### Batched MD
 
 ```bash
-python benchmark_md_batch_nvalchemiops.py --config benchmark_config.yaml
+python benchmark_md_batch.py --config benchmark_config.yaml
 ```
 
 ### Single-System Optimization
@@ -267,7 +267,7 @@ python benchmark_opt_single.py --config benchmark_config.yaml
 ### Batched Optimization
 
 ```bash
-python benchmark_opt_batch_nvalchemiops.py --config benchmark_config.yaml
+python benchmark_opt_batch.py --config benchmark_config.yaml
 ```
 
 ### Configuration File

@@ -17,8 +17,9 @@ High-Level Interface
 
 This module provides GPU-accelerated integrators and thermostats for molecular dynamics
 simulations. All functions support automatic differentiation through PyTorch's autograd
-system and offer three execution modes: single system, batched with ``batch_idx``, and
-batched with ``atom_ptr``.
+system. Most functions offer three execution modes: single system, batched with
+``batch_idx``, and batched with ``atom_ptr``. NPT/NPH integrators support
+``batch_idx`` only -- see individual function docs for details.
 
 .. tip::
     Check out the :ref:`dynamics_userguide` page for usage examples and
