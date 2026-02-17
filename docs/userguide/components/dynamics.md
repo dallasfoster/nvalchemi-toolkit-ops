@@ -30,7 +30,7 @@ ALCHEMI Toolkit-Ops provides integrators for different statistical ensembles:
 
 All integrators support:
 
-- Single-system and batched calculations (via `batch_idx` or `atom_ptr`)
+- Single-system and batched calculations (via `batch_idx`; most integrators also support `atom_ptr` -- see individual function docs for details)
 - Automatic differentiation (positions, velocities, forces)
 - Both mutating (in-place) and non-mutating (out) variants
 - Float32 and float64 precision

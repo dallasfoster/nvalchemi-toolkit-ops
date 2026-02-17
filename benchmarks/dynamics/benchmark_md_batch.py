@@ -22,7 +22,7 @@ Benchmark batched MD integrators using nvalchemiops GPU-accelerated implementati
 
 Usage
 -----
-    python benchmark_md_batch_nvalchemiops.py --config benchmark_config.yaml
+    python benchmark_md_batch.py --config benchmark_config.yaml
 
 Output
 ------
@@ -36,7 +36,8 @@ import argparse
 from pathlib import Path
 
 import torch
-from shared_utils import (
+
+from .shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     get_gpu_sku,
@@ -90,7 +91,7 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    from shared_utils import create_lj_system
+    from .shared_utils import create_lj_system
 
     pos, cell, masses_single, vel = create_lj_system(
         num_atoms=num_atoms_per_system,

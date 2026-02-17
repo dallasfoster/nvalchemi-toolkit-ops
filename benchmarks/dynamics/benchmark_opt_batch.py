@@ -22,7 +22,7 @@ Benchmark batched optimization using nvalchemiops GPU-accelerated FIRE optimizer
 
 Usage
 -----
-    python benchmark_opt_batch_nvalchemiops.py --config benchmark_config.yaml
+    python benchmark_opt_batch.py --config benchmark_config.yaml
 
 Output
 ------
@@ -36,7 +36,8 @@ import argparse
 from pathlib import Path
 
 import torch
-from shared_utils import (
+
+from .shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     get_gpu_sku,
@@ -73,7 +74,7 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    from shared_utils import create_lj_system
+    from .shared_utils import create_lj_system
 
     # Create template system
     pos, cell, masses_single, vel = create_lj_system(

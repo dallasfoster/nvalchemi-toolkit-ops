@@ -40,7 +40,8 @@ import csv
 from pathlib import Path
 
 import torch
-from shared_utils import (
+
+from .shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     create_lj_system,
@@ -54,8 +55,12 @@ _SKIN = 1.0
 _NEIGHBOR_REBUILD = 10
 
 
-def _make_bench(num_atoms, perturbation=0.1, batch_size=1):
+_DEFAULT_SEED = 42
+
+
+def _make_bench(num_atoms, perturbation=0.1, batch_size=1, seed=_DEFAULT_SEED):
     """Create a NvalchemiOpsBenchmark for a perturbed LJ system."""
+    torch.manual_seed(seed)
     positions, cell, masses, velocities = create_lj_system(
         num_atoms=num_atoms,
         lattice_constant=5.26,
@@ -141,6 +146,7 @@ def run_fixed_cell_comparison(
     fire1_params,
     fire2_params,
     perturbation,
+    seed=_DEFAULT_SEED,
 ):
     """Run fixed-cell (coordinate-only) FIRE vs FIRE2 comparison.
 
@@ -160,6 +166,8 @@ def run_fixed_cell_comparison(
         FIRE2 hyperparameters passed to ``run_fire2()``.
     perturbation : float
         Random perturbation magnitude (A) applied to initial positions.
+    seed : int
+        RNG seed for reproducible initial perturbations.
 
     Returns
     -------
@@ -178,7 +186,7 @@ def run_fixed_cell_comparison(
 
     for num_atoms in system_sizes:
         # FIRE1
-        bench1, actual = _make_bench(num_atoms, perturbation=perturbation)
+        bench1, actual = _make_bench(num_atoms, perturbation=perturbation, seed=seed)
         r1 = bench1.run_fire(
             max_steps=max_steps,
             force_tolerance=force_tol,
@@ -187,7 +195,7 @@ def run_fixed_cell_comparison(
         )
 
         # FIRE2 (fresh benchmark with same system)
-        bench2, _ = _make_bench(num_atoms, perturbation=perturbation)
+        bench2, _ = _make_bench(num_atoms, perturbation=perturbation, seed=seed)
         r2 = bench2.run_fire2(
             max_steps=max_steps,
             force_tolerance=force_tol,
@@ -245,6 +253,7 @@ def run_variable_cell_comparison(
     fire1_params,
     fire2_params,
     perturbation,
+    seed=_DEFAULT_SEED,
 ):
     """Run variable-cell FIRE vs FIRE2 comparison.
 
@@ -266,6 +275,8 @@ def run_variable_cell_comparison(
         FIRE2 hyperparameters passed to ``run_fire2_cell()``.
     perturbation : float
         Random perturbation magnitude (A) applied to initial positions.
+    seed : int
+        RNG seed for reproducible initial perturbations.
 
     Returns
     -------
@@ -284,7 +295,7 @@ def run_variable_cell_comparison(
 
     for num_atoms in system_sizes:
         # FIRE1 variable-cell
-        bench1, actual = _make_bench(num_atoms, perturbation=perturbation)
+        bench1, actual = _make_bench(num_atoms, perturbation=perturbation, seed=seed)
         r1 = bench1.run_fire_cell(
             max_steps=max_steps,
             force_tolerance=force_tol,
@@ -294,7 +305,7 @@ def run_variable_cell_comparison(
         )
 
         # FIRE2 variable-cell (fresh benchmark with same system)
-        bench2, _ = _make_bench(num_atoms, perturbation=perturbation)
+        bench2, _ = _make_bench(num_atoms, perturbation=perturbation, seed=seed)
         r2 = bench2.run_fire2_cell(
             max_steps=max_steps,
             force_tolerance=force_tol,
@@ -344,7 +355,7 @@ def run_variable_cell_comparison(
 # ---------------------------------------------------------------------------
 
 
-def run_benchmarks(config: dict, output_dir: Path) -> None:
+def run_benchmarks(config: dict, output_dir: Path, seed: int = _DEFAULT_SEED) -> None:
     """Run FIRE1 vs FIRE2 accuracy comparison benchmarks.
 
     Parameters
@@ -353,6 +364,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         Benchmark configuration (uses the ``fire_compare`` section).
     output_dir : Path
         Output directory for CSV files.
+    seed : int
+        RNG seed for reproducible initial perturbations (overrides config).
     """
     cmp_config = config.get("fire_compare", {})
     if not cmp_config.get("enabled", True):
@@ -364,6 +377,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     pressure_tol = cmp_config.get("pressure_tolerance", 0.3)
     max_steps = cmp_config.get("max_steps", 2000)
     check_interval = cmp_config.get("check_interval", 10)
+    seed = seed if seed is not None else cmp_config.get("seed", _DEFAULT_SEED)
 
     # Fixed-cell config
     fixed_cfg = cmp_config.get("fixed_cell", {})
@@ -410,6 +424,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     print(f"GPU: {gpu_sku}")
     print(f"Force tolerance: {force_tol} eV/A")
     print(f"Max steps: {max_steps}")
+    print(f"Seed: {seed}")
 
     # Fixed-cell comparison
     if fixed_enabled:
@@ -421,6 +436,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
             fire1_params,
             fire2_params,
             fixed_perturbation,
+            seed=seed,
         )
         all_rows.extend(rows)
 
@@ -435,6 +451,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
             fire1_params,
             fire2_params,
             var_perturbation,
+            seed=seed,
         )
         all_rows.extend(rows)
 
@@ -496,6 +513,12 @@ def main():
         default=None,
         help="Override maximum optimization steps",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for reproducible perturbations (default: from config or 42)",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
@@ -508,8 +531,12 @@ def main():
     if args.max_steps is not None:
         config.setdefault("fire_compare", {})["max_steps"] = args.max_steps
 
+    seed = args.seed
+    if seed is None:
+        seed = config.get("fire_compare", {}).get("seed", _DEFAULT_SEED)
+
     output_dir = Path(args.output_dir)
-    run_benchmarks(config, output_dir)
+    run_benchmarks(config, output_dir, seed=seed)
 
 
 if __name__ == "__main__":

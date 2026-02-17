@@ -73,7 +73,7 @@ from typing import Any
 
 import warp as wp
 
-from ...segment_ops import _compute_ept
+from ...segment_ops import compute_ept
 from ..utils.kernel_functions import compute_vf_vv_ff
 
 # =============================================================================
@@ -724,7 +724,7 @@ def fire2_step(
     sm = max(device.sm_count, 1)
 
     # Kernel 1: reduce only (no velocity write, deferred to fused kernel)
-    ept1 = _compute_ept(N, sm, True)
+    ept1 = compute_ept(N, sm, True)
     dim1 = (N + ept1 - 1) // ept1
     wp.launch(
         _fire2_reduce_only_overloads[vec_dtype],
@@ -734,7 +734,7 @@ def fire2_step(
     )
 
     # Kernel 2: param update + deferred halfstep + mix + maxnorm
-    ept2 = _compute_ept(N, sm, True)
+    ept2 = compute_ept(N, sm, True)
     dim2 = (N + ept2 - 1) // ept2
     wp.launch(
         _fire2_fused_mix_maxnorm_overloads[vec_dtype],

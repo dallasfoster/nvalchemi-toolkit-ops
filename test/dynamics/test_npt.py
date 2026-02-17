@@ -3098,3 +3098,187 @@ class TestAdditionalCoverage:
 
         wp.synchronize_device(device)
         # Just check it ran without error
+
+
+# ==============================================================================
+# Single vs Batch Equivalence
+# ==============================================================================
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+class TestSingleBatchEquivalence:
+    """Verify single-system and batch_idx dispatch paths produce identical results."""
+
+    def _setup(self, dtype, device, seed=42):
+        """Create a single-system test fixture usable by both dispatch paths."""
+        np.random.seed(seed)
+        vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
+        mat_dtype = wp.mat33f if dtype == "float32" else wp.mat33d
+        scalar_dtype = wp.float32 if dtype == "float32" else wp.float64
+        tensor_dtype = vec9f if dtype == "float32" else vec9d
+        np_dtype = np.float32 if dtype == "float32" else np.float64
+
+        num_atoms = 20
+
+        positions = wp.array(
+            np.random.rand(num_atoms, 3).astype(np_dtype) * 8.0 + 1.0,
+            dtype=vec_dtype, device=device,
+        )
+        velocities = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype) * 0.3,
+            dtype=vec_dtype, device=device,
+        )
+        forces = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype) * 0.01,
+            dtype=vec_dtype, device=device,
+        )
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype) * 12.0,
+            dtype=scalar_dtype, device=device,
+        )
+
+        cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
+        cells = make_cell(cell_np, dtype, device)
+
+        cell_inv_np = np.linalg.inv(cell_np).astype(np_dtype)
+        cells_inv = make_cell(cell_inv_np, dtype, device)
+
+        cell_velocities = wp.zeros(1, dtype=mat_dtype, device=device)
+        virial_tensors = wp.zeros(1, dtype=tensor_dtype, device=device)
+        volumes = wp.empty(1, dtype=scalar_dtype, device=device)
+        compute_cell_volume(cells, volumes, device=device)
+        kinetic_tensors = wp.zeros((1, 9), dtype=scalar_dtype, device=device)
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
+        batch_idx = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+        eta_dots = wp.zeros((1, 1), dtype=scalar_dtype, device=device)
+
+        return dict(
+            num_atoms=num_atoms,
+            positions=positions,
+            velocities=velocities,
+            forces=forces,
+            masses=masses,
+            cells=cells,
+            cells_inv=cells_inv,
+            cell_velocities=cell_velocities,
+            virial_tensors=virial_tensors,
+            volumes=volumes,
+            kinetic_tensors=kinetic_tensors,
+            num_atoms_per_system=num_atoms_per_system,
+            batch_idx=batch_idx,
+            eta_dots=eta_dots,
+            vec_dtype=vec_dtype,
+            scalar_dtype=scalar_dtype,
+            tensor_dtype=tensor_dtype,
+        )
+
+    # -- compute_pressure_tensor ------------------------------------------
+
+    def test_pressure_tensor_equivalence(self, dtype, device):
+        s = self._setup(dtype, device)
+
+        kt_single = wp.zeros((1, 9), dtype=s["scalar_dtype"], device=device)
+        pt_single = wp.empty(1, dtype=s["tensor_dtype"], device=device)
+        compute_pressure_tensor(
+            s["velocities"], s["masses"], s["virial_tensors"], s["cells"],
+            kt_single, pt_single, s["volumes"], batch_idx=None, device=device,
+        )
+
+        kt_batch = wp.zeros((1, 9), dtype=s["scalar_dtype"], device=device)
+        pt_batch = wp.empty(1, dtype=s["tensor_dtype"], device=device)
+        compute_pressure_tensor(
+            s["velocities"], s["masses"], s["virial_tensors"], s["cells"],
+            kt_batch, pt_batch, s["volumes"], batch_idx=s["batch_idx"],
+            device=device,
+        )
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(
+            pt_single.numpy(), pt_batch.numpy(), rtol=1e-5, atol=1e-7,
+        )
+
+    # -- npt_position_update_out ------------------------------------------
+
+    def test_npt_position_update_equivalence(self, dtype, device):
+        s = self._setup(dtype, device)
+
+        pos_out_single = wp.empty_like(s["positions"])
+        npt_position_update_out(
+            s["positions"], s["velocities"], s["cells"], s["cell_velocities"],
+            dt=0.001, positions_out=pos_out_single, cells_inv=s["cells_inv"],
+            batch_idx=None, device=device,
+        )
+
+        pos_out_batch = wp.empty_like(s["positions"])
+        npt_position_update_out(
+            s["positions"], s["velocities"], s["cells"], s["cell_velocities"],
+            dt=0.001, positions_out=pos_out_batch, cells_inv=s["cells_inv"],
+            batch_idx=s["batch_idx"], device=device,
+        )
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(
+            pos_out_single.numpy(), pos_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+        )
+
+    # -- npt_velocity_half_step_out (all modes) ---------------------------
+
+    @pytest.mark.parametrize("mode", ["isotropic", "anisotropic", "triclinic"])
+    def test_npt_velocity_equivalence(self, dtype, device, mode):
+        s = self._setup(dtype, device)
+
+        vel_out_single = wp.empty_like(s["velocities"])
+        npt_velocity_half_step_out(
+            s["velocities"], s["masses"], s["forces"],
+            s["cell_velocities"], s["volumes"], s["eta_dots"],
+            s["num_atoms"], dt=0.001, velocities_out=vel_out_single,
+            batch_idx=None, num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"], mode=mode, device=device,
+        )
+
+        vel_out_batch = wp.empty_like(s["velocities"])
+        npt_velocity_half_step_out(
+            s["velocities"], s["masses"], s["forces"],
+            s["cell_velocities"], s["volumes"], s["eta_dots"],
+            s["num_atoms"], dt=0.001, velocities_out=vel_out_batch,
+            batch_idx=s["batch_idx"],
+            num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"], mode=mode, device=device,
+        )
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(
+            vel_out_single.numpy(), vel_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+        )
+
+    # -- nph_velocity_half_step_out (all modes) ---------------------------
+
+    @pytest.mark.parametrize("mode", ["isotropic", "anisotropic", "triclinic"])
+    def test_nph_velocity_equivalence(self, dtype, device, mode):
+        s = self._setup(dtype, device)
+
+        vel_out_single = wp.empty_like(s["velocities"])
+        nph_velocity_half_step_out(
+            s["velocities"], s["masses"], s["forces"],
+            s["cell_velocities"], s["volumes"],
+            s["num_atoms"], dt=0.001, velocities_out=vel_out_single,
+            batch_idx=None, num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"], mode=mode, device=device,
+        )
+
+        vel_out_batch = wp.empty_like(s["velocities"])
+        nph_velocity_half_step_out(
+            s["velocities"], s["masses"], s["forces"],
+            s["cell_velocities"], s["volumes"],
+            s["num_atoms"], dt=0.001, velocities_out=vel_out_batch,
+            batch_idx=s["batch_idx"],
+            num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"], mode=mode, device=device,
+        )
+        wp.synchronize_device(device)
+
+        np.testing.assert_allclose(
+            vel_out_single.numpy(), vel_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+        )

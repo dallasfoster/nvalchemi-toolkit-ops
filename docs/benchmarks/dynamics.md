@@ -112,9 +112,11 @@ NPH Integrator
 
 ## Geometry Optimization
 
-GPU-accelerated FIRE (Fast Inertial Relaxation Engine) optimizer for efficient
-energy minimization. Adapts timestep and velocity-force mixing for robust
-convergence on diverse energy landscapes.
+GPU-accelerated FIRE and FIRE2 (Fast Inertial Relaxation Engine) optimizers for
+efficient energy minimization. Both adapt timestep and velocity-force mixing for
+robust convergence on diverse energy landscapes. FIRE2 (Guénolé et al., 2020)
+introduces a deferred half-step and modified velocity mixing for improved
+convergence behavior.
 
 ### Single-System Optimization
 
@@ -255,7 +257,7 @@ python benchmark_md_single.py --config benchmark_config.yaml
 ### Batched MD
 
 ```bash
-python benchmark_md_batch_nvalchemiops.py --config benchmark_config.yaml
+python benchmark_md_batch.py --config benchmark_config.yaml
 ```
 
 ### Single-System Optimization
@@ -267,7 +269,25 @@ python benchmark_opt_single.py --config benchmark_config.yaml
 ### Batched Optimization
 
 ```bash
-python benchmark_opt_batch_nvalchemiops.py --config benchmark_config.yaml
+python benchmark_opt_batch.py --config benchmark_config.yaml
+```
+
+### FIRE1 vs FIRE2 Comparison
+
+Full optimization runs comparing FIRE1 and FIRE2 convergence and wall-clock time
+on fixed-cell and variable-cell LJ systems:
+
+```bash
+python benchmark_fire_compare.py --config benchmark_config.yaml --output-dir ./benchmark_results
+```
+
+### FIRE2 Kernel Performance
+
+Raw per-step GPU kernel timing using CUDA events, sweeping total atoms and batch
+sizes across float32 and float64:
+
+```bash
+python benchmark_fire2.py --config benchmark_config.yaml --output-dir ./benchmark_results
 ```
 
 ### Configuration File
@@ -337,6 +357,8 @@ Results are saved as CSV files in `docs/benchmarks/benchmark_results/`:
 - `dynamics_md_batch_nvalchemiops_<gpu_sku>.csv`
 - `dynamics_opt_single_nvalchemiops_<gpu_sku>.csv`
 - `dynamics_opt_batch_nvalchemiops_<gpu_sku>.csv`
+- `fire_compare_<gpu_sku>.csv`
+- `fire2_kernel_benchmark_<gpu_sku>.csv`
 
 Generate plots with:
 

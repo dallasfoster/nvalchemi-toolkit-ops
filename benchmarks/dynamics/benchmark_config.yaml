@@ -173,6 +173,9 @@ fire2_perf:
 fire_compare:
   enabled: true
 
+  # RNG seed for reproducible initial perturbations
+  seed: 42
+
   # System sizes (number of atoms)
   system_sizes: [256, 512, 1024, 2048]
 

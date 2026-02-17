@@ -55,7 +55,15 @@ Geometry Optimization Examples
     - Adaptive timestep and velocity mixing
     - Convergence monitoring (energy, max force)
 
-07_fire_batched.py
+07_fire_variable_cell.py
+    Variable-cell FIRE optimization for joint atom + cell relaxation.
+
+    - Cell alignment to upper-triangular form
+    - Virial → stress → cell force conversion
+    - Pack/unpack utilities for extended DOF arrays
+    - External pressure equilibration
+
+08_fire_batched.py
     Batched FIRE optimization with two indexing strategies:
 
     - **batch_idx mode**: Each atom tagged with system index
@@ -63,13 +71,27 @@ Geometry Optimization Examples
     - Per-system FIRE parameters adapt independently
     - Uses ``nvalchemiops.batch_utils`` for reductions
 
-08_fire_variable_cell.py
-    Variable-cell FIRE optimization for joint atom + cell relaxation.
+09_fire2_optimization.py
+    FIRE2 geometry optimization for a single LJ cluster.
 
-    - Cell alignment to upper-triangular form
-    - Virial → stress → cell force conversion
-    - Pack/unpack utilities for extended DOF arrays
-    - External pressure equilibration
+    - Improved FIRE variant (Guenole et al., 2020)
+    - Adaptive damping and coupled step/dt scaling
+    - Requires ``batch_idx`` even for single-system mode
+    - Hyperparameters are Python scalars (no per-system arrays)
+
+10_fire2_batched.py
+    Batched FIRE2 optimization with ``batch_idx`` batching.
+
+    - Multiple independent LJ clusters optimized in parallel
+    - Per-system FIRE2 parameters adapt independently
+    - Only supports ``batch_idx`` mode (no ``atom_ptr`` variant)
+
+11_fire2_variable_cell.py
+    Variable-cell FIRE2 optimization for joint atom + cell relaxation.
+
+    - Same pack/unpack workflow as ``07_fire_variable_cell.py``
+    - Uses ``fire2_step`` on extended DOF arrays
+    - Simpler state than FIRE (no masses, fewer per-system arrays)
 
 Key Concepts
 ------------
@@ -144,7 +166,7 @@ Run from the repository root::
 
     python examples/dynamics/01_langevin_integration.py
     python examples/dynamics/06_fire_optimization.py
-    python examples/dynamics/07_fire_batched.py
+    python examples/dynamics/08_fire_batched.py
 
 Or run interactively in VS Code or Jupyter by executing cell-by-cell
 (sections marked with ``# %%``).

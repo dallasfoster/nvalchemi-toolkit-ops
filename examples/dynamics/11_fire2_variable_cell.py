@@ -41,11 +41,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
 from _langevin_utils import (
-    AMU_TO_EV_FS2_PER_A2 as AMU_TO_INTERNAL,
-)
-from _langevin_utils import (
     EPSILON_AR,
-    MASS_AR,
     SIGMA_AR,
     MDSystem,
     create_fcc_lattice,
@@ -188,7 +184,7 @@ lattice_const_hist = []
 
 print("\n--- Step 4: Variable-cell FIRE2 optimization ---")
 print(f"Force tolerance: {force_tol:.1e}")
-print(f"FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
+print("FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
 print("=" * 90)
 print(
     f"{'Step':>6} {'Energy':>12} {'max|F|':>10} {'Volume':>10} "

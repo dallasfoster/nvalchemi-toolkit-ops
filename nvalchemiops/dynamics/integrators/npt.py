@@ -54,7 +54,8 @@ from nvalchemiops.warp_dispatch import validate_out_array
 
 from ..utils.cell_utils import compute_cell_inverse, compute_cell_volume
 from ..utils.launch_helpers import (
-    ExecutionMode,
+    KernelFamily,
+    launch_family,
     resolve_execution_mode,
 )
 from ..utils.thermostat_utils import compute_kinetic_energy
@@ -1618,21 +1619,12 @@ def compute_pressure_tensor(
     num_systems = cells.shape[0]
 
     if batch_idx is None:
-        wp.launch(
-            _compute_kinetic_tensor_single_tiled_kernel,
-            dim=num_atoms,
-            inputs=[velocities, masses, kinetic_tensors],
-            device=device,
-            block_dim=TILE_THREADS,
-        )
+        kernel = _KINETIC_TENSOR_FAMILY.single
+        inputs = [velocities, masses, kinetic_tensors]
     else:
-        wp.launch(
-            _compute_kinetic_tensor_tiled_kernel,
-            dim=num_atoms,
-            inputs=[velocities, masses, batch_idx, kinetic_tensors],
-            device=device,
-            block_dim=TILE_THREADS,
-        )
+        kernel = _KINETIC_TENSOR_FAMILY.batch_idx
+        inputs = [velocities, masses, batch_idx, kinetic_tensors]
+    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_THREADS)
 
     wp.launch(
         _finalize_pressure_tensor_kernel,
@@ -1782,6 +1774,73 @@ def _compute_barostat_mass_kernel(
     # W = (N_f + d) * kT * τ_p²
     masses_out[sys_id] = (N_f + d) * T * tau * tau
 
+
+# ==============================================================================
+# Kernel Family Tables
+# ==============================================================================
+
+# -- Kinetic tensor: single vs batched (tiled kernels, needs block_dim) ------
+_KINETIC_TENSOR_FAMILY = KernelFamily(
+    single=_compute_kinetic_tensor_single_tiled_kernel,
+    batch_idx=_compute_kinetic_tensor_tiled_kernel,
+)
+
+# -- Position update: single vs batched (shared by NPT and NPH) -------------
+_POSITION_UPDATE_FAMILY = KernelFamily(
+    single=_position_update_single_kernel,
+    batch_idx=_position_update_kernel,
+)
+
+# -- NPT velocity half-step: mode -> KernelFamily (single/batch) ------------
+_NPT_VELOCITY_FAMILIES = {
+    "isotropic": KernelFamily(
+        single=_npt_velocity_half_step_single_kernel,
+        batch_idx=_npt_velocity_half_step_kernel,
+    ),
+    "anisotropic": KernelFamily(
+        single=_npt_velocity_half_step_aniso_single_kernel,
+        batch_idx=_npt_velocity_half_step_aniso_kernel,
+    ),
+    "triclinic": KernelFamily(
+        single=_npt_velocity_half_step_triclinic_single_kernel,
+        batch_idx=_npt_velocity_half_step_triclinic_kernel,
+    ),
+}
+
+# -- NPH velocity half-step: mode -> KernelFamily (single/batch) ------------
+_NPH_VELOCITY_FAMILIES = {
+    "isotropic": KernelFamily(
+        single=_nph_velocity_half_step_single_kernel,
+        batch_idx=_nph_velocity_half_step_kernel,
+    ),
+    "anisotropic": KernelFamily(
+        single=_nph_velocity_half_step_aniso_single_kernel,
+        batch_idx=_nph_velocity_half_step_aniso_kernel,
+    ),
+    "triclinic": KernelFamily(
+        single=_nph_velocity_half_step_triclinic_single_kernel,
+        batch_idx=_nph_velocity_half_step_triclinic_kernel,
+    ),
+}
+
+# -- Barostat kernels: target_pressures.dtype -> kernel ----------------------
+_NPT_BAROSTAT_KERNELS = {
+    wp.float32: _npt_cell_velocity_update_kernel,
+    wp.float64: _npt_cell_velocity_update_kernel,
+    wp.vec3f: _npt_cell_velocity_update_aniso_kernel,
+    wp.vec3d: _npt_cell_velocity_update_aniso_kernel,
+    vec9f: _npt_cell_velocity_update_triclinic_kernel,
+    vec9d: _npt_cell_velocity_update_triclinic_kernel,
+}
+
+_NPH_BAROSTAT_KERNELS = {
+    wp.float32: _nph_cell_velocity_update_kernel,
+    wp.float64: _nph_cell_velocity_update_kernel,
+    wp.vec3f: _nph_cell_velocity_update_aniso_kernel,
+    wp.vec3d: _nph_cell_velocity_update_aniso_kernel,
+    vec9f: _nph_cell_velocity_update_triclinic_kernel,
+    vec9d: _nph_cell_velocity_update_triclinic_kernel,
+}
 
 # ==============================================================================
 # Functional Interfaces - Barostat Utilities
@@ -2182,66 +2241,29 @@ def npt_barostat_half_step(
 
     # Dispatch based on target_pressures dtype
     tp_dtype = target_pressures.dtype
-    if tp_dtype in (wp.float32, wp.float64):
-        # Isotropic
-        wp.launch(
-            _npt_cell_velocity_update_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                eta_dots,
-                dt_half,
-            ],
-            device=device,
-        )
-    elif tp_dtype in (wp.vec3f, wp.vec3d):
-        # Anisotropic (orthorhombic)
-        wp.launch(
-            _npt_cell_velocity_update_aniso_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                eta_dots,
-                dt_half,
-            ],
-            device=device,
-        )
-    elif tp_dtype in (vec9f, vec9d):
-        # Triclinic (full tensor)
-        wp.launch(
-            _npt_cell_velocity_update_triclinic_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                eta_dots,
-                dt_half,
-            ],
-            device=device,
-        )
-    else:
+    kernel = _NPT_BAROSTAT_KERNELS.get(tp_dtype)
+    if kernel is None:
         raise ValueError(
             f"Unsupported target_pressures dtype: {tp_dtype}. "
             f"Expected scalar (float32/float64) for isotropic, "
             f"vec3 for anisotropic, or vec9 for triclinic."
         )
+    wp.launch(
+        kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            eta_dots,
+            dt_half,
+        ],
+        device=device,
+    )
 
 
 # Keep separate functions for backwards compatibility and explicit control
@@ -2508,100 +2530,30 @@ def npt_velocity_half_step_out(
     n_atoms = velocities.shape[0]
     dt_half = _cast_dt(velocities.dtype, dt, 0.5)
 
-    if mode == "isotropic":
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _npt_velocity_half_step_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                volumes,
-                eta_dots,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _npt_velocity_half_step_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                volumes,
-                eta_dots,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    elif mode == "anisotropic":
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _npt_velocity_half_step_aniso_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                volumes,
-                eta_dots,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _npt_velocity_half_step_aniso_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                volumes,
-                eta_dots,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    elif mode == "triclinic":
-        if cells_inv is None:
-            raise ValueError("mode='triclinic' requires cells_inv parameter.")
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _npt_velocity_half_step_triclinic_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                cells_inv,
-                volumes,
-                eta_dots,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _npt_velocity_half_step_triclinic_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                cells_inv,
-                volumes,
-                eta_dots,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    else:
+    if mode not in _NPT_VELOCITY_FAMILIES:
         raise ValueError(
             f"Unknown mode: '{mode}'. Expected 'isotropic', 'anisotropic', or 'triclinic'."
         )
+    if mode == "triclinic" and cells_inv is None:
+        raise ValueError("mode='triclinic' requires cells_inv parameter.")
 
-    wp.launch(kernel, dim=n_atoms, inputs=inputs, device=device)
+    family = _NPT_VELOCITY_FAMILIES[mode]
+    extra = [cells_inv] if mode == "triclinic" else []
+
+    launch_family(
+        family,
+        mode=exec_mode,
+        dim=n_atoms,
+        inputs_single=[
+            velocities, masses, forces, cell_velocities, *extra,
+            volumes, eta_dots, n_atoms, dt_half, velocities_out,
+        ],
+        inputs_batch=[
+            velocities, masses, forces, batch_idx, cell_velocities, *extra,
+            volumes, eta_dots, num_atoms_per_system, dt_half, velocities_out,
+        ],
+        device=device,
+    )
     return velocities_out
 
 
@@ -2690,31 +2642,20 @@ def npt_position_update_out(
 
     dt_typed = _cast_dt(positions.dtype, dt)
 
-    if exec_mode is ExecutionMode.BATCH_IDX:
-        kernel = _position_update_kernel
-        inputs = [
-            positions,
-            velocities,
-            batch_idx,
-            cells,
-            cells_inv,
-            cell_velocities,
-            dt_typed,
-            positions_out,
-        ]
-    else:
-        kernel = _position_update_single_kernel
-        inputs = [
-            positions,
-            velocities,
-            cells,
-            cells_inv,
-            cell_velocities,
-            dt_typed,
-            positions_out,
-        ]
-
-    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device)
+    launch_family(
+        _POSITION_UPDATE_FAMILY,
+        mode=exec_mode,
+        dim=num_atoms,
+        inputs_single=[
+            positions, velocities, cells, cells_inv, cell_velocities,
+            dt_typed, positions_out,
+        ],
+        inputs_batch=[
+            positions, velocities, batch_idx, cells, cells_inv,
+            cell_velocities, dt_typed, positions_out,
+        ],
+        device=device,
+    )
     return positions_out
 
 
@@ -3130,62 +3071,27 @@ def nph_barostat_half_step(
 
     # Dispatch based on target_pressures dtype
     tp_dtype = target_pressures.dtype
-    if tp_dtype in (wp.float32, wp.float64):
-        # Isotropic
-        wp.launch(
-            _nph_cell_velocity_update_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                dt_half,
-            ],
-            device=device,
-        )
-    elif tp_dtype in (wp.vec3f, wp.vec3d):
-        # Anisotropic
-        wp.launch(
-            _nph_cell_velocity_update_aniso_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                dt_half,
-            ],
-            device=device,
-        )
-    elif tp_dtype in (vec9f, vec9d):
-        # Triclinic
-        wp.launch(
-            _nph_cell_velocity_update_triclinic_kernel,
-            dim=num_systems,
-            inputs=[
-                cell_velocities,
-                pressure_tensors,
-                target_pressures,
-                volumes,
-                cell_masses,
-                kinetic_energy,
-                num_atoms_per_system,
-                dt_half,
-            ],
-            device=device,
-        )
-    else:
+    kernel = _NPH_BAROSTAT_KERNELS.get(tp_dtype)
+    if kernel is None:
         raise ValueError(
             f"Unsupported target_pressures dtype: {tp_dtype}. "
             f"Expected scalar for isotropic, vec3 for anisotropic, vec9 for triclinic."
         )
+    wp.launch(
+        kernel,
+        dim=num_systems,
+        inputs=[
+            cell_velocities,
+            pressure_tensors,
+            target_pressures,
+            volumes,
+            cell_masses,
+            kinetic_energy,
+            num_atoms_per_system,
+            dt_half,
+        ],
+        device=device,
+    )
 
 
 # Keep separate functions for backwards compatibility
@@ -3421,94 +3327,30 @@ def nph_velocity_half_step_out(
     n_atoms = velocities.shape[0]
     dt_half = _cast_dt(velocities.dtype, dt, 0.5)
 
-    if mode == "isotropic":
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _nph_velocity_half_step_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                volumes,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _nph_velocity_half_step_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                volumes,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    elif mode == "anisotropic":
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _nph_velocity_half_step_aniso_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                volumes,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _nph_velocity_half_step_aniso_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                volumes,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    elif mode == "triclinic":
-        if cells_inv is None:
-            raise ValueError("mode='triclinic' requires cells_inv parameter.")
-        if exec_mode is ExecutionMode.BATCH_IDX:
-            kernel = _nph_velocity_half_step_triclinic_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                batch_idx,
-                cell_velocities,
-                cells_inv,
-                volumes,
-                num_atoms_per_system,
-                dt_half,
-                velocities_out,
-            ]
-        else:
-            kernel = _nph_velocity_half_step_triclinic_single_kernel
-            inputs = [
-                velocities,
-                masses,
-                forces,
-                cell_velocities,
-                cells_inv,
-                volumes,
-                num_atoms,
-                dt_half,
-                velocities_out,
-            ]
-    else:
+    if mode not in _NPH_VELOCITY_FAMILIES:
         raise ValueError(
             f"Unknown mode: '{mode}'. Expected 'isotropic', 'anisotropic', or 'triclinic'."
         )
+    if mode == "triclinic" and cells_inv is None:
+        raise ValueError("mode='triclinic' requires cells_inv parameter.")
 
-    wp.launch(kernel, dim=n_atoms, inputs=inputs, device=device)
+    family = _NPH_VELOCITY_FAMILIES[mode]
+    extra = [cells_inv] if mode == "triclinic" else []
+
+    launch_family(
+        family,
+        mode=exec_mode,
+        dim=n_atoms,
+        inputs_single=[
+            velocities, masses, forces, cell_velocities, *extra,
+            volumes, n_atoms, dt_half, velocities_out,
+        ],
+        inputs_batch=[
+            velocities, masses, forces, batch_idx, cell_velocities, *extra,
+            volumes, num_atoms_per_system, dt_half, velocities_out,
+        ],
+        device=device,
+    )
     return velocities_out
 
 

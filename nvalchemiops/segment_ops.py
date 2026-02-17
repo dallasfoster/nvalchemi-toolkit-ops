@@ -70,8 +70,32 @@ _ALL_SUPPORTED_TYPES = [
 ]
 
 
-def _compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
-    """Return elements-per-thread for reduction kernels."""
+def compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
+    """Return the elements-per-thread (EPT) for segmented reduction kernels.
+
+    The value is derived from *N* (total element count) and the GPU's
+    streaming-multiprocessor count so that the grid neither under- nor
+    over-subscribes the device.  The raw ratio ``N / (sm_count * 512)``
+    is rounded to the nearest power of two (rounding down on a tie) and
+    then clamped to ``[ept_min, ept_max]``.
+
+    Parameters
+    ----------
+    N : int
+        Total number of elements to reduce.
+    sm_count : int
+        Number of streaming multiprocessors on the target device.
+    is_vec3 : bool
+        If ``True`` the reduction operates on vec3 data; limits are
+        tighter (``ept_min=2, ept_max=8``) than for scalars
+        (``ept_min=4, ept_max=16``).
+
+    Returns
+    -------
+    int
+        Optimal elements-per-thread, guaranteed to be a power of two
+        within ``[ept_min, ept_max]``.
+    """
     w_fill = sm_count * 512
     ept_max = 8 if is_vec3 else 16
     ept_min = 2 if is_vec3 else 4
@@ -84,6 +108,10 @@ def _compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
     return max(ept_min, min(p, ept_max))
 
 
+# Backward-compatible alias -- will be removed in a future release.
+_compute_ept = compute_ept
+
+
 def _launch_rle(
     overloads: dict, key, N: int, device, *args, is_vec: bool = False
 ) -> None:
@@ -93,7 +121,7 @@ def _launch_rle(
     ``(N, elems_per_thread)``.  This helper computes the optimal EPT,
     derives the grid dimension, and calls ``wp.launch``.
     """
-    ept = _compute_ept(N, max(device.sm_count, 1), is_vec)
+    ept = compute_ept(N, max(device.sm_count, 1), is_vec)
     dim = (N + ept - 1) // ept
     wp.launch(overloads[key], dim=dim, inputs=[*args, N, ept], device=device)
 
@@ -1663,7 +1691,7 @@ def segmented_sum(
         return
 
     # -- General path: run-length segmented sum -----------------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
+    ept = compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_sum_overloads[x.dtype],
@@ -1729,7 +1757,7 @@ def segmented_component_sum(
         return
 
     # -- General path: run-length segmented component sum -------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), True)
+    ept = compute_ept(N, max(device.sm_count, 1), True)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_component_sum_overloads[x.dtype],
@@ -1804,7 +1832,7 @@ def segmented_dot(
         return
 
     # -- General path: run-length segmented dot -----------------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
+    ept = compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_dot_overloads[x.dtype],
@@ -1862,7 +1890,7 @@ def segmented_max_norm(
         return
 
     # -- General path: run-length segmented max norm -------------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), True)
+    ept = compute_ept(N, max(device.sm_count, 1), True)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_max_norm_overloads[x.dtype],
@@ -1980,7 +2008,7 @@ def segmented_inner_products(
         return
 
     # -- General path: run-length segmented inner products ------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
+    ept = compute_ept(N, max(device.sm_count, 1), x.dtype in _VEC_TYPES)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_inner_products_overloads[x.dtype],
@@ -2187,7 +2215,7 @@ def segmented_max(
     if N == 0:
         return
     device = x.device
-    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    ept = compute_ept(N, max(device.sm_count, 1), False)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_max_overloads[x.dtype],
@@ -2226,7 +2254,7 @@ def segmented_min(
     if N == 0:
         return
     device = x.device
-    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    ept = compute_ept(N, max(device.sm_count, 1), False)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_min_overloads[x.dtype],
@@ -2446,7 +2474,7 @@ def segmented_count(
         return
 
     # -- General path: run-length segmented count ---------------------------
-    ept = _compute_ept(N, max(device.sm_count, 1), False)
+    ept = compute_ept(N, max(device.sm_count, 1), False)
     dim = (N + ept - 1) // ept
     wp.launch(
         _segmented_count_kernel,
