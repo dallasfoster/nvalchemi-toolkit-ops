@@ -45,41 +45,25 @@ Kernel Selection
 """
 
 from .fire import (
-    _fire_step_downhill_batch_idx_kernel,
-    _fire_step_downhill_kernel,
+    # Low-level kernels
     _fire_step_downhill_ptr_kernel,
-    _fire_step_no_downhill_batch_idx_kernel,
-    # Low-level kernels (for advanced use)
-    _fire_step_no_downhill_kernel,
     _fire_step_no_downhill_ptr_kernel,
-    _fire_update_params_downhill_batch_idx_kernel,
-    _fire_update_params_downhill_kernel,
     _fire_update_params_downhill_ptr_kernel,
-    _fire_update_params_no_downhill_batch_idx_kernel,
-    _fire_update_params_no_downhill_kernel,
     _fire_update_params_no_downhill_ptr_kernel,
-    # Unified API (recommended)
+    # Unified API
     fire_step,
     fire_update,
 )
 from .fire2 import fire2_step
 
 __all__ = [
-    # Unified API (recommended)
+    # Unified API
     "fire_step",
     "fire_update",
     "fire2_step",
-    # Low-level kernels (for advanced use)
-    "_fire_step_no_downhill_kernel",
-    "_fire_step_no_downhill_batch_idx_kernel",
+    # Low-level kernels
     "_fire_step_no_downhill_ptr_kernel",
-    "_fire_step_downhill_kernel",
-    "_fire_step_downhill_batch_idx_kernel",
     "_fire_step_downhill_ptr_kernel",
-    "_fire_update_params_no_downhill_kernel",
-    "_fire_update_params_no_downhill_batch_idx_kernel",
     "_fire_update_params_no_downhill_ptr_kernel",
-    "_fire_update_params_downhill_kernel",
-    "_fire_update_params_downhill_batch_idx_kernel",
     "_fire_update_params_downhill_ptr_kernel",
 ]

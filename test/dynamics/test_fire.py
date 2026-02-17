@@ -3768,5 +3768,308 @@ class TestFireStepBatchIdx:
             )
 
 
+# ==============================================================================
+# Determinism Tests
+# ==============================================================================
+
+
+class TestFireDeterminism:
+    """Verify that fire_step and fire_update produce bitwise-identical results
+    across repeated runs with identical inputs.
+
+    The previous fused kernels had read-before-reduction-complete races that
+    caused non-deterministic outputs. The RLE-based multi-kernel approach should
+    produce identical results every time.
+    """
+
+    NUM_REPEATS = 20
+
+    def _clone_wp_array(self, arr):
+        """Create a deep copy of a warp array."""
+        clone = wp.empty_like(arr)
+        wp.copy(clone, arr)
+        return clone
+
+    def _snapshot(self, arrays_dict):
+        """Deep-copy a dict of warp arrays."""
+        return {k: self._clone_wp_array(v) for k, v in arrays_dict.items()}
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize(
+        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
+    )
+    def test_fire_step_single_deterministic(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """fire_step single-system must be deterministic across repeats."""
+        np.random.seed(42)
+        num_atoms = 64
+
+        positions_ref = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities_ref = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype) * 0.01,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces_ref = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(num_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+
+        params_ref = make_fire_params(1, dtype_scalar, device, np_dtype)
+        accum_ref = make_accumulators(1, dtype_scalar, device, np_dtype)
+
+        ref_pos = ref_vel = ref_dt = ref_alpha = None
+
+        for i in range(self.NUM_REPEATS):
+            pos = self._clone_wp_array(positions_ref)
+            vel = self._clone_wp_array(velocities_ref)
+            forces = self._clone_wp_array(forces_ref)
+            params = self._snapshot(params_ref)
+            accum = self._snapshot(accum_ref)
+
+            fire_step(
+                positions=pos,
+                velocities=vel,
+                forces=forces,
+                masses=masses,
+                **params,
+                **accum,
+                device=device,
+            )
+            wp.synchronize()
+
+            if i == 0:
+                ref_pos = pos
+                ref_vel = vel
+                ref_dt = params["dt"]
+                ref_alpha = params["alpha"]
+            else:
+                assert np.array_equal(
+                    ref_pos.numpy(), pos.numpy()
+                ), f"Positions differ on repeat {i}"
+                assert np.array_equal(
+                    ref_vel.numpy(), vel.numpy()
+                ), f"Velocities differ on repeat {i}"
+                assert np.array_equal(
+                    ref_dt.numpy(), params["dt"].numpy()
+                ), f"dt differs on repeat {i}"
+                assert np.array_equal(
+                    ref_alpha.numpy(), params["alpha"].numpy()
+                ), f"alpha differs on repeat {i}"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize(
+        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
+    )
+    def test_fire_step_batch_idx_deterministic(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """fire_step batch_idx mode must be deterministic across repeats."""
+        np.random.seed(123)
+        num_systems = 3
+        atoms_per_system = 32
+        total_atoms = num_systems * atoms_per_system
+
+        positions_ref = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        velocities_ref = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype) * 0.01,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces_ref = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        masses = wp.array(
+            np.ones(total_atoms, dtype=np_dtype), dtype=dtype_scalar, device=device
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params_ref = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        accum_ref = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+
+        ref_pos = ref_vel = None
+
+        for i in range(self.NUM_REPEATS):
+            pos = self._clone_wp_array(positions_ref)
+            vel = self._clone_wp_array(velocities_ref)
+            forces = self._clone_wp_array(forces_ref)
+            params = self._snapshot(params_ref)
+            accum = self._snapshot(accum_ref)
+
+            fire_step(
+                positions=pos,
+                velocities=vel,
+                forces=forces,
+                masses=masses,
+                batch_idx=batch_idx,
+                **params,
+                **accum,
+                device=device,
+            )
+            wp.synchronize()
+
+            if i == 0:
+                ref_pos = pos
+                ref_vel = vel
+            else:
+                assert np.array_equal(
+                    ref_pos.numpy(), pos.numpy()
+                ), f"Positions differ on repeat {i}"
+                assert np.array_equal(
+                    ref_vel.numpy(), vel.numpy()
+                ), f"Velocities differ on repeat {i}"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize(
+        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
+    )
+    def test_fire_update_single_deterministic(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """fire_update single-system must be deterministic across repeats."""
+        np.random.seed(200)
+        num_atoms = 64
+
+        velocities_ref = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype) * 0.01,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces_ref = wp.array(
+            np.random.randn(num_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+
+        params_ref = make_fire_params(1, dtype_scalar, device, np_dtype)
+        accum_ref = make_accumulators(1, dtype_scalar, device, np_dtype)
+
+        ref_vel = ref_dt = ref_alpha = None
+
+        for i in range(self.NUM_REPEATS):
+            vel = self._clone_wp_array(velocities_ref)
+            forces = self._clone_wp_array(forces_ref)
+            params = self._snapshot(params_ref)
+            accum = self._snapshot(accum_ref)
+
+            fire_update(
+                velocities=vel,
+                forces=forces,
+                alpha=params["alpha"],
+                dt=params["dt"],
+                alpha_start=params["alpha_start"],
+                f_alpha=params["f_alpha"],
+                dt_min=params["dt_min"],
+                dt_max=params["dt_max"],
+                n_steps_positive=params["n_steps_positive"],
+                n_min=params["n_min"],
+                f_dec=params["f_dec"],
+                f_inc=params["f_inc"],
+                **accum,
+                device=device,
+            )
+            wp.synchronize()
+
+            if i == 0:
+                ref_vel = vel
+                ref_dt = params["dt"]
+                ref_alpha = params["alpha"]
+            else:
+                assert np.array_equal(
+                    ref_vel.numpy(), vel.numpy()
+                ), f"Velocities differ on repeat {i}"
+                assert np.array_equal(
+                    ref_dt.numpy(), params["dt"].numpy()
+                ), f"dt differs on repeat {i}"
+                assert np.array_equal(
+                    ref_alpha.numpy(), params["alpha"].numpy()
+                ), f"alpha differs on repeat {i}"
+
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize(
+        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
+    )
+    def test_fire_update_batch_idx_deterministic(
+        self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
+    ):
+        """fire_update batch_idx mode must be deterministic across repeats."""
+        np.random.seed(300)
+        num_systems = 3
+        atoms_per_system = 32
+        total_atoms = num_systems * atoms_per_system
+
+        velocities_ref = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype) * 0.01,
+            dtype=dtype_vec,
+            device=device,
+        )
+        forces_ref = wp.array(
+            np.random.randn(total_atoms, 3).astype(np_dtype),
+            dtype=dtype_vec,
+            device=device,
+        )
+        batch_idx = wp.array(
+            np.repeat(np.arange(num_systems), atoms_per_system).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+
+        params_ref = make_fire_params(num_systems, dtype_scalar, device, np_dtype)
+        accum_ref = make_accumulators(num_systems, dtype_scalar, device, np_dtype)
+
+        ref_vel = None
+
+        for i in range(self.NUM_REPEATS):
+            vel = self._clone_wp_array(velocities_ref)
+            forces = self._clone_wp_array(forces_ref)
+            params = self._snapshot(params_ref)
+            accum = self._snapshot(accum_ref)
+
+            fire_update(
+                velocities=vel,
+                forces=forces,
+                alpha=params["alpha"],
+                dt=params["dt"],
+                alpha_start=params["alpha_start"],
+                f_alpha=params["f_alpha"],
+                dt_min=params["dt_min"],
+                dt_max=params["dt_max"],
+                n_steps_positive=params["n_steps_positive"],
+                n_min=params["n_min"],
+                f_dec=params["f_dec"],
+                f_inc=params["f_inc"],
+                batch_idx=batch_idx,
+                **accum,
+                device=device,
+            )
+            wp.synchronize()
+
+            if i == 0:
+                ref_vel = vel
+            else:
+                assert np.array_equal(
+                    ref_vel.numpy(), vel.numpy()
+                ), f"Velocities differ on repeat {i}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
