@@ -36,7 +36,6 @@ from _dynamics_utils import (
     DEFAULT_CUTOFF,
     DEFAULT_SKIN,
     EPSILON_AR,
-    MASS_AR,
     SIGMA_AR,
     create_random_box_cluster,
 )
@@ -247,7 +246,7 @@ print("FIRE2 BATCHED OPTIMIZATION (batch_idx)")
 print("=" * 80)
 print(f"\nRunning FIRE2 optimization ({max_steps} max steps)...")
 print(f"Force tolerance: {force_tol:.1e} eV/Å")
-print(f"FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
+print("FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
 print("-" * 70)
 print(f"{'Step':>6} {'Total E':>14} {'max|F|':>12} {'Converged':>12}")
 print("-" * 70)

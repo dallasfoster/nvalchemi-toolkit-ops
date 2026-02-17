@@ -118,7 +118,7 @@ print("FIRE2 GEOMETRY OPTIMIZATION (LJ cluster)")
 print("=" * 95)
 print(f"  atoms: {num_atoms}, cutoff={cutoff:.2f} Å, box={box_L:.1f} Å")
 print(f"  max_steps={max_steps}, force_tol={force_tolerance:.2e} eV/Å")
-print(f"  FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
+print("  FIRE2 defaults: delaystep=60, dtgrow=1.05, alpha0=0.09, maxstep=0.1")
 
 log_interval = 100
 check_interval = 50
