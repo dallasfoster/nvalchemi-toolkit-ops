@@ -1073,42 +1073,6 @@ def _batch_compute_temperature_from_ke_kernel(
     ke = kinetic_energies[sys_id]
     temperatures[sys_id] = wp.where(dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0))
 
-
-# ==============================================================================
-# Constant Fill Kernels (Pure Warp - no numpy)
-# ==============================================================================
-
-
-@wp.kernel
-def _fill_constant_f32_kernel(
-    arr: wp.array(dtype=wp.float32),
-    value: wp.float32,
-):
-    """Fill array with constant value (float32).
-
-    Launch Grid
-    -----------
-    dim = [array_length]
-    """
-    idx = wp.tid()
-    arr[idx] = value
-
-
-@wp.kernel
-def _fill_constant_f64_kernel(
-    arr: wp.array(dtype=wp.float64),
-    value: wp.float64,
-):
-    """Fill array with constant value (float64).
-
-    Launch Grid
-    -----------
-    dim = [array_length]
-    """
-    idx = wp.tid()
-    arr[idx] = value
-
-
 # ==============================================================================
 # Kernel Overloads for Explicit Typing
 # ==============================================================================
