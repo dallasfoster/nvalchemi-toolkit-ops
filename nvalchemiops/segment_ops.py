@@ -269,6 +269,8 @@ def _segmented_component_sum_kernel(
     """
     t = wp.tid()
     start = t * elems_per_thread
+    if start >= N:
+        return
     end = wp.min(start + elems_per_thread, N)
 
     s_cur = idx[start]
@@ -369,6 +371,8 @@ def _segmented_dot_scalar_kernel(
     """
     t = wp.tid()
     start = t * elems_per_thread
+    if start >= N:
+        return
     end = wp.min(start + elems_per_thread, N)
 
     s_cur = idx[start]
@@ -425,6 +429,8 @@ def _segmented_dot_vec_kernel(
     """
     t = wp.tid()
     start = t * elems_per_thread
+    if start >= N:
+        return
     end = wp.min(start + elems_per_thread, N)
 
     s_cur = idx[start]
@@ -541,6 +547,8 @@ def _segmented_max_norm_kernel(
     """
     t = wp.tid()
     start = t * elems_per_thread
+    if start >= N:
+        return
     end = wp.min(start + elems_per_thread, N)
 
     s_cur = idx[start]
