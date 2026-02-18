@@ -274,7 +274,7 @@ def _langevin_baoab_half_step_out_kernel(
     kT = temperature[0]
     gamma = friction[0]
 
-    inv_mass = type(mass)(1.0) / mass
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
@@ -367,7 +367,11 @@ def _batch_langevin_baoab_half_step_kernel(
     kT = temperature[system_id]
     gamma = friction[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if mass is zero, set inv_mass to zero
+    if mass > type(mass)(0.0):
+        inv_mass = type(mass)(1.0) / mass
+    else:
+        inv_mass = type(mass)(0.0)
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
@@ -466,7 +470,11 @@ def _batch_langevin_baoab_half_step_out_kernel(
     kT = temperature[system_id]
     gamma = friction[system_id]
 
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if mass is zero, set inv_mass to zero
+    if mass > type(mass)(0.0):
+        inv_mass = type(mass)(1.0) / mass
+    else:
+        inv_mass = type(mass)(0.0)
     half_dt = type(dt_val)(0.5) * dt_val
 
     # B step
@@ -560,7 +568,11 @@ def _langevin_baoab_half_step_ptr_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
+        # Guard against division by zero: if mass is zero, set inv_mass to zero
+        if mass > type(mass)(0.0):
+            inv_mass = type(mass)(1.0) / mass
+        else:
+            inv_mass = type(mass)(0.0)
 
         # B step: v += (dt/2m)*F
         vel_step = vel + half_dt * force * inv_mass
@@ -658,7 +670,11 @@ def _langevin_baoab_half_step_ptr_out_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
+        # Guard against division by zero: if mass is zero, set inv_mass to zero
+        if mass > type(mass)(0.0):
+            inv_mass = type(mass)(1.0) / mass
+        else:
+            inv_mass = type(mass)(0.0)
 
         # B step
         vel_step = vel + half_dt * force * inv_mass

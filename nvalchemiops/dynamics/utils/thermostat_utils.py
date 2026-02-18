@@ -719,7 +719,7 @@ def _initialize_velocities_kernel(
     masses : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
         Atomic masses. Shape (num_atoms,).
     temperature : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Temperature. Shape (1,).
+        Temperature - k_B * T. Shape (1,).
     random_seed : wp.uint64
         Random seed.
 
@@ -730,10 +730,10 @@ def _initialize_velocities_kernel(
     atom_idx = wp.tid()
 
     mass = masses[atom_idx]
-    kT = temperature[0]
+    kT = type(mass)(temperature[0])
 
     # Standard deviation: sigma = sqrt(kT/m)
-    sigma = wp.sqrt(type(mass)(kT) / mass)
+    sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(type(mass)(kT) / mass), type(mass)(0.0))
 
     # Initialize RNG state for this atom
     rng_state = wp.rand_init(int(random_seed), atom_idx)
@@ -766,7 +766,7 @@ def _batch_initialize_velocities_kernel(
     masses : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
         Atomic masses. Shape (num_atoms,).
     temperature : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Temperature. Shape (num_systems,).
+        Temperature - k_B * T. Shape (num_systems,).
     random_seed : wp.uint64
         Random seed.
     batch_idx : wp.array(dtype=wp.int32)
@@ -779,7 +779,7 @@ def _batch_initialize_velocities_kernel(
     atom_idx = wp.tid()
     system_id = batch_idx[atom_idx]
     mass = masses[atom_idx]
-    kT = temperature[system_id]
+    kT = type(mass)(temperature[system_id])
 
     # Standard deviation: sigma = sqrt(kT/m)
     sigma = wp.sqrt(type(mass)(kT) / mass)
@@ -815,7 +815,7 @@ def _initialize_velocities_ptr_kernel(
     masses : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
         Atomic masses. Shape (num_atoms_total,).
     temperature : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Temperature per system. Shape (num_systems,).
+        Temperature - k_B * T. Shape (num_systems,).
     random_seed : wp.uint64
         Random seed.
     atom_ptr : wp.array(dtype=wp.int32)
@@ -828,11 +828,11 @@ def _initialize_velocities_ptr_kernel(
     sys_id = wp.tid()
     a0 = atom_ptr[sys_id]
     a1 = atom_ptr[sys_id + 1]
-    kT = temperature[sys_id]
+    kT = type(masses[a0])(temperature[sys_id])
 
     for i in range(a0, a1):
         mass = masses[i]
-        sigma = wp.sqrt(type(mass)(kT) / mass)
+        sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(kT / mass), type(mass)(0.0))
 
         # Use (random_seed + i) for per-atom variation
         rng_state = wp.rand_init(int(random_seed), i)
@@ -864,7 +864,7 @@ def _initialize_velocities_out_kernel(
     kT = temperature[0]
 
     kT_typed = type(mass)(kT)
-    sigma = wp.sqrt(kT_typed / mass)
+    sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(kT_typed / mass), type(mass)(0.0))
 
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
@@ -910,7 +910,7 @@ def _batch_initialize_velocities_out_kernel(
     kT = temperature[system_id]
 
     kT_typed = type(mass)(kT)
-    sigma = wp.sqrt(kT_typed / mass)
+    sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(kT_typed / mass), type(mass)(0.0))
 
     rng_state = wp.rand_init(int(random_seed), atom_idx)
 
@@ -940,7 +940,7 @@ def _initialize_velocities_ptr_out_kernel(
     masses : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
         Atomic masses. Shape (num_atoms_total,).
     temperature : wp.array(dtype=Any), e.g., wp.array(dtype=wp.float32)
-        Temperature per system. Shape (num_systems,).
+        Temperature - k_B * T. Shape (num_systems,).
     random_seed : wp.uint64
         Random seed.
     atom_ptr : wp.array(dtype=wp.int32)
@@ -960,7 +960,7 @@ def _initialize_velocities_ptr_out_kernel(
     for i in range(a0, a1):
         mass = masses[i]
         kT_typed = type(mass)(kT)
-        sigma = wp.sqrt(kT_typed / mass)
+        sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(kT_typed / mass), type(mass)(0.0))
 
         # Use (random_seed + i) for per-atom variation
         rng_state = wp.rand_init(int(random_seed), i)
@@ -1002,7 +1002,8 @@ def _compute_com_from_momentum_kernel(
     dim = [1]
     """
     mass = total_mass[0]
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if total_mass is zero, set inv_mass to zero
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
     com_velocity[0] = total_momentum[0] * inv_mass
 
 
@@ -1029,7 +1030,7 @@ def _batch_compute_com_from_momentum_kernel(
     """
     sys_id = wp.tid()
     mass = total_mass[sys_id]
-    inv_mass = type(mass)(1.0) / mass
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
     com_velocities[sys_id] = total_momentum[sys_id] * inv_mass
 
 
@@ -1052,7 +1053,8 @@ def _compute_temperature_from_ke_kernel(
     """
     sys_id = wp.tid()
     ke = kinetic_energy[sys_id]
-    temperature[sys_id] = type(ke)(2.0) * ke / dof
+    # Guard against division by zero: if dof is zero, set temperature to zero
+    temperature[sys_id] = wp.where(dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0))
 
 
 @wp.kernel
@@ -1069,7 +1071,7 @@ def _batch_compute_temperature_from_ke_kernel(
     """
     sys_id = wp.tid()
     ke = kinetic_energies[sys_id]
-    temperatures[sys_id] = type(ke)(2.0) * ke / dof
+    temperatures[sys_id] = wp.where(dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0))
 
 
 # ==============================================================================
@@ -1462,7 +1464,7 @@ def compute_temperature(
     kinetic_energy : wp.array
         Pre-computed kinetic energy. Shape (1,) or (B,).
     temperature : wp.array
-        Output temperature array. Shape (1,) or (B,).
+        Output temperature array. Temperature - k_B * T. Shape (1,) or (B,).
     num_atoms : int
         Number of atoms (per system for batched).
     dof : int, optional

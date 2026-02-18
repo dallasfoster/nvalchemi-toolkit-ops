@@ -42,7 +42,7 @@ from .launch_helpers import build_family_dict
 @wp.func
 def velocity_half_kick(vel: Any, force: Any, mass: Any, dt_val: Any) -> Any:
     """Half-step velocity kick: ``v_new = v + 0.5 * (F / m) * dt``."""
-    inv_mass = type(mass)(1.0) / mass
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
     half_dt = type(dt_val)(0.5) * dt_val
     return vel + half_dt * force * inv_mass
 

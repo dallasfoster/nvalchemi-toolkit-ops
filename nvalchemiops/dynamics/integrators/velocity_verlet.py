@@ -261,7 +261,8 @@ def _velocity_verlet_position_update_out_kernel(
     mass = masses[atom_idx]
     dt_val = dt[0]
 
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if mass is zero, set inv_mass to zero
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
 
     # Compute acceleration
     acc_x = force[0] * inv_mass
@@ -318,7 +319,11 @@ def _batch_velocity_verlet_position_update_kernel(
     force = forces[atom_idx]
     mass = masses[atom_idx]
 
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if mass is zero, set inv_mass to zero
+    if mass > type(mass)(0.0):
+        inv_mass = type(mass)(1.0) / mass
+    else:
+        inv_mass = type(mass)(0.0)
 
     acc_x = force[0] * inv_mass
     acc_y = force[1] * inv_mass
@@ -370,7 +375,11 @@ def _batch_velocity_verlet_position_update_out_kernel(
     force = forces[atom_idx]
     mass = masses[atom_idx]
 
-    inv_mass = type(mass)(1.0) / mass
+    # Guard against division by zero: if mass is zero, set inv_mass to zero
+    if mass > type(mass)(0.0):
+        inv_mass = type(mass)(1.0) / mass
+    else:
+        inv_mass = type(mass)(0.0)
 
     acc_x = force[0] * inv_mass
     acc_y = force[1] * inv_mass
@@ -442,7 +451,11 @@ def _velocity_verlet_position_update_ptr_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
+        # Guard against division by zero: if mass is zero, set inv_mass to zero
+        if mass > type(mass)(0.0):
+            inv_mass = type(mass)(1.0) / mass
+        else:
+            inv_mass = type(mass)(0.0)
 
         # Compute acceleration
         acc_x = force[0] * inv_mass
@@ -520,7 +533,11 @@ def _velocity_verlet_position_update_ptr_out_kernel(
         force = forces[i]
         mass = masses[i]
 
-        inv_mass = type(mass)(1.0) / mass
+        # Guard against division by zero: if mass is zero, set inv_mass to zero
+        if mass > type(mass)(0.0):
+            inv_mass = type(mass)(1.0) / mass
+        else:
+            inv_mass = type(mass)(0.0)
 
         # Compute acceleration
         acc_x = force[0] * inv_mass

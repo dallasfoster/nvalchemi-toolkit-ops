@@ -121,7 +121,8 @@ vec3d = wp.vec3d
 @wp.func
 def _npt_accel(f: Any, m: Any) -> Any:
     """Acceleration: F/m as vec3."""
-    return type(f)(f[0] / m, f[1] / m, f[2] / m)
+    inv_mass = wp.where(m > type(m)(0.0), type(m)(1.0) / m, type(m)(0.0))
+    return type(f)(f[0] * inv_mass, f[1] * inv_mass, f[2] * inv_mass)
 
 
 @wp.func

@@ -334,9 +334,9 @@ def _fire_update_downhill_batch_idx_kernel(
         velocities[atom_idx] = zero * velocities[atom_idx]
 
     # Position update
-    velocities[atom_idx] = (
-        velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
-    )
+    mass = masses[atom_idx]
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+    velocities[atom_idx] = velocities[atom_idx] + local_dt * forces[atom_idx] * inv_mass
     dr = local_dt * velocities[atom_idx]
     dr_clamped = clamp_displacement(dr, maxstep[sys])
     positions[atom_idx] = positions[atom_idx] + dr_clamped
@@ -671,9 +671,9 @@ def _fire_update_batch_idx_kernel(
         velocities[atom_idx] = zero * velocities[atom_idx]
 
     # Update velocities with forces (mass-aware) and positions
-    velocities[atom_idx] = (
-        velocities[atom_idx] + local_dt * forces[atom_idx] / masses[atom_idx]
-    )
+    mass = masses[atom_idx]
+    inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+    velocities[atom_idx] = velocities[atom_idx] + local_dt * forces[atom_idx] * inv_mass
     dr = local_dt * velocities[atom_idx]
     dr_clamped = clamp_displacement(dr, maxstep[sys])
     positions[atom_idx] = positions[atom_idx] + dr_clamped
@@ -788,7 +788,9 @@ def _fire_step_no_downhill_ptr_kernel(
         alpha_start[sys],
     )
     for i in range(a0, a1):
-        velocities[i] += dt[sys] * forces[i] / masses[i]
+        mass = masses[i]
+        inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+        velocities[i] += dt[sys] * forces[i] * inv_mass
         dr = dt[sys] * velocities[i]
         dr_clamped = clamp_displacement(dr, maxstep[sys])
         positions[i] += dr_clamped
@@ -926,7 +928,9 @@ def _fire_step_downhill_ptr_kernel(
     )
 
     for i in range(a0, a1):
-        velocities[i] += dt[sys] * forces[i] / masses[i]
+        mass = masses[i]
+        inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+        velocities[i] += dt[sys] * forces[i] * inv_mass
         dr = dt[sys] * velocities[i]
         dr_clamped = clamp_displacement(dr, maxstep[sys])
         positions[i] += dr_clamped
