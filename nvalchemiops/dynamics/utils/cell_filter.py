@@ -148,12 +148,16 @@ def _align_cell_kernel(
     cos_beta = wp.dot(_cell[0], _cell[2]) / (a * c)  # angle between a and c
     cos_gamma = wp.dot(_cell[0], _cell[1]) / (a * b)  # angle between a and b
 
-    sin_gamma = wp.sqrt(_one - cos_gamma * cos_gamma)
+    sin_gamma = wp.sqrt(
+        wp.max(_zero, _one - cos_gamma * cos_gamma)
+    )
 
     # Compute c vector components in aligned frame
     c1 = c * cos_beta
     c2 = (c * (cos_alpha - cos_beta * cos_gamma)) / sin_gamma
-    c3 = wp.sqrt(c * c - c1 * c1 - c2 * c2)
+    c3 = wp.sqrt(
+        wp.max(_zero, c * c - c1 * c1 - c2 * c2)
+    )
 
     # Construct aligned cell (upper triangular)
     cell_r = type(_cell)(
