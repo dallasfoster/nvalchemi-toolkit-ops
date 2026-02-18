@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -147,7 +147,7 @@ def _compute_cell_inverse_kernel(
         + a02 * (a10 * a21 - a11 * a20)
     )
 
-    inv_det = type(a00)(1.0) / det
+    inv_det = type(a00)(1.0) / wp.max(det, type(a00)(1e-10))
 
     # Adjugate matrix / det
     inv00 = (a11 * a22 - a12 * a21) * inv_det
