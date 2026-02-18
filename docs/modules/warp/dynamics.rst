@@ -29,7 +29,7 @@ Integrators
 -----------
 
 Velocity Verlet
-^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~
 
 Time-reversible, symplectic integrator for NVE (microcanonical) ensemble.
 
@@ -39,7 +39,7 @@ Time-reversible, symplectic integrator for NVE (microcanonical) ensemble.
 .. autofunction:: nvalchemiops.dynamics.integrators.velocity_verlet.velocity_verlet_velocity_finalize_out
 
 Langevin Dynamics
-^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~
 
 BAOAB splitting scheme for NVT (canonical) ensemble with stochastic thermostat.
 
@@ -49,7 +49,7 @@ BAOAB splitting scheme for NVT (canonical) ensemble with stochastic thermostat.
 .. autofunction:: nvalchemiops.dynamics.integrators.langevin.langevin_baoab_finalize_out
 
 Nosé-Hoover Chain
-^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~
 
 Deterministic thermostat for NVT ensemble using Nosé-Hoover chains with Yoshida-Suzuki integration.
 
@@ -63,7 +63,7 @@ Deterministic thermostat for NVT ensemble using Nosé-Hoover chains with Yoshida
 .. autofunction:: nvalchemiops.dynamics.integrators.nose_hoover.nhc_compute_chain_energy
 
 Velocity Rescaling
-^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~
 
 Simple velocity rescaling thermostat for quick equilibration (non-canonical).
 
@@ -72,7 +72,7 @@ Simple velocity rescaling thermostat for quick equilibration (non-canonical).
 .. autofunction:: nvalchemiops.dynamics.integrators.velocity_rescaling.compute_rescale_factor
 
 NPT/NPH (Isothermal-Isobaric / Isenthalpic-Isobaric)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Extended ensemble integrators for constant pressure simulations using Nosé-Hoover chains
 and Martyna-Tobias-Klein barostat. Supports both isotropic and anisotropic pressure control.
@@ -114,7 +114,7 @@ Optimizers
 ----------
 
 FIRE
-^^^^
+~~~~
 
 Fast Inertial Relaxation Engine for geometry optimization.
 
@@ -122,7 +122,7 @@ Fast Inertial Relaxation Engine for geometry optimization.
 .. autofunction:: nvalchemiops.dynamics.optimizers.fire.fire_update
 
 FIRE2
-^^^^^
+~~~~~
 
 Improved FIRE optimizer with adaptive damping and velocity mixing.
 

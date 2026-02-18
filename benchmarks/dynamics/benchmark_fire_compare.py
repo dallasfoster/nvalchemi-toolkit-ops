@@ -41,7 +41,7 @@ from pathlib import Path
 
 import torch
 
-from .shared_utils import (
+from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     create_lj_system,
@@ -421,6 +421,7 @@ def run_benchmarks(config: dict, output_dir: Path, seed: int = _DEFAULT_SEED) ->
     all_rows = []
 
     print("FIRE vs FIRE2 Accuracy Comparison")
+    print("This benchmark compares convergence speed and wall-clock time.")
     print(f"GPU: {gpu_sku}")
     print(f"Force tolerance: {force_tol} eV/A")
     print(f"Max steps: {max_steps}")

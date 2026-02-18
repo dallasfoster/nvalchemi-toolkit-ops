@@ -840,7 +840,7 @@ def shake_iteration(
     Returns
     -------
     wp.array(dtype=wp.float64)
-        Maximum constraint error |r²_ij - d²_ij|. Shape (1,).
+        Maximum constraint error :math:`|r^2_{ij} - d^2_{ij}|`. Shape (1,).
     """
     if device is None:
         device = positions.device
@@ -912,7 +912,7 @@ def shake_constraints(
     Returns
     -------
     wp.array(dtype=wp.float64)
-        Final constraint error |r²_ij - d²_ij|. Shape (1,).
+        Final constraint error :math:`|r^2_{ij} - d^2_{ij}|`. Shape (1,).
 
     Example
     -------
@@ -1090,7 +1090,7 @@ def rattle_iteration(
     max_error: wp.array,
     device: str = None,
 ) -> wp.array:
-    """
+    r"""
     Perform single RATTLE iteration (in-place).
 
     Parameters
@@ -1114,7 +1114,7 @@ def rattle_iteration(
     Returns
     -------
     wp.array(dtype=wp.float64)
-        Maximum velocity constraint error |v_ij · r_ij|. Shape (1,).
+        Maximum velocity constraint error :math:`|v_{ij} \cdot r_{ij}|`. Shape (1,).
     """
     if device is None:
         device = positions.device
@@ -1144,7 +1144,7 @@ def rattle_constraints(
     num_iter: int = 10,
     device: str = None,
 ) -> wp.array:
-    """
+    r"""
     Apply RATTLE velocity constraints for a fixed number of iterations (in-place).
 
     This function runs a fixed number of RATTLE iterations without convergence
@@ -1174,7 +1174,7 @@ def rattle_constraints(
     Returns
     -------
     wp.array(dtype=wp.float64)
-        Final constraint error |v_ij · r_ij|. Shape (1,).
+        Final constraint error :math:`|v_{ij} \cdot r_{ij}|`. Shape (1,).
     """
     if device is None:
         device = positions.device

@@ -41,7 +41,7 @@ from pathlib import Path
 
 import torch
 
-from .shared_utils import (
+from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     create_lj_system,
@@ -126,7 +126,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         )
 
         # FIRE
-        if "fire" in optimizers:
+        if optimizers.get("fire", {}).get("enabled", False):
             fire_config = optimizers["fire"]
             result = nv_bench.run_fire(
                 max_steps=fire_config.get("max_steps", 1000),

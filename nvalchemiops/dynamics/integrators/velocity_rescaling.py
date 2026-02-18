@@ -152,7 +152,7 @@ def velocity_rescale(
     """
     Rescale velocities to achieve target temperature (in-place).
 
-    Applies v_i *= scale_factor to all velocities.
+    Applies ``v_i *= scale_factor`` to all velocities.
 
     Parameters
     ----------

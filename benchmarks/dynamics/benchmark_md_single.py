@@ -41,7 +41,7 @@ from pathlib import Path
 
 import torch
 
-from .shared_utils import (
+from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
     create_lj_system,

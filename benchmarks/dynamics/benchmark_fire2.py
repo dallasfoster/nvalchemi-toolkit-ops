@@ -41,6 +41,7 @@ import numpy as np
 import torch
 import warp as wp
 
+from benchmarks.dynamics.shared_utils import get_gpu_sku, load_config
 from nvalchemiops.batch_utils import atom_ptr_to_batch_idx, batch_idx_to_atom_ptr
 from nvalchemiops.dynamics.optimizers import fire2_step, fire_step
 from nvalchemiops.dynamics.utils.cell_filter import (
@@ -56,8 +57,6 @@ from nvalchemiops.torch.fire2 import (
     fire2_step_coord_cell,
     fire2_step_extended,
 )
-
-from .shared_utils import get_gpu_sku, load_config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -348,12 +347,8 @@ def bench_fire1_warp_cell(N, M, device, dtype, warmup, runs):
     maxstep_wp = wp.array(
         np.full(M, 0.1, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
     )
-    nsteps_wp = wp.array(
-        np.zeros(M, dtype=np.int32), dtype=wp.int32, device=wp_device
-    )
-    nmin_wp = wp.array(
-        np.full(M, 5, dtype=np.int32), dtype=wp.int32, device=wp_device
-    )
+    nsteps_wp = wp.array(np.zeros(M, dtype=np.int32), dtype=wp.int32, device=wp_device)
+    nmin_wp = wp.array(np.full(M, 5, dtype=np.int32), dtype=wp.int32, device=wp_device)
     f_dec_wp = wp.array(
         np.full(M, 0.5, dtype=np_dtype), dtype=scalar_dtype, device=wp_device
     )
@@ -371,28 +366,49 @@ def bench_fire1_warp_cell(N, M, device, dtype, warmup, runs):
         # Pack into extended arrays
         if M == 1:
             pack_positions_with_cell(
-                wp_pos, wp_cell, wp_ext_pos, device=wp_device,
+                wp_pos,
+                wp_cell,
+                wp_ext_pos,
+                device=wp_device,
             )
             pack_velocities_with_cell(
-                wp_vel, wp_cell_vel, wp_ext_vel, device=wp_device,
+                wp_vel,
+                wp_cell_vel,
+                wp_ext_vel,
+                device=wp_device,
             )
             pack_forces_with_cell(
-                wp_forces, wp_cell_force, wp_ext_forces, device=wp_device,
+                wp_forces,
+                wp_cell_force,
+                wp_ext_forces,
+                device=wp_device,
             )
         else:
             pack_positions_with_cell(
-                wp_pos, wp_cell, wp_ext_pos,
-                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                wp_pos,
+                wp_cell,
+                wp_ext_pos,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
                 batch_idx=wp_bidx,
             )
             pack_velocities_with_cell(
-                wp_vel, wp_cell_vel, wp_ext_vel,
-                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                wp_vel,
+                wp_cell_vel,
+                wp_ext_vel,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
                 batch_idx=wp_bidx,
             )
             pack_forces_with_cell(
-                wp_forces, wp_cell_force, wp_ext_forces,
-                wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+                wp_forces,
+                wp_cell_force,
+                wp_ext_forces,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
                 batch_idx=wp_bidx,
             )
 
@@ -427,23 +443,37 @@ def bench_fire1_warp_cell(N, M, device, dtype, warmup, runs):
         # Unpack back to original arrays
         if M == 1:
             unpack_positions_with_cell(
-                wp_ext_pos, wp_pos, wp_cell,
-                num_atoms=N, device=wp_device,
+                wp_ext_pos,
+                wp_pos,
+                wp_cell,
+                num_atoms=N,
+                device=wp_device,
             )
             unpack_velocities_with_cell(
-                wp_ext_vel, wp_vel, wp_cell_vel,
-                num_atoms=N, device=wp_device,
+                wp_ext_vel,
+                wp_vel,
+                wp_cell_vel,
+                num_atoms=N,
+                device=wp_device,
             )
         else:
             unpack_positions_with_cell(
-                wp_ext_pos, wp_pos, wp_cell,
-                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                wp_ext_pos,
+                wp_pos,
+                wp_cell,
+                atom_ptr=wp_atom_ptr,
+                ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
             unpack_velocities_with_cell(
-                wp_ext_vel, wp_vel, wp_cell_vel,
-                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                wp_ext_vel,
+                wp_vel,
+                wp_cell_vel,
+                atom_ptr=wp_atom_ptr,
+                ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
 
     return _bench_cuda(run, warmup, runs, device)
@@ -640,22 +670,28 @@ def bench_fire2_extended(N, M, device, dtype, hyper, warmup, runs):
         wp.from_torch(pos, dtype=vec_type),
         wp.from_torch(cell, dtype=mat_type),
         wp.from_torch(ext_pos, dtype=vec_type),
-        wp_atom_ptr, wp_ext_atom_ptr,
-        device=wp_device, batch_idx=wp_bidx,
+        wp_atom_ptr,
+        wp_ext_atom_ptr,
+        device=wp_device,
+        batch_idx=wp_bidx,
     )
     pack_velocities_with_cell(
         wp.from_torch(vel, dtype=vec_type),
         wp.from_torch(cell_vel, dtype=mat_type),
         wp.from_torch(ext_vel, dtype=vec_type),
-        wp_atom_ptr, wp_ext_atom_ptr,
-        device=wp_device, batch_idx=wp_bidx,
+        wp_atom_ptr,
+        wp_ext_atom_ptr,
+        device=wp_device,
+        batch_idx=wp_bidx,
     )
     pack_forces_with_cell(
         wp.from_torch(forces, dtype=vec_type),
         wp.from_torch(cell_force, dtype=mat_type),
         wp.from_torch(ext_forces, dtype=vec_type),
-        wp_atom_ptr, wp_ext_atom_ptr,
-        device=wp_device, batch_idx=wp_bidx,
+        wp_atom_ptr,
+        wp_ext_atom_ptr,
+        device=wp_device,
+        batch_idx=wp_bidx,
     )
 
     vf = torch.zeros(M, dtype=dtype, device=device)
@@ -854,9 +890,7 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
                 "warp_fire1_cell",
                 "FIRE1(cell)",
                 "F1cl",
-                lambda N, M, dev, dt, w, r: bench_fire1_warp_cell(
-                    N, M, dev, dt, w, r
-                ),
+                lambda N, M, dev, dt, w, r: bench_fire1_warp_cell(N, M, dev, dt, w, r),
             )
         )
     if methods_cfg.get("fire2_extended", True):
@@ -886,6 +920,9 @@ def run_benchmarks(config: dict, output_dir: Path, device: torch.device) -> None
         torch_dtype, dtype_label = _DTYPE_MAP[dtype_str]
 
         print(f"\nFIRE2 Kernel Benchmark — dtype: {dtype_label} — device: {device}")
+        print(
+            "This benchmark does not compare convergence speed, only the speed of the algorithm steps."
+        )
         print(f"GPU: {gpu_sku}")
         print(f"Warmup: {warmup}, Runs: {runs}")
 

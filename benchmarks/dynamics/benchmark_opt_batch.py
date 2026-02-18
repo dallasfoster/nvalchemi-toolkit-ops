@@ -37,9 +37,10 @@ from pathlib import Path
 
 import torch
 
-from .shared_utils import (
+from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
     NvalchemiopsLJModel,
+    create_lj_system,
     get_gpu_sku,
     load_config,
     print_batch_benchmark_footer,
@@ -74,8 +75,6 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    from .shared_utils import create_lj_system
-
     # Create template system
     pos, cell, masses_single, vel = create_lj_system(
         num_atoms=num_atoms_per_system,

@@ -661,8 +661,8 @@ def compute_cell_volume(
     volumes: wp.array,
     device: str = None,
 ) -> wp.array:
-    """
-    Compute cell volume V = |det(cell)|.
+    r"""
+    Compute cell volume :math:`V = |\det(cell)|`.
 
     Parameters
     ----------

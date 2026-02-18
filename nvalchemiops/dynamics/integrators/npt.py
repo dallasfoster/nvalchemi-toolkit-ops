@@ -1624,7 +1624,9 @@ def compute_pressure_tensor(
     else:
         kernel = _KINETIC_TENSOR_FAMILY.batch_idx
         inputs = [velocities, masses, batch_idx, kinetic_tensors]
-    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_THREADS)
+    wp.launch(
+        kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_THREADS
+    )
 
     wp.launch(
         _finalize_pressure_tensor_kernel,
@@ -1920,8 +1922,8 @@ def compute_barostat_mass(
 
     References
     ----------
-    .. [1] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
-    .. [2] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    .. [MTK1994] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
+    .. [SSM2004] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
     """
     if device is None:
         device = target_temperature.device
@@ -2226,8 +2228,8 @@ def npt_barostat_half_step(
 
     References
     ----------
-    .. [1] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
-    .. [2] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
+    .. [MTK1994] Martyna, Tobias, Klein, J. Chem. Phys. 101, 4177 (1994)
+    .. [SSM2004] Shinoda, Shiga, Mikami, Phys. Rev. B 69, 134103 (2004)
     """
     if device is None:
         device = cell_velocities.device
@@ -2545,12 +2547,29 @@ def npt_velocity_half_step_out(
         mode=exec_mode,
         dim=n_atoms,
         inputs_single=[
-            velocities, masses, forces, cell_velocities, *extra,
-            volumes, eta_dots, n_atoms, dt_half, velocities_out,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            *extra,
+            volumes,
+            eta_dots,
+            n_atoms,
+            dt_half,
+            velocities_out,
         ],
         inputs_batch=[
-            velocities, masses, forces, batch_idx, cell_velocities, *extra,
-            volumes, eta_dots, num_atoms_per_system, dt_half, velocities_out,
+            velocities,
+            masses,
+            forces,
+            batch_idx,
+            cell_velocities,
+            *extra,
+            volumes,
+            eta_dots,
+            num_atoms_per_system,
+            dt_half,
+            velocities_out,
         ],
         device=device,
     )
@@ -2647,12 +2666,23 @@ def npt_position_update_out(
         mode=exec_mode,
         dim=num_atoms,
         inputs_single=[
-            positions, velocities, cells, cells_inv, cell_velocities,
-            dt_typed, positions_out,
+            positions,
+            velocities,
+            cells,
+            cells_inv,
+            cell_velocities,
+            dt_typed,
+            positions_out,
         ],
         inputs_batch=[
-            positions, velocities, batch_idx, cells, cells_inv,
-            cell_velocities, dt_typed, positions_out,
+            positions,
+            velocities,
+            batch_idx,
+            cells,
+            cells_inv,
+            cell_velocities,
+            dt_typed,
+            positions_out,
         ],
         device=device,
     )
@@ -3342,12 +3372,27 @@ def nph_velocity_half_step_out(
         mode=exec_mode,
         dim=n_atoms,
         inputs_single=[
-            velocities, masses, forces, cell_velocities, *extra,
-            volumes, n_atoms, dt_half, velocities_out,
+            velocities,
+            masses,
+            forces,
+            cell_velocities,
+            *extra,
+            volumes,
+            n_atoms,
+            dt_half,
+            velocities_out,
         ],
         inputs_batch=[
-            velocities, masses, forces, batch_idx, cell_velocities, *extra,
-            volumes, num_atoms_per_system, dt_half, velocities_out,
+            velocities,
+            masses,
+            forces,
+            batch_idx,
+            cell_velocities,
+            *extra,
+            volumes,
+            num_atoms_per_system,
+            dt_half,
+            velocities_out,
         ],
         device=device,
     )
