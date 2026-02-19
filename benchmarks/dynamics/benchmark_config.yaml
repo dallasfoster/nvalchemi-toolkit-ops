@@ -180,7 +180,7 @@ fire_compare:
   system_sizes: [256, 512, 1024, 2048]
 
   # Convergence criteria
-  force_tolerance: 0.005   # eV/Å
+  force_tolerance: 0.01   # eV/Å
   pressure_tolerance: 0.3  # kBar (variable-cell only)
   max_steps: 2000
   check_interval: 10
