@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import warp as wp
 from _dynamics_utils import (
+    BatchedMDSystem,
     DEFAULT_CUTOFF,
     DEFAULT_SKIN,
     EPSILON_AR,
@@ -42,106 +43,10 @@ from _dynamics_utils import (
 
 from nvalchemiops.batch_utils import create_atom_ptr, create_batch_idx
 from nvalchemiops.dynamics.optimizers import fire2_step
-from nvalchemiops.interactions import lj_energy_forces
 from nvalchemiops.segment_ops import (
     segmented_max_norm,
     segmented_sum,
 )
-from nvalchemiops.torch.neighbors import batch_cell_list
-
-# ==============================================================================
-# Batched LJ Force Computation
-# ==============================================================================
-
-
-class BatchedLJSystem:
-    """Simple batched LJ system for FIRE2 optimization demonstration."""
-
-    def __init__(
-        self,
-        positions: np.ndarray,
-        cells: np.ndarray,
-        batch_idx: np.ndarray,
-        num_systems: int,
-        epsilon: float = EPSILON_AR,
-        sigma: float = SIGMA_AR,
-        cutoff: float = DEFAULT_CUTOFF,
-        skin: float = DEFAULT_SKIN,
-        device: str = "cuda:0",
-    ):
-        self.num_systems = num_systems
-        self.total_atoms = len(positions)
-        self.epsilon = epsilon
-        self.sigma = sigma
-        self.cutoff = cutoff
-        self.skin = skin
-        self.device = device
-
-        # Warp arrays
-        self.wp_positions = wp.array(positions, dtype=wp.vec3d, device=device)
-        self.wp_cells = wp.array(cells, dtype=wp.mat33d, device=device)
-        self.wp_batch_idx = wp.array(
-            batch_idx.astype(np.int32), dtype=wp.int32, device=device
-        )
-        self.wp_forces = wp.zeros(self.total_atoms, dtype=wp.vec3d, device=device)
-
-        # Torch tensors for neighbor list
-        self.torch_positions = torch.tensor(
-            positions, dtype=torch.float64, device=device
-        )
-        self.torch_cells = torch.tensor(cells, dtype=torch.float64, device=device)
-        self.torch_batch_idx = torch.tensor(batch_idx, dtype=torch.int32, device=device)
-        self.torch_pbc = torch.tensor(
-            np.tile([True, True, True], (num_systems, 1)),
-            dtype=torch.bool,
-            device=device,
-        )
-
-        # Build initial neighbor list
-        self._rebuild_neighbors()
-
-    def _rebuild_neighbors(self):
-        """Rebuild batched neighbor list."""
-        self.torch_positions = wp.to_torch(self.wp_positions)
-        self.torch_cells = wp.to_torch(self.wp_cells)
-
-        neighbor_matrix, num_neighbors, neighbor_shifts = batch_cell_list(
-            positions=self.torch_positions,
-            cutoff=self.cutoff + self.skin,
-            cell=self.torch_cells,
-            pbc=self.torch_pbc,
-            batch_idx=self.torch_batch_idx,
-            max_neighbors=100,
-            half_fill=True,
-            fill_value=self.total_atoms,
-        )
-
-        self.wp_neighbor_matrix = wp.from_torch(neighbor_matrix, dtype=wp.int32)
-        self.wp_neighbor_shifts = wp.from_torch(neighbor_shifts, dtype=wp.vec3i)
-        self.wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32)
-
-    def compute_forces(self) -> wp.array:
-        """Compute LJ forces and return per-atom energies."""
-        self._rebuild_neighbors()
-
-        energies, forces = lj_energy_forces(
-            positions=self.wp_positions,
-            cell=self.wp_cells,
-            epsilon=self.epsilon,
-            sigma=self.sigma,
-            cutoff=self.cutoff,
-            switch_width=1.0,  # Smooth cutoff for optimization
-            half_neighbor_list=True,
-            neighbor_matrix=self.wp_neighbor_matrix,
-            neighbor_matrix_shifts=self.wp_neighbor_shifts,
-            num_neighbors=self.wp_num_neighbors,
-            fill_value=self.total_atoms,
-            batch_idx=self.wp_batch_idx,
-            device=self.device,
-        )
-
-        wp.copy(self.wp_forces, forces)
-        return energies
 
 
 # ==============================================================================
@@ -200,12 +105,17 @@ print(f"  batch_idx shape: {batch_idx.shape}")
 print(f"  atom_ptr shape: {atom_ptr.shape}")
 print(f"  atom_ptr values: {atom_ptr.numpy()}")
 
-# Create batched LJ system
-lj_system = BatchedLJSystem(
+# Create batched MD system (using BatchedMDSystem, ignoring velocities/masses for FIRE2)
+lj_system = BatchedMDSystem(
     positions=positions_np,
     cells=cells_np,
     batch_idx=batch_idx_np,
     num_systems=num_systems,
+    epsilon=EPSILON_AR,
+    sigma=SIGMA_AR,
+    cutoff=DEFAULT_CUTOFF,
+    skin=DEFAULT_SKIN,
+    switch_width=1.0,  # Smooth cutoff for optimization
     device=device,
 )
 

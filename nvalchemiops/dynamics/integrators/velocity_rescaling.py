@@ -60,7 +60,7 @@ Supports three execution modes for scaling velocities:
     compute_temperature(ke, T_current, num_atoms=100)
 
     # Compute scaling factor
-    factor = compute_rescale_factor(T_current.numpy()[0], T_target=1.0)
+    factor = _compute_rescale_factor(T_current, T_target=1.0)
     scale_factor = wp.array([factor], dtype=wp.float64, device="cuda:0")
 
     # Apply rescaling
@@ -89,7 +89,7 @@ REFERENCES
 """
 
 from __future__ import annotations
-
+from typing import Any
 import warp as wp
 
 from nvalchemiops.warp_dispatch import validate_out_array
@@ -103,7 +103,7 @@ __all__ = [
     # Non-mutating APIs
     "velocity_rescale_out",
     # Utility
-    "compute_rescale_factor",
+    "_compute_rescale_factor",
 ]
 
 
@@ -111,11 +111,11 @@ __all__ = [
 # Functional Interface
 # ==============================================================================
 
-
-def compute_rescale_factor(
-    current_temperature: float,
-    target_temperature: float,
-) -> float:
+@wp.func
+def _compute_rescale_factor(
+    current_temperature: Any,
+    target_temperature: Any,
+) -> Any:
     """
     Compute velocity rescaling factor.
 
@@ -131,15 +131,10 @@ def compute_rescale_factor(
     float
         Scaling factor sqrt(T_target / T_current).
 
-    Notes
-    -----
-    Returns 1.0 if current_temperature <= 0 to avoid division by zero.
     """
-    import math
-
-    if current_temperature <= 0.0:
-        return 1.0
-    return math.sqrt(target_temperature / current_temperature)
+    if current_temperature <= type(current_temperature)(0.0):
+        return type(current_temperature)(1.0)
+    return wp.sqrt(target_temperature / current_temperature)
 
 
 def velocity_rescale(
@@ -177,7 +172,7 @@ def velocity_rescale(
     >>> compute_temperature(ke, T_current, num_atoms=100)
     >>>
     >>> # Compute rescaling factor
-    >>> factor = compute_rescale_factor(T_current, T_target)
+    >>> factor = _compute_rescale_factor(T_current, T_target)
     >>> scale = wp.array([factor], dtype=wp.float32, device=device)
     >>>
     >>> # Apply rescaling

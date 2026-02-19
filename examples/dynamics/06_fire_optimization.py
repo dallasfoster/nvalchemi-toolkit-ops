@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 import warp as wp
 from _dynamics_utils import MDSystem, create_random_cluster
 
@@ -173,7 +172,7 @@ for step in range(max_steps):
     if step % check_interval == 0 or step == max_steps - 1:
         pe = float(energies.numpy().sum())
         fmax = float(
-            torch.linalg.norm(wp.to_torch(system.wp_forces), dim=1).max().item()
+            np.linalg.norm(system.wp_forces.numpy(), axis=1).max()
         )
 
         energy_hist.append(pe)
@@ -212,7 +211,7 @@ ax[1].legend(frameon=False, loc="best")
 # Visualize initial vs final geometry (XY projection)
 
 pos0 = initial_positions
-pos1 = wp.to_torch(system.wp_positions).cpu().numpy()
+pos1 = system.wp_positions.numpy()
 
 fig2, ax2 = plt.subplots(
     1, 2, figsize=(8.0, 3.5), sharex=True, sharey=True, constrained_layout=True

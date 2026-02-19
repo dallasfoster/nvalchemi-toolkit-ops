@@ -185,7 +185,7 @@ from .npt import (
 )
 from .velocity_rescaling import (
     # Utility
-    compute_rescale_factor,
+    _compute_rescale_factor,
     # Mutating
     velocity_rescale,
     # Non-mutating
@@ -218,7 +218,7 @@ __all__ = [
     # Velocity Rescaling - Non-mutating
     "velocity_rescale_out",
     # Velocity Rescaling - Utility
-    "compute_rescale_factor",
+    "_compute_rescale_factor",
     # Nosé-Hoover Chain - Mutating
     "nhc_thermostat_chain_update",
     "nhc_velocity_half_step",

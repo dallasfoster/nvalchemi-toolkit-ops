@@ -40,7 +40,7 @@ from __future__ import annotations
 import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
-from _langevin_utils import (
+from _dynamics_utils import (
     EPSILON_AR,
     SIGMA_AR,
     MDSystem,

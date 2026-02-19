@@ -114,6 +114,16 @@ def pressure_ev_per_a3_to_atm(pressure_ev_per_a3: float) -> float:
     return float(pressure_ev_per_a3) * _EV_PER_A3_TO_PA / 101325.0
 
 
+def pressure_gpa_to_ev_per_a3(p_gpa: float) -> float:
+    """Convert pressure from GPa to eV/Å³."""
+    return p_gpa * 1e9 / _EV_PER_A3_TO_PA
+
+
+def pressure_ev_per_a3_to_gpa(p_ev: float) -> float:
+    """Convert pressure from eV/Å³ to GPa."""
+    return p_ev * _EV_PER_A3_TO_PA / 1e9
+
+
 # Argon LJ parameters (commonly used for liquid argon simulations)
 EPSILON_AR = 0.0104  # eV
 SIGMA_AR = 3.40  # Angstrom
@@ -193,6 +203,93 @@ def _copy_1d_to_row2d_kernel(src: wp.array(dtype=Any), dst: wp.array2d(dtype=Any
     k = wp.tid()
     if k < src.shape[0]:
         dst[0, k] = src[k]
+
+
+@wp.kernel
+def _virial_to_stress_kernel(
+    virial_flat: wp.array(dtype=wp.float64),
+    volume: wp.array(dtype=wp.float64),
+    external_pressure: wp.float64,
+    stress: wp.array(dtype=wp.mat33d),
+):
+    """Convert virial to stress tensor for cell optimization.
+
+    Computes: stress = P_ext - P_internal
+
+    where P_internal = -virial/V (negated because LJ virial has W = -Σ r ⊗ F).
+
+    At equilibrium: P_internal = P_ext, so stress = 0.
+    When P_internal < P_ext: stress > 0, cell contracts (via stress_to_cell_force).
+    When P_internal > P_ext: stress < 0, cell expands.
+    """
+    sys = wp.tid()
+    V = volume[sys]
+    inv_V = wp.float64(1.0) / V
+
+    # Virial components (row-major: xx, xy, xz, yx, yy, yz, zx, zy, zz)
+    # Negate because LJ virial uses convention W = -Σ r ⊗ F
+    # After negation: positive = compression (repulsive forces)
+    vxx = -virial_flat[0]
+    vxy = -virial_flat[1]
+    vxz = -virial_flat[2]
+    vyx = -virial_flat[3]
+    vyy = -virial_flat[4]
+    vyz = -virial_flat[5]
+    vzx = -virial_flat[6]
+    vzy = -virial_flat[7]
+    vzz = -virial_flat[8]
+
+    # Internal pressure (diagonal): P_int = virial/V (positive = compression)
+    # Stress for optimization: σ = P_ext - P_int
+    # This ensures σ = 0 at equilibrium, and correct sign for cell force
+    stress[sys] = wp.mat33d(
+        external_pressure - vxx * inv_V,
+        -vxy * inv_V,
+        -vxz * inv_V,
+        -vyx * inv_V,
+        external_pressure - vyy * inv_V,
+        -vyz * inv_V,
+        -vzx * inv_V,
+        -vzy * inv_V,
+        external_pressure - vzz * inv_V,
+    )
+
+
+def virial_to_stress(
+    virial_flat: wp.array,
+    cell: wp.array,
+    external_pressure: float,
+    device: str,
+) -> wp.array:
+    """Convert virial tensor to stress with external pressure.
+
+    Parameters
+    ----------
+    virial_flat : wp.array, shape (9,)
+        Flat virial tensor from LJ computation.
+    cell : wp.array, shape (1, 3, 3)
+        Cell matrix.
+    external_pressure : float
+        External pressure in eV/Å³.
+    device : str
+        Warp device.
+
+    Returns
+    -------
+    stress : wp.array, shape (1,), dtype=mat33d
+        Stress tensor for cell optimization.
+    """
+    volume = wp.empty(1, dtype=wp.float64, device=device)
+    compute_cell_volume(cell, volumes=volume, device=device)
+    stress = wp.zeros(1, dtype=wp.mat33d, device=device)
+    wp.launch(
+        _virial_to_stress_kernel,
+        dim=1,
+        inputs=[virial_flat, volume, wp.float64(external_pressure)],
+        outputs=[stress],
+        device=device,
+    )
+    return stress
 
 
 def neighbor_distance_stats(
@@ -496,6 +593,31 @@ def create_fcc_argon(
     cell = np.eye(3, dtype=np.float64) * L
 
     return positions, cell
+
+
+def create_fcc_lattice(n_cells: int, a: float) -> tuple[np.ndarray, np.ndarray]:
+    """Create FCC lattice with n_cells unit cells per dimension.
+
+    Parameters
+    ----------
+    n_cells : int
+        Number of unit cells in each dimension.
+    a : float
+        Lattice constant (Å).
+
+    Returns
+    -------
+    positions : np.ndarray, shape (N, 3)
+        Atomic positions.
+    cell : np.ndarray, shape (3, 3)
+        Cell matrix.
+
+    Note
+    ----
+    This is an alias for :func:`create_fcc_argon` with different parameter name.
+    For consistency, consider using :func:`create_fcc_argon` instead.
+    """
+    return create_fcc_argon(num_unit_cells=n_cells, a=a)
 
 
 def create_random_cluster(
@@ -808,13 +930,31 @@ class MDSystem:
         wp.copy(self.wp_forces, wp_forces)
         return wp_energies
 
-    def compute_forces_virial(self, virial_tensors: wp.array) -> wp.array:
-        """Compute LJ forces and virial (for NPT/NPH), return per-atom energies (device array).
+    def compute_forces_virial(
+        self, virial_tensors: wp.array | None = None
+    ) -> wp.array | tuple[wp.array, wp.array, wp.array]:
+        """Compute LJ forces and virial.
+
+        Parameters
+        ----------
+        virial_tensors : wp.array, optional
+            If provided (for NPT/NPH), packs virial into vec9 format and returns only energies.
+            If None (for variable-cell), returns tuple (energies, forces, virial_flat).
+
+        Returns
+        -------
+        If virial_tensors is provided:
+            wp.array : Per-atom potential energies (shape (num_atoms,))
+        If virial_tensors is None:
+            tuple[wp.array, wp.array, wp.array] : (energies, forces, virial_flat)
+                - energies: Per-atom potential energies (shape (num_atoms,))
+                - forces: Forces on atoms (shape (num_atoms,), dtype=vec3d)
+                - virial_flat: Flat virial tensor (shape (9,), row-major)
 
         Notes
         -----
-        For barostat integrators the cell changes over time, so we conservatively rebuild
-        the neighbor list every time this function is called.
+        For barostat integrators (NPT/NPH), provide virial_tensors parameter.
+        For variable-cell optimization, call without parameter to get flat virial.
         """
         # Always rebuild neighbors (cell may have changed)
         self._rebuild_neighbors()
@@ -836,15 +976,33 @@ class MDSystem:
 
         wp.copy(self.wp_forces, wp_forces)
 
-        # Pack float64[9] into vec9[f/d] expected by the MTK integrators
-        wp.launch(
-            _pack_virial_flat_to_vec9_kernel,
-            dim=1,
-            inputs=[wp_virial_flat, virial_tensors],
-            device=self.device,
-        )
+        if virial_tensors is not None:
+            # Pack float64[9] into vec9[f/d] expected by the MTK integrators
+            wp.launch(
+                _pack_virial_flat_to_vec9_kernel,
+                dim=1,
+                inputs=[wp_virial_flat, virial_tensors],
+                device=self.device,
+            )
+            return wp_energies
+        else:
+            # Return tuple for variable-cell optimization
+            return wp_energies, wp_forces, wp_virial_flat
 
-        return wp_energies
+    def update_cell(self, cell: wp.array) -> None:
+        """Update cell matrix and recompute cell inverse.
+
+        Parameters
+        ----------
+        cell : wp.array, shape (1, 3, 3)
+            New cell matrix.
+        """
+        wp.copy(self.wp_cell, cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.device)
+        # Update torch cell for neighbor list
+        self.torch_cell = wp.to_torch(self.wp_cell).squeeze(0)
+        # Force neighbor rebuild on next force computation
+        self.neighbor_manager.positions_at_rebuild = None
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""

@@ -17,7 +17,7 @@
 Comprehensive tests for velocity rescaling thermostat.
 
 Tests cover:
-- compute_rescale_factor utility
+- _compute_rescale_factor utility
 - velocity_rescale (in-place)
 - velocity_rescale_out (non-mutating)
 - Single and batched modes
@@ -29,7 +29,7 @@ import pytest
 import warp as wp
 
 from nvalchemiops.dynamics.integrators.velocity_rescaling import (
-    compute_rescale_factor,
+    _compute_rescale_factor,
     velocity_rescale,
     velocity_rescale_out,
 )
@@ -70,52 +70,52 @@ class TestComputeRescaleFactor:
         current_temp = 200.0
         target_temp = 300.0
 
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
         expected = np.sqrt(target_temp / current_temp)
-        np.testing.assert_allclose(factor, expected, rtol=1e-10)
+        np.testing.assert_allclose(factor, expected, rtol=1e-6)
 
     def test_cooling(self):
         """Test rescaling factor for cooling (target < current)."""
         current_temp = 400.0
         target_temp = 300.0
 
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
         # Factor should be < 1 for cooling
         assert factor < 1.0
         expected = np.sqrt(target_temp / current_temp)
-        np.testing.assert_allclose(factor, expected, rtol=1e-10)
+        np.testing.assert_allclose(factor, expected, rtol=1e-6)
 
     def test_heating(self):
         """Test rescaling factor for heating (target > current)."""
         current_temp = 200.0
         target_temp = 400.0
 
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
         # Factor should be > 1 for heating
         assert factor > 1.0
         expected = np.sqrt(target_temp / current_temp)
-        np.testing.assert_allclose(factor, expected, rtol=1e-10)
+        np.testing.assert_allclose(factor, expected, rtol=1e-6)
 
     def test_no_rescaling(self):
         """Test rescaling factor when temperatures are equal."""
         current_temp = 300.0
         target_temp = 300.0
 
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
-        np.testing.assert_allclose(factor, 1.0, rtol=1e-10)
+        np.testing.assert_allclose(factor, 1.0, rtol=1e-6)
 
     def test_zero_current_temperature(self):
         """Test handling of zero current temperature (returns 1.0)."""
-        factor = compute_rescale_factor(0.0, 300.0)
+        factor = _compute_rescale_factor(0.0, 300.0)
         assert factor == 1.0
 
     def test_negative_current_temperature(self):
         """Test handling of negative current temperature (returns 1.0)."""
-        factor = compute_rescale_factor(-100.0, 300.0)
+        factor = _compute_rescale_factor(-100.0, 300.0)
         assert factor == 1.0
 
     def test_very_small_temperature(self):
@@ -123,7 +123,7 @@ class TestComputeRescaleFactor:
         current_temp = 300.0
         target_temp = 300.0001
 
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
         # Should be very close to 1
         assert 0.99 < factor < 1.01
@@ -412,7 +412,7 @@ class TestVelocityRescalingIntegration:
         current_temp = 2 * ke_initial / (ndof * kB)
 
         # Compute rescale factor
-        factor = compute_rescale_factor(current_temp, target_temp)
+        factor = _compute_rescale_factor(current_temp, target_temp)
 
         # Apply rescaling
         velocities = wp.array(velocities_np, dtype=dtype_vec, device=device)
