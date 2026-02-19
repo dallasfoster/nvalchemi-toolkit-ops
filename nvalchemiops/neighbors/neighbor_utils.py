@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -382,8 +382,8 @@ def compute_naive_num_shifts(
 
 def estimate_max_neighbors(
     cutoff: float,
-    atomic_density: float = 0.35,
-    safety_factor: float = 5.0,
+    atomic_density: float = 0.2,
+    safety_factor: float = 1.0,
 ) -> int:
     r"""Estimate maximum neighbors per atom based on volume calculations.
 
@@ -396,9 +396,9 @@ def estimate_max_neighbors(
     cutoff : float
         Maximum distance for considering atoms as neighbors.
     atomic_density : float, optional
-        Atomic density in atoms per unit volume. Default is 0.35.
+        Atomic density in atoms per unit volume. Default is 0.2.
     safety_factor : float
-        Safety factor to multiply the estimated number of neighbors. Default is 5.0.
+        Safety factor to multiply the estimated number of neighbors. Default is 1.0.
 
     Returns
     -------

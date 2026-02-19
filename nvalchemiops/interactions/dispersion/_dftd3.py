@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -651,10 +651,10 @@ def _unit_shift_to_cartesian(
     cell_mat: Any,
 ) -> Any:
     """Convert integer unit cell shift to Cartesian coordinates."""
-    unit_shift_float = wp.vec(
-        cell_mat[0].dtype(unit_shift[0]),
-        cell_mat[0].dtype(unit_shift[1]),
-        cell_mat[0].dtype(unit_shift[2]),
+    unit_shift_float = type(cell_mat[0])(
+        type(cell_mat[0, 0])(unit_shift[0]),
+        type(cell_mat[0, 0])(unit_shift[1]),
+        type(cell_mat[0, 0])(unit_shift[2]),
     )
     return unit_shift_float * cell_mat
 
