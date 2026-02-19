@@ -1413,7 +1413,9 @@ def run_batched_langevin_baoab(
         compute_kinetic_energy as ke_fn,
     )
 
-    wp_ke_scratch = wp.zeros(system.num_systems, dtype=system.wp_dtype, device=system.device)
+    wp_ke_scratch = wp.zeros(
+        system.num_systems, dtype=system.wp_dtype, device=system.device
+    )
 
     dof = np.maximum(
         3 * np.asarray(system.num_atoms_per_system, dtype=np.int64) - 3, 1
@@ -1682,7 +1684,9 @@ def run_nph_mtk(
     # Barostat mass uses kT and tau_p
     kT_ref = float(reference_temperature_K) * KB_EV
     wp_temp_arr = wp.array([kT_ref], dtype=system.wp_dtype, device=system.device)
-    wp_tau_arr = wp.array([float(pdamp_fs)], dtype=system.wp_dtype, device=system.device)
+    wp_tau_arr = wp.array(
+        [float(pdamp_fs)], dtype=system.wp_dtype, device=system.device
+    )
     wp_natoms_arr = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
     cell_masses = wp.empty(1, dtype=system.wp_dtype, device=system.device)
     compute_barostat_mass(
@@ -1703,7 +1707,9 @@ def run_nph_mtk(
     nph_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
     nph_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
     nph_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
-    nph_num_atoms_per_system = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+    nph_num_atoms_per_system = wp.array(
+        [system.num_atoms], dtype=wp.int32, device=system.device
+    )
 
     # Initial forces/virial
     wp_energies = system.compute_forces_virial(virial_tensors)
@@ -1711,8 +1717,10 @@ def run_nph_mtk(
     # Pre-compute volumes and kinetic energy for the first step
     compute_cell_volume(system.wp_cell, volumes=nph_volumes, device=system.device)
     compute_kinetic_energy(
-        system.wp_velocities, system.wp_masses,
-        kinetic_energy=nph_kinetic_energy, device=system.device,
+        system.wp_velocities,
+        system.wp_masses,
+        kinetic_energy=nph_kinetic_energy,
+        device=system.device,
     )
 
     stats_history: list[BarostatStats] = []
@@ -1818,7 +1826,9 @@ def run_npt_mtk(
     wp_target_pressure = wp.array([p_ext], dtype=system.wp_dtype, device=system.device)
 
     # Thermostat chain masses/state (expects kT, tau in same time units as dt)
-    thermostat_masses = wp.empty(int(chain_length), dtype=system.wp_dtype, device=system.device)
+    thermostat_masses = wp.empty(
+        int(chain_length), dtype=system.wp_dtype, device=system.device
+    )
     nhc_compute_masses(
         ndof=3 * system.num_atoms,
         target_temp=kT,
@@ -1846,7 +1856,9 @@ def run_npt_mtk(
 
     # Barostat masses/state
     wp_temp_baro = wp.array([kT], dtype=system.wp_dtype, device=system.device)
-    wp_tau_baro = wp.array([float(pdamp_fs)], dtype=system.wp_dtype, device=system.device)
+    wp_tau_baro = wp.array(
+        [float(pdamp_fs)], dtype=system.wp_dtype, device=system.device
+    )
     wp_natoms_baro = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
     cell_masses = wp.empty(1, dtype=system.wp_dtype, device=system.device)
     compute_barostat_mass(
@@ -1867,7 +1879,9 @@ def run_npt_mtk(
     npt_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
     npt_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
     npt_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
-    npt_num_atoms_per_system = wp.array([system.num_atoms], dtype=wp.int32, device=system.device)
+    npt_num_atoms_per_system = wp.array(
+        [system.num_atoms], dtype=wp.int32, device=system.device
+    )
 
     # Initial forces/virial
     wp_energies = system.compute_forces_virial(virial_tensors)
@@ -1875,8 +1889,10 @@ def run_npt_mtk(
     # Pre-compute volumes and kinetic energy for the first step
     compute_cell_volume(system.wp_cell, volumes=npt_volumes, device=system.device)
     compute_kinetic_energy(
-        system.wp_velocities, system.wp_masses,
-        kinetic_energy=npt_kinetic_energy, device=system.device,
+        system.wp_velocities,
+        system.wp_masses,
+        kinetic_energy=npt_kinetic_energy,
+        device=system.device,
     )
 
     stats_history: list[BarostatStats] = []

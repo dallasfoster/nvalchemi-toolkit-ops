@@ -3123,19 +3123,23 @@ class TestSingleBatchEquivalence:
 
         positions = wp.array(
             np.random.rand(num_atoms, 3).astype(np_dtype) * 8.0 + 1.0,
-            dtype=vec_dtype, device=device,
+            dtype=vec_dtype,
+            device=device,
         )
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype) * 0.3,
-            dtype=vec_dtype, device=device,
+            dtype=vec_dtype,
+            device=device,
         )
         forces = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype) * 0.01,
-            dtype=vec_dtype, device=device,
+            dtype=vec_dtype,
+            device=device,
         )
         masses = wp.array(
             np.ones(num_atoms, dtype=np_dtype) * 12.0,
-            dtype=scalar_dtype, device=device,
+            dtype=scalar_dtype,
+            device=device,
         )
 
         cell_np = np.diag([10.0, 10.0, 10.0]).astype(np_dtype)
@@ -3182,21 +3186,37 @@ class TestSingleBatchEquivalence:
         kt_single = wp.zeros((1, 9), dtype=s["scalar_dtype"], device=device)
         pt_single = wp.empty(1, dtype=s["tensor_dtype"], device=device)
         compute_pressure_tensor(
-            s["velocities"], s["masses"], s["virial_tensors"], s["cells"],
-            kt_single, pt_single, s["volumes"], batch_idx=None, device=device,
+            s["velocities"],
+            s["masses"],
+            s["virial_tensors"],
+            s["cells"],
+            kt_single,
+            pt_single,
+            s["volumes"],
+            batch_idx=None,
+            device=device,
         )
 
         kt_batch = wp.zeros((1, 9), dtype=s["scalar_dtype"], device=device)
         pt_batch = wp.empty(1, dtype=s["tensor_dtype"], device=device)
         compute_pressure_tensor(
-            s["velocities"], s["masses"], s["virial_tensors"], s["cells"],
-            kt_batch, pt_batch, s["volumes"], batch_idx=s["batch_idx"],
+            s["velocities"],
+            s["masses"],
+            s["virial_tensors"],
+            s["cells"],
+            kt_batch,
+            pt_batch,
+            s["volumes"],
+            batch_idx=s["batch_idx"],
             device=device,
         )
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(
-            pt_single.numpy(), pt_batch.numpy(), rtol=1e-5, atol=1e-7,
+            pt_single.numpy(),
+            pt_batch.numpy(),
+            rtol=1e-5,
+            atol=1e-7,
         )
 
     # -- npt_position_update_out ------------------------------------------
@@ -3206,21 +3226,36 @@ class TestSingleBatchEquivalence:
 
         pos_out_single = wp.empty_like(s["positions"])
         npt_position_update_out(
-            s["positions"], s["velocities"], s["cells"], s["cell_velocities"],
-            dt=0.001, positions_out=pos_out_single, cells_inv=s["cells_inv"],
-            batch_idx=None, device=device,
+            s["positions"],
+            s["velocities"],
+            s["cells"],
+            s["cell_velocities"],
+            dt=0.001,
+            positions_out=pos_out_single,
+            cells_inv=s["cells_inv"],
+            batch_idx=None,
+            device=device,
         )
 
         pos_out_batch = wp.empty_like(s["positions"])
         npt_position_update_out(
-            s["positions"], s["velocities"], s["cells"], s["cell_velocities"],
-            dt=0.001, positions_out=pos_out_batch, cells_inv=s["cells_inv"],
-            batch_idx=s["batch_idx"], device=device,
+            s["positions"],
+            s["velocities"],
+            s["cells"],
+            s["cell_velocities"],
+            dt=0.001,
+            positions_out=pos_out_batch,
+            cells_inv=s["cells_inv"],
+            batch_idx=s["batch_idx"],
+            device=device,
         )
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(
-            pos_out_single.numpy(), pos_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+            pos_out_single.numpy(),
+            pos_out_batch.numpy(),
+            rtol=1e-5,
+            atol=1e-7,
         )
 
     # -- npt_velocity_half_step_out (all modes) ---------------------------
@@ -3231,26 +3266,46 @@ class TestSingleBatchEquivalence:
 
         vel_out_single = wp.empty_like(s["velocities"])
         npt_velocity_half_step_out(
-            s["velocities"], s["masses"], s["forces"],
-            s["cell_velocities"], s["volumes"], s["eta_dots"],
-            s["num_atoms"], dt=0.001, velocities_out=vel_out_single,
-            batch_idx=None, num_atoms_per_system=s["num_atoms_per_system"],
-            cells_inv=s["cells_inv"], mode=mode, device=device,
+            s["velocities"],
+            s["masses"],
+            s["forces"],
+            s["cell_velocities"],
+            s["volumes"],
+            s["eta_dots"],
+            s["num_atoms"],
+            dt=0.001,
+            velocities_out=vel_out_single,
+            batch_idx=None,
+            num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"],
+            mode=mode,
+            device=device,
         )
 
         vel_out_batch = wp.empty_like(s["velocities"])
         npt_velocity_half_step_out(
-            s["velocities"], s["masses"], s["forces"],
-            s["cell_velocities"], s["volumes"], s["eta_dots"],
-            s["num_atoms"], dt=0.001, velocities_out=vel_out_batch,
+            s["velocities"],
+            s["masses"],
+            s["forces"],
+            s["cell_velocities"],
+            s["volumes"],
+            s["eta_dots"],
+            s["num_atoms"],
+            dt=0.001,
+            velocities_out=vel_out_batch,
             batch_idx=s["batch_idx"],
             num_atoms_per_system=s["num_atoms_per_system"],
-            cells_inv=s["cells_inv"], mode=mode, device=device,
+            cells_inv=s["cells_inv"],
+            mode=mode,
+            device=device,
         )
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(
-            vel_out_single.numpy(), vel_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+            vel_out_single.numpy(),
+            vel_out_batch.numpy(),
+            rtol=1e-5,
+            atol=1e-7,
         )
 
     # -- nph_velocity_half_step_out (all modes) ---------------------------
@@ -3261,24 +3316,42 @@ class TestSingleBatchEquivalence:
 
         vel_out_single = wp.empty_like(s["velocities"])
         nph_velocity_half_step_out(
-            s["velocities"], s["masses"], s["forces"],
-            s["cell_velocities"], s["volumes"],
-            s["num_atoms"], dt=0.001, velocities_out=vel_out_single,
-            batch_idx=None, num_atoms_per_system=s["num_atoms_per_system"],
-            cells_inv=s["cells_inv"], mode=mode, device=device,
+            s["velocities"],
+            s["masses"],
+            s["forces"],
+            s["cell_velocities"],
+            s["volumes"],
+            s["num_atoms"],
+            dt=0.001,
+            velocities_out=vel_out_single,
+            batch_idx=None,
+            num_atoms_per_system=s["num_atoms_per_system"],
+            cells_inv=s["cells_inv"],
+            mode=mode,
+            device=device,
         )
 
         vel_out_batch = wp.empty_like(s["velocities"])
         nph_velocity_half_step_out(
-            s["velocities"], s["masses"], s["forces"],
-            s["cell_velocities"], s["volumes"],
-            s["num_atoms"], dt=0.001, velocities_out=vel_out_batch,
+            s["velocities"],
+            s["masses"],
+            s["forces"],
+            s["cell_velocities"],
+            s["volumes"],
+            s["num_atoms"],
+            dt=0.001,
+            velocities_out=vel_out_batch,
             batch_idx=s["batch_idx"],
             num_atoms_per_system=s["num_atoms_per_system"],
-            cells_inv=s["cells_inv"], mode=mode, device=device,
+            cells_inv=s["cells_inv"],
+            mode=mode,
+            device=device,
         )
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(
-            vel_out_single.numpy(), vel_out_batch.numpy(), rtol=1e-5, atol=1e-7,
+            vel_out_single.numpy(),
+            vel_out_batch.numpy(),
+            rtol=1e-5,
+            atol=1e-7,
         )

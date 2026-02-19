@@ -196,8 +196,11 @@ converged = False
 for step in range(max_steps):
     # Unpack current state
     pos_current, cell_current = unpack_positions_with_cell(
-        ext_positions, positions=pos_scratch, cell=cell_scratch,
-        num_atoms=num_atoms, device=device,
+        ext_positions,
+        positions=pos_scratch,
+        cell=cell_scratch,
+        num_atoms=num_atoms,
+        device=device,
     )
 
     # Update MD system with current geometry
@@ -221,16 +224,25 @@ for step in range(max_steps):
     # Convert stress to cell force (for optimization)
     compute_cell_volume(md_system.wp_cell, volumes=volume_scratch, device=device)
     stress_to_cell_force(
-        stress, md_system.wp_cell, volume=volume_scratch,
-        cell_force=cell_force_scratch, keep_aligned=True, device=device,
+        stress,
+        md_system.wp_cell,
+        volume=volume_scratch,
+        cell_force=cell_force_scratch,
+        keep_aligned=True,
+        device=device,
     )
 
     # Pack forces into extended array
-    pack_forces_with_cell(forces, cell_force_scratch, extended=ext_forces, device=device)
+    pack_forces_with_cell(
+        forces, cell_force_scratch, extended=ext_forces, device=device
+    )
 
     # Re-pack positions (after wrapping)
     pack_positions_with_cell(
-        md_system.wp_positions, md_system.wp_cell, extended=ext_positions, device=device,
+        md_system.wp_positions,
+        md_system.wp_cell,
+        extended=ext_positions,
+        device=device,
     )
 
     # FIRE2 step on extended arrays
@@ -290,8 +302,11 @@ for step in range(max_steps):
 
 wp.synchronize()
 final_pos, final_cell = unpack_positions_with_cell(
-    ext_positions, positions=pos_scratch, cell=cell_scratch,
-    num_atoms=num_atoms, device=device,
+    ext_positions,
+    positions=pos_scratch,
+    cell=cell_scratch,
+    num_atoms=num_atoms,
+    device=device,
 )
 
 wp.synchronize()

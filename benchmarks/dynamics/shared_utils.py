@@ -2741,7 +2741,13 @@ class NvalchemiOpsBenchmark:
 
         # Align cell (one-time preprocessing)
         wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
-        align_cell(wp_positions, wp_cell, wp_transform, batch_idx=wp_bidx, device=self.wp_device)
+        align_cell(
+            wp_positions,
+            wp_cell,
+            wp_transform,
+            batch_idx=wp_bidx,
+            device=self.wp_device,
+        )
         self.wp_cell = wp_cell
         self.model.wp_cell = self.wp_cell
         wp.synchronize()
@@ -2865,7 +2871,9 @@ class NvalchemiOpsBenchmark:
 
         # Pre-allocate scratch buffers for unpack/repack in the loop
         wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
-        wp_positions_scratch = wp.empty(N, dtype=self.wp_vec_dtype, device=self.wp_device)
+        wp_positions_scratch = wp.empty(
+            N, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
         wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
 
         # Timed loop
@@ -3084,7 +3092,13 @@ class NvalchemiOpsBenchmark:
 
         # Align cell (one-time preprocessing)
         wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
-        align_cell(wp_positions, wp_cell, wp_transform, batch_idx=wp_bidx, device=self.wp_device)
+        align_cell(
+            wp_positions,
+            wp_cell,
+            wp_transform,
+            batch_idx=wp_bidx,
+            device=self.wp_device,
+        )
         self.wp_cell = wp_cell
         self.model.wp_cell = self.wp_cell
         wp.synchronize()
@@ -3157,7 +3171,9 @@ class NvalchemiOpsBenchmark:
 
         # Pre-allocate scratch buffers for unpack/repack in the loop
         wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
-        wp_positions_scratch = wp.empty(N, dtype=self.wp_vec_dtype, device=self.wp_device)
+        wp_positions_scratch = wp.empty(
+            N, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
         wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
 
         # Timed loop

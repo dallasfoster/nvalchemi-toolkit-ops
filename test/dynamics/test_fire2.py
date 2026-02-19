@@ -2766,8 +2766,16 @@ class TestFire2TorchCoordCell:
 
         # Run A: M==1 (convenience API)
         fire2_step_coord_cell(
-            pos_a, vel_a, forces, cell_a, cell_vel_a, cell_force,
-            batch_idx, alpha_a, dt_a, nsteps_a,
+            pos_a,
+            vel_a,
+            forces,
+            cell_a,
+            cell_vel_a,
+            cell_force,
+            batch_idx,
+            alpha_a,
+            dt_a,
+            nsteps_a,
             **FIRE2_DEFAULTS,
         )
 
@@ -2836,16 +2844,28 @@ class TestFire2TorchCoordCell:
 
         # Pack using batched kernels
         pack_positions_with_cell(
-            wp_pos_b, wp_cell_b, wp_ext_pos,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_pos_b,
+            wp_cell_b,
+            wp_ext_pos,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
         )
         pack_velocities_with_cell(
-            wp_vel_b, wp_cell_vel_b, wp_ext_vel,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_vel_b,
+            wp_cell_vel_b,
+            wp_ext_vel,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
         )
         pack_forces_with_cell(
-            wp_forces, wp_cell_force, wp_ext_forces,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_forces,
+            wp_cell_force,
+            wp_ext_forces,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
         )
 
         vf = torch.zeros(M, dtype=torch_dtype, device=device)
@@ -2854,7 +2874,9 @@ class TestFire2TorchCoordCell:
         max_norm_buf = torch.zeros(M, dtype=torch_dtype, device=device)
 
         _fire2_step(
-            wp_ext_pos, wp_ext_vel, wp_ext_forces,
+            wp_ext_pos,
+            wp_ext_vel,
+            wp_ext_forces,
             wp.from_torch(ext_bidx, dtype=wp.int32),
             wp.from_torch(alpha_b),
             wp.from_torch(dt_b),
@@ -2869,13 +2891,19 @@ class TestFire2TorchCoordCell:
 
         # Unpack using batched kernels
         unpack_positions_with_cell(
-            wp_ext_pos, wp_pos_b, wp_cell_b,
-            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+            wp_ext_pos,
+            wp_pos_b,
+            wp_cell_b,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
             device=wp_device,
         )
         unpack_velocities_with_cell(
-            wp_ext_vel, wp_vel_b, wp_cell_vel_b,
-            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
+            wp_ext_vel,
+            wp_vel_b,
+            wp_cell_vel_b,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
             device=wp_device,
         )
 
@@ -2900,24 +2928,26 @@ class TestFire2TorchCoordCell:
         np_dtype = np.float64
 
         # Build batch_idx for uneven systems
-        bidx_np = np.concatenate([
-            np.full(n, i, dtype=np.int32)
-            for i, n in enumerate(atoms_per_system)
-        ])
+        bidx_np = np.concatenate(
+            [np.full(n, i, dtype=np.int32) for i, n in enumerate(atoms_per_system)]
+        )
         batch_idx = torch.tensor(bidx_np, dtype=torch.int32, device=device)
 
         # Random state
         pos = torch.tensor(
             rng.standard_normal((N, 3)).astype(np_dtype),
-            dtype=torch_dtype, device=device,
+            dtype=torch_dtype,
+            device=device,
         )
         vel = torch.tensor(
             rng.standard_normal((N, 3)).astype(np_dtype) * 0.01,
-            dtype=torch_dtype, device=device,
+            dtype=torch_dtype,
+            device=device,
         )
         forces = torch.tensor(
             rng.standard_normal((N, 3)).astype(np_dtype),
-            dtype=torch_dtype, device=device,
+            dtype=torch_dtype,
+            device=device,
         )
         alpha = torch.full((M,), 0.09, dtype=torch_dtype, device=device)
         dt = torch.full((M,), 0.05, dtype=torch_dtype, device=device)
@@ -2935,8 +2965,16 @@ class TestFire2TorchCoordCell:
         # Run 5 steps
         for _ in range(5):
             fire2_step_coord_cell(
-                pos, vel, forces, cell, cell_vel, cell_force,
-                batch_idx, alpha, dt, nsteps_inc,
+                pos,
+                vel,
+                forces,
+                cell,
+                cell_vel,
+                cell_force,
+                batch_idx,
+                alpha,
+                dt,
+                nsteps_inc,
                 **FIRE2_DEFAULTS,
             )
 
@@ -2970,8 +3008,16 @@ class TestFire2TorchCoordCell:
 
         for _ in range(num_steps):
             fire2_step_coord_cell(
-                pos_a, vel_a, forces_a, cell_a, cell_vel_a, cell_force_a,
-                batch_idx, alpha_a, dt_a, nsteps_a,
+                pos_a,
+                vel_a,
+                forces_a,
+                cell_a,
+                cell_vel_a,
+                cell_force_a,
+                batch_idx,
+                alpha_a,
+                dt_a,
+                nsteps_a,
                 **FIRE2_DEFAULTS,
             )
 
@@ -3040,28 +3086,39 @@ class TestFire2TorchCoordCell:
                 wp.from_torch(pos_b, dtype=vec_type),
                 wp.from_torch(cell_b, dtype=mat_type),
                 wp.from_torch(ext_pos, dtype=vec_type),
-                wp_atom_ptr, wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
             pack_velocities_with_cell(
                 wp.from_torch(vel_b, dtype=vec_type),
                 wp.from_torch(cell_vel_b, dtype=mat_type),
                 wp.from_torch(ext_vel, dtype=vec_type),
-                wp_atom_ptr, wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
             pack_forces_with_cell(
                 wp.from_torch(forces_b, dtype=vec_type),
                 wp.from_torch(cell_force_b, dtype=mat_type),
                 wp.from_torch(ext_forces, dtype=vec_type),
-                wp_atom_ptr, wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                wp_atom_ptr,
+                wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
 
             # FIRE2 on extended arrays
             fire2_step_extended(
-                ext_pos, ext_vel, ext_forces, ext_bidx,
-                alpha_b, dt_b, nsteps_b,
+                ext_pos,
+                ext_vel,
+                ext_forces,
+                ext_bidx,
+                alpha_b,
+                dt_b,
+                nsteps_b,
                 **FIRE2_DEFAULTS,
             )
 
@@ -3070,15 +3127,19 @@ class TestFire2TorchCoordCell:
                 wp.from_torch(ext_pos, dtype=vec_type),
                 wp.from_torch(pos_b, dtype=vec_type),
                 wp.from_torch(cell_b, dtype=mat_type),
-                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                atom_ptr=wp_atom_ptr,
+                ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
             unpack_velocities_with_cell(
                 wp.from_torch(ext_vel, dtype=vec_type),
                 wp.from_torch(vel_b, dtype=vec_type),
                 wp.from_torch(cell_vel_b, dtype=mat_type),
-                atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-                device=wp_device, batch_idx=wp_bidx,
+                atom_ptr=wp_atom_ptr,
+                ext_atom_ptr=wp_ext_atom_ptr,
+                device=wp_device,
+                batch_idx=wp_bidx,
             )
 
         torch.cuda.synchronize()

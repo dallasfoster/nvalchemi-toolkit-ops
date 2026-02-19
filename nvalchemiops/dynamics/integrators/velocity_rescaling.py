@@ -89,7 +89,9 @@ REFERENCES
 """
 
 from __future__ import annotations
+
 from typing import Any
+
 import warp as wp
 
 from nvalchemiops.warp_dispatch import validate_out_array
@@ -110,6 +112,7 @@ __all__ = [
 # ==============================================================================
 # Functional Interface
 # ==============================================================================
+
 
 @wp.func
 def _compute_rescale_factor(

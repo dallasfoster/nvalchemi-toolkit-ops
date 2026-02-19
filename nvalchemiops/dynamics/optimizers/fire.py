@@ -789,7 +789,9 @@ def _fire_step_no_downhill_ptr_kernel(
     )
     for i in range(a0, a1):
         mass = masses[i]
-        inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+        inv_mass = wp.where(
+            mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0)
+        )
         velocities[i] += dt[sys] * forces[i] * inv_mass
         dr = dt[sys] * velocities[i]
         dr_clamped = clamp_displacement(dr, maxstep[sys])
@@ -929,7 +931,9 @@ def _fire_step_downhill_ptr_kernel(
 
     for i in range(a0, a1):
         mass = masses[i]
-        inv_mass = wp.where(mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0))
+        inv_mass = wp.where(
+            mass > type(mass)(0.0), type(mass)(1.0) / mass, type(mass)(0.0)
+        )
         velocities[i] += dt[sys] * forces[i] * inv_mass
         dr = dt[sys] * velocities[i]
         dr_clamped = clamp_displacement(dr, maxstep[sys])
@@ -1644,16 +1648,44 @@ def fire_step(
         kernel = _FIRE_STEP_PTR_OVERLOADS[downhill_enabled][vec_dtype]
         if downhill_enabled:
             inputs = [
-                energy, forces, positions, velocities, masses,
-                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                maxstep, n_steps_positive, n_min, f_dec, f_inc,
-                energy_last, positions_last, velocities_last, atom_ptr,
+                energy,
+                forces,
+                positions,
+                velocities,
+                masses,
+                alpha,
+                dt,
+                alpha_start,
+                f_alpha,
+                dt_min,
+                dt_max,
+                maxstep,
+                n_steps_positive,
+                n_min,
+                f_dec,
+                f_inc,
+                energy_last,
+                positions_last,
+                velocities_last,
+                atom_ptr,
             ]
         else:
             inputs = [
-                positions, velocities, forces, masses,
-                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                maxstep, n_steps_positive, n_min, f_dec, f_inc,
+                positions,
+                velocities,
+                forces,
+                masses,
+                alpha,
+                dt,
+                alpha_start,
+                f_alpha,
+                dt_min,
+                dt_max,
+                maxstep,
+                n_steps_positive,
+                n_min,
+                f_dec,
+                f_inc,
                 atom_ptr,
             ]
         wp.launch(kernel, dim=num_systems, inputs=inputs, device=device)
@@ -1686,10 +1718,18 @@ def fire_step(
                 _fire_revert_and_reduce_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    positions, velocities, forces,
-                    positions_last, velocities_last,
-                    batch_idx, uphill_flag,
-                    vf, vv, ff, num_atoms, ept,
+                    positions,
+                    velocities,
+                    forces,
+                    positions_last,
+                    velocities_last,
+                    batch_idx,
+                    uphill_flag,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
                 ],
                 device=device,
             )
@@ -1699,10 +1739,26 @@ def fire_step(
                 _FIRE_STEP_BATCH_UPDATE_OVERLOADS[True][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    positions, velocities, forces, masses,
-                    batch_idx, alpha, dt, alpha_start, f_alpha,
-                    dt_min, dt_max, maxstep, n_steps_positive,
-                    n_min, f_dec, f_inc, vf, vv, ff, uphill_flag,
+                    positions,
+                    velocities,
+                    forces,
+                    masses,
+                    batch_idx,
+                    alpha,
+                    dt,
+                    alpha_start,
+                    f_alpha,
+                    dt_min,
+                    dt_max,
+                    maxstep,
+                    n_steps_positive,
+                    n_min,
+                    f_dec,
+                    f_inc,
+                    vf,
+                    vv,
+                    ff,
+                    uphill_flag,
                 ],
                 device=device,
             )
@@ -1712,8 +1768,14 @@ def fire_step(
                 _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    velocities, forces, batch_idx,
-                    vf, vv, ff, num_atoms, ept,
+                    velocities,
+                    forces,
+                    batch_idx,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
                 ],
                 device=device,
             )
@@ -1723,10 +1785,25 @@ def fire_step(
                 _FIRE_STEP_BATCH_UPDATE_OVERLOADS[False][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    positions, velocities, forces, masses,
-                    batch_idx, alpha, dt, alpha_start, f_alpha,
-                    dt_min, dt_max, maxstep, n_steps_positive,
-                    n_min, f_dec, f_inc, vf, vv, ff,
+                    positions,
+                    velocities,
+                    forces,
+                    masses,
+                    batch_idx,
+                    alpha,
+                    dt,
+                    alpha_start,
+                    f_alpha,
+                    dt_min,
+                    dt_max,
+                    maxstep,
+                    n_steps_positive,
+                    n_min,
+                    f_dec,
+                    f_inc,
+                    vf,
+                    vv,
+                    ff,
                 ],
                 device=device,
             )
@@ -1874,16 +1951,40 @@ def fire_update(
         kernel = _FIRE_UPDATE_PTR_OVERLOADS[downhill_enabled][vec_dtype]
         if downhill_enabled:
             inputs = [
-                energy, energy_last, positions, positions_last,
-                velocities, velocities_last, forces,
-                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                n_steps_positive, n_min, f_dec, f_inc, atom_ptr,
+                energy,
+                energy_last,
+                positions,
+                positions_last,
+                velocities,
+                velocities_last,
+                forces,
+                alpha,
+                dt,
+                alpha_start,
+                f_alpha,
+                dt_min,
+                dt_max,
+                n_steps_positive,
+                n_min,
+                f_dec,
+                f_inc,
+                atom_ptr,
             ]
         else:
             inputs = [
-                velocities, forces,
-                alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                n_steps_positive, n_min, f_dec, f_inc, atom_ptr,
+                velocities,
+                forces,
+                alpha,
+                dt,
+                alpha_start,
+                f_alpha,
+                dt_min,
+                dt_max,
+                n_steps_positive,
+                n_min,
+                f_dec,
+                f_inc,
+                atom_ptr,
             ]
         wp.launch(kernel, dim=num_systems, inputs=inputs, device=device)
 
@@ -1918,10 +2019,18 @@ def fire_update(
                 _fire_revert_and_reduce_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    positions, velocities, forces,
-                    positions_last, velocities_last,
-                    batch_idx, uphill_flag,
-                    vf, vv, ff, num_atoms, ept,
+                    positions,
+                    velocities,
+                    forces,
+                    positions_last,
+                    velocities_last,
+                    batch_idx,
+                    uphill_flag,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
                 ],
                 device=device,
             )
@@ -1931,10 +2040,23 @@ def fire_update(
                 _FIRE_UPDATE_BATCH_UPDATE_OVERLOADS[True][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    velocities, forces, batch_idx,
-                    alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                    n_steps_positive, n_min, f_dec, f_inc,
-                    vf, vv, ff, uphill_flag,
+                    velocities,
+                    forces,
+                    batch_idx,
+                    alpha,
+                    dt,
+                    alpha_start,
+                    f_alpha,
+                    dt_min,
+                    dt_max,
+                    n_steps_positive,
+                    n_min,
+                    f_dec,
+                    f_inc,
+                    vf,
+                    vv,
+                    ff,
+                    uphill_flag,
                 ],
                 device=device,
             )
@@ -1944,8 +2066,14 @@ def fire_update(
                 _fire_reduce_batch_idx_rle_kernel_overload[vec_dtype],
                 dim=dim_reduce,
                 inputs=[
-                    velocities, forces, batch_idx,
-                    vf, vv, ff, num_atoms, ept,
+                    velocities,
+                    forces,
+                    batch_idx,
+                    vf,
+                    vv,
+                    ff,
+                    num_atoms,
+                    ept,
                 ],
                 device=device,
             )
@@ -1955,10 +2083,22 @@ def fire_update(
                 _FIRE_UPDATE_BATCH_UPDATE_OVERLOADS[False][vec_dtype],
                 dim=num_atoms,
                 inputs=[
-                    velocities, forces, batch_idx,
-                    alpha, dt, alpha_start, f_alpha, dt_min, dt_max,
-                    n_steps_positive, n_min, f_dec, f_inc,
-                    vf, vv, ff,
+                    velocities,
+                    forces,
+                    batch_idx,
+                    alpha,
+                    dt,
+                    alpha_start,
+                    f_alpha,
+                    dt_min,
+                    dt_max,
+                    n_steps_positive,
+                    n_min,
+                    f_dec,
+                    f_inc,
+                    vf,
+                    vv,
+                    ff,
                 ],
                 device=device,
             )

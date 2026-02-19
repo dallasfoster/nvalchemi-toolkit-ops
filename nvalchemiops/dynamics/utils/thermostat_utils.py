@@ -733,7 +733,9 @@ def _initialize_velocities_kernel(
     kT = type(mass)(temperature[0])
 
     # Standard deviation: sigma = sqrt(kT/m)
-    sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(type(mass)(kT) / mass), type(mass)(0.0))
+    sigma = wp.where(
+        mass > type(mass)(0.0), wp.sqrt(type(mass)(kT) / mass), type(mass)(0.0)
+    )
 
     # Initialize RNG state for this atom
     rng_state = wp.rand_init(int(random_seed), atom_idx)
@@ -960,7 +962,9 @@ def _initialize_velocities_ptr_out_kernel(
     for i in range(a0, a1):
         mass = masses[i]
         kT_typed = type(mass)(kT)
-        sigma = wp.where(mass > type(mass)(0.0), wp.sqrt(kT_typed / mass), type(mass)(0.0))
+        sigma = wp.where(
+            mass > type(mass)(0.0), wp.sqrt(kT_typed / mass), type(mass)(0.0)
+        )
 
         # Use (random_seed + i) for per-atom variation
         rng_state = wp.rand_init(int(random_seed), i)
@@ -1054,7 +1058,9 @@ def _compute_temperature_from_ke_kernel(
     sys_id = wp.tid()
     ke = kinetic_energy[sys_id]
     # Guard against division by zero: if dof is zero, set temperature to zero
-    temperature[sys_id] = wp.where(dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0))
+    temperature[sys_id] = wp.where(
+        dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0)
+    )
 
 
 @wp.kernel
@@ -1071,7 +1077,10 @@ def _batch_compute_temperature_from_ke_kernel(
     """
     sys_id = wp.tid()
     ke = kinetic_energies[sys_id]
-    temperatures[sys_id] = wp.where(dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0))
+    temperatures[sys_id] = wp.where(
+        dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0)
+    )
+
 
 # ==============================================================================
 # Kernel Overloads for Explicit Typing

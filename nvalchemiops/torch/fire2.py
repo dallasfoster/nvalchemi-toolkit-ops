@@ -457,28 +457,49 @@ def fire2_step_coord_cell(
     # --- Pack into extended arrays ---
     if M == 1:
         pack_positions_with_cell(
-            wp_pos, wp_cell, wp_ext_pos, device=wp_device,
+            wp_pos,
+            wp_cell,
+            wp_ext_pos,
+            device=wp_device,
         )
         pack_velocities_with_cell(
-            wp_vel, wp_cell_vel, wp_ext_vel, device=wp_device,
+            wp_vel,
+            wp_cell_vel,
+            wp_ext_vel,
+            device=wp_device,
         )
         pack_forces_with_cell(
-            wp_forces, wp_cell_force, wp_ext_forces, device=wp_device,
+            wp_forces,
+            wp_cell_force,
+            wp_ext_forces,
+            device=wp_device,
         )
     else:
         pack_positions_with_cell(
-            wp_pos, wp_cell, wp_ext_pos,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_pos,
+            wp_cell,
+            wp_ext_pos,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
             batch_idx=wp_bidx,
         )
         pack_velocities_with_cell(
-            wp_vel, wp_cell_vel, wp_ext_vel,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_vel,
+            wp_cell_vel,
+            wp_ext_vel,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
             batch_idx=wp_bidx,
         )
         pack_forces_with_cell(
-            wp_forces, wp_cell_force, wp_ext_forces,
-            wp_atom_ptr, wp_ext_atom_ptr, device=wp_device,
+            wp_forces,
+            wp_cell_force,
+            wp_ext_forces,
+            wp_atom_ptr,
+            wp_ext_atom_ptr,
+            device=wp_device,
             batch_idx=wp_bidx,
         )
 
@@ -517,23 +538,37 @@ def fire2_step_coord_cell(
     # --- Unpack extended arrays back to original tensors ---
     if M == 1:
         unpack_positions_with_cell(
-            wp_ext_pos, wp_pos, wp_cell,
-            num_atoms=N, device=wp_device,
+            wp_ext_pos,
+            wp_pos,
+            wp_cell,
+            num_atoms=N,
+            device=wp_device,
         )
         unpack_velocities_with_cell(
-            wp_ext_vel, wp_vel, wp_cell_vel,
-            num_atoms=N, device=wp_device,
+            wp_ext_vel,
+            wp_vel,
+            wp_cell_vel,
+            num_atoms=N,
+            device=wp_device,
         )
     else:
         unpack_positions_with_cell(
-            wp_ext_pos, wp_pos, wp_cell,
-            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-            device=wp_device, batch_idx=wp_bidx,
+            wp_ext_pos,
+            wp_pos,
+            wp_cell,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device,
+            batch_idx=wp_bidx,
         )
         unpack_velocities_with_cell(
-            wp_ext_vel, wp_vel, wp_cell_vel,
-            atom_ptr=wp_atom_ptr, ext_atom_ptr=wp_ext_atom_ptr,
-            device=wp_device, batch_idx=wp_bidx,
+            wp_ext_vel,
+            wp_vel,
+            wp_cell_vel,
+            atom_ptr=wp_atom_ptr,
+            ext_atom_ptr=wp_ext_atom_ptr,
+            device=wp_device,
+            batch_idx=wp_bidx,
         )
 
 

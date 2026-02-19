@@ -897,9 +897,7 @@ class TestFireUpdateErrors:
         del params["maxstep"]
         del params["uphill_flag"]
 
-        with pytest.raises(
-            ValueError, match="batch_idx OR atom_ptr, not both"
-        ):
+        with pytest.raises(ValueError, match="batch_idx OR atom_ptr, not both"):
             fire_update(
                 velocities=velocities,
                 forces=forces,
@@ -2193,9 +2191,7 @@ class TestBatchedPackUnpackParity:
         cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
 
         # Create atom_ptr, ext_atom_ptr, batch_idx
-        atom_ptr_np = np.array(
-            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
-        )
+        atom_ptr_np = np.array([0] + list(np.cumsum(atoms_per_system)), dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
         ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
         extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
@@ -2211,22 +2207,31 @@ class TestBatchedPackUnpackParity:
         # Batched pack (auto-compute batch_idx)
         ext_legacy = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_positions_with_cell(
-            positions, cells, ext_legacy,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
+            positions,
+            cells,
+            ext_legacy,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
             device=device,
         )
 
         # Batched pack (pre-computed batch_idx)
         ext_parallel = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_positions_with_cell(
-            positions, cells, ext_parallel,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            positions,
+            cells,
+            ext_parallel,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(
-            ext_parallel.numpy(), ext_legacy.numpy(), rtol=1e-6,
+            ext_parallel.numpy(),
+            ext_legacy.numpy(),
+            rtol=1e-6,
             err_msg="Atom-parallel pack positions does not match legacy batched",
         )
 
@@ -2249,45 +2254,58 @@ class TestBatchedPackUnpackParity:
         positions = wp.array(positions_np, dtype=dtype_vec, device=device)
         cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
 
-        atom_ptr_np = np.array(
-            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
-        )
+        atom_ptr_np = np.array([0] + list(np.cumsum(atoms_per_system)), dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
         ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
         extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
 
         batch_idx_np = np.repeat(
-            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+            np.arange(num_systems, dtype=np.int32),
+            atoms_per_system,
         )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
         ext_size = total_atoms + 2 * num_systems
         extended = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_positions_with_cell(
-            positions, cells, extended,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+            positions,
+            cells,
+            extended,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
         )
 
         # Batched unpack (auto-compute batch_idx)
         pos_legacy = wp.empty(total_atoms, dtype=dtype_vec, device=device)
         cell_legacy = wp.empty(num_systems, dtype=dtype_mat, device=device)
         unpack_positions_with_cell(
-            extended, pos_legacy, cell_legacy,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+            extended,
+            pos_legacy,
+            cell_legacy,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
         )
 
         # Batched unpack (pre-computed batch_idx)
         pos_parallel = wp.empty(total_atoms, dtype=dtype_vec, device=device)
         cell_parallel = wp.empty(num_systems, dtype=dtype_mat, device=device)
         unpack_positions_with_cell(
-            extended, pos_parallel, cell_parallel,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            extended,
+            pos_parallel,
+            cell_parallel,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(
-            pos_parallel.numpy(), pos_legacy.numpy(), rtol=1e-6,
+            pos_parallel.numpy(),
+            pos_legacy.numpy(),
+            rtol=1e-6,
             err_msg="Atom-parallel unpack positions mismatch",
         )
         np.testing.assert_allclose(
@@ -2314,17 +2332,18 @@ class TestBatchedPackUnpackParity:
             cell_forces_np[i] = np.random.randn(3, 3).astype(np_dtype) * 0.1
 
         forces = wp.array(forces_np, dtype=dtype_vec, device=device)
-        cell_forces = wp.array(cell_forces_np.reshape(-1), dtype=dtype_mat, device=device)
-
-        atom_ptr_np = np.array(
-            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
+        cell_forces = wp.array(
+            cell_forces_np.reshape(-1), dtype=dtype_mat, device=device
         )
+
+        atom_ptr_np = np.array([0] + list(np.cumsum(atoms_per_system)), dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
         ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
         extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
 
         batch_idx_np = np.repeat(
-            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+            np.arange(num_systems, dtype=np.int32),
+            atoms_per_system,
         )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
@@ -2333,21 +2352,31 @@ class TestBatchedPackUnpackParity:
         # Batched pack (auto-compute batch_idx)
         ext_legacy = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_forces_with_cell(
-            forces, cell_forces, ext_legacy,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr, device=device,
+            forces,
+            cell_forces,
+            ext_legacy,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
         )
 
         # Batched pack (pre-computed batch_idx)
         ext_parallel = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_forces_with_cell(
-            forces, cell_forces, ext_parallel,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            forces,
+            cell_forces,
+            ext_parallel,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(
-            ext_parallel.numpy(), ext_legacy.numpy(), rtol=1e-6,
+            ext_parallel.numpy(),
+            ext_legacy.numpy(),
+            rtol=1e-6,
             err_msg="Pre-computed batch_idx pack forces does not match auto-computed",
         )
 
@@ -2370,15 +2399,14 @@ class TestBatchedPackUnpackParity:
         positions = wp.array(positions_np, dtype=dtype_vec, device=device)
         cells = wp.array(cells_np.reshape(-1), dtype=dtype_mat, device=device)
 
-        atom_ptr_np = np.array(
-            [0] + list(np.cumsum(atoms_per_system)), dtype=np.int32
-        )
+        atom_ptr_np = np.array([0] + list(np.cumsum(atoms_per_system)), dtype=np.int32)
         atom_ptr = wp.array(atom_ptr_np, dtype=wp.int32, device=device)
         ext_atom_ptr = wp.empty(num_systems + 1, dtype=wp.int32, device=device)
         extend_atom_ptr(atom_ptr, ext_atom_ptr, device=device)
 
         batch_idx_np = np.repeat(
-            np.arange(num_systems, dtype=np.int32), atoms_per_system,
+            np.arange(num_systems, dtype=np.int32),
+            atoms_per_system,
         )
         batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
 
@@ -2387,28 +2415,40 @@ class TestBatchedPackUnpackParity:
         # Pack with batched kernels
         ext_packed = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_positions_with_cell(
-            positions, cells, ext_packed,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            positions,
+            cells,
+            ext_packed,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         # Unpack with batched kernels
         pos_out = wp.empty(total_atoms, dtype=dtype_vec, device=device)
         cell_out = wp.empty(num_systems, dtype=dtype_mat, device=device)
         unpack_positions_with_cell(
-            ext_packed, pos_out, cell_out,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            ext_packed,
+            pos_out,
+            cell_out,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(
-            pos_out.numpy(), positions_np, rtol=1e-5,
+            pos_out.numpy(),
+            positions_np,
+            rtol=1e-5,
             err_msg="Positions not recovered after pack/unpack roundtrip",
         )
         recovered_cells = cell_out.numpy().reshape(num_systems, 3, 3)
         np.testing.assert_allclose(
-            recovered_cells, cells_np, rtol=1e-5,
+            recovered_cells,
+            cells_np,
+            rtol=1e-5,
             err_msg="Cells not recovered after pack/unpack roundtrip",
         )
 
@@ -2441,28 +2481,40 @@ class TestBatchedPackUnpackParity:
         # Pack
         ext_packed = wp.empty(ext_size, dtype=dtype_vec, device=device)
         pack_positions_with_cell(
-            positions, cells, ext_packed,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            positions,
+            cells,
+            ext_packed,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         # Unpack
         pos_out = wp.empty(N, dtype=dtype_vec, device=device)
         cell_out = wp.empty(M, dtype=dtype_mat, device=device)
         unpack_positions_with_cell(
-            ext_packed, pos_out, cell_out,
-            atom_ptr=atom_ptr, ext_atom_ptr=ext_atom_ptr,
-            device=device, batch_idx=batch_idx,
+            ext_packed,
+            pos_out,
+            cell_out,
+            atom_ptr=atom_ptr,
+            ext_atom_ptr=ext_atom_ptr,
+            device=device,
+            batch_idx=batch_idx,
         )
 
         wp.synchronize_device(device)
         np.testing.assert_allclose(
-            pos_out.numpy(), positions_np, rtol=1e-10,
+            pos_out.numpy(),
+            positions_np,
+            rtol=1e-10,
             err_msg="Large-N/small-M pack/unpack mismatch",
         )
         recovered_cells = cell_out.numpy().reshape(M, 3, 3)
         np.testing.assert_allclose(
-            recovered_cells, cells_np, rtol=1e-10,
+            recovered_cells,
+            cells_np,
+            rtol=1e-10,
             err_msg="Large-N/small-M cell mismatch",
         )
 
@@ -3795,9 +3847,7 @@ class TestFireDeterminism:
         return {k: self._clone_wp_array(v) for k, v in arrays_dict.items()}
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize(
-        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
-    )
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
     def test_fire_step_single_deterministic(
         self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
     ):
@@ -3853,23 +3903,21 @@ class TestFireDeterminism:
                 ref_dt = params["dt"]
                 ref_alpha = params["alpha"]
             else:
-                assert np.array_equal(
-                    ref_pos.numpy(), pos.numpy()
-                ), f"Positions differ on repeat {i}"
-                assert np.array_equal(
-                    ref_vel.numpy(), vel.numpy()
-                ), f"Velocities differ on repeat {i}"
-                assert np.array_equal(
-                    ref_dt.numpy(), params["dt"].numpy()
-                ), f"dt differs on repeat {i}"
-                assert np.array_equal(
-                    ref_alpha.numpy(), params["alpha"].numpy()
-                ), f"alpha differs on repeat {i}"
+                assert np.array_equal(ref_pos.numpy(), pos.numpy()), (
+                    f"Positions differ on repeat {i}"
+                )
+                assert np.array_equal(ref_vel.numpy(), vel.numpy()), (
+                    f"Velocities differ on repeat {i}"
+                )
+                assert np.array_equal(ref_dt.numpy(), params["dt"].numpy()), (
+                    f"dt differs on repeat {i}"
+                )
+                assert np.array_equal(ref_alpha.numpy(), params["alpha"].numpy()), (
+                    f"alpha differs on repeat {i}"
+                )
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize(
-        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
-    )
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
     def test_fire_step_batch_idx_deterministic(
         self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
     ):
@@ -3931,17 +3979,15 @@ class TestFireDeterminism:
                 ref_pos = pos
                 ref_vel = vel
             else:
-                assert np.array_equal(
-                    ref_pos.numpy(), pos.numpy()
-                ), f"Positions differ on repeat {i}"
-                assert np.array_equal(
-                    ref_vel.numpy(), vel.numpy()
-                ), f"Velocities differ on repeat {i}"
+                assert np.array_equal(ref_pos.numpy(), pos.numpy()), (
+                    f"Positions differ on repeat {i}"
+                )
+                assert np.array_equal(ref_vel.numpy(), vel.numpy()), (
+                    f"Velocities differ on repeat {i}"
+                )
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize(
-        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
-    )
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
     def test_fire_update_single_deterministic(
         self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
     ):
@@ -3994,20 +4040,18 @@ class TestFireDeterminism:
                 ref_dt = params["dt"]
                 ref_alpha = params["alpha"]
             else:
-                assert np.array_equal(
-                    ref_vel.numpy(), vel.numpy()
-                ), f"Velocities differ on repeat {i}"
-                assert np.array_equal(
-                    ref_dt.numpy(), params["dt"].numpy()
-                ), f"dt differs on repeat {i}"
-                assert np.array_equal(
-                    ref_alpha.numpy(), params["alpha"].numpy()
-                ), f"alpha differs on repeat {i}"
+                assert np.array_equal(ref_vel.numpy(), vel.numpy()), (
+                    f"Velocities differ on repeat {i}"
+                )
+                assert np.array_equal(ref_dt.numpy(), params["dt"].numpy()), (
+                    f"dt differs on repeat {i}"
+                )
+                assert np.array_equal(ref_alpha.numpy(), params["alpha"].numpy()), (
+                    f"alpha differs on repeat {i}"
+                )
 
     @pytest.mark.parametrize("device", DEVICES)
-    @pytest.mark.parametrize(
-        "dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS
-    )
+    @pytest.mark.parametrize("dtype_vec,dtype_scalar,dtype_mat,np_dtype", DTYPE_CONFIGS)
     def test_fire_update_batch_idx_deterministic(
         self, device, dtype_vec, dtype_scalar, dtype_mat, np_dtype
     ):
@@ -4066,9 +4110,9 @@ class TestFireDeterminism:
             if i == 0:
                 ref_vel = vel
             else:
-                assert np.array_equal(
-                    ref_vel.numpy(), vel.numpy()
-                ), f"Velocities differ on repeat {i}"
+                assert np.array_equal(ref_vel.numpy(), vel.numpy()), (
+                    f"Velocities differ on repeat {i}"
+                )
 
 
 if __name__ == "__main__":

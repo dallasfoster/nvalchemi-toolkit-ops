@@ -148,16 +148,12 @@ def _align_cell_kernel(
     cos_beta = wp.dot(_cell[0], _cell[2]) / (a * c)  # angle between a and c
     cos_gamma = wp.dot(_cell[0], _cell[1]) / (a * b)  # angle between a and b
 
-    sin_gamma = wp.sqrt(
-        wp.max(_zero, _one - cos_gamma * cos_gamma)
-    )
+    sin_gamma = wp.sqrt(wp.max(_zero, _one - cos_gamma * cos_gamma))
 
     # Compute c vector components in aligned frame
     c1 = c * cos_beta
     c2 = (c * (cos_alpha - cos_beta * cos_gamma)) / sin_gamma
-    c3 = wp.sqrt(
-        wp.max(_zero, c * c - c1 * c1 - c2 * c2)
-    )
+    c3 = wp.sqrt(wp.max(_zero, c * c - c1 * c1 - c2 * c2))
 
     # Construct aligned cell (upper triangular)
     cell_r = type(_cell)(
@@ -477,9 +473,7 @@ def _pack_cell_dofs_kernel(
     ext_start = ext_atom_ptr[sys]
     H = cells[sys]
     extended[ext_start + n_atoms_sys] = type(extended[0])(H[0, 0], H[1, 0], H[2, 0])
-    extended[ext_start + n_atoms_sys + 1] = type(extended[0])(
-        H[1, 1], H[2, 1], H[2, 2]
-    )
+    extended[ext_start + n_atoms_sys + 1] = type(extended[0])(H[1, 1], H[2, 1], H[2, 2])
 
 
 @wp.kernel(enable_backward=False)
@@ -540,9 +534,15 @@ def _unpack_cell_dofs_kernel(
 
     _zero = type(v1[0])(0.0)
     cells[sys] = type(cells[0])(
-        v1[0], _zero, _zero,
-        v1[1], v2[0], _zero,
-        v1[2], v2[1], v2[2],
+        v1[0],
+        _zero,
+        _zero,
+        v1[1],
+        v2[0],
+        _zero,
+        v1[2],
+        v2[1],
+        v2[2],
     )
 
 
@@ -1328,7 +1328,13 @@ def unpack_velocities_with_cell(
         (velocities, cell_velocity)
     """
     return unpack_positions_with_cell(
-        extended, velocities, cell_velocity, num_atoms, atom_ptr, ext_atom_ptr, device,
+        extended,
+        velocities,
+        cell_velocity,
+        num_atoms,
+        atom_ptr,
+        ext_atom_ptr,
+        device,
         batch_idx,
     )
 

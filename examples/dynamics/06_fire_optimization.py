@@ -171,9 +171,7 @@ for step in range(max_steps):
     # Logging / stopping criteria (host read only at intervals)
     if step % check_interval == 0 or step == max_steps - 1:
         pe = float(energies.numpy().sum())
-        fmax = float(
-            np.linalg.norm(system.wp_forces.numpy(), axis=1).max()
-        )
+        fmax = float(np.linalg.norm(system.wp_forces.numpy(), axis=1).max())
 
         energy_hist.append(pe)
         maxf_hist.append(fmax)

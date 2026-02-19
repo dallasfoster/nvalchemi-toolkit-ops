@@ -35,15 +35,14 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 import warp as wp
 from _dynamics_utils import (
-    BatchedMDSystem,
     DEFAULT_CUTOFF,
     DEFAULT_SKIN,
     EPSILON_AR,
     MASS_AR,
     SIGMA_AR,
+    BatchedMDSystem,
     create_random_box_cluster,
     mass_amu_to_internal,
 )
@@ -54,7 +53,6 @@ from nvalchemiops.segment_ops import (
     segmented_max_norm,
     segmented_sum,
 )
-
 
 # ==============================================================================
 # Main Example
