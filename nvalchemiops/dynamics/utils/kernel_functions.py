@@ -31,7 +31,7 @@ Examples
 --------
 Basic usage in a kernel::
 
-    from ..utils.kernel_functions import (
+    from nvalchemiops.dynamics.utils.kernel_functions import (
         compute_acceleration_from_force,
         velocity_half_step_from_acceleration,
     )

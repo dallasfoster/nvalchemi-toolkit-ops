@@ -84,6 +84,7 @@ REFERENCES
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import warp as wp
@@ -109,7 +110,7 @@ __all__ = [
 # ==============================================================================
 
 # Tile block size for cooperative reductions
-TILE_THREADS = 128
+TILE_DIM = int(os.getenv("NVALCHEMIOPS_DYNAMICS_TILE_DIM", 256))
 
 
 @wp.kernel
@@ -216,7 +217,7 @@ def _shake_iteration_tiled_kernel(
     Updates positions to satisfy bond length constraint using atomic operations
     for position corrections. Uses tile reductions for max error computation.
 
-    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_bonds], block_dim = TILE_DIM
 
     Notes
     -----
@@ -258,7 +259,7 @@ def _shake_iteration_tiled_kernel(
     block_max_error = max_tile_error[0]
 
     # Only first thread in block updates max error
-    if bond_idx % TILE_THREADS == 0:
+    if bond_idx % TILE_DIM == 0:
         wp.atomic_max(max_error, 0, block_max_error)
 
     # Dot product r_ij · r_ij_old
@@ -370,7 +371,7 @@ def _shake_iteration_out_tiled_kernel(
 ):
     """Single SHAKE iteration with tile reductions (non-mutating).
 
-    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_bonds], block_dim = TILE_DIM
     """
     bond_idx = wp.tid()
 
@@ -400,7 +401,7 @@ def _shake_iteration_out_tiled_kernel(
     block_max_error = max_tile_error[0]
 
     # Only first thread in block updates max error
-    if bond_idx % TILE_THREADS == 0:
+    if bond_idx % TILE_DIM == 0:
         wp.atomic_max(max_error, 0, block_max_error)
 
     dot = wp.dot(r_ij, r_ij_old)
@@ -567,7 +568,7 @@ def _rattle_iteration_tiled_kernel(
     Updates velocities to satisfy velocity constraints using atomic operations
     for velocity corrections. Uses tile reductions for max error computation.
 
-    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_bonds], block_dim = TILE_DIM
 
     Notes
     -----
@@ -605,7 +606,7 @@ def _rattle_iteration_tiled_kernel(
     block_max_error = max_tile_error[0]
 
     # Only first thread in block updates max error
-    if bond_idx % TILE_THREADS == 0:
+    if bond_idx % TILE_DIM == 0:
         wp.atomic_max(max_error, 0, block_max_error)
 
     # Bond length squared
@@ -641,7 +642,7 @@ def _rattle_iteration_out_tiled_kernel(
 ):
     """Single RATTLE iteration with tile reductions (non-mutating).
 
-    Launch Grid: dim = [num_bonds], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_bonds], block_dim = TILE_DIM
     """
     bond_idx = wp.tid()
 
@@ -669,7 +670,7 @@ def _rattle_iteration_out_tiled_kernel(
     block_max_error = max_tile_error[0]
 
     # Only first thread in block updates max error
-    if bond_idx % TILE_THREADS == 0:
+    if bond_idx % TILE_DIM == 0:
         wp.atomic_max(max_error, 0, block_max_error)
 
     r_sq = wp.dot(r_ij, r_ij)
@@ -867,7 +868,7 @@ def shake_iteration(
             max_error,
         ],
         device=device,
-        block_dim=TILE_THREADS,
+        block_dim=TILE_DIM,
     )
 
     return max_error
@@ -1010,7 +1011,7 @@ def shake_iteration_out(
             max_error,
         ],
         device=device,
-        block_dim=TILE_THREADS,
+        block_dim=TILE_DIM,
     )
 
     return position_corrections, max_error
@@ -1133,7 +1134,7 @@ def rattle_iteration(
         dim=num_bonds,
         inputs=[positions, velocities, masses, bond_atom_i, bond_atom_j, max_error],
         device=device,
-        block_dim=TILE_THREADS,
+        block_dim=TILE_DIM,
     )
 
     return max_error
@@ -1251,7 +1252,7 @@ def rattle_iteration_out(
             max_error,
         ],
         device=device,
-        block_dim=TILE_THREADS,
+        block_dim=TILE_DIM,
     )
 
     return velocity_corrections, max_error

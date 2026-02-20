@@ -37,7 +37,7 @@ from typing import Any
 
 import warp as wp
 
-from .launch_helpers import build_family_dict
+from nvalchemiops.dynamics.utils.launch_helpers import build_family_dict
 
 # =============================================================================
 # @wp.func -- shared physics computations

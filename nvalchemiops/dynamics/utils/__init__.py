@@ -123,7 +123,7 @@ is_first_atom_of_system
 
 """
 
-from .cell_filter import (
+from nvalchemiops.dynamics.utils.cell_filter import (
     # Cell alignment
     align_cell,
     # Batch index extension
@@ -140,7 +140,7 @@ from .cell_filter import (
     unpack_positions_with_cell,
     unpack_velocities_with_cell,
 )
-from .cell_utils import (
+from nvalchemiops.dynamics.utils.cell_utils import (
     apply_strain_to_cell,
     # Coordinate transformations
     cartesian_to_fractional,
@@ -157,7 +157,7 @@ from .cell_utils import (
     wrap_positions_to_cell,
     wrap_positions_to_cell_out,
 )
-from .constraints import (
+from nvalchemiops.dynamics.utils.constraints import (
     # RATTLE - Mutating
     rattle_constraints,
     # RATTLE - Non-mutating
@@ -171,7 +171,7 @@ from .constraints import (
     shake_iteration,
     shake_iteration_out,
 )
-from .kernel_functions import (
+from nvalchemiops.dynamics.utils.kernel_functions import (
     # Physics functions
     clamp_displacement,
     compute_acceleration_from_force,
@@ -184,7 +184,7 @@ from .kernel_functions import (
     velocity_half_step_from_acceleration,
     velocity_verlet_position_step,
 )
-from .thermostat_utils import (
+from nvalchemiops.dynamics.utils.thermostat_utils import (
     # Non-mutating (compute only)
     compute_kinetic_energy,
     compute_temperature,

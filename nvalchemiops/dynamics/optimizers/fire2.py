@@ -69,19 +69,20 @@ REFERENCES
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import warp as wp
 
-from ...segment_ops import compute_ept
-from ..utils.kernel_functions import compute_vf_vv_ff
+from nvalchemiops.dynamics.utils.kernel_functions import compute_vf_vv_ff
+from nvalchemiops.segment_ops import compute_ept
 
 # =============================================================================
 # Kernel 1: Triple inner-product reduction (deferred half-step)
 # =============================================================================
 
 # Tile block size for cooperative reductions
-TILE_THREADS = 256
+TILE_DIM = int(os.getenv("NVALCHEMIOPS_DYNAMICS_TILE_DIM", 256))
 
 
 @wp.kernel(enable_backward=False)
@@ -194,13 +195,13 @@ def _fire2_reduce_only_tiled_kernel(
 
     where v_upd[i] = velocities[i] + forces[i] * dt[batch_idx[i]].
 
-    Launch Grid: dim = [N_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [N_atoms], block_dim = TILE_DIM
 
     Notes
     -----
     - Simpler per-atom processing (no RLE complexity)
     - Uses wp.tile() and wp.tile_sum() for cooperative reduction
-    - Reduces atomics from N to N/TILE_THREADS per system
+    - Reduces atomics from N to N/TILE_DIM per system
     """
     atom_idx = wp.tid()
     system_id = batch_idx[atom_idx]
@@ -227,7 +228,7 @@ def _fire2_reduce_only_tiled_kernel(
     sum_ff = s_ff[0]
 
     # Only first thread in block writes (3 atomics per block)
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(vf, system_id, sum_vf)
         wp.atomic_add(v_sumsq, system_id, sum_vv)
         wp.atomic_add(f_sumsq, system_id, sum_ff)
@@ -638,8 +639,6 @@ def fire2_step(
     tmax: float = 0.08,
     tmin: float = 0.005,
     maxstep: float = 0.1,
-    # Device
-    device: str = None,
 ) -> None:
     """Complete FIRE2 optimization step.
 
@@ -675,8 +674,6 @@ def fire2_step(
         Timestep bounds.
     maxstep : float
         Maximum step magnitude per system.
-    device : str, optional
-        Warp device. Inferred from ``positions`` if not provided.
 
     Notes
     -----
@@ -712,10 +709,7 @@ def fire2_step(
         raise ValueError(f"nsteps_inc length {nsteps_inc.shape[0]} != alpha length {M}")
 
     vec_dtype = positions.dtype
-    if device is None:
-        device = positions.device
-    elif isinstance(device, str):
-        device = wp.get_device(device)
+    device = positions.device
 
     vf.zero_()
     v_sumsq.zero_()

@@ -53,7 +53,7 @@ Example
 ... )
 """
 
-from . import integrators, optimizers, utils
+from nvalchemiops.dynamics import integrators, optimizers, utils
 
 __all__ = [
     # Submodules

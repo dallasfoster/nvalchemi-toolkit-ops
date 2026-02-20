@@ -290,6 +290,8 @@ def _pack_positions_kernel(
         # Second cell vec3: [b*sin(γ), c2, c3] = [H[1,1], H[2,1], H[2,2]]
         H = cell[0]
         extended[idx] = type(positions[0])(H[1, 1], H[2, 1], H[2, 2])
+    else:
+        return
 
 
 @wp.kernel
@@ -346,6 +348,8 @@ def _unpack_positions_kernel(
             v2[1],
             v2[2],  # Row 2
         )
+    else:
+        return
 
 
 @wp.kernel
@@ -392,6 +396,8 @@ def _pack_forces_kernel(
         # Second cell force vec3
         Fc = cell_force[0]
         extended[idx] = type(forces[0])(Fc[1, 1], Fc[2, 1], Fc[2, 2])
+    else:
+        return
 
 
 @wp.kernel

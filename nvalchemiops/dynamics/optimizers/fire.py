@@ -71,14 +71,17 @@ from typing import Any
 
 import warp as wp
 
-from ...segment_ops import compute_ept
-from ..utils.kernel_functions import (
+from nvalchemiops.dynamics.utils.kernel_functions import (
     clamp_displacement,
     compute_vf_vv_ff,
     fire_velocity_mixing,
     is_first_atom_of_system,
 )
-from ..utils.launch_helpers import ExecutionMode, resolve_execution_mode
+from nvalchemiops.dynamics.utils.launch_helpers import (
+    ExecutionMode,
+    resolve_execution_mode,
+)
+from nvalchemiops.segment_ops import compute_ept
 
 
 @wp.kernel(enable_backward=False)
@@ -1528,8 +1531,6 @@ def fire_step(
     energy_last: wp.array = None,
     positions_last: wp.array = None,
     velocities_last: wp.array = None,
-    # Device
-    device: str = None,
 ) -> None:
     """
     Unified FIRE optimization step with MD integration.
@@ -1588,8 +1589,6 @@ def fire_step(
         Last accepted positions (for downhill rollback).
     velocities_last : wp.array, shape (N,) or (N_total,), dtype=wp.vec3*, optional
         Last accepted velocities (for downhill rollback).
-    device : str, optional
-        Warp device.
 
     Examples
     --------
@@ -1623,8 +1622,7 @@ def fire_step(
     ...           energy=energy, energy_last=energy_last,
     ...           positions_last=positions_last, velocities_last=velocities_last)
     """
-    if device is None:
-        device = positions.device
+    device = positions.device
 
     if vf is not None:
         vf.zero_()
@@ -1842,8 +1840,6 @@ def fire_update(
     positions: wp.array = None,
     positions_last: wp.array = None,
     velocities_last: wp.array = None,
-    # Device
-    device: str = None,
 ) -> None:
     """
     FIRE parameter update and velocity mixing WITHOUT MD integration.
@@ -1862,7 +1858,7 @@ def fire_update(
     velocities : wp.array, shape (N,) or (N_total,), dtype=wp.vec3*
         Velocities (modified in-place with FIRE mixing).
     forces : wp.array, shape (N,) or (N_total,), dtype=wp.vec3*
-        Forces.
+        Atomic forces.
     alpha : wp.array, shape (1,) or (B,), dtype=wp.float*
         FIRE mixing parameter.
     dt : wp.array, shape (1,) or (B,), dtype=wp.float*
@@ -1900,8 +1896,6 @@ def fire_update(
         Last accepted positions (for downhill rollback).
     velocities_last : wp.array, shape (N,) or (N_total,), dtype=wp.vec3*, optional
         Last accepted velocities (for downhill rollback).
-    device : str, optional
-        Warp device.
 
     Examples
     --------
@@ -1925,8 +1919,7 @@ def fire_update(
     >>> # Unpack results
     >>> positions, cell = unpack_positions_with_cell(ext_pos, num_atoms)
     """
-    if device is None:
-        device = velocities.device
+    device = velocities.device
 
     if vf is not None:
         vf.zero_()

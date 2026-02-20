@@ -380,7 +380,6 @@ class TestFireStepPtr:
             masses=masses,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -421,7 +420,6 @@ class TestFireStepPtr:
             masses=masses,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -474,7 +472,6 @@ class TestFireStepPtr:
             atom_ptr=atom_ptr,
             **params,
             **downhill,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -521,7 +518,6 @@ class TestFireStepPtrPhysics:
                 masses=masses,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
             wp.synchronize_device(device)
@@ -588,7 +584,6 @@ class TestFireStepPtrPhysics:
                 masses=masses,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
         wp.synchronize_device(device)
@@ -648,7 +643,6 @@ class TestFireUpdate:
             forces=forces,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -684,7 +678,6 @@ class TestFireUpdate:
             forces=forces,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -724,7 +717,6 @@ class TestFireUpdate:
             forces=forces,
             **params,
             **accum,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -767,7 +759,6 @@ class TestFireUpdate:
             batch_idx=batch_idx,
             **params,
             **accum,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -829,7 +820,6 @@ class TestFireUpdate:
             positions_last=positions_last,
             velocities_last=velocities_last,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -904,7 +894,6 @@ class TestFireUpdateErrors:
                 atom_ptr=atom_ptr,
                 batch_idx=batch_idx,
                 **params,
-                device=device,
             )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -939,7 +928,6 @@ class TestFireUpdateErrors:
                 atom_ptr=atom_ptr,
                 energy=energy,
                 **params,
-                device=device,
             )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -976,7 +964,6 @@ class TestFireUpdateErrors:
                 forces=forces,
                 batch_idx=batch_idx,
                 **params,
-                device=device,
             )
 
 
@@ -2853,7 +2840,6 @@ class TestVariableCellOptimization:
             masses=masses,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -2893,7 +2879,6 @@ class TestVariableCellOptimization:
             forces=forces,
             atom_ptr=atom_ptr,
             **params,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -3020,7 +3005,6 @@ class TestVariableCellOptimization:
                 masses=ext_masses,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
         wp.synchronize_device(device)
@@ -3176,7 +3160,6 @@ class TestVariableCellOptimization:
                 masses=ext_masses,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
         wp.synchronize_device(device)
@@ -3407,7 +3390,6 @@ class TestVariableCellOptimization:
                 masses=ext_masses,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
         wp.synchronize_device(device)
@@ -3478,7 +3460,6 @@ class TestFireStepErrors:
                 batch_idx=batch_idx,
                 atom_ptr=atom_ptr,
                 **params,
-                device=device,
             )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -3505,7 +3486,6 @@ class TestFireStepErrors:
                 masses=masses,
                 # No vf, vv, ff provided
                 **params,
-                device=device,
             )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -3538,7 +3518,6 @@ class TestFireStepErrors:
                 atom_ptr=atom_ptr,
                 energy=energy,  # Partial downhill
                 **params,
-                device=device,
             )
 
 
@@ -3583,7 +3562,6 @@ class TestFireStepSingle:
             masses=masses,
             **params,
             **accum,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -3630,7 +3608,6 @@ class TestFireStepSingle:
             **params,
             **accum,
             **downhill,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -3718,7 +3695,6 @@ class TestFireStepBatchIdx:
             batch_idx=batch_idx,
             **params,
             **accum,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -3772,7 +3748,6 @@ class TestFireStepBatchIdx:
             **params,
             **accum,
             **downhill,
-            device=device,
         )
 
         wp.synchronize_device(device)
@@ -3816,7 +3791,6 @@ class TestFireStepBatchIdx:
                 masses=masses,
                 batch_idx=batch_idx,
                 **params,
-                device=device,
             )
 
 
@@ -3893,7 +3867,6 @@ class TestFireDeterminism:
                 masses=masses,
                 **params,
                 **accum,
-                device=device,
             )
             wp.synchronize()
 
@@ -3971,7 +3944,6 @@ class TestFireDeterminism:
                 batch_idx=batch_idx,
                 **params,
                 **accum,
-                device=device,
             )
             wp.synchronize()
 
@@ -4031,7 +4003,6 @@ class TestFireDeterminism:
                 f_dec=params["f_dec"],
                 f_inc=params["f_inc"],
                 **accum,
-                device=device,
             )
             wp.synchronize()
 
@@ -4103,7 +4074,6 @@ class TestFireDeterminism:
                 f_inc=params["f_inc"],
                 batch_idx=batch_idx,
                 **accum,
-                device=device,
             )
             wp.synchronize()
 

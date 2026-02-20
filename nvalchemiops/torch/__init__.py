@@ -36,6 +36,10 @@ if importlib.util.find_spec("torch") is None:
         " Please install via `pip install 'nvalchemiops[torch]'`."
     )
 
-from .fire2 import fire2_step_coord, fire2_step_coord_cell, fire2_step_extended
+from nvalchemiops.torch.fire2 import (
+    fire2_step_coord,
+    fire2_step_coord_cell,
+    fire2_step_extended,
+)
 
 __all__ = ["fire2_step_coord", "fire2_step_coord_cell", "fire2_step_extended"]

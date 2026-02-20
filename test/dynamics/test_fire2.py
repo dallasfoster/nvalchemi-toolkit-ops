@@ -1239,7 +1239,6 @@ class TestFire2DeviceInference:
             v_sumsq,
             f_sumsq,
             max_norm,
-            device=device,
             **FIRE2_DEFAULTS,
         )
         wp.synchronize()
@@ -2886,7 +2885,6 @@ class TestFire2TorchCoordCell:
             wp.from_torch(v_sumsq),
             wp.from_torch(f_sumsq),
             wp.from_torch(max_norm_buf),
-            device=wp_device,
             **FIRE2_DEFAULTS,
         )
 

@@ -108,10 +108,6 @@ def compute_ept(N: int, sm_count: int, is_vec3: bool) -> int:
     return max(ept_min, min(p, ept_max))
 
 
-# Backward-compatible alias -- will be removed in a future release.
-_compute_ept = compute_ept
-
-
 def _launch_rle(
     overloads: dict, key, N: int, device, *args, is_vec: bool = False
 ) -> None:

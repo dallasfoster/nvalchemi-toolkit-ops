@@ -46,19 +46,22 @@ All kernels are dtype-agnostic and support both float32 and float64.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import warp as wp
 
-from nvalchemiops.warp_dispatch import validate_out_array
-
-from ..utils.cell_utils import compute_cell_inverse, compute_cell_volume
-from ..utils.launch_helpers import (
+from nvalchemiops.dynamics.utils.cell_utils import (
+    compute_cell_inverse,
+    compute_cell_volume,
+)
+from nvalchemiops.dynamics.utils.launch_helpers import (
     KernelFamily,
     launch_family,
     resolve_execution_mode,
 )
-from ..utils.thermostat_utils import compute_kinetic_energy
+from nvalchemiops.dynamics.utils.thermostat_utils import compute_kinetic_energy
+from nvalchemiops.warp_dispatch import validate_out_array
 
 __all__ = [
     # Tensor types for pressure/virial
@@ -180,7 +183,7 @@ def _npt_position_step(r: Any, v: Any, h_dot: Any, h_inv: Any, dt: Any) -> Any:
 # ==============================================================================
 
 # Tile block size for cooperative reductions
-TILE_THREADS = 256
+TILE_DIM = int(os.getenv("NVALCHEMIOPS_DYNAMICS_TILE_DIM", 256))
 
 
 @wp.kernel
@@ -222,7 +225,7 @@ def _compute_kinetic_tensor_single_tiled_kernel(
 
     P_kin[i,j] = sum_k m_k * v_k[i] * v_k[j]
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
     v = velocities[atom_idx]
@@ -273,7 +276,7 @@ def _compute_kinetic_tensor_single_tiled_kernel(
     sum_zz = s_zz[0]
 
     # Only first thread in block writes (9 atomics per block)
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(kinetic_tensors, 0, 0, sum_xx)
         wp.atomic_add(kinetic_tensors, 0, 1, sum_xy)
         wp.atomic_add(kinetic_tensors, 0, 2, sum_xz)
@@ -321,7 +324,7 @@ def _compute_kinetic_tensor_tiled_kernel(
 ):
     """Compute kinetic contribution to pressure tensor with tile reductions (batched).
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
     sys_id = batch_idx[atom_idx]
@@ -373,7 +376,7 @@ def _compute_kinetic_tensor_tiled_kernel(
     sum_zz = s_zz[0]
 
     # Only first thread in block writes (9 atomics per block per system)
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(kinetic_tensors, sys_id, 0, sum_xx)
         wp.atomic_add(kinetic_tensors, sys_id, 1, sum_xy)
         wp.atomic_add(kinetic_tensors, sys_id, 2, sum_xz)
@@ -1625,9 +1628,7 @@ def compute_pressure_tensor(
     else:
         kernel = _KINETIC_TENSOR_FAMILY.batch_idx
         inputs = [velocities, masses, batch_idx, kinetic_tensors]
-    wp.launch(
-        kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_THREADS
-    )
+    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_DIM)
 
     wp.launch(
         _finalize_pressure_tensor_kernel,

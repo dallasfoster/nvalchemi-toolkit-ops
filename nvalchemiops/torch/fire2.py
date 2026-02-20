@@ -164,7 +164,6 @@ def fire2_step_coord(
     device = positions.device
     M = alpha.shape[0]
     vec_type = _TORCH_TO_WP_VEC[dtype]
-    wp_device = wp.device_from_torch(device)
 
     # Scratch buffers: allocate if not provided, zero if provided
     vf = _alloc_or_zero(vf, M, dtype, device)
@@ -193,7 +192,6 @@ def fire2_step_coord(
         tmax=tmax,
         tmin=tmin,
         maxstep=maxstep,
-        device=wp_device,
     )
 
 
@@ -532,7 +530,6 @@ def fire2_step_coord_cell(
         tmax=tmax,
         tmin=tmin,
         maxstep=maxstep,
-        device=wp_device,
     )
 
     # --- Unpack extended arrays back to original tensors ---
@@ -634,7 +631,6 @@ def fire2_step_extended(
     device = ext_positions.device
     M = alpha.shape[0]
     vec_type = _TORCH_TO_WP_VEC[dtype]
-    wp_device = wp.device_from_torch(device)
 
     # Reduction scratch buffers
     vf = _alloc_or_zero(vf, M, dtype, device)
@@ -662,5 +658,4 @@ def fire2_step_extended(
         tmax=tmax,
         tmin=tmin,
         maxstep=maxstep,
-        device=wp_device,
     )

@@ -131,7 +131,7 @@ Usage Examples
 For detailed documentation and mathematical formulations, see the :ref:`dynamics_userguide`.
 """
 
-from .langevin import (
+from nvalchemiops.dynamics.integrators.langevin import (
     langevin_baoab_finalize,
     langevin_baoab_finalize_out,
     # Mutating
@@ -139,7 +139,7 @@ from .langevin import (
     # Non-mutating
     langevin_baoab_half_step_out,
 )
-from .nose_hoover import (
+from nvalchemiops.dynamics.integrators.nose_hoover import (
     nhc_compute_chain_energy,
     # Utilities
     nhc_compute_masses,
@@ -152,7 +152,7 @@ from .nose_hoover import (
     nhc_velocity_half_step,
     nhc_velocity_half_step_out,
 )
-from .npt import (
+from nvalchemiops.dynamics.integrators.npt import (
     # Barostat utilities
     compute_barostat_mass,
     compute_barostat_potential_energy,
@@ -188,7 +188,7 @@ from .npt import (
     # Tensor types for pressure/virial
     vec9f,
 )
-from .velocity_rescaling import (
+from nvalchemiops.dynamics.integrators.velocity_rescaling import (
     # Utility
     _compute_rescale_factor,
     # Mutating
@@ -196,7 +196,7 @@ from .velocity_rescaling import (
     # Non-mutating
     velocity_rescale_out,
 )
-from .velocity_verlet import (
+from nvalchemiops.dynamics.integrators.velocity_verlet import (
     # Mutating
     velocity_verlet_position_update,
     # Non-mutating

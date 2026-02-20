@@ -49,7 +49,7 @@ Kernel Selection
 - Downhill arrays provided: downhill variant with energy check
 """
 
-from .fire import (
+from nvalchemiops.dynamics.optimizers.fire import (
     # Low-level kernels
     _fire_step_downhill_ptr_kernel,
     _fire_step_no_downhill_ptr_kernel,
@@ -59,7 +59,7 @@ from .fire import (
     fire_step,
     fire_update,
 )
-from .fire2 import fire2_step
+from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
 
 __all__ = [
     # Unified API

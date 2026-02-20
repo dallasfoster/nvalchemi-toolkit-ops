@@ -67,14 +67,17 @@ All functions in this module support three execution modes:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import warp as wp
 
+from nvalchemiops.dynamics.utils.launch_helpers import dispatch_family
+from nvalchemiops.dynamics.utils.shared_kernels import (
+    position_update_families,
+    velocity_kick_families,
+)
 from nvalchemiops.warp_dispatch import validate_out_array
-
-from ..utils.launch_helpers import dispatch_family
-from ..utils.shared_kernels import position_update_families, velocity_kick_families
 
 __all__ = [
     # Mutating (in-place) APIs
@@ -119,7 +122,7 @@ YOSHIDA_SUZUKI_5 = [_YS5_W0, _YS5_W1, _YS5_W2, _YS5_W1, _YS5_W0]
 # ==============================================================================
 
 # Tile block size for cooperative reductions
-TILE_THREADS = 256
+TILE_DIM = int(os.getenv("NVALCHEMIOPS_DYNAMICS_TILE_DIM", 256))
 
 
 @wp.kernel
@@ -152,7 +155,7 @@ def _compute_2ke_tiled_kernel(
 ):
     """Compute 2*KE with tile reductions (single system).
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
 
@@ -172,7 +175,7 @@ def _compute_2ke_tiled_kernel(
     sum_2ke = s[0]
 
     # Only first thread in block writes
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(ke2, 0, sum_2ke)
 
 

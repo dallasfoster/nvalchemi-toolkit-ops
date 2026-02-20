@@ -97,6 +97,7 @@ All functions in this module support three execution modes:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import warp as wp
@@ -118,7 +119,7 @@ __all__ = [
 # ==============================================================================
 
 # Tile block size for cooperative reductions
-TILE_THREADS = 128
+TILE_DIM = int(os.getenv("NVALCHEMIOPS_DYNAMICS_TILE_DIM", 256))
 
 
 @wp.kernel
@@ -166,7 +167,7 @@ def _compute_kinetic_energy_tiled_kernel(
 
     Accumulates KE = 0.5 * sum_i(m_i * v_i · v_i) using block-level reductions.
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
 
@@ -186,7 +187,7 @@ def _compute_kinetic_energy_tiled_kernel(
     sum_ke = s_ke[0]
 
     # Only first thread in block writes
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(kinetic_energy, 0, sum_ke)
 
 
@@ -236,7 +237,7 @@ def _batch_compute_kinetic_energy_tiled_kernel(
 ):
     """Compute per-system kinetic energy with tile reductions (batched).
 
-    Launch Grid: dim = [num_atoms_total], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms_total], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
     system_id = batch_idx[atom_idx]
@@ -257,7 +258,7 @@ def _batch_compute_kinetic_energy_tiled_kernel(
     sum_ke = s_ke[0]
 
     # Only first thread in block writes
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         wp.atomic_add(kinetic_energies, system_id, sum_ke)
 
 
@@ -352,7 +353,7 @@ def _compute_com_velocity_tiled_kernel(
 ):
     """Compute center of mass momentum and total mass with tile reductions (single system).
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
 
@@ -380,7 +381,7 @@ def _compute_com_velocity_tiled_kernel(
     sum_mass = s_mass[0]
 
     # Only first thread in block writes
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         sum_mom = type(vel)(sum_mom_x, sum_mom_y, sum_mom_z)
         wp.atomic_add(total_momentum, 0, sum_mom)
         wp.atomic_add(total_mass, 0, sum_mass)
@@ -434,7 +435,7 @@ def _batch_compute_com_velocity_tiled_kernel(
 ):
     """Compute center of mass momentum and total mass with tile reductions (batched).
 
-    Launch Grid: dim = [num_atoms], block_dim = TILE_THREADS
+    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
     """
     atom_idx = wp.tid()
     system_id = batch_idx[atom_idx]
@@ -462,7 +463,7 @@ def _batch_compute_com_velocity_tiled_kernel(
     sum_mass = s_mass[0]
 
     # Only first thread in block writes
-    if atom_idx % TILE_THREADS == 0:
+    if atom_idx % TILE_DIM == 0:
         sum_mom = type(vel)(sum_mom_x, sum_mom_y, sum_mom_z)
         wp.atomic_add(total_momentum, system_id, sum_mom)
         wp.atomic_add(total_mass, system_id, sum_mass)
@@ -1415,7 +1416,7 @@ def compute_kinetic_energy(
             dim=num_atoms,
             inputs=[velocities, masses, kinetic_energy],
             device=device,
-            block_dim=TILE_THREADS,
+            block_dim=TILE_DIM,
         )
 
     return kinetic_energy
@@ -1843,7 +1844,7 @@ def remove_com_motion(
             dim=num_atoms,
             inputs=[velocities, masses, total_momentum, total_mass],
             device=device,
-            block_dim=TILE_THREADS,
+            block_dim=TILE_DIM,
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
@@ -1979,7 +1980,7 @@ def remove_com_motion_out(
             dim=num_atoms,
             inputs=[velocities, masses, total_momentum, total_mass],
             device=device,
-            block_dim=TILE_THREADS,
+            block_dim=TILE_DIM,
         )
 
         # Compute COM velocity using Warp kernel (no numpy)
