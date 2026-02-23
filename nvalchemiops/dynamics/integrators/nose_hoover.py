@@ -1014,7 +1014,7 @@ def nhc_compute_masses(
     if device is None:
         device = "cuda:0"
 
-    is_batched = num_systems > 1
+    is_batched = masses.ndim == 2
 
     # Get the scalar type for kernel launch
     if dtype == wp.float32:

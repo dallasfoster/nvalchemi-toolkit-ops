@@ -39,13 +39,11 @@ import torch
 
 from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
-    NvalchemiopsLJModel,
+    create_fcc_argon,
     get_gpu_sku,
     load_config,
-    print_batch_benchmark_footer,
     print_batch_benchmark_header,
     print_batch_benchmark_result,
-    write_results_csv,
 )
 
 
@@ -91,39 +89,29 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    from .shared_utils import create_lj_system
-
-    pos, cell, masses_single, vel = create_lj_system(
-        num_atoms=num_atoms_per_system,
-        lattice_constant=lattice_constant,
-        temperature=temperature,
-        device=device,
-        dtype=dtype,
+    num_cells = int(num_atoms_per_system ** (1 / 3))
+    pos, cell = create_fcc_argon(
+        num_unit_cells=num_cells,
+        a=lattice_constant,
     )
 
-    actual_num_atoms = masses_single.shape[0]
+    actual_num_atoms = pos.shape[0]
 
     # Replicate for batch
     positions_list = []
-    velocities_list = []
-    masses_list = []
     cell_list = []
-
+    positions = torch.as_tensor(pos, dtype=dtype, device=device)
+    cell = torch.as_tensor(cell, dtype=dtype, device=device)
     for i in range(batch_size):
         # Slightly perturb each system to make them independent
-        pos_perturbed = pos + torch.randn_like(pos) * 0.01
-        vel_perturbed = vel + torch.randn_like(vel) * 0.01
+        pos_perturbed = positions + torch.randn_like(positions) * 0.01
 
         positions_list.append(pos_perturbed)
-        velocities_list.append(vel_perturbed)
-        masses_list.append(masses_single)
         cell_list.append(cell)
 
     # Stack into batched tensors
     positions = torch.cat(positions_list, dim=0)
-    velocities = torch.cat(velocities_list, dim=0)
-    masses = torch.cat(masses_list, dim=0)
-    cell = torch.cat(cell_list, dim=0)
+    cell = torch.stack(cell_list, dim=0).reshape(batch_size, 3, 3)
 
     # Create batch_idx: [0,0,0,...,1,1,1,...,2,2,2,...]
     batch_idx = torch.repeat_interleave(
@@ -136,10 +124,10 @@ def create_batched_system(
         (batch_size + 1) * actual_num_atoms,
         actual_num_atoms,
         device=device,
-        dtype=torch.int64,
+        dtype=torch.int32,
     )
 
-    return positions, velocities, cell, masses, batch_idx, atom_ptr
+    return positions, cell, batch_idx, atom_ptr
 
 
 def run_benchmarks(config: dict, output_dir: Path) -> None:
@@ -153,6 +141,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         Output directory for CSV files.
     """
     batch_config = config.get("md_batch", {})
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = batch_config.get("dtype", torch.float32)
     if not batch_config.get("enabled", False):
         print("Batched MD benchmarks disabled in config")
         return
@@ -182,9 +172,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
             # Create batched system
             (
                 batch_positions,
-                batch_velocities,
                 batch_cells,
-                batch_masses,
                 batch_idx,
                 atom_ptr,
             ) = create_batched_system(
@@ -192,35 +180,23 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 batch_size=batch_size,
                 lattice_constant=5.26,
                 temperature=300.0,
-                device="cuda",
-                dtype=torch.float64,
+                device=device,
+                dtype=dtype,
             )
 
             pbc = torch.tensor([True, True, True], device=batch_positions.device)
-
-            # Create LJ model
-            lj_model = NvalchemiopsLJModel(
-                epsilon=epsilon,
-                sigma=sigma,
-                cutoff=cutoff,
-                cell=batch_cells,
-                batch_idx=batch_idx,
-                device="cuda",
-                dtype=torch.float64,
-            )
 
             # Run nvalchemiops benchmarks
             nv_bench = NvalchemiOpsBenchmark(
                 positions=batch_positions,
                 cell=batch_cells,
-                masses=batch_masses,
                 pbc=pbc,
-                model=lj_model,
                 skin=skin,
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
                 neighbor_rebuild_interval=neighbor_rebuild_interval,
-                velocities=batch_velocities,
                 batch_idx=batch_idx,
-                atom_ptr=atom_ptr,
             )
 
             # Velocity Verlet
@@ -240,20 +216,42 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 result = nv_bench.run_langevin(
                     dt=lang_config.get("dt", 0.001),
                     num_steps=lang_config.get("steps", 10000),
-                    temperature=lang_config.get("temperature", 300.0),
+                    temperature=lang_config.get("temperature", 94.4),
                     friction=lang_config.get("friction", 0.01),
                     warmup_steps=lang_config.get("warmup_steps", 100),
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=True)
 
-    print_batch_benchmark_footer()
+            # NPT
+            if integrators.get("npt", {}).get("enabled", False):
+                npt_config = integrators["npt"]
+                result = nv_bench.run_npt(
+                    dt=npt_config.get("dt", 0.001),
+                    num_steps=npt_config.get("steps", 10000),
+                    temperature=npt_config.get("temperature", 94.4),
+                    pressure=npt_config.get("pressure", 1.0),
+                    tau_t=npt_config.get("tau_t", 500.0),
+                    tau_p=npt_config.get("tau_p", 5000.0),
+                    chain_length=npt_config.get("chain_length", 3),
+                    warmup_steps=npt_config.get("warmup_steps", 100),
+                )
+                results.append(result)
+                print_batch_benchmark_result(result, is_md=True)
 
-    # Write CSV results
-    if results:
-        output_path = output_dir / f"dynamics_md_batch_nvalchemiops_{gpu_sku}.csv"
-        write_results_csv(results, output_path)
-        print(f"\nWrote results to {output_path}")
+            # NPH
+            if integrators.get("nph", {}).get("enabled", False):
+                nph_config = integrators["nph"]
+                result = nv_bench.run_nph(
+                    dt=nph_config.get("dt", 0.001),
+                    num_steps=nph_config.get("steps", 10000),
+                    temperature=nph_config.get("temperature", 94.4),
+                    pressure=nph_config.get("pressure", 1.0),
+                    tau_p=nph_config.get("tau_p", 5000.0),
+                    warmup_steps=nph_config.get("warmup_steps", 100),
+                )
+                results.append(result)
+                print_batch_benchmark_result(result, is_md=True)
 
 
 def main():

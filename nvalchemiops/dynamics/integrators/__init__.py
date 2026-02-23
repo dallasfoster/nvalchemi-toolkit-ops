@@ -235,6 +235,8 @@ __all__ = [
     "nhc_position_update_out",
     # Nosé-Hoover Chain - Utilities
     "nhc_compute_masses",
+    # NPT/NPH - Virial conversion
+    "flat_virial_to_vec9",
     # NPT/NPH - Tensor types
     "vec9f",
     "vec9d",

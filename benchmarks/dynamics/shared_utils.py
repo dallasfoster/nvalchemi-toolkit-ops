@@ -30,39 +30,121 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 import warp as wp
 import yaml
 
-from nvalchemiops.interactions.lj import lj_energy_forces, lj_energy_forces_virial
+from nvalchemiops.dynamics.integrators import (
+    # NPT/NPH (MTK) high-level steps + utilities
+    compute_barostat_mass,
+    compute_pressure_tensor,
+    compute_scalar_pressure,
+    langevin_baoab_finalize,
+    langevin_baoab_half_step,
+    nhc_compute_masses,
+    run_nph_step,
+    run_npt_step,
+    vec9d,
+    vec9f,
+    velocity_verlet_position_update,
+    velocity_verlet_velocity_finalize,
+)
+from nvalchemiops.dynamics.utils import (
+    compute_cell_inverse,
+    compute_cell_volume,
+    compute_kinetic_energy,
+    compute_temperature,
+    initialize_velocities,
+    wrap_positions_to_cell,
+)
+from nvalchemiops.interactions import lj_energy_forces, lj_energy_forces_virial
+from nvalchemiops.torch.neighbors import batch_cell_list, cell_list
+from nvalchemiops.torch.neighbors.rebuild_detection import neighbor_list_needs_rebuild
 
 wp.init()
 
 # ==============================================================================
-# Unit Conversion Constants
+# Physical Constants
 # ==============================================================================
-# The nvalchemiops dynamics kernels are unitless: they assume a self-consistent
-# unit system for (x, v, t, m, E, F).
+
+# Boltzmann constant in eV/K
+KB_EV = 8.617333262e-5
+
+# ------------------------------------------------------------------------------
+# Unit conventions used by this example
+# ------------------------------------------------------------------------------
 #
-# We use:
-# - length: Angstrom (Å)
-# - time: femtosecond (fs)
-# - energy: electron-volt (eV)
-# - mass (internal): eV * fs^2 / Å^2 (so KE = 0.5 * m * v^2 is in eV)
+# The nvalchemiops dynamics kernels are *unitless*: they assume the caller uses a
+# self-consistent unit system for (x, v, t, m, E, F).
 #
-# To convert from amu to internal mass units:
-#   1 amu = amu_kg / (eV*fs^2/Å^2)_kg
+# In this example we choose:
+# - length:        Angstrom (Å)
+# - time:          femtosecond (fs)
+# - energy:        electron-volt (eV)
+# - mass (internal): eV * fs^2 / Å^2   (so that KE = 0.5 * m * v^2 is in eV when
+#                                     v is in Å/fs)
+#
+# We accept user-facing masses in amu and convert them to the internal mass unit.
+#
+# Derivation:
+#   1 [eV * fs^2 / Å^2] in SI is:
+#     (eV→J) * (fs→s)^2 / (Å→m)^2 = kg
+#   so:
+#     1 amu = amu_kg / (eV*fs^2/Å^2)_kg
+#
 EV_TO_J = 1.602176634e-19
 AMU_TO_KG = 1.66053906660e-27
 FS_TO_S = 1.0e-15
 ANGSTROM_TO_M = 1.0e-10
-_MASS_UNIT_KG = EV_TO_J * (FS_TO_S**2) / (ANGSTROM_TO_M**2)
-AMU_TO_INTERNAL = AMU_TO_KG / _MASS_UNIT_KG  # ~103.6427
 
-# Boltzmann constant in eV/K
-KB_EV = 8.617333262e-5
+_MASS_UNIT_KG = EV_TO_J * (FS_TO_S**2) / (ANGSTROM_TO_M**2)  # kg per (eV*fs^2/Å^2)
+AMU_TO_EV_FS2_PER_A2 = AMU_TO_KG / _MASS_UNIT_KG  # ~103.642691
+
+
+def mass_amu_to_internal(mass_amu: np.ndarray) -> np.ndarray:
+    """Convert masses from amu to internal units (eV*fs^2/Å^2)."""
+
+    return mass_amu * AMU_TO_EV_FS2_PER_A2
+
+
+# Pressure unit conversion
+# 1 eV/Å^3 = 1.602176634e11 Pa
+_EV_PER_A3_TO_PA = EV_TO_J / (ANGSTROM_TO_M**3)
+
+
+def pressure_atm_to_ev_per_a3(pressure_atm: float) -> float:
+    """Convert pressure from atm to eV/Å^3."""
+
+    return float(pressure_atm) * 101325.0 / _EV_PER_A3_TO_PA
+
+
+def pressure_ev_per_a3_to_atm(pressure_ev_per_a3: float) -> float:
+    """Convert pressure from eV/Å^3 to atm."""
+
+    return float(pressure_ev_per_a3) * _EV_PER_A3_TO_PA / 101325.0
+
+
+def pressure_gpa_to_ev_per_a3(p_gpa: float) -> float:
+    """Convert pressure from GPa to eV/Å³."""
+    return p_gpa * 1e9 / _EV_PER_A3_TO_PA
+
+
+def pressure_ev_per_a3_to_gpa(p_ev: float) -> float:
+    """Convert pressure from eV/Å³ to GPa."""
+    return p_ev * _EV_PER_A3_TO_PA / 1e9
+
+
+# Argon LJ parameters (commonly used for liquid argon simulations)
+EPSILON_AR = 0.0104  # eV
+SIGMA_AR = 3.40  # Angstrom
+MASS_AR = 39.948  # amu
+
+# Default cutoff (2.5*sigma is typical for LJ)
+DEFAULT_CUTOFF = 2.5 * SIGMA_AR  # ~8.5 Angstrom
+DEFAULT_SKIN = 0.5  # Angstrom
 
 
 @dataclass
@@ -372,7 +454,8 @@ def print_benchmark_result(result: BenchmarkResult, is_md: bool = True) -> None:
     is_md : bool
         Whether this is an MD benchmark (True) or optimization (False).
     """
-    method_str = f"{result.name} ({result.ensemble})"
+    oom_note = " [OOM]" if result.total_time == 0 and not result.step_times else ""
+    method_str = f"{result.name} ({result.ensemble}){oom_note}"
 
     if is_md:
         # For MD: show ns/day
@@ -418,7 +501,8 @@ def print_batch_benchmark_result(result: BenchmarkResult, is_md: bool = True) ->
     is_md : bool
         Whether this is an MD benchmark (True) or optimization (False).
     """
-    method_str = f"{result.name}"
+    oom_note = " [OOM]" if result.total_time == 0 and not result.step_times else ""
+    method_str = f"{result.name}{oom_note}"
     batch_size = result.batch_size if result.batch_size else 1
     total_atoms = result.total_atoms
 
@@ -496,390 +580,1148 @@ def get_gpu_sku() -> str:
         return "unknown_gpu"
 
 
-def create_lj_system(
-    num_atoms: int,
-    lattice_constant: float = 5.26,
-    temperature: float = 300.0,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.float64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create an FCC argon system for LJ simulations.
+@wp.kernel
+def _pack_virial_flat_to_vec9_kernel(
+    virial_flat: wp.array(dtype=Any),
+    virial_vec9: wp.array(dtype=Any),
+):
+    """Pack a 9-element virial into a vec9f/vec9d output array (single system)."""
+    sys_id = wp.tid()
+    v = virial_vec9[sys_id]
+    v0 = virial_vec9[sys_id][0]
+    # NOTE ON SIGN CONVENTION:
+    # - The LJ kernels accumulate virial with a negative sign convention: W = -Σ r ⊗ F.
+    # - The MTK NPT/NPH implementation in `nvalchemiops.dynamics.integrators.npt`
+    #   computes pressure as P = (kinetic + virial) / V, which expects virial in the
+    #   *positive* convention: +Σ r ⊗ F.
+    # Therefore we negate here so the integrators see the expected virial sign.
+    virial_vec9[sys_id] = type(v)(
+        type(v0)(-virial_flat[0]),
+        type(v0)(-virial_flat[1]),
+        type(v0)(-virial_flat[2]),
+        type(v0)(-virial_flat[3]),
+        type(v0)(-virial_flat[4]),
+        type(v0)(-virial_flat[5]),
+        type(v0)(-virial_flat[6]),
+        type(v0)(-virial_flat[7]),
+        type(v0)(-virial_flat[8]),
+    )
+
+
+@wp.kernel
+def _copy_1d_to_row2d_kernel(src: wp.array(dtype=Any), dst: wp.array2d(dtype=Any)):
+    """Copy src[k] -> dst[0, k]. Used to adapt single-system outputs to batched APIs."""
+    k = wp.tid()
+    if k < src.shape[0]:
+        dst[0, k] = src[k]
+
+
+@wp.kernel
+def _virial_to_stress_kernel(
+    virial_flat: wp.array(dtype=wp.float64),
+    volume: wp.array(dtype=wp.float64),
+    external_pressure: wp.float64,
+    stress: wp.array(dtype=wp.mat33d),
+):
+    """Convert virial to stress tensor for cell optimization.
+
+    Computes: stress = P_ext - P_internal
+
+    where P_internal = -virial/V (negated because LJ virial has W = -Σ r ⊗ F).
+
+    At equilibrium: P_internal = P_ext, so stress = 0.
+    When P_internal < P_ext: stress > 0, cell contracts (via stress_to_cell_force).
+    When P_internal > P_ext: stress < 0, cell expands.
+    """
+    sys = wp.tid()
+    V = volume[sys]
+    inv_V = wp.float64(1.0) / V
+
+    # Virial components (row-major: xx, xy, xz, yx, yy, yz, zx, zy, zz)
+    # Negate because LJ virial uses convention W = -Σ r ⊗ F
+    # After negation: positive = compression (repulsive forces)
+    vxx = -virial_flat[0]
+    vxy = -virial_flat[1]
+    vxz = -virial_flat[2]
+    vyx = -virial_flat[3]
+    vyy = -virial_flat[4]
+    vyz = -virial_flat[5]
+    vzx = -virial_flat[6]
+    vzy = -virial_flat[7]
+    vzz = -virial_flat[8]
+
+    # Internal pressure (diagonal): P_int = virial/V (positive = compression)
+    # Stress for optimization: σ = P_ext - P_int
+    # This ensures σ = 0 at equilibrium, and correct sign for cell force
+    stress[sys] = wp.mat33d(
+        external_pressure - vxx * inv_V,
+        -vxy * inv_V,
+        -vxz * inv_V,
+        -vyx * inv_V,
+        external_pressure - vyy * inv_V,
+        -vyz * inv_V,
+        -vzx * inv_V,
+        -vzy * inv_V,
+        external_pressure - vzz * inv_V,
+    )
+
+
+def virial_to_stress(
+    virial_flat: wp.array,
+    cell: wp.array,
+    external_pressure: float,
+    device: str,
+) -> wp.array:
+    """Convert virial tensor to stress with external pressure.
+
+    Parameters
+    ----------
+    virial_flat : wp.array, shape (9,)
+        Flat virial tensor from LJ computation.
+    cell : wp.array, shape (1, 3, 3)
+        Cell matrix.
+    external_pressure : float
+        External pressure in eV/Å³.
+    device : str
+        Warp device.
+
+    Returns
+    -------
+    stress : wp.array, shape (1,), dtype=mat33d
+        Stress tensor for cell optimization.
+    """
+    volume = wp.empty(1, dtype=wp.float64, device=device)
+    compute_cell_volume(cell, volumes=volume, device=device)
+    stress = wp.zeros(1, dtype=wp.mat33d, device=device)
+    wp.launch(
+        _virial_to_stress_kernel,
+        dim=1,
+        inputs=[virial_flat, volume, wp.float64(external_pressure)],
+        outputs=[stress],
+        device=device,
+    )
+    return stress
+
+
+# ==============================================================================
+# Neighbor List Management
+# ==============================================================================
+
+
+class NeighborListManager:
+    """Manages neighbor list construction and updates.
+
+    Uses the cell list algorithm for O(N) neighbor finding with periodic
+    boundary conditions.
 
     Parameters
     ----------
     num_atoms : int
-        Target number of atoms (actual may differ slightly due to FCC structure).
-    lattice_constant : float, optional
-        FCC lattice constant in Angstroms (default: 5.26 for argon).
-    temperature : float, optional
-        Initial temperature in Kelvin (default: 300.0).
-    device : str, optional
-        Torch device (default: 'cuda').
-    dtype : torch.dtype, optional
-        Data type for tensors (default: torch.float64).
-
-    Returns
-    -------
-    positions : torch.Tensor
-        Atomic positions, shape (N, 3).
-    cell : torch.Tensor
-        Unit cell matrix, shape (1, 3, 3).
-    masses : torch.Tensor
-        Atomic masses in internal units, shape (N,).
-    velocities : torch.Tensor
-        Initial velocities from Maxwell-Boltzmann distribution, shape (N, 3).
-
-    Notes
-    -----
-    - Creates FCC (face-centered cubic) structure with 4 atoms per unit cell
-    - Initializes velocities from Maxwell-Boltzmann distribution
-    - Removes center-of-mass momentum
-    - Actual number of atoms may differ slightly from target due to FCC structure
-    - Uses argon mass: 39.948 amu
-    """
-    # Calculate supercell size needed
-    atoms_per_cell = 4  # FCC has 4 atoms per unit cell
-    n_cells = int(np.ceil((num_atoms / atoms_per_cell) ** (1 / 3)))
-
-    # Create FCC lattice basis (4 atoms per unit cell)
-    basis = torch.tensor(
-        [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]],
-        dtype=dtype,
-    )
-
-    # Generate supercell positions
-    positions_list = []
-    for i in range(n_cells):
-        for j in range(n_cells):
-            for k in range(n_cells):
-                offset = torch.tensor([i, j, k], dtype=dtype)
-                for atom_basis in basis:
-                    pos = (offset + atom_basis) * lattice_constant
-                    positions_list.append(pos)
-
-    positions = torch.stack(positions_list).to(device)
-    actual_num_atoms = positions.shape[0]
-
-    # Create cell matrix (cubic cell)
-    cell_length = n_cells * lattice_constant
-    cell = torch.eye(3, dtype=dtype, device=device) * cell_length
-    cell = cell.unsqueeze(0)  # Shape (1, 3, 3)
-
-    # Create masses (argon: 39.948 amu)
-    argon_mass_amu = 39.948
-    masses = torch.full(
-        (actual_num_atoms,),
-        argon_mass_amu * AMU_TO_INTERNAL,
-        dtype=dtype,
-        device=device,
-    )
-
-    # Initialize velocities from Maxwell-Boltzmann distribution
-    # For 3D: v ~ N(0, sqrt(kB*T/m)) for each component
-    # kB*T in eV, mass in internal units (eV*fs^2/Å^2)
-    kB_T = KB_EV * temperature  # eV
-    mass_internal = argon_mass_amu * AMU_TO_INTERNAL
-    sigma_v = np.sqrt(kB_T / mass_internal)  # Å/fs
-
-    velocities = torch.randn(actual_num_atoms, 3, dtype=dtype, device=device) * sigma_v
-
-    # Remove center-of-mass momentum
-    momenta = velocities * masses.unsqueeze(1)
-    total_momentum = momenta.sum(dim=0)
-    velocities -= total_momentum / masses.sum() / masses.unsqueeze(1)
-
-    return positions, cell, masses, velocities
-
-
-# ==============================================================================
-# Warp Kernels for Virial Conversion
-# ==============================================================================
-
-
-@wp.kernel
-def _convert_flat_virial_to_vec9_kernel(
-    virial_flat: wp.array(dtype=wp.float64),
-    virial_vec9: wp.array(dtype=wp.types.vector(length=9, dtype=wp.float64)),
-    negate: wp.bool,
-):
-    """Convert flat virial array to vec9 format with optional negation.
-
-    The LJ kernels use virial sign convention: W = -Σ r ⊗ F
-    The NPT/NPH integrators expect: W = +Σ r ⊗ F
-    Therefore we negate when passing to NPT/NPH.
-
-    For batched mode, virial_flat has shape (num_systems*9,) and we process
-    each system's 9 elements separately.
-
-    Launched with dim=num_systems.
-    """
-    sys_id = wp.tid()
-
-    sign = -1.0 if negate else 1.0
-
-    # Offset into flat array for this system
-    offset = sys_id * 9
-
-    virial_vec9[sys_id] = wp.types.vector(length=9, dtype=wp.float64)(
-        sign * virial_flat[offset + 0],
-        sign * virial_flat[offset + 1],
-        sign * virial_flat[offset + 2],
-        sign * virial_flat[offset + 3],
-        sign * virial_flat[offset + 4],
-        sign * virial_flat[offset + 5],
-        sign * virial_flat[offset + 6],
-        sign * virial_flat[offset + 7],
-        sign * virial_flat[offset + 8],
-    )
-
-
-@wp.kernel
-def _convert_flat_virial_to_vec9_kernel_f32(
-    virial_flat: wp.array(dtype=wp.float32),
-    virial_vec9: wp.array(dtype=wp.types.vector(length=9, dtype=wp.float32)),
-    negate: wp.bool,
-):
-    """Convert flat virial array to vec9 format with optional negation (float32 version)."""
-    sys_id = wp.tid()
-
-    sign = -1.0 if negate else 1.0
-
-    # Offset into flat array for this system
-    offset = sys_id * 9
-
-    virial_vec9[sys_id] = wp.types.vector(length=9, dtype=wp.float32)(
-        sign * virial_flat[offset + 0],
-        sign * virial_flat[offset + 1],
-        sign * virial_flat[offset + 2],
-        sign * virial_flat[offset + 3],
-        sign * virial_flat[offset + 4],
-        sign * virial_flat[offset + 5],
-        sign * virial_flat[offset + 6],
-        sign * virial_flat[offset + 7],
-        sign * virial_flat[offset + 8],
-    )
-
-
-def convert_flat_virial_to_vec9(
-    virial_flat: wp.array,
-    virial_vec9: wp.array,
-    negate: bool,
-    device: str,
-):
-    """Convert flat virial array to vec9 format without synchronization.
-
-    Parameters
-    ----------
-    virial_flat : wp.array
-        Flat 9-element array (or multiple of 9 for batched).
-    virial_vec9 : wp.array
-        Output vec9 array (1 element for single system, B elements for batched).
-    negate : bool
-        Whether to negate virial (True for NPT/NPH, False otherwise).
-    device : str
-        Warp device string.
-    """
-    # Determine dtype and launch appropriate kernel
-    if virial_flat.dtype == wp.float32:
-        wp.launch(
-            kernel=_convert_flat_virial_to_vec9_kernel_f32,
-            dim=virial_vec9.shape[0],
-            inputs=[virial_flat, virial_vec9, negate],
-            device=device,
-        )
-    else:
-        wp.launch(
-            kernel=_convert_flat_virial_to_vec9_kernel,
-            dim=virial_vec9.shape[0],
-            inputs=[virial_flat, virial_vec9, negate],
-            device=device,
-        )
-
-
-# ==============================================================================
-# Model Interface for Benchmarking
-# ==============================================================================
-
-
-class NvalchemiopsModelInterface:
-    """Abstract interface for models used in nvalchemiops benchmarks.
-
-    This interface allows different force calculation methods (LJ, MACE, etc.)
-    to be used interchangeably in the benchmark infrastructure.
-    """
-
-    def compute_forces(
-        self,
-        wp_positions: wp.array,
-        neighbor_matrix: wp.array,
-        num_neighbors: wp.array,
-        neighbor_shifts: wp.array,
-    ) -> tuple[wp.array, wp.array]:
-        """Compute energies and forces.
-
-        Parameters
-        ----------
-        wp_positions : wp.array
-            Atomic positions (warp array)
-        neighbor_matrix : wp.array
-            Neighbor list matrix
-        num_neighbors : wp.array
-            Number of neighbors per atom
-        neighbor_shifts : wp.array
-            PBC shift vectors for neighbors
-
-        Returns
-        -------
-        wp_energies : wp.array
-            Atomic energies
-        wp_forces : wp.array
-            Atomic forces
-        """
-        raise NotImplementedError
-
-    def compute_virial(
-        self,
-        wp_positions: wp.array,
-        neighbor_matrix: wp.array,
-        num_neighbors: wp.array,
-        neighbor_shifts: wp.array,
-    ) -> tuple[wp.array, wp.array, wp.array]:
-        """Compute energies, forces, and virial.
-
-        Parameters
-        ----------
-        wp_positions : wp.array
-            Atomic positions (warp array)
-        neighbor_matrix : wp.array
-            Neighbor list matrix
-        num_neighbors : wp.array
-            Number of neighbors per atom
-        neighbor_shifts : wp.array
-            PBC shift vectors for neighbors
-
-        Returns
-        -------
-        wp_energies : wp.array
-            Atomic energies
-        wp_forces : wp.array
-            Atomic forces
-        wp_virial : wp.array
-            Virial tensor (9 components per system)
-        """
-        raise NotImplementedError
-
-
-class NvalchemiopsLJModel(NvalchemiopsModelInterface):
-    """Lennard-Jones model using nvalchemiops kernels.
-
-    Parameters
-    ----------
-    epsilon : float
-        LJ epsilon parameter (eV)
-    sigma : float
-        LJ sigma parameter (Å)
+        Number of atoms in the system.
     cutoff : float
-        LJ cutoff distance (Å)
-    cell : torch.Tensor
-        Unit cell matrix
-    batch_idx : torch.Tensor or None
-        Batch index for each atom (for batched mode)
-    device : str
-        Warp device string
-    dtype : torch.dtype
-        Data type
+        Cutoff distance for neighbor detection (Angstrom).
+    skin : float
+        Neighbor list skin distance (Angstrom). Rebuild when any atom
+        moves more than skin/2.
+    max_neighbors : int, optional
+        Maximum number of neighbors per atom.
+    device : str, optional
+        Device for warp arrays (e.g., "cuda:0", "cpu").
     """
 
     def __init__(
         self,
-        epsilon: float,
-        sigma: float,
+        num_atoms: int,
         cutoff: float,
-        cell: torch.Tensor,
-        batch_idx: torch.Tensor | None,
-        device: str,
-        dtype: torch.dtype,
+        skin: float,
+        max_neighbors: int = 100,
+        half_fill: bool = True,
+        device: str = "cuda:0",
     ):
+        self.num_atoms = num_atoms
+        self.cutoff = cutoff
+        self.skin = skin
+        self.max_neighbors = max_neighbors
+        self.half_fill = half_fill
+        self.device = device
+
+        # Track positions at last rebuild
+        self.positions_at_rebuild: torch.Tensor | None = None
+
+        # Torch tensors (from cell_list)
+        self.torch_neighbor_matrix: torch.Tensor | None = None
+        self.torch_neighbor_shifts: torch.Tensor | None = None
+        self.torch_num_neighbors: torch.Tensor | None = None
+
+        # Warp arrays (converted from torch)
+        self.wp_neighbor_matrix: wp.array | None = None
+        self.wp_neighbor_shifts: wp.array | None = None
+        self.wp_num_neighbors: wp.array | None = None
+
+    def needs_rebuild(self, positions: torch.Tensor) -> bool:
+        """Check if neighbor list needs rebuilding.
+
+        Parameters
+        ----------
+        positions : torch.Tensor, shape (N, 3)
+            Current atomic positions.
+
+        Returns
+        -------
+        bool
+            True if rebuild needed (any atom moved > skin/2).
+        """
+        if self.positions_at_rebuild is None:
+            return True
+
+        # Use the package's GPU rebuild detection kernel (early-termination).
+        # Note: the returned tensor is on-device; calling .item() syncs, but this
+        # is still cheaper than a full max-reduction in Python.
+        rebuild = neighbor_list_needs_rebuild(
+            reference_positions=self.positions_at_rebuild,
+            current_positions=positions,
+            skin_distance_threshold=float(self.skin / 2.0),
+        )
+        return bool(rebuild.item())
+
+    def build(
+        self,
+        positions: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+    ) -> None:
+        """Build neighbor list from positions.
+
+        Parameters
+        ----------
+        positions : torch.Tensor, shape (N, 3)
+            Atomic positions.
+        cell : torch.Tensor, shape (3, 3)
+            Unit cell matrix.
+        pbc : torch.Tensor, shape (3,), dtype=bool
+            Periodic boundary conditions in each dimension.
+        """
+        # Use cell_list for efficient neighbor finding
+        neighbor_matrix, num_neighbors, neighbor_shifts = cell_list(
+            positions=positions,
+            cutoff=self.cutoff + self.skin,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=self.max_neighbors,
+            half_fill=self.half_fill,
+            fill_value=self.num_atoms,
+        )
+
+        self.torch_neighbor_matrix = neighbor_matrix
+        self.torch_neighbor_shifts = neighbor_shifts
+        self.torch_num_neighbors = num_neighbors
+        self.positions_at_rebuild = positions.clone()
+
+        # Convert to warp arrays
+        self._convert_to_warp()
+
+    def _convert_to_warp(self) -> None:
+        """Convert torch tensors to warp arrays."""
+        # Neighbor matrix (int32)
+        self.wp_neighbor_matrix = wp.from_torch(
+            self.torch_neighbor_matrix, dtype=wp.int32
+        )
+
+        # Shifts (vec3i)
+        self.wp_neighbor_shifts = wp.from_torch(
+            self.torch_neighbor_shifts, dtype=wp.vec3i
+        )
+
+        # Num neighbors (int32)
+        self.wp_num_neighbors = wp.from_torch(self.torch_num_neighbors, dtype=wp.int32)
+
+    def total_neighbors(self) -> int:
+        """Get total number of neighbors across all atoms."""
+        if self.torch_num_neighbors is None:
+            return 0
+        return int(self.torch_num_neighbors.sum().item())
+
+
+class BatchedNeighborListManager:
+    """Neighbor list manager for batched systems (multiple independent cells)."""
+
+    def __init__(
+        self,
+        total_atoms: int,
+        cutoff: float,
+        skin: float,
+        batch_idx: torch.Tensor,
+        num_systems: int,
+        max_neighbors: int = 100,
+        half_fill: bool = True,
+        device: str = "cuda:0",
+    ):
+        self.total_atoms = int(total_atoms)
+        self.cutoff = float(cutoff)
+        self.skin = float(skin)
+        self.batch_idx = batch_idx.to(dtype=torch.int32)
+        self.num_systems = int(num_systems)
+        self.max_neighbors = int(max_neighbors)
+        self.half_fill = bool(half_fill)
+        self.device = device
+
+        self.positions_at_rebuild: torch.Tensor | None = None
+
+        self.torch_neighbor_matrix: torch.Tensor | None = None
+        self.torch_neighbor_shifts: torch.Tensor | None = None
+        self.torch_num_neighbors: torch.Tensor | None = None
+
+        self.wp_neighbor_matrix: wp.array | None = None
+        self.wp_neighbor_shifts: wp.array | None = None
+        self.wp_num_neighbors: wp.array | None = None
+
+    def build(
+        self, positions: torch.Tensor, cells: torch.Tensor, pbc: torch.Tensor
+    ) -> None:
+        neighbor_matrix, num_neighbors, neighbor_shifts = batch_cell_list(
+            positions=positions,
+            cutoff=self.cutoff + self.skin,
+            cell=cells,
+            pbc=pbc,
+            batch_idx=self.batch_idx,
+            max_neighbors=self.max_neighbors,
+            half_fill=self.half_fill,
+            fill_value=self.total_atoms,
+        )
+        self.torch_neighbor_matrix = neighbor_matrix
+        self.torch_neighbor_shifts = neighbor_shifts
+        self.torch_num_neighbors = num_neighbors
+        self.positions_at_rebuild = positions.clone()
+        self._convert_to_warp()
+
+    def _convert_to_warp(self) -> None:
+        self.wp_neighbor_matrix = wp.from_torch(
+            self.torch_neighbor_matrix, dtype=wp.int32
+        )
+        self.wp_neighbor_shifts = wp.from_torch(
+            self.torch_neighbor_shifts, dtype=wp.vec3i
+        )
+        self.wp_num_neighbors = wp.from_torch(self.torch_num_neighbors, dtype=wp.int32)
+
+    def total_neighbors(self) -> int:
+        if self.torch_num_neighbors is None:
+            return 0
+        return int(self.torch_num_neighbors.sum().item())
+
+
+# ==============================================================================
+# System Creation
+# ==============================================================================
+
+
+def create_fcc_argon(
+    num_unit_cells: int = 4, a: float = 5.26
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create FCC argon lattice.
+
+    Creates a face-centered cubic (FCC) lattice with 4 atoms per unit cell,
+    typical for noble gas crystals near the triple point.
+
+    Parameters
+    ----------
+    num_unit_cells : int
+        Number of unit cells in each dimension. Total atoms = 4 * n^3.
+    a : float
+        Lattice constant in Angstrom. For argon at 94K: ~5.26 Å
+
+    Returns
+    -------
+    positions : np.ndarray, shape (N, 3)
+        Atomic positions in Angstrom.
+    cell : np.ndarray, shape (3, 3)
+        Unit cell matrix (diagonal).
+    """
+    # FCC basis (4 atoms per unit cell)
+    basis = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.0, 0.5],
+            [0.0, 0.5, 0.5],
+        ]
+    )
+
+    # Generate all positions
+    positions = []
+    for i in range(num_unit_cells):
+        for j in range(num_unit_cells):
+            for k in range(num_unit_cells):
+                for b in basis:
+                    pos = (np.array([i, j, k]) + b) * a
+                    positions.append(pos)
+
+    positions = np.array(positions, dtype=np.float64)
+
+    # Create cell matrix (cubic)
+    L = num_unit_cells * a
+    cell = np.eye(3, dtype=np.float64) * L
+
+    return positions, cell
+
+
+def create_fcc_lattice(n_cells: int, a: float) -> tuple[np.ndarray, np.ndarray]:
+    """Create FCC lattice with n_cells unit cells per dimension.
+
+    Parameters
+    ----------
+    n_cells : int
+        Number of unit cells in each dimension.
+    a : float
+        Lattice constant (Å).
+
+    Returns
+    -------
+    positions : np.ndarray, shape (N, 3)
+        Atomic positions.
+    cell : np.ndarray, shape (3, 3)
+        Cell matrix.
+
+    Note
+    ----
+    This is an alias for :func:`create_fcc_argon` with different parameter name.
+    For consistency, consider using :func:`create_fcc_argon` instead.
+    """
+    return create_fcc_argon(num_unit_cells=n_cells, a=a)
+
+
+def create_random_cluster(
+    num_atoms: int,
+    radius: float = 10.0,
+    min_dist: float = 3.0,
+    center: np.ndarray | None = None,
+    seed: int = 0,
+) -> np.ndarray:
+    """Create a random spherical cluster with minimum distance constraint.
+
+    Generates atoms distributed within a sphere, rejecting overlaps to create
+    a loose cluster suitable for geometry optimization.
+
+    Parameters
+    ----------
+    num_atoms : int
+        Number of atoms to place.
+    radius : float
+        Maximum radius of the cluster (Angstrom).
+    min_dist : float
+        Minimum allowed distance between any two atoms (Angstrom).
+        Typically ~0.9 * sigma for LJ systems.
+    center : np.ndarray, shape (3,), optional
+        Center of the cluster. Defaults to origin.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    positions : np.ndarray, shape (num_atoms, 3)
+        Atomic positions in Angstrom.
+
+    Raises
+    ------
+    RuntimeError
+        If unable to place all atoms within max_tries attempts.
+
+    Examples
+    --------
+    >>> positions = create_random_cluster(32, radius=12.0, min_dist=3.0, seed=42)
+    >>> positions.shape
+    (32, 3)
+    """
+    rng = np.random.default_rng(seed)
+    positions = np.zeros((num_atoms, 3), dtype=np.float64)
+    placed = 0
+    max_tries = 100000
+    tries = 0
+
+    while placed < num_atoms and tries < max_tries:
+        tries += 1
+        # Generate point uniformly in sphere using rejection sampling
+        v = rng.normal(size=3)
+        v /= np.linalg.norm(v) + 1e-12
+        r = radius * (rng.random() ** (1.0 / 3.0))  # Uniform in volume
+        candidate = r * v
+
+        if placed == 0:
+            positions[placed] = candidate
+            placed += 1
+            continue
+
+        d = np.linalg.norm(positions[:placed] - candidate[None, :], axis=1)
+        if np.all(d > min_dist):
+            positions[placed] = candidate
+            placed += 1
+
+    if placed != num_atoms:
+        raise RuntimeError(
+            f"Failed to place cluster atoms (placed={placed}/{num_atoms}). "
+            f"Try increasing radius or decreasing min_dist."
+        )
+
+    # Apply center offset if provided
+    if center is not None:
+        positions += np.asarray(center, dtype=np.float64)
+
+    return positions
+
+
+def create_random_box_cluster(
+    num_atoms: int,
+    box_size: float,
+    min_dist: float = 3.0,
+    margin: float = 0.1,
+    seed: int = 0,
+) -> np.ndarray:
+    """Create a random cluster in a cubic box with minimum distance constraint.
+
+    Generates atoms uniformly distributed within a box (with margin from edges),
+    rejecting overlaps. Suitable for periodic systems.
+
+    Parameters
+    ----------
+    num_atoms : int
+        Number of atoms to place.
+    box_size : float
+        Size of the cubic box (Angstrom).
+    min_dist : float
+        Minimum allowed distance between any two atoms (Angstrom).
+    margin : float
+        Fraction of box size to leave as margin from edges (0 to 0.5).
+        Atoms are placed in [margin*L, (1-margin)*L].
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    positions : np.ndarray, shape (num_atoms, 3)
+        Atomic positions in Angstrom.
+
+    Raises
+    ------
+    RuntimeError
+        If unable to place all atoms within max_tries attempts.
+
+    Examples
+    --------
+    >>> positions = create_random_box_cluster(32, box_size=30.0, min_dist=3.0, seed=42)
+    >>> positions.shape
+    (32, 3)
+    """
+    rng = np.random.default_rng(seed)
+    positions = np.zeros((num_atoms, 3), dtype=np.float64)
+    placed = 0
+    max_tries = 100000
+    tries = 0
+
+    lo = margin * box_size
+    hi = (1.0 - margin) * box_size
+
+    while placed < num_atoms and tries < max_tries:
+        tries += 1
+        candidate = rng.uniform(lo, hi, size=3)
+
+        if placed == 0:
+            positions[placed] = candidate
+            placed += 1
+            continue
+
+        d = np.linalg.norm(positions[:placed] - candidate[None, :], axis=1)
+        if np.all(d > min_dist):
+            positions[placed] = candidate
+            placed += 1
+
+    if placed != num_atoms:
+        raise RuntimeError(
+            f"Failed to place cluster atoms (placed={placed}/{num_atoms}). "
+            f"Try increasing box_size or decreasing min_dist."
+        )
+
+    return positions
+
+
+# ==============================================================================
+# Core MD System (integrator-agnostic)
+# ==============================================================================
+
+
+class MDSystem:
+    """Integrator-agnostic molecular dynamics system.
+
+    This class owns the *state* needed for many MD algorithms:
+    - positions / velocities / forces / masses (Warp arrays)
+    - cell + inverse (Warp arrays)
+    - neighbor list manager (Torch → Warp conversion)
+    - LJ force evaluation (via :func:`nvalchemiops.interactions.lj_energy_forces`)
+
+    Integrators (Langevin, Velocity Verlet, NPT, NPH, ...) should be implemented
+    as separate "runner" functions operating on this system.
+    """
+
+    def __init__(
+        self,
+        positions: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        masses: torch.Tensor | None = None,
+        epsilon: float = EPSILON_AR,
+        sigma: float = SIGMA_AR,
+        cutoff: float = DEFAULT_CUTOFF,
+        skin: float = DEFAULT_SKIN,
+        switch_width: float = 0.0,
+        half_neighbor_list: bool = True,
+        device: str = "cuda:0",
+        dtype: np.dtype = torch.float64,
+    ):
+        self.num_atoms = len(positions)
+        self.num_systems = 1
         self.epsilon = epsilon
         self.sigma = sigma
         self.cutoff = cutoff
+        self.switch_width = float(switch_width)
+        self.half_neighbor_list = bool(half_neighbor_list)
         self.device = device
+        self.wp_device = wp.device_from_torch(device)
+        self.num_atoms_per_system = torch.tensor(
+            [self.num_atoms], dtype=torch.int32, device=device
+        )
+
+        # Determine types
         self.dtype = dtype
+        self.wp_dtype = wp.float64 if dtype == torch.float64 else wp.float32
+        self.wp_vec_dtype = wp.vec3d if dtype == torch.float64 else wp.vec3f
+        self.wp_mat_dtype = wp.mat33d if dtype == torch.float64 else wp.mat33f
+        self.torch_dtype = torch.float64 if dtype == torch.float64 else torch.float32
 
-        # Import type helpers
-        from nvalchemiops.types import get_wp_mat_dtype
-
-        wp_mat_dtype = get_wp_mat_dtype(dtype)
-        self.wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
-
-        self.batch_idx = batch_idx
-        self.wp_batch_idx = (
-            None
-            if batch_idx is None
-            else wp.from_torch(batch_idx.to(torch.int32), dtype=wp.int32)
-        )
-        self.is_batched = batch_idx is not None
-
-    def compute_forces(
-        self,
-        wp_positions: wp.array,
-        neighbor_matrix: wp.array,
-        num_neighbors: wp.array,
-        neighbor_shifts: wp.array,
-    ) -> tuple[wp.array, wp.array]:
-        """Compute LJ energies and forces."""
-        # Determine fill_value (num_atoms)
-        if hasattr(neighbor_matrix, "shape"):
-            fill_value = neighbor_matrix.shape[0]
+        # Set up masses
+        if masses is None:
+            masses = torch.full((self.num_atoms,), MASS_AR, dtype=dtype, device=device)
         else:
-            # Fallback
-            fill_value = num_neighbors.shape[0]
+            masses = masses.astype(dtype)
 
+        # Convert masses to internal MD units (so KE is in eV when v is Å/fs)
+        masses = mass_amu_to_internal(masses)
+
+        # Create torch tensors (for neighbor list - uses PyTorch interface)
+        self.positions = positions
+        self.cell = cell
+        self.pbc = pbc
+
+        # Create warp arrays for dynamics
+        self.wp_positions = wp.from_torch(positions, dtype=self.wp_vec_dtype)
+        self.wp_velocities = wp.zeros(
+            self.num_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        self.wp_forces = wp.zeros(
+            self.num_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        self.wp_masses = wp.from_torch(masses, dtype=self.wp_dtype)
+
+        # Cell matrix (shape (1,) for single system)
+        cell_reshaped = cell.reshape(1, 3, 3).to(dtype=self.torch_dtype)
+        self.wp_cell = wp.from_torch(cell_reshaped, dtype=self.wp_mat_dtype)
+
+        # Compute cell inverse for position wrapping
+        self.wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.wp_device)
+
+        # Set up neighbor list manager
+        self.neighbor_manager = NeighborListManager(
+            num_atoms=self.num_atoms,
+            cutoff=cutoff,
+            skin=skin,
+            device=device,
+            half_fill=self.half_neighbor_list,
+        )
+
+        # Build initial neighbor list
+        self._rebuild_neighbors()
+
+        print(f"Initialized MD system with {self.num_atoms} atoms")
+        print(f"  Cell: {cell[0, 0]:.2f} x {cell[1, 1]:.2f} x {cell[2, 2]:.2f} Å")
+        print(f"  Cutoff: {cutoff:.2f} Å (+ {skin:.2f} Å skin)")
+        print(f"  LJ: ε = {epsilon:.4f} eV, σ = {sigma:.2f} Å")
+        print(f"  Device: {device}, dtype: {dtype}")
+        print("  Units: x [Å], t [fs], E [eV], m [eV·fs²/Å²] (from amu), v [Å/fs]")
+
+    def _rebuild_neighbors(self) -> None:
+        """Rebuild neighbor list from current positions."""
+        # Sync warp positions to torch
+        self.torch_positions = wp.to_torch(self.wp_positions)
+
+        # Sync warp cell to torch (cell may change for NPT/NPH)
+        self.torch_cell = wp.to_torch(self.wp_cell).squeeze(0)
+
+        self.neighbor_manager.build(
+            positions=self.positions,
+            cell=self.cell,
+            pbc=self.pbc,
+        )
+
+    def _check_rebuild(self) -> bool:
+        """Check if neighbor list needs rebuilding and rebuild if so."""
+        self.positions = wp.to_torch(self.wp_positions)
+
+        if self.neighbor_manager.needs_rebuild(self.positions):
+            self._rebuild_neighbors()
+            return True
+        return False
+
+    def compute_forces(self) -> wp.array:
+        """Compute LJ forces and return per-atom potential energies (device array).
+
+        Notes
+        -----
+        This function intentionally does **not** synchronize or pull data back to
+        the host. Host-side reductions (e.g., PE sum) should be done only at
+        logging / analysis points.
+        """
+        # Check neighbor list
+        self._check_rebuild()
+
+        # Compute LJ energy and forces using the interactions module
         wp_energies, wp_forces = lj_energy_forces(
-            positions=wp_positions,
+            positions=self.wp_positions,
             cell=self.wp_cell,
             epsilon=self.epsilon,
             sigma=self.sigma,
             cutoff=self.cutoff,
-            neighbor_matrix=neighbor_matrix,
-            neighbor_matrix_shifts=neighbor_shifts,
-            num_neighbors=num_neighbors,
-            fill_value=fill_value,
-            batch_idx=self.wp_batch_idx,
-            device=self.device,
+            switch_width=self.switch_width,
+            half_neighbor_list=self.half_neighbor_list,
+            neighbor_matrix=self.neighbor_manager.wp_neighbor_matrix,
+            neighbor_matrix_shifts=self.neighbor_manager.wp_neighbor_shifts,
+            num_neighbors=self.neighbor_manager.wp_num_neighbors,
+            fill_value=self.num_atoms,
+            device=self.wp_device,
         )
 
-        return wp_energies, wp_forces
+        # Copy computed forces to our force array
+        wp.copy(self.wp_forces, wp_forces)
+        return wp_energies
 
-    def compute_virial(
-        self,
-        wp_positions: wp.array,
-        neighbor_matrix: wp.array,
-        num_neighbors: wp.array,
-        neighbor_shifts: wp.array,
-    ) -> tuple[wp.array, wp.array, wp.array]:
-        """Compute LJ energies, forces, and virial."""
-        # Determine fill_value (num_atoms)
-        if hasattr(neighbor_matrix, "shape"):
-            fill_value = neighbor_matrix.shape[0]
+    def compute_forces_virial(
+        self, virial_tensors: wp.array | None = None
+    ) -> wp.array | tuple[wp.array, wp.array, wp.array]:
+        """Compute LJ forces and virial.
+
+        Parameters
+        ----------
+        virial_tensors : wp.array, optional
+            If provided (for NPT/NPH), packs virial into vec9 format and returns only energies.
+            If None (for variable-cell), returns tuple (energies, forces, virial_flat).
+
+        Returns
+        -------
+        If virial_tensors is provided:
+            wp.array : Per-atom potential energies (shape (num_atoms,))
+        If virial_tensors is None:
+            tuple[wp.array, wp.array, wp.array] : (energies, forces, virial_flat)
+                - energies: Per-atom potential energies (shape (num_atoms,))
+                - forces: Forces on atoms (shape (num_atoms,), dtype=vec3d)
+                - virial_flat: Flat virial tensor (shape (9,), row-major)
+
+        Notes
+        -----
+        For barostat integrators (NPT/NPH), provide virial_tensors parameter.
+        For variable-cell optimization, call without parameter to get flat virial.
+        """
+        # Always rebuild neighbors (cell may have changed)
+        self._rebuild_neighbors()
+
+        wp_energies, wp_forces, wp_virial_flat = lj_energy_forces_virial(
+            positions=self.wp_positions,
+            cell=self.wp_cell,
+            epsilon=self.epsilon,
+            sigma=self.sigma,
+            cutoff=self.cutoff,
+            switch_width=self.switch_width,
+            half_neighbor_list=self.half_neighbor_list,
+            neighbor_matrix=self.neighbor_manager.wp_neighbor_matrix,
+            neighbor_matrix_shifts=self.neighbor_manager.wp_neighbor_shifts,
+            num_neighbors=self.neighbor_manager.wp_num_neighbors,
+            fill_value=self.num_atoms,
+            device=self.wp_device,
+        )
+
+        wp.copy(self.wp_forces, wp_forces)
+
+        if virial_tensors is not None:
+            # Pack float64[9] into vec9[f/d] expected by the MTK integrators
+            wp.launch(
+                _pack_virial_flat_to_vec9_kernel,
+                dim=1,
+                inputs=[wp_virial_flat, virial_tensors],
+                device=self.wp_device,
+            )
+            return wp_energies
         else:
-            fill_value = num_neighbors.shape[0]
+            # Return tuple for variable-cell optimization
+            return wp_energies, wp_forces, wp_virial_flat
 
-        wp_energies, wp_forces, wp_virial = lj_energy_forces_virial(
-            positions=wp_positions,
+    def update_cell(self, cell: wp.array) -> None:
+        """Update cell matrix and recompute cell inverse.
+
+        Parameters
+        ----------
+        cell : wp.array, shape (1, 3, 3)
+            New cell matrix.
+        """
+        wp.copy(self.wp_cell, cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.device)
+        # Update torch cell for neighbor list
+        self.cell = wp.to_torch(self.wp_cell)
+        # Force neighbor rebuild on next force computation
+        self.neighbor_manager.positions_at_rebuild = None
+
+    def kinetic_energy(self) -> wp.array:
+        """Compute kinetic energy on device (shape (1,), in eV)."""
+        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_kinetic_energy(
+            velocities=self.wp_velocities,
+            masses=self.wp_masses,
+            kinetic_energy=ke,
+            device=self.device,
+        )
+        return ke
+
+    def temperature_kT(self) -> wp.array:
+        """Compute instantaneous temperature on device (kB*T in eV, shape (1,))."""
+        ke = self.kinetic_energy()
+        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        compute_temperature(
+            kinetic_energy=ke,
+            temperature=temp,
+            num_atoms_per_system=wp.array(
+                [self.num_atoms], dtype=wp.int32, device=self.device
+            ),
+        )
+        return temp
+
+    def initialize_temperature(self, temperature: float, seed: int = 42) -> None:
+        """Initialize velocities to target temperature (single system).
+
+        Parameters
+        ----------
+        temperature : float
+            Target temperature in Kelvin.
+        seed : int
+            Random seed for reproducibility.
+        """
+        kT = float(temperature) * KB_EV
+        wp_temperature = wp.array([kT], dtype=self.wp_dtype, device=self.device)
+
+        # Scratch arrays for COM removal
+        wp_total_momentum = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+        wp_total_mass = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        wp_com_velocities = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+
+        initialize_velocities(
+            velocities=self.wp_velocities,
+            masses=self.wp_masses,
+            temperature=wp_temperature,
+            total_momentum=wp_total_momentum,
+            total_mass=wp_total_mass,
+            com_velocities=wp_com_velocities,
+            random_seed=seed,
+            remove_com=True,
+            device=self.device,
+        )
+
+        # One-time feedback: host read for user confidence
+        actual_kT = float(self.temperature_kT().numpy()[0])
+        actual_temp = actual_kT / KB_EV
+        print(
+            f"Initialized velocities: target={temperature:.1f} K, actual={actual_temp:.1f} K"
+        )
+
+
+class BatchedMDSystem:
+    """Batched MD system for multiple independent systems packed into one set of arrays."""
+
+    def __init__(
+        self,
+        positions: torch.Tensor,  # (N_total, 3)
+        cells: torch.Tensor,  # (B, 3, 3)
+        pbc: torch.Tensor,  # (B, 3)
+        batch_idx: torch.Tensor,  # (N_total,)
+        num_systems: int,
+        masses: torch.Tensor | None = None,  # (N_total,)
+        epsilon: float = EPSILON_AR,
+        sigma: float = SIGMA_AR,
+        cutoff: float = DEFAULT_CUTOFF,
+        skin: float = DEFAULT_SKIN,
+        switch_width: float = 0.0,
+        half_neighbor_list: bool = True,
+        device: str = "cuda:0",
+        dtype: np.dtype = np.float64,
+    ):
+        self.num_systems = int(num_systems)
+        self.total_atoms = int(len(positions))
+        self.num_atoms = self.total_atoms
+        self.epsilon = float(epsilon)
+        self.sigma = float(sigma)
+        self.cutoff = float(cutoff)
+        self.skin = float(skin)
+        self.switch_width = float(switch_width)
+        self.half_neighbor_list = bool(half_neighbor_list)
+        self.device = device
+        self.wp_device = wp.device_from_torch(device)
+        self.dtype = dtype
+        self.wp_dtype = wp.float64 if dtype == torch.float64 else wp.float32
+        self.wp_vec_dtype = wp.vec3d if dtype == torch.float64 else wp.vec3f
+        self.wp_mat_dtype = wp.mat33d if dtype == torch.float64 else wp.mat33f
+        self.torch_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+
+        if masses is None:
+            masses = torch.full(
+                (self.total_atoms,), MASS_AR, dtype=dtype, device=device
+            )
+        masses = mass_amu_to_internal(masses)
+
+        self.positions = positions
+        self.cell = cells
+        self.pbc = pbc
+        self.batch_idx = batch_idx
+
+        self.num_atoms_per_system = torch.bincount(
+            batch_idx, minlength=self.num_systems
+        )
+
+        self.wp_positions = wp.from_torch(positions, dtype=self.wp_vec_dtype)
+        self.wp_velocities = wp.zeros(
+            self.total_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        self.wp_forces = wp.zeros(
+            self.total_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        self.wp_masses = wp.from_torch(masses, dtype=self.wp_dtype)
+
+        self.wp_cell = wp.from_torch(cells, dtype=self.wp_mat_dtype)
+        self.wp_cell_inv = wp.empty_like(self.wp_cell)
+        compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.wp_device)
+
+        self.wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+
+        self.neighbor_manager = BatchedNeighborListManager(
+            total_atoms=self.total_atoms,
+            cutoff=self.cutoff,
+            skin=self.skin,
+            batch_idx=self.batch_idx,
+            num_systems=self.num_systems,
+            max_neighbors=100,
+            half_fill=self.half_neighbor_list,
+            device=device,
+        )
+        self._rebuild_neighbors()
+
+    def _rebuild_neighbors(self) -> None:
+        self.neighbor_manager.build(self.positions, self.cell, self.pbc)
+
+    def initialize_temperature(self, temperatures_K: np.ndarray, seed: int = 0) -> None:
+        """Initialize velocities to target temperature (batched mode).
+
+        Parameters
+        ----------
+        temperatures_K : np.ndarray
+            Target temperatures in Kelvin. Shape (num_systems,).
+        seed : int
+            Random seed for reproducibility.
+        """
+        from nvalchemiops.dynamics.utils.thermostat_utils import (
+            initialize_velocities as init_vel,
+        )
+
+        kT = temperatures_K * KB_EV
+        wp_temperature = wp.from_torch(kT)
+        wp_total_momentum = wp.zeros(
+            self.num_systems, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        wp_total_mass = wp.zeros(
+            self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+        )
+        wp_com_velocities = wp.zeros(
+            self.num_systems, dtype=self.wp_vec_dtype, device=self.wp_device
+        )
+        init_vel(
+            velocities=self.wp_velocities,
+            masses=self.wp_masses,
+            temperature=wp_temperature,
+            total_momentum=wp_total_momentum,
+            total_mass=wp_total_mass,
+            com_velocities=wp_com_velocities,
+            random_seed=seed,
+            remove_com=True,
+            batch_idx=self.wp_batch_idx,
+            num_systems=self.num_systems,
+            device=self.wp_device,
+        )
+
+        # One-time feedback: compute achieved per-system temperatures (host read)
+        from nvalchemiops.dynamics.utils.thermostat_utils import (
+            compute_kinetic_energy as ke_fn,
+        )
+
+        wp_ke = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        ke_fn(
+            self.wp_velocities,
+            self.wp_masses,
+            kinetic_energy=wp_ke,
+            batch_idx=self.wp_batch_idx,
+            num_systems=self.num_systems,
+            device=self.wp_device,
+        )
+        ke = wp_ke.numpy()
+        dof = np.maximum(3 * self.num_atoms_per_system - 3, 1).astype(np.float64)
+        actual_kT = 2.0 * ke / dof
+        actual_T = actual_kT / KB_EV
+        print(f"Initialized velocities: target={temperatures_K} K, actual={actual_T} K")
+
+    def compute_forces(self) -> wp.array:
+        """Compute LJ forces and return per-atom potential energies (device array).
+
+        Notes
+        -----
+        This function intentionally does **not** synchronize or pull data back to
+        the host. Host-side reductions (e.g., PE sum) should be done only at
+        logging / analysis points.
+        """
+        self._rebuild_neighbors()
+        wp_energies, wp_forces = lj_energy_forces(
+            positions=self.wp_positions,
             cell=self.wp_cell,
             epsilon=self.epsilon,
             sigma=self.sigma,
             cutoff=self.cutoff,
-            neighbor_matrix=neighbor_matrix,
-            neighbor_matrix_shifts=neighbor_shifts,
-            num_neighbors=num_neighbors,
-            fill_value=fill_value,
+            switch_width=self.switch_width,
+            half_neighbor_list=self.half_neighbor_list,
+            neighbor_matrix=self.neighbor_manager.wp_neighbor_matrix,
+            neighbor_matrix_shifts=self.neighbor_manager.wp_neighbor_shifts,
+            num_neighbors=self.neighbor_manager.wp_num_neighbors,
+            fill_value=self.total_atoms,
             batch_idx=self.wp_batch_idx,
-            device=self.device,
+            device=self.wp_device,
+        )
+        wp.copy(self.wp_forces, wp_forces)
+        return wp_energies
+
+    def compute_forces_virial(
+        self, virial_tensors: wp.array | None = None
+    ) -> wp.array | tuple[wp.array, wp.array, wp.array]:
+        """Compute LJ forces and virial.
+
+        Parameters
+        ----------
+        virial_tensors : wp.array, optional
+            If provided (for NPT/NPH), packs virial into vec9 format and returns only energies.
+            If None (for variable-cell), returns tuple (energies, forces, virial_flat).
+
+        Returns
+        -------
+        If virial_tensors is provided:
+            wp.array : Per-atom potential energies (shape (num_atoms,))
+        If virial_tensors is None:
+            tuple[wp.array, wp.array, wp.array] : (energies, forces, virial_flat)
+                - energies: Per-atom potential energies (shape (num_atoms,))
+                - forces: Forces on atoms (shape (num_atoms,), dtype=vec3d)
+                - virial_flat: Flat virial tensor (shape (9,), row-major)
+
+        Notes
+        -----
+        For barostat integrators (NPT/NPH), provide virial_tensors parameter.
+        For variable-cell optimization, call without parameter to get flat virial.
+        """
+        # Always rebuild neighbors (cell may have changed)
+        self._rebuild_neighbors()
+
+        wp_energies, wp_forces, wp_virial_flat = lj_energy_forces_virial(
+            positions=self.wp_positions,
+            cell=self.wp_cell,
+            epsilon=self.epsilon,
+            sigma=self.sigma,
+            cutoff=self.cutoff,
+            switch_width=self.switch_width,
+            half_neighbor_list=self.half_neighbor_list,
+            neighbor_matrix=self.neighbor_manager.wp_neighbor_matrix,
+            neighbor_matrix_shifts=self.neighbor_manager.wp_neighbor_shifts,
+            num_neighbors=self.neighbor_manager.wp_num_neighbors,
+            fill_value=self.num_atoms,
+            device=self.wp_device,
+            batch_idx=self.wp_batch_idx,
         )
 
-        return wp_energies, wp_forces, wp_virial
+        wp.copy(self.wp_forces, wp_forces)
+        if virial_tensors is not None:
+            virial_flat = wp.to_torch(wp_virial_flat)
+            virial_tensors = wp.from_torch(
+                virial_flat, dtype=vec9f if self.dtype == torch.float32 else vec9d
+            )
+            return wp_energies
+        else:
+            # Return tuple for variable-cell optimization
+            return wp_energies, wp_forces, wp_virial_flat
+
+    def kinetic_energy_per_system(self) -> wp.array:
+        """Compute kinetic energy per system (shape (B,), in eV)."""
+        ke = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.device)
+        compute_kinetic_energy(
+            velocities=self.wp_velocities,
+            masses=self.wp_masses,
+            kinetic_energy=ke,
+            batch_idx=self.wp_batch_idx,
+            num_systems=self.num_systems,
+            device=self.wp_device,
+        )
+        return ke
+
+    def temperature_kT_per_system(self) -> wp.array:
+        """Compute temperature per system (kB*T, shape (B,)).
+
+        Note
+        ----
+        :func:`nvalchemiops.dynamics.utils.compute_temperature` currently takes a
+        single `num_atoms` value (per system). For heterogeneous batches this is
+        ambiguous, so we require uniform system sizes here.
+        """
+        ke = self.kinetic_energy_per_system()
+        temp = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        compute_temperature(
+            kinetic_energy=ke,
+            temperature=temp,
+            num_atoms_per_system=self.num_atoms_per_system,
+        )
+        return temp
+
+    def _scalar_pressure_and_volume(
+        self,
+        virial_tensors: wp.array,
+    ) -> tuple[wp.array, wp.array]:
+        """Compute scalar pressure (eV/Å^3) and volume (Å^3)."""
+        tensor_dtype = vec9f if self.wp_dtype == wp.float32 else vec9d
+
+        # Pre-allocate scratch arrays
+        volumes = wp.empty(1, dtype=self.wp_dtype, device=self.device)
+        compute_cell_volume(self.wp_cell, volumes=volumes, device=self.wp_device)
+
+        kinetic_tensors = wp.zeros((1, 9), dtype=self.wp_dtype, device=self.wp_device)
+        pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=self.wp_device)
+        compute_pressure_tensor(
+            velocities=self.wp_velocities,
+            masses=self.wp_masses,
+            virial_tensors=virial_tensors,
+            cells=self.wp_cell,
+            kinetic_tensors=kinetic_tensors,
+            pressure_tensors=pressure_tensors,
+            volumes=volumes,
+            device=self.wp_device,
+        )
+
+        scalar_pressures = wp.empty(1, dtype=self.wp_dtype, device=self.wp_device)
+        compute_scalar_pressure(
+            pressure_tensors, scalar_pressures, device=self.wp_device
+        )
+        return scalar_pressures, volumes
 
 
 # ==============================================================================
@@ -936,211 +1778,50 @@ class NvalchemiOpsBenchmark:
         self,
         positions: torch.Tensor,
         cell: torch.Tensor,
-        masses: torch.Tensor,
         pbc: torch.Tensor,
-        model: NvalchemiopsModelInterface | None = None,
+        masses: torch.Tensor | None = None,
         epsilon: float | None = None,
         sigma: float | None = None,
         cutoff: float | None = None,
         skin: float = 1.0,
+        switch_width: float = 0.0,
+        half_neighbor_list: bool = True,
         neighbor_rebuild_interval: int = 10,
         velocities: torch.Tensor | None = None,
         batch_idx: torch.Tensor | None = None,
-        atom_ptr: torch.Tensor | None = None,
     ):
-        # Store torch tensors
-        self.torch_positions = positions
-        self.torch_cell = cell
-        self.torch_masses = masses
-        self.torch_velocities = velocities
-        self.pbc = pbc
-
-        # Batching parameters
-        self.batch_idx = batch_idx
-        self.wp_batch_idx = (
-            None
-            if batch_idx is None
-            else wp.from_torch(batch_idx.to(torch.int32), dtype=wp.int32)
-        )
-        self.atom_ptr = atom_ptr
-        self.wp_atom_ptr = (
-            None
-            if atom_ptr is None
-            else wp.from_torch(atom_ptr.to(torch.int32), dtype=wp.int32)
-        )
-        self.is_batched = batch_idx is not None and atom_ptr is not None
+        self.is_batched = batch_idx is not None
+        if self.is_batched:
+            self.system = BatchedMDSystem(
+                positions=positions,
+                cells=cell,
+                pbc=pbc,
+                batch_idx=batch_idx,
+                num_systems=cell.shape[0],
+                masses=masses,
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
+                skin=skin,
+                switch_width=switch_width,
+                half_neighbor_list=half_neighbor_list,
+                device=positions.device,
+                dtype=positions.dtype,
+            )
+        else:
+            self.system = MDSystem(
+                positions=positions,
+                cell=cell,
+                masses=masses,
+                pbc=pbc,
+                device=positions.device,
+                dtype=positions.dtype,
+            )
 
         # Device and dtype setup (needed for model creation)
         self.device = positions.device
         self.dtype = positions.dtype
         self.wp_device = str(self.device)
-
-        # Model setup: use provided model or create LJ model from parameters
-        if model is not None:
-            self.model = model
-            # For neighbor list, we need cutoff
-            # Try to get it from model if available
-            if hasattr(model, "cutoff"):
-                cutoff = model.cutoff
-            elif cutoff is None:
-                raise ValueError(
-                    "cutoff must be provided when using external model without cutoff attribute"
-                )
-        else:
-            # Backward compatibility: create LJ model from parameters
-            if epsilon is None or sigma is None or cutoff is None:
-                raise ValueError(
-                    "Must provide either model or (epsilon, sigma, cutoff)"
-                )
-            self.model = NvalchemiopsLJModel(
-                epsilon=epsilon,
-                sigma=sigma,
-                cutoff=cutoff,
-                cell=cell,
-                batch_idx=batch_idx,
-                device=self.wp_device,
-                dtype=self.dtype,
-            )
-
-        # Neighbor list parameters
-        self.cutoff = cutoff
-        self.skin = skin
-        self.neighbor_rebuild_interval = neighbor_rebuild_interval
-
-        # System size
-        if self.is_batched:
-            self.total_atoms = positions.shape[0]
-            self.num_systems = len(atom_ptr) - 1
-            self.num_atoms = self.total_atoms // self.num_systems
-        else:
-            self.num_atoms = positions.shape[0]
-            self.total_atoms = self.num_atoms
-            self.num_systems = 1
-
-        # Import type helpers
-        from nvalchemiops.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
-
-        self.wp_dtype = get_wp_dtype(self.dtype)
-        self.wp_vec_dtype = get_wp_vec_dtype(self.dtype)
-        self.wp_mat_dtype = get_wp_mat_dtype(self.dtype)
-
-        # Convert to warp arrays
-        self.wp_cell = wp.from_torch(cell, dtype=self.wp_mat_dtype)
-        self.wp_masses = wp.from_torch(masses.contiguous(), dtype=self.wp_dtype)
-
-        # Neighbor list state (initialized on first rebuild)
-        self._torch_neighbor_matrix = None
-        self._torch_num_neighbors = None
-        self._torch_neighbor_shifts = None
-        self._wp_neighbor_matrix = None
-        self._wp_num_neighbors = None
-        self._wp_neighbor_shifts = None
-        self._ref_positions = positions.clone()  # For displacement-based rebuilding
-        self._steps_since_rebuild = 0
-
-        # Initial neighbor list build
-        self._rebuild_neighbors()
-
-    def _rebuild_neighbors(self) -> None:
-        """Rebuild neighbor lists."""
-        from nvalchemiops.neighborlist import neighbor_list
-
-        # Compute neighbor list
-        neighbor_matrix, num_neighbors, neighbor_shifts = neighbor_list(
-            positions=self.torch_positions,
-            cutoff=self.cutoff + self.skin,
-            cell=self.torch_cell,
-            pbc=self.pbc,
-            method="cell_list" if not self.is_batched else "batch_cell_list",
-            batch_idx=self.batch_idx,
-            batch_ptr=self.atom_ptr,
-        )
-
-        # Store torch versions
-        self._torch_neighbor_matrix = neighbor_matrix
-        self._torch_num_neighbors = num_neighbors
-        self._torch_neighbor_shifts = neighbor_shifts
-
-        # Convert to warp
-        self._wp_neighbor_matrix = wp.from_torch(neighbor_matrix, dtype=wp.int32)
-        self._wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32)
-        self._wp_neighbor_shifts = wp.from_torch(neighbor_shifts, dtype=wp.vec3i)
-        self._steps_since_rebuild = 0
-
-    def _check_rebuild(self, positions: torch.Tensor | None = None) -> bool:
-        """Check if neighbor list needs rebuilding.
-
-        Parameters
-        ----------
-        positions : torch.Tensor, optional
-            Current positions. If None, uses interval-based check.
-
-        Returns
-        -------
-        bool
-            True if rebuild is needed.
-        """
-        if self.neighbor_rebuild_interval > 0:
-            # Interval-based rebuilding
-            self._steps_since_rebuild += 1
-            return self._steps_since_rebuild >= self.neighbor_rebuild_interval
-        else:
-            # Displacement-based rebuilding
-            if positions is None:
-                return False
-            max_displacement = (
-                torch.norm(positions - self._ref_positions, dim=1).max().item()
-            )
-            return max_displacement > self.skin / 2.0
-
-    def _compute_forces(
-        self, wp_positions: wp.array, compute_virial: bool = False
-    ) -> tuple[wp.array, wp.array, wp.array | None]:
-        """Compute energies, forces, and optionally virial using the model.
-
-        Parameters
-        ----------
-        wp_positions : wp.array
-            Atomic positions.
-        compute_virial : bool, optional
-            Whether to compute virial tensor (for NPT/NPH).
-
-        Returns
-        -------
-        wp_energies : wp.array
-            Atomic energies.
-        wp_forces : wp.array
-            Atomic forces.
-        wp_virial : wp.array or None
-            Virial tensor (9 components) if compute_virial=True, else None.
-        """
-
-        # Check if rebuild needed (for displacement-based)
-        if self.neighbor_rebuild_interval == 0:
-            positions_torch = wp.to_torch(wp_positions)
-            if self._check_rebuild(positions_torch):
-                self.torch_positions = positions_torch
-                self._rebuild_neighbors()
-                self._ref_positions = positions_torch.clone()
-
-        # Call model to compute forces/energies
-        if compute_virial:
-            wp_energies, wp_forces, wp_virial = self.model.compute_virial(
-                wp_positions=wp_positions,
-                neighbor_matrix=self._wp_neighbor_matrix,
-                num_neighbors=self._wp_num_neighbors,
-                neighbor_shifts=self._wp_neighbor_shifts,
-            )
-        else:
-            wp_energies, wp_forces = self.model.compute_forces(
-                wp_positions=wp_positions,
-                neighbor_matrix=self._wp_neighbor_matrix,
-                num_neighbors=self._wp_num_neighbors,
-                neighbor_shifts=self._wp_neighbor_shifts,
-            )
-            wp_virial = None
-
-        return wp_energies, wp_forces, wp_virial
 
     def _run_warmup(
         self, run_step_fn, warmup_steps: int, log_message: str = "Warmup"
@@ -1194,12 +1875,53 @@ class NvalchemiOpsBenchmark:
         start_time = time.perf_counter()
 
         for step in range(num_steps):
-            run_step_fn(step)
+            run_step_fn()
 
         wp.synchronize()
         total_time = time.perf_counter() - start_time
         step_times = [total_time / num_steps] * num_steps
         return total_time, step_times
+
+    def _oom_result(
+        self,
+        name: str,
+        ensemble: str,
+        num_steps: int,
+        dt: float,
+        warmup_steps: int,
+    ) -> BenchmarkResult:
+        """Build a BenchmarkResult representing an OOM failure.
+
+        Parameters
+        ----------
+        name : str
+            Benchmark name (e.g. 'velocity_verlet').
+        ensemble : str
+            Ensemble (e.g. 'NVE', 'NVT').
+        num_steps : int
+            Requested number of steps.
+        dt : float
+            Timestep in fs.
+        warmup_steps : int
+            Warmup steps.
+
+        Returns
+        -------
+        BenchmarkResult
+            Result with total_time=0 and empty step_times so throughput is 0.
+        """
+        return BenchmarkResult(
+            name=name,
+            backend="nvalchemiops",
+            ensemble=ensemble,
+            num_atoms=self.num_atoms,
+            num_steps=num_steps,
+            dt=dt,
+            warmup_steps=warmup_steps,
+            total_time=0.0,
+            step_times=[],
+            batch_size=self.num_systems if self.is_batched else None,
+        )
 
     # ========================================================================
     # MD Integrators
@@ -1230,112 +1952,79 @@ class NvalchemiOpsBenchmark:
         BenchmarkResult
             Benchmark result with timing and metadata.
         """
-        from nvalchemiops.dynamics.integrators import (
-            velocity_verlet_position_update,
-            velocity_verlet_velocity_finalize,
-        )
-        from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
-            wrap_positions_to_cell,
-        )
+        try:
+            return self._run_velocity_verlet_impl(
+                dt=dt,
+                num_steps=num_steps,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result(
+                "velocity_verlet", "NVE", num_steps, dt, warmup_steps
+            )
 
-        # Convert to warp
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(
-            self.torch_velocities.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_dt = wp.array([dt], dtype=self.wp_dtype, device=self.wp_device)
-
-        # Pre-compute cell inverse
-        wp_cell_inv = wp.empty_like(self.wp_cell)
-        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
+    def _run_velocity_verlet_impl(
+        self,
+        dt: float,
+        num_steps: int,
+        warmup_steps: int = 100,
+        log_interval: int = 100,
+    ) -> BenchmarkResult:
+        """Implementation of velocity Verlet (called by run_velocity_verlet)."""
 
         # Initial forces
-        _, wp_forces, _ = self._compute_forces(wp_positions)
+        self.system.compute_forces()
+        batch_idx = None if not self.is_batched else self.system.wp_batch_idx
+        wp_dt = wp.array(
+            [dt] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
 
         # Warmup
-        def warmup_step():
+        def step():
             velocity_verlet_position_update(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
+                self.system.wp_positions,
+                self.system.wp_velocities,
+                self.system.wp_forces,
+                self.system.wp_masses,
                 wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
             wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                self.system.wp_positions,
+                cells=self.system.wp_cell,
+                cells_inv=self.system.wp_cell_inv,
+                device=self.system.wp_device,
             )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
+            self.system.compute_forces()
             velocity_verlet_velocity_finalize(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
+                self.system.wp_velocities,
+                self.system.wp_forces,
+                self.system.wp_masses,
                 wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
 
-        self._run_warmup(warmup_step, warmup_steps, "Velocity Verlet warmup")
+        self._run_warmup(step, warmup_steps, "Velocity Verlet warmup")
 
-        # Timed loop
-        def run_step(step):
-            velocity_verlet_position_update(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
-            velocity_verlet_velocity_finalize(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
-
-        total_time, step_times = self._run_timed_loop(run_step, num_steps, log_interval)
+        total_time, step_times = self._run_timed_loop(step, num_steps, log_interval)
 
         return BenchmarkResult(
             name="velocity_verlet",
             backend="nvalchemiops",
             ensemble="NVE",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )
 
     def run_langevin(
@@ -1369,363 +2058,110 @@ class NvalchemiOpsBenchmark:
         BenchmarkResult
             Benchmark result with timing and metadata.
         """
-        from nvalchemiops.dynamics.integrators import (
-            langevin_baoab_finalize,
-            langevin_baoab_half_step,
-        )
-        from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
-            wrap_positions_to_cell,
-        )
+        try:
+            return self._run_langevin_impl(
+                dt=dt,
+                num_steps=num_steps,
+                temperature=temperature,
+                friction=friction,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result("langevin", "NVT", num_steps, dt, warmup_steps)
+
+    def _run_langevin_impl(
+        self,
+        dt: float,
+        num_steps: int,
+        temperature: float,
+        friction: float,
+        warmup_steps: int = 100,
+        log_interval: int = 100,
+    ) -> BenchmarkResult:
+        """Implementation of Langevin (called by run_langevin)."""
 
         # Convert temperature to kT (eV)
-        kT = temperature * KB_EV
-
-        # Convert to warp
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
+        kT = wp.array(
+            [temperature * KB_EV],
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
-        wp_velocities = wp.from_torch(
-            self.torch_velocities.clone(), dtype=self.wp_vec_dtype
+        gamma = wp.array(
+            [friction], dtype=self.system.wp_dtype, device=self.system.wp_device
         )
-        wp_dt = wp.array([dt], dtype=self.wp_dtype, device=self.wp_device)
-        wp_temp = wp.array([kT], dtype=self.wp_dtype, device=self.wp_device)
-        wp_friction = wp.array([friction], dtype=self.wp_dtype, device=self.wp_device)
-        # Pre-compute cell inverse
-        wp_cell_inv = wp.empty_like(self.wp_cell)
-        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
+        wp_dt = wp.array(
+            [dt] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        wp_temperature = kT
+        wp_friction = gamma
 
+        batch_idx = None if not self.is_batched else self.system.wp_batch_idx
         # Initial forces
-        _, wp_forces, _ = self._compute_forces(wp_positions)
+        self.system.compute_forces()
+
+        wp_ke_scratch = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
 
         # Warmup
-        def warmup_step():
+        def step():
             langevin_baoab_half_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                wp_temp,
-                wp_friction,
-                42,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                velocities=self.system.wp_velocities,
+                forces=self.system.wp_forces,
+                masses=self.system.wp_masses,
+                dt=wp_dt,
+                temperature=wp_temperature,
+                friction=wp_friction,
+                random_seed=42,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
             wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                cells=self.system.wp_cell,
+                cells_inv=self.system.wp_cell_inv,
+                device=self.system.wp_device,
             )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
+            self.system.compute_forces()
+            compute_kinetic_energy(
+                velocities=self.system.wp_velocities,
+                masses=self.system.wp_masses,
+                kinetic_energy=wp_ke_scratch,
+                batch_idx=batch_idx,
+                num_systems=self.system.num_systems,
+                device=self.system.wp_device,
+            )
             langevin_baoab_finalize(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
+                velocities=self.system.wp_velocities,
+                forces_new=self.system.wp_forces,
+                masses=self.system.wp_masses,
+                dt=wp_dt,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
 
-        self._run_warmup(warmup_step, warmup_steps, "Langevin warmup")
+        self._run_warmup(step, warmup_steps, "Langevin warmup")
 
-        # Timed loop
-        def run_step(step):
-            langevin_baoab_half_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                wp_temp,
-                wp_friction,
-                42,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
-            langevin_baoab_finalize(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
-
-        total_time, step_times = self._run_timed_loop(run_step, num_steps, log_interval)
+        total_time, step_times = self._run_timed_loop(step, num_steps, log_interval)
 
         return BenchmarkResult(
             name="langevin",
             backend="nvalchemiops",
             ensemble="NVT",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
-        )
-
-    def run_nose_hoover(
-        self,
-        dt: float,
-        num_steps: int,
-        temperature: float,
-        tau: float,
-        chain_length: int = 3,
-        warmup_steps: int = 100,
-        log_interval: int = 100,
-    ) -> BenchmarkResult:
-        """Run NVT simulation with Nosé-Hoover chains.
-
-        Parameters
-        ----------
-        dt : float
-            Timestep in fs.
-        num_steps : int
-            Number of simulation steps.
-        temperature : float
-            Target temperature in K.
-        tau : float
-            Thermostat time constant in fs.
-        chain_length : int, optional
-            Number of thermostats in chain.
-        warmup_steps : int, optional
-            Number of warmup steps (excluded from timing).
-        log_interval : int, optional
-            Logging interval.
-
-        Returns
-        -------
-        BenchmarkResult
-            Benchmark result with timing and metadata.
-        """
-        from nvalchemiops.dynamics.integrators import (
-            nhc_compute_masses,
-            nhc_position_update,
-            nhc_thermostat_chain_update,
-            nhc_velocity_half_step,
-        )
-        from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
-            wrap_positions_to_cell,
-        )
-
-        # Convert temperature to kT (eV)
-        kT = temperature * KB_EV
-
-        # Degrees of freedom (per system)
-        ndof = 3 * self.num_atoms - 3
-
-        # Initialize thermostat chain variables
-        if self.is_batched:
-            eta = torch.zeros(
-                self.num_systems, chain_length, device=self.device, dtype=self.dtype
-            )
-            eta_dot = torch.zeros(
-                self.num_systems, chain_length, device=self.device, dtype=self.dtype
-            )
-        else:
-            eta = torch.zeros(chain_length, device=self.device, dtype=self.dtype)
-            eta_dot = torch.zeros(chain_length, device=self.device, dtype=self.dtype)
-
-        # Compute thermostat masses
-        eta_mass = nhc_compute_masses(
-            ndof,
-            kT,
-            tau,
-            chain_length,
-            num_systems=self.num_systems,
-            device=self.wp_device,
-            dtype=self.wp_dtype,
-        )
-
-        # Convert to warp
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(
-            self.torch_velocities.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_dt = wp.array([dt], dtype=self.wp_dtype, device=self.wp_device)
-        wp_temp = wp.array([kT], dtype=self.wp_dtype, device=self.wp_device)
-        wp_eta = wp.from_torch(eta, dtype=self.wp_dtype)
-        wp_eta_dot = wp.from_torch(eta_dot, dtype=self.wp_dtype)
-        wp_ndof = wp.array([ndof], dtype=self.wp_dtype, device=self.wp_device)
-        # Pre-compute cell inverse
-        wp_cell_inv = wp.empty_like(self.wp_cell)
-        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
-
-        # Initial forces
-        _, wp_forces, _ = self._compute_forces(wp_positions)
-
-        # Warmup
-        def warmup_step():
-            # NHC integration: thermostat -> velocity half -> position -> forces -> velocity half -> thermostat
-            nhc_thermostat_chain_update(
-                wp_velocities,
-                self.wp_masses,
-                wp_eta,
-                wp_eta_dot,
-                eta_mass,
-                wp_temp,
-                wp_dt,
-                wp_ndof,
-                nloops=1,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_velocity_half_step(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_position_update(
-                wp_positions,
-                wp_velocities,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
-            nhc_velocity_half_step(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_thermostat_chain_update(
-                wp_velocities,
-                self.wp_masses,
-                wp_eta,
-                wp_eta_dot,
-                eta_mass,
-                wp_temp,
-                wp_dt,
-                wp_ndof,
-                nloops=1,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
-
-        self._run_warmup(warmup_step, warmup_steps, "Nosé-Hoover warmup")
-
-        # Timed loop
-        def run_step(step):
-            nhc_thermostat_chain_update(
-                wp_velocities,
-                self.wp_masses,
-                wp_eta,
-                wp_eta_dot,
-                eta_mass,
-                wp_temp,
-                wp_dt,
-                wp_ndof,
-                nloops=1,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_velocity_half_step(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_position_update(
-                wp_positions,
-                wp_velocities,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-            _, wp_forces_new, _ = self._compute_forces(wp_positions)
-            wp.copy(wp_forces, wp_forces_new)
-            nhc_velocity_half_step(
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_dt,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            nhc_thermostat_chain_update(
-                wp_velocities,
-                self.wp_masses,
-                wp_eta,
-                wp_eta_dot,
-                eta_mass,
-                wp_temp,
-                wp_dt,
-                wp_ndof,
-                nloops=1,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
-            )
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
-
-        total_time, step_times = self._run_timed_loop(run_step, num_steps, log_interval)
-
-        return BenchmarkResult(
-            name="nose_hoover",
-            backend="nvalchemiops",
-            ensemble="NVT",
-            num_atoms=self.num_atoms,
-            num_steps=num_steps,
-            dt=dt,
-            warmup_steps=warmup_steps,
-            total_time=total_time,
-            step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )
 
     def run_npt(
@@ -1774,222 +2210,214 @@ class NvalchemiOpsBenchmark:
         - Virial computation is required for pressure calculation.
         - Neighbor lists are rebuilt every step due to changing cell.
         """
-        from nvalchemiops.dynamics.integrators import (
-            compute_barostat_mass,
-            nhc_compute_masses,
-            run_npt_step,
-            vec9d,
-            vec9f,
-        )
-        from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
-            wrap_positions_to_cell,
-        )
-
-        # Convert units
-        kT = temperature * KB_EV
-        target_pressure_evA3 = pressure * 6.2415e-7  # bar to eV/Å³
-
-        # Degrees of freedom per system
-        ndof = 3 * self.num_atoms - 3
-
-        # Initialize thermostat chain variables
-        eta = torch.zeros(
-            self.num_systems, chain_length, device=self.device, dtype=self.dtype
-        )
-        eta_dot = torch.zeros(
-            self.num_systems, chain_length, device=self.device, dtype=self.dtype
-        )
-
-        # Compute thermostat masses
-        thermostat_masses_1d = nhc_compute_masses(
-            ndof,
-            kT,
-            tau_t,
-            chain_length,
-            num_systems=self.num_systems,
-            device=self.wp_device,
-            dtype=self.wp_dtype,
-        )
-        thermostat_masses = thermostat_masses_1d.reshape(
-            (self.num_systems, chain_length)
-        )
-
-        # Cell velocity (initially zero)
-        cell_velocity = torch.zeros(
-            self.num_systems, 3, 3, device=self.device, dtype=self.dtype
-        )
-
-        # Compute barostat mass
-        cell_mass_single = compute_barostat_mass(
-            target_temperature=float(kT),
-            tau_p=float(tau_p),
-            num_atoms=self.num_atoms,
-            dtype=self.wp_dtype,
-            device=self.wp_device,
-        )
-        if self.is_batched:
-            # For batched, replicate the single mass to all systems
-            cell_mass_torch = (
-                wp.to_torch(cell_mass_single).expand(self.num_systems).clone()
+        try:
+            return self._run_npt_impl(
+                dt=dt,
+                num_steps=num_steps,
+                target_temperature_K=temperature,
+                target_pressure_atm=pressure,
+                tdamp_fs=tau_t,
+                pdamp_fs=tau_p,
+                chain_length=chain_length,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
             )
-            cell_mass = wp.from_torch(cell_mass_torch, dtype=self.wp_dtype)
-        else:
-            cell_mass = cell_mass_single
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result("npt", "NPT", num_steps, dt, warmup_steps)
 
-        # vec9 type
-        vec_type = vec9f if self.dtype == torch.float32 else vec9d
+    def _run_npt_impl(
+        self,
+        dt: float,
+        num_steps: int,
+        target_temperature_K: float = 94.4,
+        target_pressure_atm: float = 1.0,
+        tdamp_fs: float = 500.0,
+        pdamp_fs: float = 5000.0,
+        chain_length: int = 3,
+        warmup_steps: int = 100,
+        log_interval: int = 100,
+    ) -> BenchmarkResult:
+        """Implementation of NPT (called by run_npt)."""
+        kT = float(target_temperature_K) * KB_EV
+        p_ext = pressure_atm_to_ev_per_a3(target_pressure_atm)
 
-        # Convert to warp arrays
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(
-            self.torch_velocities.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_cells = wp.from_torch(self.torch_cell.clone(), dtype=self.wp_mat_dtype)
-        wp_cell_velocities = wp.from_torch(cell_velocity, dtype=self.wp_mat_dtype)
-        wp_eta = wp.from_torch(eta, dtype=self.wp_dtype)
-        wp_eta_dot = wp.from_torch(eta_dot, dtype=self.wp_dtype)
-        wp_target_temp = wp.array(
-            [kT] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+        # Convert units (same convention as examples/dynamics: bar -> eV/Å³)
+        # Per-system targets (required by NPT kernels; broadcast same value for all systems).
+        wp_target_temperature = wp.array(
+            [kT] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_target_pressure = wp.array(
-            [target_pressure_evA3] * self.num_systems,
-            dtype=self.wp_dtype,
-            device=self.wp_device,
+            [p_ext] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
-        wp_virial_vec9 = wp.zeros(
-            self.num_systems, dtype=vec_type, device=self.wp_device
+        # Thermostat chain masses: always (num_systems, chain_length) so NPT kernel indexing is correct.
+        thermostat_masses = wp.empty(
+            (self.system.num_systems, int(chain_length)),
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        batch_idx = None if not self.is_batched else self.system.wp_batch_idx
+        nhc_compute_masses(
+            ndof=3 * self.system.num_atoms_per_system[0].item() - 3,
+            target_temp=kT,
+            tau=float(tdamp_fs),
+            chain_length=int(chain_length),
+            masses=thermostat_masses,
+            num_systems=self.system.num_systems,
+            device=self.system.wp_device,
+            dtype=self.system.wp_dtype,
+        )
+        eta = wp.zeros(
+            (self.system.num_systems, chain_length),
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        eta_dot = wp.zeros(
+            (self.system.num_systems, chain_length),
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        # Barostat masses/state
+        wp_temp_baro = wp.array(
+            [kT] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        wp_tau_baro = wp.array(
+            [float(pdamp_fs)] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        npt_num_atoms_per_system = wp.array(
+            self.system.num_atoms_per_system.to(torch.int32),
+            dtype=wp.int32,
+            device=self.system.wp_device,
+        )
+        cell_masses = wp.empty(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        compute_barostat_mass(
+            target_temperature=wp_temp_baro,
+            tau_p=wp_tau_baro,
+            num_atoms=npt_num_atoms_per_system,
+            masses_out=cell_masses,
+            device=self.system.wp_device,
+        )
+        cell_velocities = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_mat_dtype,
+            device=self.system.wp_device,
         )
 
-        # Initial forces with virial
-        _, wp_forces, wp_virial_flat = self._compute_forces(
-            wp_positions, compute_virial=True
+        tensor_dtype = vec9f if self.system.wp_dtype == wp.float32 else vec9d
+        virial_tensors = wp.zeros(
+            self.system.num_systems, dtype=tensor_dtype, device=self.system.wp_device
         )
 
-        # Convert flat virial to vec9 without synchronization (negate for sign convention)
-        convert_flat_virial_to_vec9(
-            wp_virial_flat, wp_virial_vec9, negate=True, device=self.wp_device
+        # Scratch arrays for NPT step
+        npt_pressure_tensors = wp.zeros(
+            self.system.num_systems, dtype=tensor_dtype, device=self.system.wp_device
+        )
+        npt_volumes = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        npt_kinetic_energy = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        npt_cells_inv = wp.empty(
+            self.system.num_systems,
+            dtype=self.system.wp_mat_dtype,
+            device=self.system.wp_device,
+        )
+        npt_kinetic_tensors = wp.zeros(
+            (self.system.num_systems, 9),
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
 
-        # For batched mode, need num_atoms_per_system array
-        if self.is_batched:
-            num_atoms_per_system = wp.array(
-                [self.num_atoms] * self.num_systems,
-                dtype=wp.int32,
-                device=self.wp_device,
-            )
-        else:
-            num_atoms_per_system = None
+        # Initial forces/virial
+        wp_energies = self.system.compute_forces_virial(virial_tensors)
+        # Pre-compute volumes and kinetic energy for the first step
+        compute_cell_volume(
+            self.system.wp_cell, volumes=npt_volumes, device=self.system.wp_device
+        )
+        compute_kinetic_energy(
+            self.system.wp_velocities,
+            self.system.wp_masses,
+            kinetic_energy=npt_kinetic_energy,
+            batch_idx=batch_idx,
+            num_systems=self.system.num_systems,
+            device=self.system.wp_device,
+        )
 
-        # Force computation callback for NPT
-        def compute_forces_callback(pos, cells, forces_out, virial_out):
-            # Update cell and rebuild neighbors
-            self.torch_positions = wp.to_torch(pos)
-            self.torch_cell = wp.to_torch(cells)
-            self.wp_cell = cells
-            self._rebuild_neighbors()
+        def _compute_forces_cb(positions, cells, forces, virial_out):
+            nonlocal wp_energies
+            self.system.wp_positions = positions
+            self.system.wp_cell = cells
+            wp_energies = self.system.compute_forces_virial(virial_out)
+            wp.copy(forces, self.system.wp_forces)
 
-            # Compute forces and virial
-            _, new_forces, new_virial = self._compute_forces(pos, compute_virial=True)
-            wp.copy(forces_out, new_forces)
-
-            # Convert flat virial to vec9 without synchronization (negate for sign convention)
-            convert_flat_virial_to_vec9(
-                new_virial, virial_out, negate=True, device=self.wp_device
-            )
-
-        # Pre-allocate cell inverse scratch buffer for wrapping
-        wp_cell_inv = wp.empty_like(wp_cells)
-
-        # Warmup
-        def warmup_step():
+        def step():
             run_npt_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_cells,
-                wp_cell_velocities,
-                wp_virial_vec9,
-                wp_eta,
-                wp_eta_dot,
-                thermostat_masses,
-                cell_mass,
-                wp_target_temp,
-                wp_target_pressure,
-                self.num_atoms,
-                chain_length,
-                dt,
-                compute_forces_fn=compute_forces_callback,
-                batch_idx=self.wp_batch_idx,
-                num_atoms_per_system=num_atoms_per_system,
-                device=self.wp_device,
-            )
-            # Wrap positions
-            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=wp_cells,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                velocities=self.system.wp_velocities,
+                forces=self.system.wp_forces,
+                masses=self.system.wp_masses,
+                cells=self.system.wp_cell,
+                cell_velocities=cell_velocities,
+                virial_tensors=virial_tensors,
+                eta=eta,
+                eta_dot=eta_dot,
+                thermostat_masses=thermostat_masses,
+                cell_masses=cell_masses,
+                target_temperature=wp_target_temperature,
+                target_pressure=wp_target_pressure,
+                num_atoms=self.system.num_atoms,
+                chain_length=int(chain_length),
+                dt=float(dt),
+                pressure_tensors=npt_pressure_tensors,
+                volumes=npt_volumes,
+                kinetic_energy=npt_kinetic_energy,
+                cells_inv=npt_cells_inv,
+                kinetic_tensors=npt_kinetic_tensors,
+                num_atoms_per_system=npt_num_atoms_per_system,
+                compute_forces_fn=_compute_forces_cb,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
 
-        self._run_warmup(warmup_step, warmup_steps, "NPT warmup")
+        self._run_warmup(step, warmup_steps, "NPT warmup")
 
-        # Timed loop
-        def run_step(step):
-            run_npt_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_cells,
-                wp_cell_velocities,
-                wp_virial_vec9,
-                wp_eta,
-                wp_eta_dot,
-                thermostat_masses,
-                cell_mass,
-                wp_target_temp,
-                wp_target_pressure,
-                self.num_atoms,
-                chain_length,
-                dt,
-                compute_forces_fn=compute_forces_callback,
-                batch_idx=self.wp_batch_idx,
-                num_atoms_per_system=num_atoms_per_system,
-                device=self.wp_device,
-            )
-            # Wrap positions
-            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=wp_cells,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-
-        total_time, step_times = self._run_timed_loop(run_step, num_steps, log_interval)
+        total_time, step_times = self._run_timed_loop(step, num_steps, log_interval)
 
         return BenchmarkResult(
             name="npt",
             backend="nvalchemiops",
             ensemble="NPT",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )
 
     def run_nph(
         self,
         dt: float,
         num_steps: int,
+        temperature: float = 94.4,
         pressure: float = 0.0,
         tau_p: float = 1000.0,
         warmup_steps: int = 100,
@@ -2023,181 +2451,172 @@ class NvalchemiOpsBenchmark:
         - Virial computation is required for pressure calculation.
         - Neighbor lists are rebuilt every step due to changing cell.
         """
-        from nvalchemiops.dynamics.integrators import (
-            compute_barostat_mass,
-            run_nph_step,
-            vec9d,
-            vec9f,
-        )
-        from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
-            wrap_positions_to_cell,
-        )
-
-        # Convert pressure
-        target_pressure_evA3 = pressure * 6.2415e-7  # bar to eV/Å³
-
-        # Use initial temperature for barostat mass calculation (computed on device)
-        velocities_wp = wp.from_torch(self.torch_velocities, dtype=self.wp_vec_dtype)
-        vel_torch = wp.to_torch(velocities_wp)
-        ke = 0.5 * (self.torch_masses.unsqueeze(1) * (vel_torch**2)).sum()
-        initial_temp = 2.0 * ke / (3.0 * self.total_atoms * KB_EV)
-        kT = initial_temp * KB_EV
-
-        # Cell velocity (initially zero)
-        cell_velocity = torch.zeros(
-            self.num_systems, 3, 3, device=self.device, dtype=self.dtype
-        )
-
-        # Compute barostat mass
-        cell_mass_single = compute_barostat_mass(
-            target_temperature=float(kT.item()),
-            tau_p=float(tau_p),
-            num_atoms=self.num_atoms,
-            dtype=self.wp_dtype,
-            device=self.wp_device,
-        )
-        if self.is_batched:
-            # For batched, replicate the single mass to all systems
-            cell_mass_torch = (
-                wp.to_torch(cell_mass_single).expand(self.num_systems).clone()
+        try:
+            return self._run_nph_impl(
+                dt=dt,
+                num_steps=num_steps,
+                target_pressure_atm=pressure,
+                pdamp_fs=tau_p,
+                reference_temperature_K=temperature,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
             )
-            cell_mass = wp.from_torch(cell_mass_torch, dtype=self.wp_dtype)
-        else:
-            cell_mass = cell_mass_single
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result("nph", "NPH", num_steps, dt, warmup_steps)
 
-        # vec9 type
-        vec_type = vec9f if self.dtype == torch.float32 else vec9d
-
-        # Convert to warp arrays
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(
-            self.torch_velocities.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_cells = wp.from_torch(self.torch_cell.clone(), dtype=self.wp_mat_dtype)
-        wp_cell_velocities = wp.from_torch(cell_velocity, dtype=self.wp_mat_dtype)
+    def _run_nph_impl(
+        self,
+        dt: float,
+        num_steps: int,
+        target_pressure_atm: float = 1.0,
+        pdamp_fs: float = 1000.0,
+        reference_temperature_K: float = 94.4,
+        warmup_steps: int = 100,
+        log_interval: int = 100,
+    ) -> BenchmarkResult:
+        """Implementation of NPH (called by run_nph)."""
+        p_ext = pressure_atm_to_ev_per_a3(target_pressure_atm)
+        # Per-system target pressure (kernels expect shape (num_systems,)).
         wp_target_pressure = wp.array(
-            [target_pressure_evA3] * self.num_systems,
-            dtype=self.wp_dtype,
-            device=self.wp_device,
-        )
-        wp_virial_vec9 = wp.zeros(
-            self.num_systems, dtype=vec_type, device=self.wp_device
+            [p_ext] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
 
-        # Initial forces with virial
-        _, wp_forces, wp_virial_flat = self._compute_forces(
-            wp_positions, compute_virial=True
+        # Barostat mass per system (kT, tau_p, num_atoms_per_system) for correct dynamics in batch.
+        kT_ref = float(reference_temperature_K) * KB_EV
+        wp_temp_arr = wp.array(
+            [kT_ref] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        wp_tau_arr = wp.array(
+            [float(pdamp_fs)] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        nph_num_atoms_per_system = wp.array(
+            self.system.num_atoms_per_system.to(torch.int32),
+            dtype=wp.int32,
+            device=self.system.wp_device,
+        )
+        cell_masses = wp.empty(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        compute_barostat_mass(
+            target_temperature=wp_temp_arr,
+            tau_p=wp_tau_arr,
+            num_atoms=nph_num_atoms_per_system,
+            masses_out=cell_masses,
+            device=self.system.wp_device,
         )
 
-        # Convert flat virial to vec9 without synchronization (negate for sign convention)
-        convert_flat_virial_to_vec9(
-            wp_virial_flat, wp_virial_vec9, negate=True, device=self.wp_device
+        cell_velocities = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_mat_dtype,
+            device=self.system.wp_device,
+        )
+        tensor_dtype = vec9f if self.system.wp_dtype == wp.float32 else vec9d
+        virial_tensors = wp.zeros(
+            self.system.num_systems, dtype=tensor_dtype, device=self.system.wp_device
         )
 
-        # For batched mode, need num_atoms_per_system array
-        if self.is_batched:
-            num_atoms_per_system = wp.array(
-                [self.num_atoms] * self.num_systems,
-                dtype=wp.int32,
-                device=self.wp_device,
-            )
-        else:
-            num_atoms_per_system = None
+        # Scratch arrays for NPH step
+        nph_pressure_tensors = wp.zeros(
+            self.system.num_systems, dtype=tensor_dtype, device=self.system.wp_device
+        )
+        nph_volumes = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        nph_kinetic_energy = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        nph_cells_inv = wp.empty(
+            self.system.num_systems,
+            dtype=self.system.wp_mat_dtype,
+            device=self.system.wp_device,
+        )
+        nph_kinetic_tensors = wp.zeros(
+            (self.system.num_systems, 9),
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        # nph_num_atoms_per_system already created above for compute_barostat_mass; reuse.
+
+        batch_idx = None if not self.is_batched else self.system.wp_batch_idx
+
+        # Initial forces/virial
+        wp_energies = self.system.compute_forces_virial(virial_tensors)
+
+        # Pre-compute volumes and kinetic energy for the first step
+        compute_cell_volume(
+            self.system.wp_cell, volumes=nph_volumes, device=self.system.wp_device
+        )
+        compute_kinetic_energy(
+            self.system.wp_velocities,
+            self.system.wp_masses,
+            kinetic_energy=nph_kinetic_energy,
+            batch_idx=batch_idx,
+            num_systems=self.system.num_systems,
+            device=self.system.wp_device,
+        )
 
         # Force computation callback for NPH
-        def compute_forces_callback(pos, cells, forces_out, virial_out):
-            # Update cell and rebuild neighbors
-            self.torch_positions = wp.to_torch(pos)
-            self.torch_cell = wp.to_torch(cells)
-            self.wp_cell = cells
-            self._rebuild_neighbors()
-
-            # Compute forces and virial
-            _, new_forces, new_virial = self._compute_forces(pos, compute_virial=True)
-            wp.copy(forces_out, new_forces)
-
-            # Convert flat virial to vec9 without synchronization (negate for sign convention)
-            convert_flat_virial_to_vec9(
-                new_virial, virial_out, negate=True, device=self.wp_device
-            )
-
-        # Pre-allocate cell inverse scratch buffer for wrapping
-        wp_cell_inv = wp.empty_like(wp_cells)
+        def _compute_forces_cb(positions, cells, forces, virial_out):
+            nonlocal wp_energies
+            # Ensure the system points at the integrator-updated arrays
+            self.system.wp_positions = positions
+            self.system.wp_cell = cells
+            wp_energies = self.system.compute_forces_virial(virial_out)
+            wp.copy(forces, self.system.wp_forces)
 
         # Warmup
-        def warmup_step():
+        def step():
             run_nph_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_cells,
-                wp_cell_velocities,
-                wp_virial_vec9,
-                cell_mass,
-                wp_target_pressure,
-                self.num_atoms,
-                dt,
-                compute_forces_fn=compute_forces_callback,
-                batch_idx=self.wp_batch_idx,
-                num_atoms_per_system=num_atoms_per_system,
-                device=self.wp_device,
-            )
-            # Wrap positions
-            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=wp_cells,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                velocities=self.system.wp_velocities,
+                forces=self.system.wp_forces,
+                masses=self.system.wp_masses,
+                cells=self.system.wp_cell,
+                cell_velocities=cell_velocities,
+                virial_tensors=virial_tensors,
+                cell_masses=cell_masses,
+                target_pressure=wp_target_pressure,
+                num_atoms=self.system.num_atoms,
+                dt=float(dt),
+                pressure_tensors=nph_pressure_tensors,
+                volumes=nph_volumes,
+                kinetic_energy=nph_kinetic_energy,
+                cells_inv=nph_cells_inv,
+                kinetic_tensors=nph_kinetic_tensors,
+                num_atoms_per_system=nph_num_atoms_per_system,
+                compute_forces_fn=_compute_forces_cb,
+                batch_idx=batch_idx,
+                device=self.system.wp_device,
             )
 
-        self._run_warmup(warmup_step, warmup_steps, "NPH warmup")
+        self._run_warmup(step, warmup_steps, "NPH warmup")
 
-        # Timed loop
-        def run_step(step):
-            run_nph_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                self.wp_masses,
-                wp_cells,
-                wp_cell_velocities,
-                wp_virial_vec9,
-                cell_mass,
-                wp_target_pressure,
-                self.num_atoms,
-                dt,
-                compute_forces_fn=compute_forces_callback,
-                batch_idx=self.wp_batch_idx,
-                num_atoms_per_system=num_atoms_per_system,
-                device=self.wp_device,
-            )
-            # Wrap positions
-            compute_cell_inverse(wp_cells, wp_cell_inv, device=self.wp_device)
-            wrap_positions_to_cell(
-                wp_positions,
-                cells=wp_cells,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
-            )
-
-        total_time, step_times = self._run_timed_loop(run_step, num_steps, log_interval)
+        total_time, step_times = self._run_timed_loop(step, num_steps, log_interval)
 
         return BenchmarkResult(
             name="nph",
             backend="nvalchemiops",
             ensemble="NPH",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )
 
     # ========================================================================
@@ -2266,6 +2685,47 @@ class NvalchemiOpsBenchmark:
         - Supports both single-system and batched modes.
         - Uses optimized nvalchemiops FIRE kernels.
         """
+        try:
+            return self._run_fire_impl(
+                max_steps=max_steps,
+                force_tolerance=force_tolerance,
+                dt_start=dt_start,
+                dt_max=dt_max,
+                dt_min=dt_min,
+                alpha_start=alpha_start,
+                n_min=n_min,
+                f_inc=f_inc,
+                f_dec=f_dec,
+                f_alpha=f_alpha,
+                maxstep=maxstep,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
+                check_interval=check_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result(
+                "fire", "optimization", max_steps, dt_start, warmup_steps
+            )
+
+    def _run_fire_impl(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 1.0,
+        dt_max: float = 10.0,
+        dt_min: float = 0.001,
+        alpha_start: float = 0.1,
+        n_min: int = 5,
+        f_inc: float = 1.1,
+        f_dec: float = 0.5,
+        f_alpha: float = 0.99,
+        maxstep: float = 0.2,
+        warmup_steps: int = 0,
+        log_interval: int = 100,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Implementation of FIRE (called by run_fire)."""
         from nvalchemiops.dynamics.optimizers.fire import fire_step
         from nvalchemiops.dynamics.utils import (
             compute_cell_inverse,
@@ -2485,6 +2945,47 @@ class NvalchemiOpsBenchmark:
         - Supports both single-system and batched modes.
         - Uses 3 fused kernel launches per step for minimal overhead.
         """
+        try:
+            return self._run_fire2_impl(
+                max_steps=max_steps,
+                force_tolerance=force_tolerance,
+                dt_start=dt_start,
+                tmax=tmax,
+                tmin=tmin,
+                delaystep=delaystep,
+                dtgrow=dtgrow,
+                dtshrink=dtshrink,
+                alpha0=alpha0,
+                alphashrink=alphashrink,
+                maxstep=maxstep,
+                warmup_steps=warmup_steps,
+                log_interval=log_interval,
+                check_interval=check_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result(
+                "fire2", "optimization", max_steps, dt_start, warmup_steps
+            )
+
+    def _run_fire2_impl(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 0.045,
+        tmax: float = 0.10,
+        tmin: float = 0.005,
+        delaystep: int = 50,
+        dtgrow: float = 1.09,
+        dtshrink: float = 0.95,
+        alpha0: float = 0.20,
+        alphashrink: float = 0.985,
+        maxstep: float = 0.25,
+        warmup_steps: int = 0,
+        log_interval: int = 100,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Implementation of FIRE2 (called by run_fire2)."""
         from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
         from nvalchemiops.dynamics.utils import (
             compute_cell_inverse,
@@ -2707,6 +3208,45 @@ class NvalchemiOpsBenchmark:
         BenchmarkResult
             Benchmark result with timing and metadata.
         """
+        try:
+            return self._run_fire_cell_impl(
+                max_steps=max_steps,
+                force_tolerance=force_tolerance,
+                dt_start=dt_start,
+                dt_max=dt_max,
+                dt_min=dt_min,
+                alpha_start=alpha_start,
+                n_min=n_min,
+                f_inc=f_inc,
+                f_dec=f_dec,
+                f_alpha=f_alpha,
+                maxstep=maxstep,
+                cell_mass=cell_mass,
+                pressure_tolerance=pressure_tolerance,
+                check_interval=check_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result("fire_cell", "optimization", max_steps, dt_start, 0)
+
+    def _run_fire_cell_impl(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 1.0,
+        dt_max: float = 10.0,
+        dt_min: float = 0.001,
+        alpha_start: float = 0.1,
+        n_min: int = 5,
+        f_inc: float = 1.1,
+        f_dec: float = 0.5,
+        f_alpha: float = 0.99,
+        maxstep: float = 0.2,
+        cell_mass: float = 1.0,
+        pressure_tolerance: float = 0.3,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Implementation of FIRE variable-cell (called by run_fire_cell)."""
         from nvalchemiops.dynamics.optimizers.fire import fire_step
         from nvalchemiops.dynamics.utils import (
             compute_cell_inverse,
@@ -3058,6 +3598,45 @@ class NvalchemiOpsBenchmark:
         BenchmarkResult
             Benchmark result with timing and metadata.
         """
+        try:
+            return self._run_fire2_cell_impl(
+                max_steps=max_steps,
+                force_tolerance=force_tolerance,
+                dt_start=dt_start,
+                tmax=tmax,
+                tmin=tmin,
+                delaystep=delaystep,
+                dtgrow=dtgrow,
+                dtshrink=dtshrink,
+                alpha0=alpha0,
+                alphashrink=alphashrink,
+                maxstep=maxstep,
+                pressure_tolerance=pressure_tolerance,
+                check_interval=check_interval,
+            )
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return self._oom_result(
+                "fire2_cell", "optimization", max_steps, dt_start, 0
+            )
+
+    def _run_fire2_cell_impl(
+        self,
+        max_steps: int = 1000,
+        force_tolerance: float = 0.01,
+        dt_start: float = 0.045,
+        tmax: float = 0.10,
+        tmin: float = 0.005,
+        delaystep: int = 50,
+        dtgrow: float = 1.09,
+        dtshrink: float = 0.95,
+        alpha0: float = 0.20,
+        alphashrink: float = 0.985,
+        maxstep: float = 0.25,
+        pressure_tolerance: float = 0.3,
+        check_interval: int = 20,
+    ) -> BenchmarkResult:
+        """Implementation of FIRE2 variable-cell (called by run_fire2_cell)."""
         from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
         from nvalchemiops.dynamics.utils import (
             compute_cell_inverse,

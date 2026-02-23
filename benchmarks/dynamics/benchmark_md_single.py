@@ -43,8 +43,7 @@ import torch
 
 from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
-    NvalchemiopsLJModel,
-    create_lj_system,
+    create_fcc_argon,
     get_gpu_sku,
     load_config,
     print_benchmark_footer,
@@ -65,6 +64,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         Output directory for CSV files.
     """
     md_config = config.get("md_single", {})
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = md_config.get("dtype", torch.float32)
     if not md_config.get("enabled", True):
         print("MD single-system benchmarks disabled in config")
         return
@@ -89,41 +90,30 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
 
     for num_atoms in system_sizes:
         # Create system
-        positions, cell, masses, velocities = create_lj_system(
-            num_atoms=num_atoms,
-            lattice_constant=5.26,
-            temperature=300.0,
-            device="cuda",
-            dtype=torch.float64,
+        num_cells = int(num_atoms ** (1 / 3))
+        positions, cell = create_fcc_argon(
+            num_unit_cells=num_cells,
+            a=5.26,
         )
 
+        positions = torch.as_tensor(positions, dtype=dtype, device=device)
+        cell = torch.as_tensor(cell, dtype=dtype, device=device)
         pbc = torch.tensor([True, True, True], device=positions.device)
-
-        # Create LJ model
-        lj_model = NvalchemiopsLJModel(
-            epsilon=epsilon,
-            sigma=sigma,
-            cutoff=cutoff,
-            cell=cell,
-            batch_idx=None,  # Single-system mode
-            device="cuda",
-            dtype=torch.float64,
-        )
 
         # Run nvalchemiops benchmarks
         nv_bench = NvalchemiOpsBenchmark(
             positions=positions,
             cell=cell,
-            masses=masses,
             pbc=pbc,
-            model=lj_model,
             skin=skin,
+            epsilon=epsilon,
+            sigma=sigma,
+            cutoff=cutoff,
             neighbor_rebuild_interval=neighbor_rebuild_interval,
-            velocities=velocities,
         )
 
         # Velocity Verlet
-        if "velocity_verlet" in integrators:
+        if integrators.get("velocity_verlet", {}).get("enabled", False):
             vv_config = integrators["velocity_verlet"]
             result = nv_bench.run_velocity_verlet(
                 dt=vv_config.get("dt", 0.001),
@@ -134,14 +124,44 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
             print_benchmark_result(result, is_md=True)
 
         # Langevin
-        if "langevin" in integrators:
+        if integrators.get("langevin", {}).get("enabled", False):
             lang_config = integrators["langevin"]
             result = nv_bench.run_langevin(
                 dt=lang_config.get("dt", 0.001),
                 num_steps=lang_config.get("steps", 10000),
-                temperature=lang_config.get("temperature", 300.0),
+                temperature=lang_config.get("temperature", 94.4),
                 friction=lang_config.get("friction", 0.01),
                 warmup_steps=lang_config.get("warmup_steps", 100),
+            )
+            results_nvalchemiops.append(result)
+            print_benchmark_result(result, is_md=True)
+
+        # NPT
+        if integrators.get("npt", {}).get("enabled", False):
+            npt_config = integrators["npt"]
+            result = nv_bench.run_npt(
+                dt=npt_config.get("dt", 0.001),
+                num_steps=npt_config.get("steps", 10000),
+                temperature=npt_config.get("temperature", 94.4),
+                pressure=npt_config.get("pressure", 0.0),
+                tau_t=npt_config.get("tau_t", 500.0),
+                tau_p=npt_config.get("tau_p", 5000.0),
+                chain_length=npt_config.get("chain_length", 3),
+                warmup_steps=npt_config.get("warmup_steps", 100),
+            )
+            results_nvalchemiops.append(result)
+            print_benchmark_result(result, is_md=True)
+
+        # NPH
+        if integrators.get("nph", {}).get("enabled", False):
+            nph_config = integrators["nph"]
+            result = nv_bench.run_nph(
+                dt=nph_config.get("dt", 0.001),
+                num_steps=nph_config.get("steps", 10000),
+                temperature=nph_config.get("temperature", 94.4),
+                pressure=nph_config.get("pressure", 1.0),
+                tau_p=nph_config.get("tau_p", 1000.0),
+                warmup_steps=nph_config.get("warmup_steps", 100),
             )
             results_nvalchemiops.append(result)
             print_benchmark_result(result, is_md=True)

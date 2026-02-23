@@ -252,7 +252,7 @@ class TestTemperatureComputation:
     def test_compute_temperature_runs(self, device, dtype_vec, dtype_scalar, np_dtype):
         """Test that compute_temperature executes without error."""
         num_atoms = 100
-        dof = 3 * num_atoms
+
         np.random.seed(42)
 
         velocities = wp.array(
@@ -269,9 +269,8 @@ class TestTemperatureComputation:
         kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
         compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         temperature = wp.empty(1, dtype=dtype_scalar, device=device)
-        temp = compute_temperature(
-            kinetic_energy, temperature, num_atoms, dof=dof, device=device
-        )
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
+        temp = compute_temperature(kinetic_energy, temperature, num_atoms_per_system)
         wp.synchronize_device(device)
 
         assert temp.shape[0] == 1
@@ -285,7 +284,6 @@ class TestTemperatureComputation:
     ):
         """Test temperature computation with device inferred from arrays."""
         num_atoms = 50
-        dof = 3 * num_atoms
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
@@ -301,8 +299,9 @@ class TestTemperatureComputation:
         kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
         compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         temperature = wp.empty(1, dtype=dtype_scalar, device=device)
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
         # Call without explicit device
-        temp = compute_temperature(kinetic_energy, temperature, num_atoms, dof=dof)
+        temp = compute_temperature(kinetic_energy, temperature, num_atoms_per_system)
         wp.synchronize_device(device)
 
         assert temp.shape[0] == 1
@@ -314,7 +313,6 @@ class TestTemperatureComputation:
     ):
         """Test temperature computation with pre-computed kinetic energy."""
         num_atoms = 50
-        dof = 3 * num_atoms
 
         velocities = wp.array(
             np.random.randn(num_atoms, 3).astype(np_dtype),
@@ -331,7 +329,8 @@ class TestTemperatureComputation:
         compute_kinetic_energy(velocities, masses, ke, device=device)
 
         temperature = wp.empty(1, dtype=dtype_scalar, device=device)
-        temp = compute_temperature(ke, temperature, num_atoms, dof=dof, device=device)
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
+        temp = compute_temperature(ke, temperature, num_atoms_per_system)
 
         wp.synchronize_device(device)
         assert temp.shape[0] == 1
@@ -341,7 +340,7 @@ class TestTemperatureComputation:
     def test_compute_temperature_value(self, device, dtype_vec, dtype_scalar, np_dtype):
         """Test that temperature follows kT = 2*KE / dof."""
         num_atoms = 100
-        dof = 3 * num_atoms
+        dof = 3 * num_atoms - 3
         np.random.seed(42)
 
         vel = np.random.randn(num_atoms, 3).astype(np_dtype)
@@ -353,9 +352,8 @@ class TestTemperatureComputation:
         kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
         compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         temperature = wp.empty(1, dtype=dtype_scalar, device=device)
-        temp = compute_temperature(
-            kinetic_energy, temperature, num_atoms, dof=dof, device=device
-        )
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
+        temp = compute_temperature(kinetic_energy, temperature, num_atoms_per_system)
         wp.synchronize_device(device)
 
         ke = 0.5 * np.sum(mass[:, np.newaxis] * vel**2)
@@ -372,7 +370,6 @@ class TestTemperatureComputation:
         num_systems = 3
         atoms_per_system = 50
         total_atoms = num_systems * atoms_per_system
-        dof_per_system = 3 * atoms_per_system
         np.random.seed(42)
 
         velocities = wp.array(
@@ -401,14 +398,13 @@ class TestTemperatureComputation:
             device=device,
         )
         temperature = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        num_atoms_per_system = wp.array(
+            [atoms_per_system] * num_systems, dtype=wp.int32, device=device
+        )
         temp = compute_temperature(
             kinetic_energy,
             temperature,
-            atoms_per_system,
-            dof=dof_per_system,
-            batch_idx=batch_idx,
-            num_systems=num_systems,
-            device=device,
+            num_atoms_per_system,
         )
         wp.synchronize_device(device)
 
@@ -423,7 +419,6 @@ class TestTemperatureComputation:
         num_systems = 2
         atoms_per_system = 20
         total_atoms = num_systems * atoms_per_system
-        dof_per_system = 3 * atoms_per_system
 
         velocities = wp.array(
             np.random.randn(total_atoms, 3).astype(np_dtype),
@@ -452,14 +447,13 @@ class TestTemperatureComputation:
         )
 
         temperature = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        num_atoms_per_system = wp.array(
+            [atoms_per_system] * num_systems, dtype=wp.int32, device=device
+        )
         temp = compute_temperature(
             ke,
             temperature,
-            atoms_per_system,
-            dof=dof_per_system,
-            batch_idx=batch_idx,
-            num_systems=num_systems,
-            device=device,
+            num_atoms_per_system,
         )
 
         wp.synchronize_device(device)
@@ -621,7 +615,6 @@ class TestVelocityInitialization:
         """Test that initialized velocities give correct temperature."""
         num_atoms = 10000
         target_temp = 1.0
-        dof = 3 * num_atoms
 
         velocities = wp.empty(num_atoms, dtype=dtype_vec, device=device)
         masses = wp.array(
@@ -648,8 +641,9 @@ class TestVelocityInitialization:
         kinetic_energy = wp.zeros(1, dtype=dtype_scalar, device=device)
         compute_kinetic_energy(velocities, masses, kinetic_energy, device=device)
         measured_temp_arr = wp.empty(1, dtype=dtype_scalar, device=device)
+        num_atoms_per_system = wp.array([num_atoms], dtype=wp.int32, device=device)
         measured_temp = compute_temperature(
-            kinetic_energy, measured_temp_arr, num_atoms, dof=dof, device=device
+            kinetic_energy, measured_temp_arr, num_atoms_per_system
         )
         wp.synchronize_device(device)
 
@@ -1274,7 +1268,7 @@ class TestTemperatureAtomPtr:
         atom_counts = [50, 50, 50]
         total_atoms = sum(atom_counts)
         num_systems = len(atom_counts)
-        dof_per_system = 3 * 50
+        num_atoms_per_system = wp.array(atom_counts, dtype=wp.int32, device=device)
         np.random.seed(42)
 
         atom_ptr_np = np.concatenate([[0], np.cumsum(atom_counts)]).astype(np.int32)
@@ -1304,11 +1298,7 @@ class TestTemperatureAtomPtr:
         temp = compute_temperature(
             kinetic_energy,
             temperature,
-            num_atoms=50,
-            dof=dof_per_system,
-            atom_ptr=atom_ptr,
-            num_systems=num_systems,
-            device=device,
+            num_atoms_per_system,
         )
         wp.synchronize_device(device)
 
@@ -1326,7 +1316,9 @@ class TestTemperatureAtomPtr:
         num_systems = 3
         atoms_per_system = 20
         total_atoms = num_systems * atoms_per_system
-        dof_per_system = 3 * atoms_per_system
+        num_atoms_per_system = wp.array(
+            [atoms_per_system] * num_systems, dtype=wp.int32, device=device
+        )
 
         np.random.seed(42)
         initial_vel = np.random.randn(total_atoms, 3).astype(np_dtype)
@@ -1360,11 +1352,7 @@ class TestTemperatureAtomPtr:
         temp_batch = compute_temperature(
             ke_batch,
             temp_batch_arr,
-            num_atoms=atoms_per_system,
-            dof=dof_per_system,
-            batch_idx=batch_idx,
-            num_systems=num_systems,
-            device=device,
+            num_atoms_per_system,
         )
 
         # Execute with atom_ptr
@@ -1378,14 +1366,13 @@ class TestTemperatureAtomPtr:
             device=device,
         )
         temp_ptr_arr = wp.empty(num_systems, dtype=dtype_scalar, device=device)
+        num_atoms_per_system = wp.array(
+            [atoms_per_system] * num_systems, dtype=wp.int32, device=device
+        )
         temp_ptr = compute_temperature(
             ke_ptr,
             temp_ptr_arr,
-            num_atoms=atoms_per_system,
-            dof=dof_per_system,
-            atom_ptr=atom_ptr,
-            num_systems=num_systems,
-            device=device,
+            num_atoms_per_system,
         )
 
         wp.synchronize_device(device)

@@ -1051,28 +1051,8 @@ def _batch_compute_com_from_momentum_kernel(
 
 @wp.kernel
 def _compute_temperature_from_ke_kernel(
-    kinetic_energy: wp.array(dtype=Any),
-    dof: Any,
-    temperature: wp.array(dtype=Any),
-):
-    """Compute temperature from kinetic energy: T = 2*KE / DOF
-
-    Launch Grid
-    -----------
-    dim = [1] (or [num_systems] for batched)
-    """
-    sys_id = wp.tid()
-    ke = kinetic_energy[sys_id]
-    # Guard against division by zero: if dof is zero, set temperature to zero
-    temperature[sys_id] = wp.where(
-        dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0)
-    )
-
-
-@wp.kernel
-def _batch_compute_temperature_from_ke_kernel(
     kinetic_energies: wp.array(dtype=Any),
-    dof: Any,
+    num_atoms_per_system: wp.array(dtype=Any),
     temperatures: wp.array(dtype=Any),
 ):
     """Compute temperature from kinetic energy for batched systems: T = 2*KE / DOF
@@ -1083,8 +1063,9 @@ def _batch_compute_temperature_from_ke_kernel(
     """
     sys_id = wp.tid()
     ke = kinetic_energies[sys_id]
+    dof = 3 * num_atoms_per_system[sys_id] - 3
     temperatures[sys_id] = wp.where(
-        dof > type(ke)(0.0), type(ke)(2.0) * ke / dof, type(ke)(0.0)
+        type(ke)(dof) > type(ke)(0.0), type(ke)(2.0) * ke / type(ke)(dof), type(ke)(0.0)
     )
 
 
@@ -1104,7 +1085,6 @@ _compute_kinetic_energy_ptr_kernel_overload = {}
 
 # Temperature kernel overloads
 _compute_temperature_from_ke_kernel_overload = {}
-_batch_compute_temperature_from_ke_kernel_overload = {}
 
 # COM velocity kernel overloads
 _compute_com_velocity_kernel_overload = {}
@@ -1170,11 +1150,7 @@ for t, v in zip(_T, _V):
     # Temperature kernels (keyed by scalar type)
     _compute_temperature_from_ke_kernel_overload[t] = wp.overload(
         _compute_temperature_from_ke_kernel,
-        [wp.array(dtype=t), t, wp.array(dtype=t)],
-    )
-    _batch_compute_temperature_from_ke_kernel_overload[t] = wp.overload(
-        _batch_compute_temperature_from_ke_kernel,
-        [wp.array(dtype=t), t, wp.array(dtype=t)],
+        [wp.array(dtype=t), wp.array(dtype=wp.int32), wp.array(dtype=t)],
     )
 
     # COM velocity kernels (now using 1D vector arrays for momentum)
@@ -1425,12 +1401,7 @@ def compute_kinetic_energy(
 def compute_temperature(
     kinetic_energy: wp.array,
     temperature: wp.array,
-    num_atoms: int,
-    dof: int = None,
-    batch_idx: wp.array = None,
-    atom_ptr: wp.array = None,
-    num_systems: int = 1,
-    device: str = None,
+    num_atoms_per_system: wp.array,
 ) -> wp.array:
     """
     Compute instantaneous temperature from kinetic energy.
@@ -1444,62 +1415,22 @@ def compute_temperature(
         Pre-computed kinetic energy. Shape (1,) or (B,).
     temperature : wp.array
         Output temperature array. Temperature - k_B * T. Shape (1,) or (B,).
-    num_atoms : int
+    num_atoms_per_system : wp.array
         Number of atoms (per system for batched).
-    dof : int, optional
-        Degrees of freedom. If None, uses 3*N - 3.
-    batch_idx : wp.array(dtype=wp.int32), optional
-        System index for each atom. For batched mode (atomic operations).
-    atom_ptr : wp.array(dtype=wp.int32), optional
-        CSR-style pointers. Shape (num_systems + 1,). For batched mode (sequential per-system).
-    num_systems : int, optional
-        Number of systems. Default 1.
-    device : str, optional
-        Warp device.
 
     Returns
     -------
     wp.array
         Temperature in energy units (k_B*T). Shape (1,) or (B,).
     """
-    if batch_idx is not None and atom_ptr is not None:
-        raise ValueError("Provide batch_idx OR atom_ptr, not both")
-
-    if device is None:
-        device = kinetic_energy.device
-
-    # Determine scalar dtype from kinetic_energy
-    scalar_dtype = kinetic_energy.dtype
-
-    # Determine DOF
-    if dof is None:
-        dof_val = float(3 * num_atoms - 3)
-    else:
-        dof_val = float(dof)
-
-    # Get typed dof value
-    if scalar_dtype == wp.float32:
-        dof_typed = wp.float32(dof_val)
-    else:
-        dof_typed = wp.float64(dof_val)
 
     # Compute temperature: T = 2*KE / DOF using Warp kernel
-    is_batched = batch_idx is not None or atom_ptr is not None or num_systems > 1
-
-    if is_batched:
-        wp.launch(
-            _batch_compute_temperature_from_ke_kernel_overload[scalar_dtype],
-            dim=num_systems,
-            inputs=[kinetic_energy, dof_typed, temperature],
-            device=device,
-        )
-    else:
-        wp.launch(
-            _compute_temperature_from_ke_kernel_overload[scalar_dtype],
-            dim=1,
-            inputs=[kinetic_energy, dof_typed, temperature],
-            device=device,
-        )
+    wp.launch(
+        _compute_temperature_from_ke_kernel_overload[kinetic_energy.dtype],
+        dim=num_atoms_per_system.shape[0],
+        inputs=[kinetic_energy, num_atoms_per_system, temperature],
+        device=kinetic_energy.device,
+    )
 
     return temperature
 
