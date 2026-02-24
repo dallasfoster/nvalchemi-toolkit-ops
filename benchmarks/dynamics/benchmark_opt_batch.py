@@ -172,15 +172,15 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
 
             # Run nvalchemiops benchmarks
             nv_bench = NvalchemiOpsBenchmark(
-                positions=batch_positions,
-                cell=batch_cells,
+                positions=batch_positions.clone(),
+                cell=batch_cells.clone(),
                 pbc=pbc,
                 epsilon=epsilon,
                 sigma=sigma,
                 cutoff=cutoff,
                 skin=skin,
                 neighbor_rebuild_interval=neighbor_rebuild_interval,
-                batch_idx=batch_idx,
+                batch_idx=batch_idx.clone(),
             )
 
             # FIRE
@@ -189,6 +189,18 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 result = nv_bench.run_fire(
                     max_steps=fire_config.get("max_steps", 1000),
                     force_tolerance=fire_config.get("force_tolerance", 0.01),
+                    dt_start=fire_config.get("dt_start", 1.0),
+                    dt_max=fire_config.get("dt_max", 10.0),
+                    dt_min=fire_config.get("dt_min", 0.001),
+                    alpha_start=fire_config.get("alpha_start", 0.1),
+                    n_min=fire_config.get("n_min", 5),
+                    f_inc=fire_config.get("f_inc", 1.1),
+                    f_dec=fire_config.get("f_dec", 0.5),
+                    f_alpha=fire_config.get("f_alpha", 0.99),
+                    maxstep=fire_config.get("maxstep", 0.2),
+                    warmup_steps=fire_config.get("warmup_steps", 0),
+                    log_interval=fire_config.get("log_interval", 100),
+                    check_interval=fire_config.get("check_interval", 20),
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=False)
@@ -201,7 +213,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 sigma=sigma,
                 cutoff=cutoff,
                 neighbor_rebuild_interval=neighbor_rebuild_interval,
-                batch_idx=batch_idx,
+                batch_idx=batch_idx.clone(),
             )
 
             if optimizers.get("fire2", {}).get("enabled", False):
@@ -209,9 +221,25 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 result = nv_bench.run_fire2(
                     max_steps=fire2_config.get("max_steps", 1000),
                     force_tolerance=fire2_config.get("force_tolerance", 0.01),
+                    dt_start=fire2_config.get("dt_start", 0.045),
+                    tmax=fire2_config.get("tmax", 0.10),
+                    tmin=fire2_config.get("tmin", 0.005),
+                    delaystep=fire2_config.get("delaystep", 50),
+                    dtgrow=fire2_config.get("dtgrow", 1.09),
+                    dtshrink=fire2_config.get("dtshrink", 0.95),
+                    alpha0=fire2_config.get("alpha0", 0.20),
+                    alphashrink=fire2_config.get("alphashrink", 0.985),
+                    maxstep=fire2_config.get("maxstep", 0.25),
+                    warmup_steps=fire2_config.get("warmup_steps", 0),
+                    log_interval=fire2_config.get("log_interval", 100),
+                    check_interval=fire2_config.get("check_interval", 20),
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=False)
+            
+            del nv_bench
+            torch.cuda.empty_cache()
+            
     print_batch_benchmark_footer()
 
     # Write CSV results

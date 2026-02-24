@@ -178,20 +178,18 @@ opt_batch:
       max_steps: 1000
       force_tolerance: 0.01  # eV/Å
       dt_start: 0.045  # fs
-      tmax: 0.10  # fs
+      tmax: 0.08  # fs
       tmin: 0.005  # fs
-      delaystep: 50
-      dtgrow: 1.09
-      dtshrink: 0.95
-      alpha0: 0.20
+      delaystep: 5
+      dtgrow: 1.05
+      dtshrink: 0.75
+      alpha0: 0.09
       alphashrink: 0.985
-      maxstep: 0.25  # Å
+      maxstep: 0.1  # Å
       warmup_steps: 100
       log_interval: 100
       check_interval: 20
 
-  # Logging interval
-  log_interval: 100
 
 # FIRE2 Kernel Performance Benchmark
 # -----------------------------------

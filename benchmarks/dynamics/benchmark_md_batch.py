@@ -140,8 +140,7 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         Output directory for CSV files.
     """
     batch_config = config.get("md_batch", {})
-    # device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    device = "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     dtype = batch_config.get("dtype", torch.float32)
     if not batch_config.get("enabled", False):
         print("Batched MD benchmarks disabled in config")
