@@ -33,8 +33,9 @@ CSV file with batched schema (14 columns):
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import gc
+from pathlib import Path
+
 import torch
 
 from benchmarks.dynamics.shared_utils import (
@@ -89,7 +90,7 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    num_cells = int( (num_atoms_per_system//4 + 1) ** (1./3.) )
+    num_cells = int((num_atoms_per_system // 4 + 1) ** (1.0 / 3.0))
     pos, cell = create_fcc_argon(
         num_unit_cells=num_cells,
         a=lattice_constant,
@@ -251,11 +252,10 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=True)
-        
+
         del nv_bench
         torch.cuda.empty_cache()
         gc.collect()
-
 
 
 def main():

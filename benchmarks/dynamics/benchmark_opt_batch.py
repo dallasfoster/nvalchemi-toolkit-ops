@@ -236,10 +236,10 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=False)
-            
+
             del nv_bench
             torch.cuda.empty_cache()
-            
+
     print_batch_benchmark_footer()
 
     # Write CSV results
