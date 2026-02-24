@@ -87,10 +87,10 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     print("\nRunning Single-System MD Benchmarks (nvalchemiops)")
     print(f"GPU: {gpu_sku}")
     print_benchmark_header("MD")
-
+    
     for num_atoms in system_sizes:
         # Create system
-        num_cells = int(num_atoms ** (1 / 3))
+        num_cells = int( (num_atoms//4 + 1) ** (1./3.) )
         positions, cell = create_fcc_argon(
             num_unit_cells=num_cells,
             a=5.26,

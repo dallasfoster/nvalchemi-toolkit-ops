@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
+import gc
 import torch
 
 from benchmarks.dynamics.shared_utils import (
@@ -89,7 +89,7 @@ def create_batched_system(
     atom_ptr : torch.Tensor
         Pointer array, shape (batch_size + 1,).
     """
-    num_cells = int(num_atoms_per_system ** (1 / 3))
+    num_cells = int( (num_atoms_per_system//4 + 1) ** (1./3.) )
     pos, cell = create_fcc_argon(
         num_unit_cells=num_cells,
         a=lattice_constant,
@@ -126,7 +126,6 @@ def create_batched_system(
         device=device,
         dtype=torch.int32,
     )
-
     return positions, cell, batch_idx, atom_ptr
 
 
@@ -141,7 +140,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         Output directory for CSV files.
     """
     batch_config = config.get("md_batch", {})
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     dtype = batch_config.get("dtype", torch.float32)
     if not batch_config.get("enabled", False):
         print("Batched MD benchmarks disabled in config")
@@ -252,6 +252,11 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 )
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=True)
+        
+        del nv_bench
+        torch.cuda.empty_cache()
+        gc.collect()
+
 
 
 def main():

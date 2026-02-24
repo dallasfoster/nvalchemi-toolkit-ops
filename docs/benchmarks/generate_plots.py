@@ -1178,7 +1178,7 @@ def _generate_dynamics_comparison_plots(
         output_path,
         title=f"{benchmark_type.upper()} {system_type.title()} Throughput Comparison",
         x_label="Number of atoms",
-        y_label="Atom-steps/s",
+        y_label="Atom-steps/us",
     )
     print(f"      Generated: {output_path.name}")
 
@@ -1188,7 +1188,7 @@ def _generate_dynamics_comparison_plots(
         for backend, df in data_by_backend.items():
             # Average across num_atoms for each batch_size
             grouped = df.groupby("batch_size")[
-                "batch_throughput_system_steps_per_s"
+                "batch_throughput_system_steps_per_us"
             ].mean()
             series[backend] = (grouped.index.values, grouped.values)
 
@@ -1201,7 +1201,7 @@ def _generate_dynamics_comparison_plots(
             output_path,
             title=f"{benchmark_type.upper()} Batch Scaling Comparison",
             x_label="Batch size",
-            y_label="System-steps/s",
+            y_label="System-steps/us",
         )
         print(f"      Generated: {output_path.name}")
 
@@ -1251,12 +1251,12 @@ def _generate_dynamics_backend_plots(
         df_method = df[df["method"] == method]
         if is_batched:
             grouped = df_method.groupby("num_atoms")[
-                "throughput_atom_steps_per_s"
+                "throughput_atom_steps_per_us"
             ].mean()
             series[method] = (grouped.index.values, grouped.values)
         else:
             grouped = df_method.groupby("num_atoms")[
-                "throughput_atom_steps_per_s"
+                "throughput_atom_steps_per_us"
             ].mean()
             series[method] = (grouped.index.values, grouped.values)
 
@@ -1270,7 +1270,7 @@ def _generate_dynamics_backend_plots(
             output_path,
             title=f"{benchmark_type.upper()} {system_type.title()} Throughput ({backend})",
             x_label="Number of atoms",
-            y_label="Atom-steps/s",
+            y_label="Atom-steps/us",
         )
         print(f"      Generated: {output_path.name}")
 

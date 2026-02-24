@@ -1840,6 +1840,7 @@ class NvalchemiOpsBenchmark:
         batch_idx: torch.Tensor | None = None,
     ):
         self.is_batched = batch_idx is not None
+        self.num_atoms = positions.shape[0] // cell.shape[0]
         if self.is_batched:
             self.system = BatchedMDSystem(
                 positions=positions,
@@ -2067,7 +2068,7 @@ class NvalchemiOpsBenchmark:
             name="velocity_verlet",
             backend="nvalchemiops",
             ensemble="NVE",
-            num_atoms=self.system.num_atoms,
+            num_atoms=self.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
@@ -2204,7 +2205,7 @@ class NvalchemiOpsBenchmark:
             name="langevin",
             backend="nvalchemiops",
             ensemble="NVT",
-            num_atoms=self.system.num_atoms,
+            num_atoms=self.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
@@ -2453,7 +2454,7 @@ class NvalchemiOpsBenchmark:
             name="npt",
             backend="nvalchemiops",
             ensemble="NPT",
-            num_atoms=self.system.num_atoms,
+            num_atoms=self.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
@@ -2659,7 +2660,7 @@ class NvalchemiOpsBenchmark:
             name="nph",
             backend="nvalchemiops",
             ensemble="NPH",
-            num_atoms=self.system.num_atoms,
+            num_atoms=self.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
