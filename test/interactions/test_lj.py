@@ -1034,7 +1034,6 @@ class TestLJBatched:
             neighbor_matrix_shifts=ns_wp,
             num_neighbors=nn_wp,
             batch_idx=batch_idx_wp,
-            num_systems=2,
             fill_value=len(positions_np),
             half_neighbor_list=False,
             device=device,

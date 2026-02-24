@@ -1886,7 +1886,6 @@ def lj_energy_forces_virial(
     neighbor_ptr: wp.array | None = None,
     neighbor_shifts: wp.array | None = None,
     batch_idx: wp.array | None = None,
-    num_systems: int = 1,
     switch_width: float = 0.0,
     half_neighbor_list: bool = True,
     device: str | None = None,
@@ -1949,6 +1948,10 @@ def lj_energy_forces_virial(
     use_matrix = neighbor_matrix is not None
     use_list = neighbor_list is not None
     is_batched = batch_idx is not None
+
+    if cell.ndim == 2:
+        cell = cell.unsqueeze(0)
+    num_systems = cell.shape[0]
 
     if not use_matrix and not use_list:
         raise ValueError("Must provide either neighbor_matrix or neighbor_list")

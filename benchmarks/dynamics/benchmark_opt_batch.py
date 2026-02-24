@@ -39,8 +39,7 @@ import torch
 
 from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
-    NvalchemiopsLJModel,
-    create_lj_system,
+    create_fcc_argon,
     get_gpu_sku,
     load_config,
     print_batch_benchmark_footer,
@@ -76,38 +75,37 @@ def create_batched_system(
         Pointer array, shape (batch_size + 1,).
     """
     # Create template system
-    pos, cell, masses_single, vel = create_lj_system(
-        num_atoms=num_atoms_per_system,
-        lattice_constant=lattice_constant,
-        temperature=temperature,
-        device=device,
-        dtype=dtype,
+    num_cells = int((num_atoms_per_system // 4 + 1) ** (1 / 3))
+    positions, cell = create_fcc_argon(
+        num_unit_cells=num_cells,
+        a=5.26,
     )
 
-    actual_num_atoms = masses_single.shape[0]
+    positions = torch.as_tensor(positions, dtype=dtype, device=device)
+    cell = torch.as_tensor(cell, dtype=dtype, device=device)
+    actual_num_atoms = positions.shape[0]
 
     # Replicate for batch with perturbations
     positions_list = []
-    masses_list = []
     cell_list = []
 
     for i in range(batch_size):
         # Perturb positions for optimization task
-        pos_perturbed = pos + torch.randn_like(pos) * 0.15  # Larger perturbation
+        pos_perturbed = (
+            positions + torch.randn_like(positions) * 0.1
+        )  # Larger perturbation
 
         positions_list.append(pos_perturbed)
-        masses_list.append(masses_single)
         cell_list.append(cell)
 
     # Stack into batched tensors
     positions = torch.cat(positions_list, dim=0)
-    masses = torch.cat(masses_list, dim=0)
-    cell = torch.cat(cell_list, dim=0)
+    cell = torch.cat(cell_list, dim=0).reshape(batch_size, 3, 3)
 
     # Create batch_idx
     batch_idx = torch.repeat_interleave(
         torch.arange(batch_size, device=device), actual_num_atoms
-    )
+    ).to(dtype=torch.int32)
 
     # Create atom_ptr
     atom_ptr = torch.arange(
@@ -115,10 +113,10 @@ def create_batched_system(
         (batch_size + 1) * actual_num_atoms,
         actual_num_atoms,
         device=device,
-        dtype=torch.int64,
+        dtype=torch.int32,
     )
 
-    return positions, cell, masses, batch_idx, atom_ptr
+    return positions, cell, batch_idx, atom_ptr
 
 
 def run_benchmarks(config: dict, output_dir: Path) -> None:
@@ -136,6 +134,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
         print("Batched optimization benchmarks disabled in config")
         return
 
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = batch_config.get("dtype", torch.float32)
     system_sizes = batch_config.get("system_sizes", [256, 512])
     batch_sizes = batch_config.get("batch_sizes", [1, 2, 4, 8, 16])
     optimizers = batch_config.get("optimizers", {})
@@ -159,42 +159,28 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     for num_atoms in system_sizes:
         for batch_size in batch_sizes:
             # Create batched system
-            batch_positions, batch_cells, batch_masses, batch_idx, atom_ptr = (
-                create_batched_system(
-                    num_atoms_per_system=num_atoms,
-                    batch_size=batch_size,
-                    lattice_constant=5.26,
-                    temperature=300.0,
-                    device="cuda",
-                    dtype=torch.float64,
-                )
+            batch_positions, batch_cells, batch_idx, atom_ptr = create_batched_system(
+                num_atoms_per_system=num_atoms,
+                batch_size=batch_size,
+                lattice_constant=5.26,
+                temperature=300.0,
+                device=device,
+                dtype=dtype,
             )
 
             pbc = torch.tensor([True, True, True], device=batch_positions.device)
-
-            # Create LJ model
-            lj_model = NvalchemiopsLJModel(
-                epsilon=epsilon,
-                sigma=sigma,
-                cutoff=cutoff,
-                cell=batch_cells,
-                batch_idx=batch_idx,
-                device="cuda",
-                dtype=torch.float64,
-            )
 
             # Run nvalchemiops benchmarks
             nv_bench = NvalchemiOpsBenchmark(
                 positions=batch_positions,
                 cell=batch_cells,
-                masses=batch_masses,
                 pbc=pbc,
-                model=lj_model,
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
                 skin=skin,
                 neighbor_rebuild_interval=neighbor_rebuild_interval,
-                velocities=None,  # Not needed for FIRE
                 batch_idx=batch_idx,
-                atom_ptr=atom_ptr,
             )
 
             # FIRE
@@ -207,6 +193,25 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
                 results.append(result)
                 print_batch_benchmark_result(result, is_md=False)
 
+            nv_bench = NvalchemiOpsBenchmark(
+                positions=batch_positions.clone(),
+                cell=batch_cells.clone(),
+                pbc=pbc,
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
+                neighbor_rebuild_interval=neighbor_rebuild_interval,
+                batch_idx=batch_idx,
+            )
+
+            if optimizers.get("fire2", {}).get("enabled", False):
+                fire2_config = optimizers["fire2"]
+                result = nv_bench.run_fire2(
+                    max_steps=fire2_config.get("max_steps", 1000),
+                    force_tolerance=fire2_config.get("force_tolerance", 0.01),
+                )
+                results.append(result)
+                print_batch_benchmark_result(result, is_md=False)
     print_batch_benchmark_footer()
 
     # Write CSV results

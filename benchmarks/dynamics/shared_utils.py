@@ -66,6 +66,49 @@ from nvalchemiops.torch.neighbors.rebuild_detection import neighbor_list_needs_r
 
 wp.init()
 
+
+@wp.kernel
+def _copy_virial_flat_to_vec9d(
+    flat: wp.array2d(dtype=wp.float64),
+    out: wp.array(dtype=vec9d),
+):
+    """Copy (B, 9) flat virial into (B,) vec9d for NPT/NPH."""
+    i = wp.tid()
+    zero_ = wp.float64(1.0)
+    out[i] = zero_ * vec9d(
+        flat[i, 0],
+        flat[i, 1],
+        flat[i, 2],
+        flat[i, 3],
+        flat[i, 4],
+        flat[i, 5],
+        flat[i, 6],
+        flat[i, 7],
+        flat[i, 8],
+    )
+
+
+@wp.kernel
+def _copy_virial_flat_to_vec9f(
+    flat: wp.array2d(dtype=wp.float32),
+    out: wp.array(dtype=vec9f),
+):
+    """Copy (B, 9) flat virial into (B,) vec9f for NPT/NPH."""
+    i = wp.tid()
+    zero_ = wp.float32(1.0)
+    out[i] = zero_ * vec9f(
+        flat[i, 0],
+        flat[i, 1],
+        flat[i, 2],
+        flat[i, 3],
+        flat[i, 4],
+        flat[i, 5],
+        flat[i, 6],
+        flat[i, 7],
+        flat[i, 8],
+    )
+
+
 # ==============================================================================
 # Physical Constants
 # ==============================================================================
@@ -1176,6 +1219,7 @@ class MDSystem:
         dtype: np.dtype = torch.float64,
     ):
         self.num_atoms = len(positions)
+        self.total_atoms = self.num_atoms
         self.num_systems = 1
         self.epsilon = epsilon
         self.sigma = sigma
@@ -1238,13 +1282,6 @@ class MDSystem:
 
         # Build initial neighbor list
         self._rebuild_neighbors()
-
-        print(f"Initialized MD system with {self.num_atoms} atoms")
-        print(f"  Cell: {cell[0, 0]:.2f} x {cell[1, 1]:.2f} x {cell[2, 2]:.2f} Å")
-        print(f"  Cutoff: {cutoff:.2f} Å (+ {skin:.2f} Å skin)")
-        print(f"  LJ: ε = {epsilon:.4f} eV, σ = {sigma:.2f} Å")
-        print(f"  Device: {device}, dtype: {dtype}")
-        print("  Units: x [Å], t [fs], E [eV], m [eV·fs²/Å²] (from amu), v [Å/fs]")
 
     def _rebuild_neighbors(self) -> None:
         """Rebuild neighbor list from current positions."""
@@ -1459,7 +1496,7 @@ class BatchedMDSystem:
     ):
         self.num_systems = int(num_systems)
         self.total_atoms = int(len(positions))
-        self.num_atoms = self.total_atoms
+        self.num_atoms = self.total_atoms // self.num_systems
         self.epsilon = float(epsilon)
         self.sigma = float(sigma)
         self.cutoff = float(cutoff)
@@ -1646,17 +1683,29 @@ class BatchedMDSystem:
             neighbor_matrix=self.neighbor_manager.wp_neighbor_matrix,
             neighbor_matrix_shifts=self.neighbor_manager.wp_neighbor_shifts,
             num_neighbors=self.neighbor_manager.wp_num_neighbors,
-            fill_value=self.num_atoms,
+            fill_value=self.total_atoms,
             device=self.wp_device,
             batch_idx=self.wp_batch_idx,
         )
 
         wp.copy(self.wp_forces, wp_forces)
         if virial_tensors is not None:
-            virial_flat = wp.to_torch(wp_virial_flat)
-            virial_tensors = wp.from_torch(
-                virial_flat, dtype=vec9f if self.dtype == torch.float32 else vec9d
-            )
+            # Copy LJ (num_systems, 9) output into caller's (num_systems,) vec9 buffer.
+            num_sys = virial_tensors.shape[0]
+            if self.wp_dtype == wp.float64:
+                wp.launch(
+                    _copy_virial_flat_to_vec9d,
+                    dim=num_sys,
+                    inputs=[wp_virial_flat, virial_tensors],
+                    device=self.wp_device,
+                )
+            else:
+                wp.launch(
+                    _copy_virial_flat_to_vec9f,
+                    dim=num_sys,
+                    inputs=[wp_virial_flat, virial_tensors],
+                    device=self.wp_device,
+                )
             return wp_energies
         else:
             # Return tuple for variable-cell optimization
@@ -1914,7 +1963,7 @@ class NvalchemiOpsBenchmark:
             name=name,
             backend="nvalchemiops",
             ensemble=ensemble,
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=num_steps,
             dt=dt,
             warmup_steps=warmup_steps,
@@ -2728,68 +2777,86 @@ class NvalchemiOpsBenchmark:
         """Implementation of FIRE (called by run_fire)."""
         from nvalchemiops.dynamics.optimizers.fire import fire_step
         from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
             wrap_positions_to_cell,
         )
 
-        # Initialize velocities to zero
-        velocities = torch.zeros_like(self.torch_positions)
-
-        # Convert to warp
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(velocities, dtype=self.wp_vec_dtype)
-
-        # Pre-compute cell inverse
-        wp_cell_inv = wp.empty_like(self.wp_cell)
-        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
-
         # Initialize FIRE control parameters as warp arrays
         wp_alpha = wp.array(
-            [alpha_start] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [alpha_start] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_dt = wp.array(
-            [dt_start] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [dt_start] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_alpha_start = wp.array(
-            [alpha_start] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [alpha_start] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_f_alpha = wp.array(
-            [f_alpha] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [f_alpha] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_dt_min = wp.array(
-            [dt_min] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [dt_min] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_dt_max = wp.array(
-            [dt_max] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [dt_max] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_maxstep = wp.array(
-            [maxstep] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [maxstep] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_n_steps_positive = wp.zeros(
-            self.num_systems, dtype=wp.int32, device=self.wp_device
+            self.system.num_systems, dtype=wp.int32, device=self.system.wp_device
         )
         wp_n_min = wp.array(
-            [n_min] * self.num_systems, dtype=wp.int32, device=self.wp_device
+            [n_min] * self.system.num_systems,
+            dtype=wp.int32,
+            device=self.system.wp_device,
         )
         wp_f_dec = wp.array(
-            [f_dec] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [f_dec] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_f_inc = wp.array(
-            [f_inc] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [f_inc] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
 
         # Accumulators (required for single/batch_idx modes)
-        wp_vf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
-        wp_vv = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
-        wp_ff = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_vf = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        wp_vv = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        wp_ff = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
         wp_uphill_flag = wp.zeros(
-            self.num_systems, dtype=wp.int32, device=self.wp_device
+            self.system.num_systems, dtype=wp.int32, device=self.system.wp_device
         )
 
         # Initial forces
-        _, wp_forces, _ = self._compute_forces(wp_positions)
+        self.system.compute_forces()
 
         # Warmup (usually not needed for optimization, but included for API consistency)
         if warmup_steps > 0:
@@ -2799,6 +2866,7 @@ class NvalchemiOpsBenchmark:
 
             self._run_warmup(warmup_step, warmup_steps, "FIRE warmup")
 
+        batch_idx = None if not self.is_batched else self.system.wp_batch_idx
         # Timed loop
         import time
 
@@ -2810,7 +2878,7 @@ class NvalchemiOpsBenchmark:
             actual_steps += 1
             # Check convergence periodically
             if step % check_interval == 0:
-                forces_torch = wp.to_torch(wp_forces)
+                forces_torch = wp.to_torch(self.system.wp_forces)
                 max_force = torch.abs(forces_torch).max().item()
                 if max_force < force_tolerance:
                     break
@@ -2822,10 +2890,10 @@ class NvalchemiOpsBenchmark:
 
             # FIRE step (includes MD integration + parameter update)
             fire_step(
-                positions=wp_positions,
-                velocities=wp_velocities,
-                forces=wp_forces,
-                masses=self.wp_masses,
+                positions=self.system.wp_positions,
+                velocities=self.system.wp_velocities,
+                forces=self.system.wp_forces,
+                masses=self.system.wp_masses,
                 alpha=wp_alpha,
                 dt=wp_dt,
                 alpha_start=wp_alpha_start,
@@ -2841,27 +2909,19 @@ class NvalchemiOpsBenchmark:
                 vf=wp_vf,
                 vv=wp_vv,
                 ff=wp_ff,
-                atom_ptr=self.wp_atom_ptr,
-                device=self.wp_device,
+                batch_idx=batch_idx,
             )
 
             # Wrap positions back into cell
             wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                cells=self.system.wp_cell,
+                cells_inv=self.system.wp_cell_inv,
+                device=self.system.wp_device,
             )
 
             # Compute new forces
-            _, wp_forces, _ = self._compute_forces(wp_positions)
-
-            # Rebuild neighbors if needed
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
+            self.system.compute_forces()
 
         wp.synchronize()
         total_time = time.perf_counter() - start_time
@@ -2873,13 +2933,13 @@ class NvalchemiOpsBenchmark:
             name="fire",
             backend="nvalchemiops",
             ensemble="optimization",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=actual_steps,
             dt=dt_start,  # Report initial dt
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=None if not self.is_batched else self.system.num_systems,
         )
 
     def run_fire2(
@@ -2988,54 +3048,48 @@ class NvalchemiOpsBenchmark:
         """Implementation of FIRE2 (called by run_fire2)."""
         from nvalchemiops.dynamics.optimizers.fire2 import fire2_step
         from nvalchemiops.dynamics.utils import (
-            compute_cell_inverse,
             wrap_positions_to_cell,
         )
 
-        # Initialize velocities to zero
-        velocities = torch.zeros_like(self.torch_positions)
-
-        # Convert to warp
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(), dtype=self.wp_vec_dtype
-        )
-        wp_velocities = wp.from_torch(velocities, dtype=self.wp_vec_dtype)
-
-        # Pre-compute cell inverse
-        wp_cell_inv = wp.empty_like(self.wp_cell)
-        compute_cell_inverse(self.wp_cell, wp_cell_inv, device=self.wp_device)
-
-        # batch_idx: use existing or create single-system index
-        if self.wp_batch_idx is not None:
-            wp_bidx = self.wp_batch_idx
-        else:
-            wp_bidx = wp.zeros(self.num_atoms, dtype=wp.int32, device=self.wp_device)
-
         # FIRE2 per-system state
         wp_alpha = wp.array(
-            [alpha0] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [alpha0] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_dt = wp.array(
-            [dt_start] * self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            [dt_start] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_nsteps_inc = wp.zeros(
-            self.num_systems, dtype=wp.int32, device=self.wp_device
+            self.system.num_systems, dtype=wp.int32, device=self.system.wp_device
         )
 
         # Scratch buffers
-        wp_vf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
+        wp_vf = wp.zeros(
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
         wp_v_sumsq = wp.zeros(
-            self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_f_sumsq = wp.zeros(
-            self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
         wp_max_norm = wp.zeros(
-            self.num_systems, dtype=self.wp_dtype, device=self.wp_device
+            self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
         )
 
         # Initial forces
-        _, wp_forces, _ = self._compute_forces(wp_positions)
+        self.system.compute_forces()
 
         # Warmup (usually not needed for optimization, but included for API consistency)
         if warmup_steps > 0:
@@ -3045,6 +3099,13 @@ class NvalchemiOpsBenchmark:
 
             self._run_warmup(warmup_step, warmup_steps, "FIRE2 warmup")
 
+        batch_idx = (
+            wp.zeros(
+                self.system.num_atoms, dtype=wp.int32, device=self.system.wp_device
+            )
+            if not self.is_batched
+            else self.system.wp_batch_idx
+        )
         # Timed loop
         import time
 
@@ -3056,7 +3117,7 @@ class NvalchemiOpsBenchmark:
             actual_steps += 1
             # Check convergence periodically
             if step % check_interval == 0:
-                forces_torch = wp.to_torch(wp_forces)
+                forces_torch = wp.to_torch(self.system.wp_forces)
                 max_force = torch.abs(forces_torch).max().item()
                 if max_force < force_tolerance:
                     break
@@ -3069,17 +3130,17 @@ class NvalchemiOpsBenchmark:
 
             # FIRE2 step
             fire2_step(
-                wp_positions,
-                wp_velocities,
-                wp_forces,
-                wp_bidx,
-                wp_alpha,
-                wp_dt,
-                wp_nsteps_inc,
-                wp_vf,
-                wp_v_sumsq,
-                wp_f_sumsq,
-                wp_max_norm,
+                positions=self.system.wp_positions,
+                velocities=self.system.wp_velocities,
+                forces=self.system.wp_forces,
+                batch_idx=batch_idx,
+                alpha=wp_alpha,
+                dt=wp_dt,
+                nsteps_inc=wp_nsteps_inc,
+                vf=wp_vf,
+                v_sumsq=wp_v_sumsq,
+                f_sumsq=wp_f_sumsq,
+                max_norm=wp_max_norm,
                 delaystep=delaystep,
                 dtgrow=dtgrow,
                 dtshrink=dtshrink,
@@ -3092,21 +3153,14 @@ class NvalchemiOpsBenchmark:
 
             # Wrap positions back into cell
             wrap_positions_to_cell(
-                wp_positions,
-                cells=self.wp_cell,
-                cells_inv=wp_cell_inv,
-                device=self.wp_device,
+                positions=self.system.wp_positions,
+                cells=self.system.wp_cell,
+                cells_inv=self.system.wp_cell_inv,
+                device=self.system.wp_device,
             )
 
             # Compute new forces
-            _, wp_forces, _ = self._compute_forces(wp_positions)
-
-            # Rebuild neighbors if needed
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self.torch_positions = wp.to_torch(wp_positions)
-                    self._rebuild_neighbors()
+            self.system.compute_forces()
 
         wp.synchronize()
         total_time = time.perf_counter() - start_time
@@ -3118,13 +3172,13 @@ class NvalchemiOpsBenchmark:
             name="fire2",
             backend="nvalchemiops",
             ensemble="optimization",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=actual_steps,
             dt=dt_start,
             warmup_steps=warmup_steps,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=None if not self.is_batched else self.system.num_systems,
         )
 
     def _virial_to_cell_force(self, wp_virial, cell_torch):
@@ -3470,7 +3524,7 @@ class NvalchemiOpsBenchmark:
                 ext_positions,
                 wp_positions_scratch,
                 wp_cell_scratch,
-                num_atoms=N,
+                num_atoms=self.system.num_atoms,
                 device=self.wp_device,
             )
             wp_positions = wp_positions_scratch

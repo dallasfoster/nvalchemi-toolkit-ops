@@ -188,15 +188,15 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
 
             # Run nvalchemiops benchmarks
             nv_bench = NvalchemiOpsBenchmark(
-                positions=batch_positions,
-                cell=batch_cells,
-                pbc=pbc,
+                positions=batch_positions.clone(),
+                cell=batch_cells.clone(),
+                pbc=pbc.clone(),
                 skin=skin,
                 epsilon=epsilon,
                 sigma=sigma,
                 cutoff=cutoff,
                 neighbor_rebuild_interval=neighbor_rebuild_interval,
-                batch_idx=batch_idx,
+                batch_idx=batch_idx.clone(),
             )
 
             # Velocity Verlet

@@ -79,12 +79,22 @@ opt_single:
       f_alpha: 0.99
       maxstep: 0.2  # Å
 
-    bfgs:
-      enabled: true  # ASE only
+    fire2:
+      enabled: true
       max_steps: 1000
       force_tolerance: 0.01  # eV/Å
-      maxstep: 0.2  # Å
-      use_line_search: true
+      dt_start: 0.045  # fs
+      tmax: 0.10  # fs
+      tmin: 0.005  # fs
+      delaystep: 50
+      dtgrow: 1.09
+      dtshrink: 0.95
+      alpha0: 0.20
+      alphashrink: 0.985
+      maxstep: 0.25  # Å
+      warmup_steps: 100
+      log_interval: 100
+      check_interval: 20
 
   # Logging interval
   log_interval: 100
@@ -103,13 +113,13 @@ md_batch:
   # MD integrators to benchmark
   integrators:
     velocity_verlet:
-      enabled: true
+      enabled: false
       steps: 1000
       dt: 0.001  # fs
       warmup_steps: 100
 
     langevin:
-      enabled: true
+      enabled: false
       steps: 1000
       dt: 0.001  # fs
       warmup_steps: 100
@@ -119,7 +129,7 @@ md_batch:
     npt:
       enabled: true
       steps: 1000
-      dt: 0.001  # fs
+      dt: 0.0001  # fs
       warmup_steps: 100
       temperature: 94.4  # K
       pressure: 1.0  # bar
@@ -128,7 +138,7 @@ md_batch:
       chain_length: 3
 
     nph:
-      enabled: true
+      enabled: false
       steps: 1000
       dt: 0.001  # fs
       warmup_steps: 100
@@ -165,6 +175,23 @@ opt_batch:
       f_dec: 0.75
       f_alpha: 0.985
       maxstep: 0.1  # Å
+
+    fire2:
+      enabled: true
+      max_steps: 1000
+      force_tolerance: 0.01  # eV/Å
+      dt_start: 0.045  # fs
+      tmax: 0.10  # fs
+      tmin: 0.005  # fs
+      delaystep: 50
+      dtgrow: 1.09
+      dtshrink: 0.95
+      alpha0: 0.20
+      alphashrink: 0.985
+      maxstep: 0.25  # Å
+      warmup_steps: 100
+      log_interval: 100
+      check_interval: 20
 
   # Logging interval
   log_interval: 100

@@ -43,8 +43,7 @@ import torch
 
 from benchmarks.dynamics.shared_utils import (
     NvalchemiOpsBenchmark,
-    NvalchemiopsLJModel,
-    create_lj_system,
+    create_fcc_argon,
     get_gpu_sku,
     load_config,
     print_benchmark_footer,
@@ -68,7 +67,8 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
     if not opt_config.get("enabled", True):
         print("Optimization single-system benchmarks disabled in config")
         return
-
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = opt_config.get("dtype", torch.float32)
     system_sizes = opt_config.get("system_sizes", [256, 512, 1024, 2048])
     optimizers = opt_config.get("optimizers", {})
 
@@ -89,40 +89,27 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
 
     for num_atoms in system_sizes:
         # Create system (perturbed from equilibrium for optimization)
-        positions, cell, masses, velocities = create_lj_system(
-            num_atoms=num_atoms,
-            lattice_constant=5.26,
-            temperature=300.0,
-            device="cuda",
-            dtype=torch.float64,
+        num_cells = int((num_atoms // 4 + 1) ** (1 / 3))
+        positions, cell = create_fcc_argon(
+            num_unit_cells=num_cells,
+            a=5.26,
         )
 
-        # Perturb positions slightly to create a non-equilibrium structure
+        positions = torch.as_tensor(positions, dtype=dtype, device=device)
         positions += torch.randn_like(positions) * 0.1
-
+        cell = torch.as_tensor(cell, dtype=dtype, device=device)
         pbc = torch.tensor([True, True, True], device=positions.device)
-
-        # Create LJ model
-        lj_model = NvalchemiopsLJModel(
-            epsilon=epsilon,
-            sigma=sigma,
-            cutoff=cutoff,
-            cell=cell,
-            batch_idx=None,  # Single-system mode
-            device="cuda",
-            dtype=torch.float64,
-        )
 
         # Run nvalchemiops benchmarks
         nv_bench = NvalchemiOpsBenchmark(
-            positions=positions,
-            cell=cell,
-            masses=masses,
+            positions=positions.clone(),
+            cell=cell.clone(),
             pbc=pbc,
-            model=lj_model,
             skin=skin,
+            epsilon=epsilon,
+            sigma=sigma,
+            cutoff=cutoff,
             neighbor_rebuild_interval=neighbor_rebuild_interval,
-            velocities=velocities,  # Note: FIRE doesn't need initial velocities but we pass them anyway
         )
 
         # FIRE
@@ -131,6 +118,49 @@ def run_benchmarks(config: dict, output_dir: Path) -> None:
             result = nv_bench.run_fire(
                 max_steps=fire_config.get("max_steps", 1000),
                 force_tolerance=fire_config.get("force_tolerance", 0.01),
+                dt_start=fire_config.get("dt_start", 1.0),
+                dt_max=fire_config.get("dt_max", 10.0),
+                dt_min=fire_config.get("dt_min", 0.001),
+                alpha_start=fire_config.get("alpha_start", 0.1),
+                n_min=fire_config.get("n_min", 5),
+                f_inc=fire_config.get("f_inc", 1.1),
+                f_dec=fire_config.get("f_dec", 0.5),
+                f_alpha=fire_config.get("f_alpha", 0.99),
+                maxstep=fire_config.get("maxstep", 0.2),
+                warmup_steps=fire_config.get("warmup_steps", 0),
+                log_interval=fire_config.get("log_interval", 100),
+                check_interval=fire_config.get("check_interval", 20),
+            )
+            results_nvalchemiops.append(result)
+            print_benchmark_result(result, is_md=False)
+
+        nv_bench = NvalchemiOpsBenchmark(
+            positions=positions.clone(),
+            cell=cell.clone(),
+            pbc=pbc,
+            skin=skin,
+            epsilon=epsilon,
+            sigma=sigma,
+            cutoff=cutoff,
+            neighbor_rebuild_interval=neighbor_rebuild_interval,
+        )
+        if optimizers.get("fire2", {}).get("enabled", False):
+            fire2_config = optimizers["fire2"]
+            result = nv_bench.run_fire2(
+                max_steps=fire2_config.get("max_steps", 1000),
+                force_tolerance=fire2_config.get("force_tolerance", 0.01),
+                dt_start=fire2_config.get("dt_start", 0.045),
+                tmax=fire2_config.get("tmax", 0.10),
+                tmin=fire2_config.get("tmin", 0.005),
+                delaystep=fire2_config.get("delaystep", 50),
+                dtgrow=fire2_config.get("dtgrow", 1.09),
+                dtshrink=fire2_config.get("dtshrink", 0.95),
+                alpha0=fire2_config.get("alpha0", 0.20),
+                alphashrink=fire2_config.get("alphashrink", 0.985),
+                maxstep=fire2_config.get("maxstep", 0.25),
+                warmup_steps=fire2_config.get("warmup_steps", 0),
+                log_interval=fire2_config.get("log_interval", 100),
+                check_interval=fire2_config.get("check_interval", 20),
             )
             results_nvalchemiops.append(result)
             print_benchmark_result(result, is_md=False)
