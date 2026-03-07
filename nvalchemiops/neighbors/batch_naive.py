@@ -26,6 +26,7 @@ import warp as wp
 from nvalchemiops.neighbors.neighbor_utils import (
     _update_neighbor_matrix,
     _update_neighbor_matrix_pbc,
+    selective_zero_num_neighbors,
 )
 
 __all__ = [
@@ -190,22 +191,47 @@ def _fill_batch_naive_neighbor_matrix_pbc(
     _shift = shifts[ishift]
     _cell = cell[isys]
 
-    positions_shifted = type(_cell[0])(_shift) * _cell + _positions
+    # Wrap atom i to the primary cell to support unwrapped coordinates.
+    _inv_cell = wp.inverse(_cell)
+    _frac_i = _positions * _inv_cell
+    _int_i = wp.vec3i(
+        wp.int32(wp.floor(_frac_i[0])),
+        wp.int32(wp.floor(_frac_i[1])),
+        wp.int32(wp.floor(_frac_i[2])),
+    )
+    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
+    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
 
     _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
     if _zero_shift:
         jatom_end = iatom
     for jatom in range(jatom_start, jatom_end):
-        diff = positions_shifted - positions[jatom]
+        # Wrap atom j to the primary cell.
+        _pos_j = positions[jatom]
+        _frac_j = _pos_j * _inv_cell
+        _int_j = wp.vec3i(
+            wp.int32(wp.floor(_frac_j[0])),
+            wp.int32(wp.floor(_frac_j[1])),
+            wp.int32(wp.floor(_frac_j[2])),
+        )
+        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
+        diff = positions_shifted - _pos_j_wrapped
         dist_sq = wp.length_sq(diff)
         if dist_sq < cutoff_sq:
+            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
+            # holds for the original (potentially unwrapped) positions.
+            _corrected_shift = wp.vec3i(
+                _shift[0] - _int_i[0] + _int_j[0],
+                _shift[1] - _int_i[1] + _int_j[1],
+                _shift[2] - _int_i[2] + _int_j[2],
+            )
             _update_neighbor_matrix_pbc(
                 jatom,
                 iatom,
                 neighbor_matrix,
                 neighbor_matrix_shifts,
                 num_neighbors,
-                _shift,
+                _corrected_shift,
                 maxnb,
                 half_fill,
             )
@@ -246,6 +272,210 @@ for t, v, m in zip(T, V, M):
     )
 
 ###########################################################################################
+########################### Selective Skip Kernels #######################################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _fill_batch_naive_neighbor_matrix_selective(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective batch naive neighbor matrix kernel - skips non-rebuilt systems.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems in Cartesian space.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    batch_ptr : wp.array, shape (num_systems + 1,), dtype=wp.int32
+        Cumulative atom counts defining system boundaries.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store relationships where i < j.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system flags. Only systems with True are processed.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Atoms in systems where rebuild_flags[isys] is False are skipped
+    """
+    tid = wp.tid()
+    isys = batch_idx[tid]
+    if not rebuild_flags[isys]:
+        return
+    j_end = batch_ptr[isys + 1]
+    positions_i = positions[tid]
+    max_neighbors = neighbor_matrix.shape[1]
+    for j in range(tid + 1, j_end):
+        diff = positions_i - positions[j]
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff_sq:
+            _update_neighbor_matrix(
+                tid, j, neighbor_matrix, num_neighbors, max_neighbors, half_fill
+            )
+
+
+@wp.kernel(enable_backward=False)
+def _fill_batch_naive_neighbor_matrix_pbc_selective(
+    positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_ptr: wp.array(dtype=wp.int32),
+    shifts: wp.array(dtype=wp.vec3i),
+    shift_system_idx: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective batch naive PBC neighbor matrix kernel - skips non-rebuilt systems.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems in Cartesian space.
+    cell : wp.array, shape (num_systems, 3, 3), dtype=wp.mat33*
+        Array of cell matrices for each system in the batch.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    batch_ptr : wp.array, shape (num_systems + 1,), dtype=wp.int32
+        Cumulative atom counts defining system boundaries.
+    shifts : wp.array, shape (total_shifts, 3), dtype=wp.vec3i
+        Array of integer shift vectors for periodic images.
+    shift_system_idx : wp.array, shape (total_shifts,), dtype=wp.int32
+        Array mapping each shift to its system index in the batch.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Matrix storing shift vectors for each neighbor relationship.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store half of the neighbor relationships.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system flags. Only systems with True are processed.
+
+    Notes
+    -----
+    - Thread launch: 2D grid (total_shifts, max_atoms_per_system)
+    - Shift/atom combos for systems where rebuild_flags[isys] is False are skipped
+    """
+    ishift, iatom = wp.tid()
+
+    isys = shift_system_idx[ishift]
+    if not rebuild_flags[isys]:
+        return
+
+    _natom = batch_ptr[isys + 1] - batch_ptr[isys]
+
+    if iatom >= _natom:
+        return
+
+    start = batch_ptr[isys]
+    iatom = iatom + start
+    jatom_start = start
+    jatom_end = batch_ptr[isys + 1]
+
+    maxnb = neighbor_matrix.shape[1]
+    _positions = positions[iatom]
+    _shift = shifts[ishift]
+    _cell = cell[isys]
+
+    # Wrap atom i to the primary cell to support unwrapped coordinates.
+    _inv_cell = wp.inverse(_cell)
+    _frac_i = _positions * _inv_cell
+    _int_i = wp.vec3i(
+        wp.int32(wp.floor(_frac_i[0])),
+        wp.int32(wp.floor(_frac_i[1])),
+        wp.int32(wp.floor(_frac_i[2])),
+    )
+    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
+    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
+
+    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
+    if _zero_shift:
+        jatom_end = iatom
+    for jatom in range(jatom_start, jatom_end):
+        # Wrap atom j to the primary cell.
+        _pos_j = positions[jatom]
+        _frac_j = _pos_j * _inv_cell
+        _int_j = wp.vec3i(
+            wp.int32(wp.floor(_frac_j[0])),
+            wp.int32(wp.floor(_frac_j[1])),
+            wp.int32(wp.floor(_frac_j[2])),
+        )
+        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
+        diff = positions_shifted - _pos_j_wrapped
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff_sq:
+            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
+            # holds for the original (potentially unwrapped) positions.
+            _corrected_shift = wp.vec3i(
+                _shift[0] - _int_i[0] + _int_j[0],
+                _shift[1] - _int_i[1] + _int_j[1],
+                _shift[2] - _int_i[2] + _int_j[2],
+            )
+            _update_neighbor_matrix_pbc(
+                jatom,
+                iatom,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                _corrected_shift,
+                maxnb,
+                half_fill,
+            )
+
+
+_fill_batch_naive_neighbor_matrix_selective_overload = {}
+_fill_batch_naive_neighbor_matrix_pbc_selective_overload = {}
+for t, v, m in zip(T, V, M):
+    _fill_batch_naive_neighbor_matrix_selective_overload[t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_selective,
+        [
+            wp.array(dtype=v),
+            t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+    _fill_batch_naive_neighbor_matrix_pbc_selective_overload[t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_pbc_selective,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=m),
+            t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.vec3i, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+
+###########################################################################################
 ########################### Warp Launchers ###############################################
 ###########################################################################################
 
@@ -260,6 +490,7 @@ def batch_naive_neighbor_matrix(
     wp_dtype: type,
     device: str,
     half_fill: bool = False,
+    rebuild_flags: wp.array | None = None,
 ) -> None:
     """Core warp launcher for batched naive neighbor matrix construction (no PBC).
 
@@ -286,6 +517,10 @@ def batch_naive_neighbor_matrix(
         Warp device string (e.g., 'cuda:0', 'cpu').
     half_fill : bool, default=False
         If True, only store relationships where i < j to avoid double counting.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool, optional
+        Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
+        is True are processed; others are skipped on the GPU without CPU sync.
+        Call selective_zero_num_neighbors before this launcher to reset counts.
 
     Notes
     -----
@@ -296,23 +531,42 @@ def batch_naive_neighbor_matrix(
     --------
     batch_naive_neighbor_matrix_pbc : Version with periodic boundary conditions
     _fill_batch_naive_neighbor_matrix : Kernel that performs the computation
+    _fill_batch_naive_neighbor_matrix_selective : Selective-skip kernel variant
     """
     total_atoms = positions.shape[0]
 
-    wp.launch(
-        kernel=_fill_batch_naive_neighbor_matrix_overload[wp_dtype],
-        dim=total_atoms,
-        inputs=[
-            positions,
-            wp_dtype(cutoff * cutoff),
-            batch_idx,
-            batch_ptr,
-            neighbor_matrix,
-            num_neighbors,
-            half_fill,
-        ],
-        device=device,
-    )
+    if rebuild_flags is not None:
+        selective_zero_num_neighbors(num_neighbors, batch_idx, rebuild_flags, device)
+        wp.launch(
+            kernel=_fill_batch_naive_neighbor_matrix_selective_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                positions,
+                wp_dtype(cutoff * cutoff),
+                batch_idx,
+                batch_ptr,
+                neighbor_matrix,
+                num_neighbors,
+                half_fill,
+                rebuild_flags,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_fill_batch_naive_neighbor_matrix_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                positions,
+                wp_dtype(cutoff * cutoff),
+                batch_idx,
+                batch_ptr,
+                neighbor_matrix,
+                num_neighbors,
+                half_fill,
+            ],
+            device=device,
+        )
 
 
 def batch_naive_neighbor_matrix_pbc(
@@ -329,6 +583,8 @@ def batch_naive_neighbor_matrix_pbc(
     device: str,
     max_atoms_per_system: int,
     half_fill: bool = False,
+    rebuild_flags: wp.array | None = None,
+    batch_idx: wp.array | None = None,
 ) -> None:
     """Core warp launcher for batched naive neighbor matrix construction with PBC.
 
@@ -364,6 +620,12 @@ def batch_naive_neighbor_matrix_pbc(
         Maximum number of atoms in any single system in the batch.
     half_fill : bool, default=False
         If True, only store half of the neighbor relationships.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool, optional
+        Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
+        is True are processed; others are skipped on the GPU without CPU sync.
+        Requires batch_idx to be provided for selective zeroing.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32, optional
+        System index for each atom. Required when rebuild_flags is provided.
 
     Notes
     -----
@@ -375,23 +637,45 @@ def batch_naive_neighbor_matrix_pbc(
     --------
     batch_naive_neighbor_matrix : Version without periodic boundary conditions
     _fill_batch_naive_neighbor_matrix_pbc : Kernel that performs the computation
+    _fill_batch_naive_neighbor_matrix_pbc_selective : Selective-skip kernel variant
     """
     total_shifts = shifts.shape[0]
 
-    wp.launch(
-        kernel=_fill_batch_naive_neighbor_matrix_pbc_overload[wp_dtype],
-        dim=(total_shifts, max_atoms_per_system),
-        inputs=[
-            positions,
-            cell,
-            wp_dtype(cutoff * cutoff),
-            batch_ptr,
-            shifts,
-            shift_system_idx,
-            neighbor_matrix,
-            neighbor_matrix_shifts,
-            num_neighbors,
-            half_fill,
-        ],
-        device=device,
-    )
+    if rebuild_flags is not None:
+        selective_zero_num_neighbors(num_neighbors, batch_idx, rebuild_flags, device)
+        wp.launch(
+            kernel=_fill_batch_naive_neighbor_matrix_pbc_selective_overload[wp_dtype],
+            dim=(total_shifts, max_atoms_per_system),
+            inputs=[
+                positions,
+                cell,
+                wp_dtype(cutoff * cutoff),
+                batch_ptr,
+                shifts,
+                shift_system_idx,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                half_fill,
+                rebuild_flags,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_fill_batch_naive_neighbor_matrix_pbc_overload[wp_dtype],
+            dim=(total_shifts, max_atoms_per_system),
+            inputs=[
+                positions,
+                cell,
+                wp_dtype(cutoff * cutoff),
+                batch_ptr,
+                shifts,
+                shift_system_idx,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                half_fill,
+            ],
+            device=device,
+        )

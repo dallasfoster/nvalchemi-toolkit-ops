@@ -26,7 +26,13 @@ from nvalchemiops.neighbors.cell_list import (
 from nvalchemiops.neighbors.cell_list import (
     query_cell_list as wp_query_cell_list,
 )
-from nvalchemiops.neighbors.neighbor_utils import estimate_max_neighbors
+from nvalchemiops.neighbors.cell_list import (
+    query_cell_list_selective as wp_query_cell_list_selective,
+)
+from nvalchemiops.neighbors.neighbor_utils import (
+    estimate_max_neighbors,
+    selective_zero_num_neighbors_single,
+)
 from nvalchemiops.torch.neighbors.neighbor_utils import (
     allocate_cell_list,
     get_neighbor_list_from_neighbor_matrix,
@@ -417,6 +423,109 @@ def _query_cell_list_op(
     )
 
 
+@torch.library.custom_op(
+    "nvalchemiops::query_cell_list_selective",
+    mutates_args=("neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"),
+)
+def _query_cell_list_selective_op(
+    positions: torch.Tensor,
+    cutoff: float,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    cells_per_dimension: torch.Tensor,
+    neighbor_search_radius: torch.Tensor,
+    atom_periodic_shifts: torch.Tensor,
+    atom_to_cell_mapping: torch.Tensor,
+    atoms_per_cell_count: torch.Tensor,
+    cell_atom_start_indices: torch.Tensor,
+    cell_atom_list: torch.Tensor,
+    neighbor_matrix: torch.Tensor,
+    neighbor_matrix_shifts: torch.Tensor,
+    num_neighbors: torch.Tensor,
+    rebuild_flags: torch.Tensor,
+    half_fill: bool = False,
+) -> None:
+    """Internal custom op for selective single-system cell list neighbor query.
+
+    Wraps the selective warp kernel that checks ``rebuild_flags[0]`` on the GPU
+    and exits immediately when False — no CPU-GPU synchronisation occurs.
+
+    See Also
+    --------
+    nvalchemiops.neighbors.cell_list.query_cell_list_selective : Core warp launcher
+    query_cell_list : High-level wrapper that dispatches here when rebuild_flags is set
+    """
+    total_atoms = positions.shape[0]
+    if total_atoms == 0:
+        return
+
+    device = positions.device
+    cell = cell if cell.ndim == 3 else cell.unsqueeze(0)
+    pbc = pbc.squeeze(0)
+
+    wp_dtype = get_wp_dtype(positions.dtype)
+    wp_vec_dtype = get_wp_vec_dtype(positions.dtype)
+    wp_mat_dtype = get_wp_mat_dtype(positions.dtype)
+    wp_device = wp.device_from_torch(device)
+
+    wp_rebuild_flags = wp.from_torch(
+        rebuild_flags.view(-1)[:1].contiguous(), dtype=wp.bool, return_ctype=True
+    )
+    wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype, return_ctype=True)
+    wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
+    wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+    wp_cells_per_dimension = wp.from_torch(
+        cells_per_dimension, dtype=wp.int32, return_ctype=True
+    )
+    wp_neighbor_search_radius = wp.from_torch(
+        neighbor_search_radius, dtype=wp.int32, return_ctype=True
+    )
+    wp_atom_periodic_shifts = wp.from_torch(
+        atom_periodic_shifts, dtype=wp.vec3i, return_ctype=True
+    )
+    wp_atom_to_cell_mapping = wp.from_torch(
+        atom_to_cell_mapping, dtype=wp.vec3i, return_ctype=True
+    )
+    wp_atoms_per_cell_count = wp.from_torch(
+        atoms_per_cell_count, dtype=wp.int32, return_ctype=True
+    )
+    wp_cell_atom_start_indices = wp.from_torch(
+        cell_atom_start_indices, dtype=wp.int32, return_ctype=True
+    )
+    wp_cell_atom_list = wp.from_torch(cell_atom_list, dtype=wp.int32, return_ctype=True)
+    wp_neighbor_matrix = wp.from_torch(
+        neighbor_matrix, dtype=wp.int32, return_ctype=True
+    )
+    wp_neighbor_matrix_shifts = wp.from_torch(
+        neighbor_matrix_shifts, dtype=wp.vec3i, return_ctype=True
+    )
+    wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
+
+    selective_zero_num_neighbors_single(
+        wp_num_neighbors, wp_rebuild_flags, str(wp_device)
+    )
+    wp_query_cell_list_selective(
+        positions=wp_positions,
+        cell=wp_cell,
+        pbc=wp_pbc,
+        cutoff=cutoff,
+        cells_per_dimension=wp_cells_per_dimension,
+        neighbor_search_radius=wp_neighbor_search_radius,
+        atom_periodic_shifts=wp_atom_periodic_shifts,
+        atom_to_cell_mapping=wp_atom_to_cell_mapping,
+        atoms_per_cell_count=wp_atoms_per_cell_count,
+        cell_atom_start_indices=wp_cell_atom_start_indices,
+        cell_atom_list=wp_cell_atom_list,
+        neighbor_matrix=wp_neighbor_matrix,
+        neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
+        num_neighbors=wp_num_neighbors,
+        rebuild_flags=wp_rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=str(wp_device),
+        half_fill=half_fill,
+    )
+
+
 def query_cell_list(
     positions: torch.Tensor,
     cutoff: float,
@@ -433,6 +542,7 @@ def query_cell_list(
     neighbor_matrix_shifts: torch.Tensor,
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
+    rebuild_flags: torch.Tensor | None = None,
 ) -> None:
     """Query spatial cell list to build neighbor matrix with distance constraints.
 
@@ -477,6 +587,12 @@ def query_cell_list(
         Must be pre-allocated.
     half_fill : bool, default=False
         If True, only store half of the neighbor relationships.
+    rebuild_flags : torch.Tensor, shape () or (1,), dtype=torch.bool, optional
+        If provided, controls whether the neighbor list is recomputed.
+        When the flag is False the kernel is skipped and the pre-allocated output
+        tensors are returned unchanged.  When the flag is True (or when this
+        argument is None) the query proceeds as normal.
+        Note: providing this argument disables torch.compile compatibility.
 
     See Also
     --------
@@ -484,6 +600,25 @@ def query_cell_list(
     build_cell_list : Builds the cell list data structures
     cell_list : High-level function that builds and queries in one call
     """
+    if rebuild_flags is not None:
+        return _query_cell_list_selective_op(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            cells_per_dimension,
+            neighbor_search_radius,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+            num_neighbors,
+            rebuild_flags,
+            half_fill,
+        )
     return _query_cell_list_op(
         positions,
         cutoff,
@@ -522,6 +657,7 @@ def cell_list(
     atoms_per_cell_count: torch.Tensor | None = None,
     cell_atom_start_indices: torch.Tensor | None = None,
     cell_atom_list: torch.Tensor | None = None,
+    rebuild_flags: torch.Tensor | None = None,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -592,6 +728,12 @@ def cell_list(
         Flattened list of atom indices organized by cell.
         Pass a pre-allocated tensor to avoid reallocation for cell list construction.
         If None, allocated internally to build the cell list.
+    rebuild_flags : torch.Tensor, shape () or (1,), dtype=torch.bool, optional
+        If provided, controls whether the neighbor list is recomputed.
+        When the flag is False the existing ``neighbor_matrix``, ``num_neighbors``,
+        and ``neighbor_matrix_shifts`` tensors are returned unchanged and all
+        kernel launches are skipped.  When the flag is True (or when this argument
+        is None) the neighbor list is recomputed as normal.
 
     Returns
     -------
@@ -656,18 +798,22 @@ def cell_list(
         neighbor_matrix = torch.full(
             (total_atoms, max_neighbors), fill_value, dtype=torch.int32, device=device
         )
-    else:
+    elif rebuild_flags is None:
         neighbor_matrix.fill_(fill_value)
     if neighbor_matrix_shifts is None:
         neighbor_matrix_shifts = torch.zeros(
             (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
         )
-    else:
+    elif rebuild_flags is None:
         neighbor_matrix_shifts.zero_()
     if num_neighbors is None:
         num_neighbors = torch.zeros((total_atoms,), dtype=torch.int32, device=device)
-    else:
+    elif rebuild_flags is None:
         num_neighbors.zero_()
+
+    # When rebuild_flags is provided the selective zero and kernel launch happen inside
+    # query_cell_list (GPU-side). We still need to build the cell list unconditionally
+    # so the query has valid spatial data for rebuilt systems.
 
     # Allocate cell list if needed
     if (

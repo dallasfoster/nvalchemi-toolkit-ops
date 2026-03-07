@@ -566,6 +566,166 @@ def _cell_list_build_neighbor_matrix(
                         )
 
 
+@wp.kernel(enable_backward=False)
+def _cell_list_build_neighbor_matrix_selective(
+    positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    pbc: wp.array(dtype=wp.bool),
+    cutoff: Any,
+    cells_per_dimension: wp.array(dtype=wp.int32),
+    neighbor_search_radius: wp.array(dtype=wp.int32),
+    atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
+    atoms_per_cell_count: wp.array(dtype=wp.int32),
+    cell_atom_start_indices: wp.array(dtype=wp.int32),
+    cell_atom_list: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts: wp.array(dtype=Any, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective single-system cell list neighbor matrix kernel.
+
+    Identical to ``_cell_list_build_neighbor_matrix`` but checks
+    ``rebuild_flags[0]`` on the GPU and returns immediately when False.
+    No CPU-GPU synchronisation occurs.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cell : wp.array, shape (1, 3, 3), dtype=wp.mat33*
+        Unit cell matrix for periodic boundary coordinate shifts.
+    pbc : wp.array, shape (3,), dtype=bool
+        Periodic boundary condition flags.
+    cutoff : float
+        Maximum distance for considering atoms as neighbors.
+    cells_per_dimension : wp.array, shape (3,), dtype=wp.int32
+        Number of spatial cells in x, y, z directions.
+    neighbor_search_radius : wp.array, shape (3,), dtype=wp.int32
+        Radius of neighboring cells to search in each dimension.
+    atom_periodic_shifts : wp.array, shape (total_atoms, 3), dtype=wp.vec3i
+        Periodic boundary crossings for each atom.
+    atom_to_cell_mapping : wp.array, shape (total_atoms, 3), dtype=wp.vec3i
+        3D cell coordinates for each atom.
+    atoms_per_cell_count : wp.array, shape (total_cells,), dtype=wp.int32
+        Number of atoms in each cell.
+    cell_atom_start_indices : wp.array, shape (total_cells,), dtype=wp.int32
+        Starting index in cell_atom_list for each cell.
+    cell_atom_list : wp.array, shape (total_atoms,), dtype=wp.int32
+        Flattened list of atom indices organized by cell.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix (untouched when not rebuilding).
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors, 3), dtype=wp.vec3i
+        OUTPUT: Shift vectors (untouched when not rebuilding).
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts (pre-zeroed by caller when rebuilding).
+    half_fill : bool
+        If True, only store half of the neighbor relationships.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        GPU-resident flag; False → kernel returns immediately.
+    """
+    atom_idx = wp.tid()
+    if not rebuild_flags[0]:
+        return
+
+    cutoff_distance_sq = cutoff * cutoff
+    central_atom_position = positions[atom_idx]
+    central_atom_cell = atom_to_cell_mapping[atom_idx]
+    central_atom_shift = atom_periodic_shifts[atom_idx]
+    max_neighbors = neighbor_matrix.shape[1]
+
+    cell_mat = cell[0]
+    cell_transpose = wp.transpose(cell_mat)
+
+    cpd_x = cells_per_dimension[0]
+    cpd_y = cells_per_dimension[1]
+    cpd_z = cells_per_dimension[2]
+
+    pbc_x = pbc[0]
+    pbc_y = pbc[1]
+    pbc_z = pbc[2]
+
+    for dx in range(0, neighbor_search_radius[0] + 1):
+        for dy in range(-neighbor_search_radius[1], neighbor_search_radius[1] + 1):
+            for dz in range(-neighbor_search_radius[2], neighbor_search_radius[2] + 1):
+                if not (
+                    dx > 0 or (dx == 0 and dy > 0) or (dx == 0 and dy == 0 and dz >= 0)
+                ):
+                    continue
+                target_x = central_atom_cell[0] + dx
+                target_y = central_atom_cell[1] + dy
+                target_z = central_atom_cell[2] + dz
+
+                if not pbc_x and (target_x < 0 or target_x >= cpd_x):
+                    continue
+                if not pbc_y and (target_y < 0 or target_y >= cpd_y):
+                    continue
+                if not pbc_z and (target_z < 0 or target_z >= cpd_z):
+                    continue
+
+                cs_x, wc_x = wpdivmod(target_x, cpd_x)
+                cs_y, wc_y = wpdivmod(target_y, cpd_y)
+                cs_z, wc_z = wpdivmod(target_z, cpd_z)
+
+                linear_cell_index = wc_x + cpd_x * (wc_y + cpd_y * wc_z)
+
+                cell_start_index = cell_atom_start_indices[linear_cell_index]
+                num_atoms_in_cell = atoms_per_cell_count[linear_cell_index]
+
+                for cell_atom_idx in range(num_atoms_in_cell):
+                    neighbor_atom_idx = cell_atom_list[cell_start_index + cell_atom_idx]
+
+                    neighbor_atom_shift = atom_periodic_shifts[neighbor_atom_idx]
+
+                    shift_x = cs_x
+                    shift_y = cs_y
+                    shift_z = cs_z
+
+                    if pbc_x:
+                        shift_x += central_atom_shift[0] - neighbor_atom_shift[0]
+                    else:
+                        shift_x = 0
+
+                    if pbc_y:
+                        shift_y += central_atom_shift[1] - neighbor_atom_shift[1]
+                    else:
+                        shift_y = 0
+
+                    if pbc_z:
+                        shift_z += central_atom_shift[2] - neighbor_atom_shift[2]
+                    else:
+                        shift_z = 0
+
+                    if dx == 0 and dy == 0 and dz == 0:
+                        if neighbor_atom_idx <= atom_idx:
+                            continue
+
+                    fractional_shift = type(central_atom_position)(
+                        type(central_atom_position[0])(shift_x),
+                        type(central_atom_position[0])(shift_y),
+                        type(central_atom_position[0])(shift_z),
+                    )
+                    cartesian_shift = cell_transpose * fractional_shift
+
+                    neighbor_pos = positions[neighbor_atom_idx]
+                    dr = neighbor_pos - central_atom_position + cartesian_shift
+                    distance_sq = wp.dot(dr, dr)
+
+                    if distance_sq < cutoff_distance_sq:
+                        _update_neighbor_matrix_pbc(
+                            atom_idx,
+                            neighbor_atom_idx,
+                            neighbor_matrix,
+                            neighbor_matrix_shifts,
+                            num_neighbors,
+                            wp.vec3i(shift_x, shift_y, shift_z),
+                            max_neighbors,
+                            half_fill,
+                        )
+
+
 T = [wp.float32, wp.float64]
 V = [wp.vec3f, wp.vec3d]
 M = [wp.mat33f, wp.mat33d]
@@ -574,6 +734,7 @@ _cell_list_construct_bin_size_overload = {}
 _cell_list_count_atoms_per_bin_overload = {}
 _cell_list_bin_atoms_overload = {}
 _cell_list_build_neighbor_matrix_overload = {}
+_cell_list_build_neighbor_matrix_selective_overload = {}
 for t, v, m in zip(T, V, M):
     _estimate_cell_list_sizes_overload[t] = wp.overload(
         _estimate_cell_list_sizes,
@@ -638,6 +799,27 @@ for t, v, m in zip(T, V, M):
             wp.array2d(dtype=wp.vec3i),
             wp.array(dtype=wp.int32),
             wp.bool,
+        ],
+    )
+    _cell_list_build_neighbor_matrix_selective_overload[t] = wp.overload(
+        _cell_list_build_neighbor_matrix_selective,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=m),
+            wp.array(dtype=wp.bool),
+            t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
         ],
     )
 
@@ -863,6 +1045,104 @@ def query_cell_list(
             neighbor_matrix_shifts,
             num_neighbors,
             half_fill,
+        ],
+        device=device,
+    )
+
+
+def query_cell_list_selective(
+    positions: wp.array,
+    cell: wp.array,
+    pbc: wp.array,
+    cutoff: float,
+    cells_per_dimension: wp.array,
+    neighbor_search_radius: wp.array,
+    atom_periodic_shifts: wp.array,
+    atom_to_cell_mapping: wp.array,
+    atoms_per_cell_count: wp.array,
+    cell_atom_start_indices: wp.array,
+    cell_atom_list: wp.array,
+    neighbor_matrix: wp.array,
+    neighbor_matrix_shifts: wp.array,
+    num_neighbors: wp.array,
+    rebuild_flags: wp.array,
+    wp_dtype: type,
+    device: str,
+    half_fill: bool = False,
+) -> None:
+    """Selective warp launcher for querying cell list to build neighbor matrix.
+
+    Equivalent to ``query_cell_list`` but the kernel checks ``rebuild_flags[0]``
+    on the GPU and exits immediately when False.
+    No CPU-GPU synchronisation occurs.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cell : wp.array, shape (1, 3, 3), dtype=wp.mat33*
+        Unit cell matrix.
+    pbc : wp.array, shape (3,), dtype=wp.bool
+        Periodic boundary condition flags.
+    cutoff : float
+        Maximum distance for considering atoms as neighbors.
+    cells_per_dimension : wp.array, shape (3,), dtype=wp.int32
+        Number of cells in x, y, z directions from build_cell_list.
+    neighbor_search_radius : wp.array, shape (3,), dtype=wp.int32
+        Shifts to search from build_cell_list.
+    atom_periodic_shifts : wp.array, shape (total_atoms, 3), dtype=wp.vec3i
+        Periodic boundary crossings for each atom.
+    atom_to_cell_mapping : wp.array, shape (total_atoms, 3), dtype=wp.vec3i
+        3D cell coordinates for each atom.
+    atoms_per_cell_count : wp.array, shape (max_total_cells,), dtype=wp.int32
+        Number of atoms in each cell.
+    cell_atom_start_indices : wp.array, shape (max_total_cells,), dtype=wp.int32
+        Starting index in cell_atom_list for each cell.
+    cell_atom_list : wp.array, shape (total_atoms,), dtype=wp.int32
+        Flattened list of atom indices organized by cell.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix (untouched when not rebuilding).
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors, 3), dtype=wp.vec3i
+        OUTPUT: Shift vectors (untouched when not rebuilding).
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts (pre-zeroed by caller when rebuilding).
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        GPU-resident flag; False → kernel returns immediately.
+    wp_dtype : type
+        Warp dtype (wp.float32 or wp.float64).
+    device : str
+        Warp device string.
+    half_fill : bool, default=False
+        If True, only store half of the neighbor relationships.
+
+    See Also
+    --------
+    query_cell_list : Non-selective variant
+    _cell_list_build_neighbor_matrix_selective : Underlying kernel
+    """
+    total_atoms = positions.shape[0]
+    wp_cutoff = wp_dtype(cutoff)
+
+    wp.launch(
+        _cell_list_build_neighbor_matrix_selective_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[
+            positions,
+            cell,
+            pbc,
+            wp_cutoff,
+            cells_per_dimension,
+            neighbor_search_radius,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+            num_neighbors,
+            half_fill,
+            rebuild_flags,
         ],
         device=device,
     )

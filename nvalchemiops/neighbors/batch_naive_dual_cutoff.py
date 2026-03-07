@@ -203,16 +203,41 @@ def _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff(
     _cell = cell[isys]
     _shift = shifts[ishift]
 
-    positions_shifted = type(_cell[0])(_shift) * _cell + _positions
+    # Wrap atom i to the primary cell to support unwrapped coordinates.
+    _inv_cell = wp.inverse(_cell)
+    _frac_i = _positions * _inv_cell
+    _int_i = wp.vec3i(
+        wp.int32(wp.floor(_frac_i[0])),
+        wp.int32(wp.floor(_frac_i[1])),
+        wp.int32(wp.floor(_frac_i[2])),
+    )
+    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
+    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
 
     _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
     if _zero_shift:
         jatom_end = iatom
 
     for jatom in range(jatom_start, jatom_end):
-        diff = positions_shifted - positions[jatom]
+        # Wrap atom j to the primary cell.
+        _pos_j = positions[jatom]
+        _frac_j = _pos_j * _inv_cell
+        _int_j = wp.vec3i(
+            wp.int32(wp.floor(_frac_j[0])),
+            wp.int32(wp.floor(_frac_j[1])),
+            wp.int32(wp.floor(_frac_j[2])),
+        )
+        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
+        diff = positions_shifted - _pos_j_wrapped
         dist_sq = wp.length_sq(diff)
         if dist_sq < cutoff2_sq:
+            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
+            # holds for the original (potentially unwrapped) positions.
+            _corrected_shift = wp.vec3i(
+                _shift[0] - _int_i[0] + _int_j[0],
+                _shift[1] - _int_i[1] + _int_j[1],
+                _shift[2] - _int_i[2] + _int_j[2],
+            )
             # Since we only generate half the shifts (lexicographically ordered),
             # we need to add both directions for non-zero shifts to get all pairs.
             # For zero shift, we already only process i < j, so use half_fill as-is.
@@ -223,7 +248,7 @@ def _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff(
                 neighbor_matrix2,
                 neighbor_matrix_shifts2,
                 num_neighbors2,
-                _shift,
+                _corrected_shift,
                 maxnb2,
                 half_fill,
             )
@@ -234,7 +259,7 @@ def _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff(
                     neighbor_matrix1,
                     neighbor_matrix_shifts1,
                     num_neighbors1,
-                    _shift,
+                    _corrected_shift,
                     maxnb1,
                     half_fill,
                 )

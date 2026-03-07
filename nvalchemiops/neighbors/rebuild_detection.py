@@ -27,6 +27,8 @@ import warp as wp
 __all__ = [
     "check_cell_list_rebuild",
     "check_neighbor_list_rebuild",
+    "check_batch_neighbor_list_rebuild",
+    "check_batch_cell_list_rebuild",
 ]
 
 ###########################################################################################
@@ -394,6 +396,401 @@ def check_neighbor_list_rebuild(
             current_positions,
             wp_dtype(skin_distance_threshold),
             rebuild_flag,
+        ],
+        device=device,
+    )
+
+
+###########################################################################################
+########################### Batch Neighbor List Rebuild Detection ########################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _check_batch_atoms_moved_beyond_skin(
+    reference_positions: wp.array(dtype=Any),
+    current_positions: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    skin_distance_threshold: Any,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Detect per-system if atoms moved beyond skin distance requiring neighbor list rebuild.
+
+    Checks each atom's displacement from its reference position against the skin distance
+    threshold. When any atom in a system exceeds this threshold, the system's rebuild flag
+    is set to True. Uses early termination per system for efficiency.
+
+    Parameters
+    ----------
+    reference_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic positions to compare against reference.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    skin_distance_threshold : float*
+        Maximum allowed displacement before neighbor list becomes invalid.
+        Typically set to (cutoff_radius - cutoff) / 2.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=bool
+        OUTPUT: Per-system flags set to True if any atom in that system moved beyond
+        skin distance (modified atomically per system).
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: rebuild_flags (atomic write per system)
+    - Early termination: Threads exit if their system's rebuild flag is already set
+    - Displacement calculation uses Euclidean distance
+    - No CPU-GPU synchronization required; flags are set entirely on GPU
+    """
+    atom_idx = wp.tid()
+
+    if atom_idx >= reference_positions.shape[0]:
+        return
+
+    isys = batch_idx[atom_idx]
+
+    # Skip computation if rebuild already flagged for this system
+    if rebuild_flags[isys]:
+        return
+
+    displacement_vector = current_positions[atom_idx] - reference_positions[atom_idx]
+    displacement_magnitude = wp.length(displacement_vector)
+
+    if displacement_magnitude > skin_distance_threshold:
+        rebuild_flags[isys] = True
+
+
+@wp.overload
+def _check_batch_atoms_moved_beyond_skin(
+    reference_positions: wp.array(dtype=wp.vec3d),
+    current_positions: wp.array(dtype=wp.vec3d),
+    batch_idx: wp.array(dtype=wp.int32),
+    skin_distance_threshold: wp.float64,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float64 precision overload for batch skin distance movement detection kernel."""
+    ...
+
+
+@wp.overload
+def _check_batch_atoms_moved_beyond_skin(
+    reference_positions: wp.array(dtype=wp.vec3f),
+    current_positions: wp.array(dtype=wp.vec3f),
+    batch_idx: wp.array(dtype=wp.int32),
+    skin_distance_threshold: wp.float32,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float32 precision overload for batch skin distance movement detection kernel."""
+    ...
+
+
+@wp.overload
+def _check_batch_atoms_moved_beyond_skin(
+    reference_positions: wp.array(dtype=wp.vec3h),
+    current_positions: wp.array(dtype=wp.vec3h),
+    batch_idx: wp.array(dtype=wp.int32),
+    skin_distance_threshold: wp.float16,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float16 precision overload for batch skin distance movement detection kernel."""
+    ...
+
+
+# Generate overload dictionary for batch neighbor list rebuild kernel
+_check_batch_atoms_moved_beyond_skin_overload = {}
+for t, v in zip(_T, _V):
+    _check_batch_atoms_moved_beyond_skin_overload[t] = wp.overload(
+        _check_batch_atoms_moved_beyond_skin,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            t,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+
+
+###########################################################################################
+########################### Batch Cell List Rebuild Detection ############################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _check_batch_atoms_changed_cells(
+    current_positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells_per_dimension: wp.array(dtype=wp.vec3i),
+    pbc: wp.array2d(dtype=wp.bool),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Detect per-system if atoms moved between cells requiring cell list rebuild.
+
+    Computes current cell assignments for each atom and compares with stored
+    cell assignments. When any atom in a system has crossed a cell boundary,
+    that system's rebuild flag is set to True. Uses early termination per system.
+
+    Parameters
+    ----------
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates in Cartesian space.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Per-system unit cell matrices for coordinate transformations.
+    atom_to_cell_mapping : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Previously computed cell coordinates for each atom from existing cell lists.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    cells_per_dimension : wp.array, shape (num_systems,), dtype=wp.vec3i
+        Number of cells in x, y, z directions for each system.
+    pbc : wp.array2d, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=bool
+        OUTPUT: Per-system flags set to True if any atom changed cells (modified atomically).
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: rebuild_flags (atomic write per system)
+    - Early termination: Threads exit if their system's rebuild flag is already set
+    - Handles periodic boundaries with proper wrapping per system
+    - No CPU-GPU synchronization required; flags are set entirely on GPU
+    """
+    atom_idx = wp.tid()
+
+    if atom_idx >= current_positions.shape[0]:
+        return
+
+    isys = batch_idx[atom_idx]
+
+    # Skip computation if rebuild already flagged for this system
+    if rebuild_flags[isys]:
+        return
+
+    _cell = cell[isys]
+    _cpd = cells_per_dimension[isys]
+
+    # Transform current position to fractional coordinates (row-vector convention)
+    _inv_cell = wp.inverse(_cell)
+    fractional_position = current_positions[atom_idx] * _inv_cell
+    current_cell_coords = wp.vec3i(0, 0, 0)
+
+    # Compute current cell coordinates for each dimension
+    for dim in range(3):
+        current_cell_coords[dim] = wp.int32(
+            wp.floor(
+                fractional_position[dim] * type(fractional_position[dim])(_cpd[dim])
+            )
+        )
+
+        # Handle periodic boundary conditions
+        if pbc[isys, dim]:
+            current_cell_coords[dim] = current_cell_coords[dim] % _cpd[dim]
+            if current_cell_coords[dim] < 0:
+                current_cell_coords[dim] += _cpd[dim]
+        else:
+            current_cell_coords[dim] = wp.clamp(
+                current_cell_coords[dim], 0, _cpd[dim] - 1
+            )
+
+    # Compare with stored cell coordinates from existing cell list
+    stored_cell_coords = atom_to_cell_mapping[atom_idx]
+
+    if (
+        current_cell_coords[0] != stored_cell_coords[0]
+        or current_cell_coords[1] != stored_cell_coords[1]
+        or current_cell_coords[2] != stored_cell_coords[2]
+    ):
+        rebuild_flags[isys] = True
+
+
+@wp.overload
+def _check_batch_atoms_changed_cells(
+    current_positions: wp.array(dtype=wp.vec3d),
+    cell: wp.array(dtype=wp.mat33d),
+    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells_per_dimension: wp.array(dtype=wp.vec3i),
+    pbc: wp.array2d(dtype=wp.bool),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float64 precision overload for batch atom cell change detection kernel."""
+    ...
+
+
+@wp.overload
+def _check_batch_atoms_changed_cells(
+    current_positions: wp.array(dtype=wp.vec3f),
+    cell: wp.array(dtype=wp.mat33f),
+    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells_per_dimension: wp.array(dtype=wp.vec3i),
+    pbc: wp.array2d(dtype=wp.bool),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float32 precision overload for batch atom cell change detection kernel."""
+    ...
+
+
+@wp.overload
+def _check_batch_atoms_changed_cells(
+    current_positions: wp.array(dtype=wp.vec3h),
+    cell: wp.array(dtype=wp.mat33h),
+    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
+    batch_idx: wp.array(dtype=wp.int32),
+    cells_per_dimension: wp.array(dtype=wp.vec3i),
+    pbc: wp.array2d(dtype=wp.bool),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:  # pragma: no cover
+    """Float16 precision overload for batch atom cell change detection kernel."""
+    ...
+
+
+# Generate overload dictionary for batch cell list rebuild kernel
+_check_batch_atoms_changed_cells_overload = {}
+for t, v, m in zip(_T, _V, _M):
+    _check_batch_atoms_changed_cells_overload[t] = wp.overload(
+        _check_batch_atoms_changed_cells,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=m),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.bool),
+            wp.array(dtype=wp.bool),
+        ],
+    )
+
+
+###########################################################################################
+########################### Batch Warp Launchers #########################################
+###########################################################################################
+
+
+def check_batch_neighbor_list_rebuild(
+    reference_positions: wp.array,
+    current_positions: wp.array,
+    batch_idx: wp.array,
+    skin_distance_threshold: float,
+    rebuild_flags: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for detecting per-system neighbor list rebuild needs.
+
+    Checks if any atoms in each system have moved beyond the skin distance since
+    the neighbor list was built. Sets per-system rebuild flags on GPU without
+    requiring CPU synchronization.
+
+    Parameters
+    ----------
+    reference_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic positions to compare against reference.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    skin_distance_threshold : float
+        Maximum allowed displacement before neighbor list becomes invalid.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        OUTPUT: Per-system flags set to True if rebuild is needed.
+        Must be pre-allocated and initialized to False by caller.
+    wp_dtype : type
+        Warp dtype (wp.float32, wp.float64, or wp.float16).
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    Notes
+    -----
+    - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
+    - rebuild_flags must be pre-allocated and initialized to False by caller.
+    - No CPU-GPU synchronization required; flags are written entirely on GPU.
+
+    See Also
+    --------
+    _check_batch_atoms_moved_beyond_skin : Kernel that performs the check
+    """
+    total_atoms = reference_positions.shape[0]
+
+    wp.launch(
+        kernel=_check_batch_atoms_moved_beyond_skin_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[
+            reference_positions,
+            current_positions,
+            batch_idx,
+            wp_dtype(skin_distance_threshold),
+            rebuild_flags,
+        ],
+        device=device,
+    )
+
+
+def check_batch_cell_list_rebuild(
+    current_positions: wp.array,
+    atom_to_cell_mapping: wp.array,
+    batch_idx: wp.array,
+    cells_per_dimension: wp.array,
+    cell: wp.array,
+    pbc: wp.array,
+    rebuild_flags: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for detecting per-system cell list rebuild needs.
+
+    Checks if any atoms in each system have moved between spatial cells since
+    the cell list was built. Sets per-system rebuild flags on GPU without
+    requiring CPU synchronization.
+
+    Parameters
+    ----------
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates in Cartesian space.
+    atom_to_cell_mapping : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Previously computed cell coordinates for each atom.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    cells_per_dimension : wp.array, shape (num_systems,), dtype=wp.vec3i
+        Number of cells in x, y, z directions for each system.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Per-system unit cell matrices for coordinate transformations.
+    pbc : wp.array, shape (num_systems, 3), dtype=wp.bool
+        Per-system periodic boundary condition flags (2D array).
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        OUTPUT: Per-system flags set to True if rebuild is needed.
+        Must be pre-allocated and initialized to False by caller.
+    wp_dtype : type
+        Warp dtype (wp.float32, wp.float64, or wp.float16).
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    Notes
+    -----
+    - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
+    - rebuild_flags must be pre-allocated and initialized to False by caller.
+    - No CPU-GPU synchronization required; flags are written entirely on GPU.
+
+    See Also
+    --------
+    _check_batch_atoms_changed_cells : Kernel that performs the check
+    """
+    total_atoms = current_positions.shape[0]
+
+    wp.launch(
+        kernel=_check_batch_atoms_changed_cells_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[
+            current_positions,
+            cell,
+            atom_to_cell_mapping,
+            batch_idx,
+            cells_per_dimension,
+            pbc,
+            rebuild_flags,
         ],
         device=device,
     )

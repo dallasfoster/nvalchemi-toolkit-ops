@@ -25,6 +25,8 @@ import torch
 import warp as wp
 
 from nvalchemiops.neighbors.rebuild_detection import (
+    check_batch_cell_list_rebuild,
+    check_batch_neighbor_list_rebuild,
     check_cell_list_rebuild,
     check_neighbor_list_rebuild,
 )
@@ -35,6 +37,8 @@ __all__ = [
     "neighbor_list_needs_rebuild",
     "check_cell_list_rebuild_needed",
     "check_neighbor_list_rebuild_needed",
+    "batch_neighbor_list_needs_rebuild",
+    "batch_cell_list_needs_rebuild",
 ]
 
 ###########################################################################################
@@ -445,3 +449,295 @@ def check_neighbor_list_rebuild_needed(
     )
 
     return rebuild_tensor.item()
+
+
+###########################################################################################
+########################### Batch Neighbor List Rebuild Detection ########################
+###########################################################################################
+
+
+@torch.library.custom_op(
+    "nvalchemiops::_batch_neighbor_list_needs_rebuild", mutates_args=()
+)
+def _batch_neighbor_list_needs_rebuild(
+    reference_positions: torch.Tensor,
+    current_positions: torch.Tensor,
+    batch_idx: torch.Tensor,
+    skin_distance_threshold: float,
+) -> torch.Tensor:
+    """Detect per-system if neighbor lists require rebuilding due to atomic motion.
+
+    Parameters
+    ----------
+    reference_positions : torch.Tensor, shape (total_atoms, 3)
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : torch.Tensor, shape (total_atoms, 3)
+        Current atomic positions to compare against reference.
+    batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    skin_distance_threshold : float
+        Maximum allowed displacement before neighbor list becomes invalid.
+
+    Returns
+    -------
+    rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
+        Per-system flags: True if any atom in that system moved beyond skin distance.
+
+    See Also
+    --------
+    batch_neighbor_list_needs_rebuild : High-level wrapper function
+    """
+    if reference_positions.shape != current_positions.shape:
+        num_systems = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else 1
+        return torch.ones(
+            num_systems, device=current_positions.device, dtype=torch.bool
+        )
+
+    total_atoms = reference_positions.shape[0]
+    device = reference_positions.device
+
+    num_systems = int(batch_idx.max().item()) + 1 if total_atoms > 0 else 1
+    rebuild_flags = torch.zeros(num_systems, device=device, dtype=torch.bool)
+
+    if total_atoms == 0:
+        return rebuild_flags
+
+    wp_dtype = get_wp_dtype(reference_positions.dtype)
+    wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
+    wp_device = str(device)
+
+    wp_reference = wp.from_torch(
+        reference_positions, dtype=wp_vec_dtype, return_ctype=True
+    )
+    wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype, return_ctype=True)
+    wp_batch_idx = wp.from_torch(
+        batch_idx.to(dtype=torch.int32), dtype=wp.int32, return_ctype=True
+    )
+    wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
+
+    check_batch_neighbor_list_rebuild(
+        reference_positions=wp_reference,
+        current_positions=wp_current,
+        batch_idx=wp_batch_idx,
+        skin_distance_threshold=skin_distance_threshold,
+        rebuild_flags=wp_rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=wp_device,
+    )
+
+    return rebuild_flags
+
+
+@_batch_neighbor_list_needs_rebuild.register_fake
+def _batch_neighbor_list_needs_rebuild_fake(
+    reference_positions: torch.Tensor,
+    current_positions: torch.Tensor,
+    batch_idx: torch.Tensor,
+    skin_distance_threshold: float,
+) -> torch.Tensor:
+    """Fake implementation for torch.compile compatibility."""
+    num_systems = batch_idx.max() + 1 if batch_idx.numel() > 0 else 1
+    return torch.zeros(num_systems, device=reference_positions.device, dtype=torch.bool)
+
+
+def batch_neighbor_list_needs_rebuild(
+    reference_positions: torch.Tensor,
+    current_positions: torch.Tensor,
+    batch_idx: torch.Tensor,
+    skin_distance_threshold: float,
+) -> torch.Tensor:
+    """Detect per-system if neighbor lists require rebuilding due to atomic motion.
+
+    This torch.compile-compatible custom operator efficiently determines which systems
+    in a batch need their neighbor list rebuilt based on atomic displacements. Uses
+    GPU-side flagging with no CPU-GPU synchronization.
+
+    Parameters
+    ----------
+    reference_positions : torch.Tensor, shape (total_atoms, 3)
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : torch.Tensor, shape (total_atoms, 3)
+        Current atomic coordinates to compare against reference.
+    batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    skin_distance_threshold : float
+        Maximum allowed atomic displacement before neighbor list becomes invalid.
+        Typically set to (cutoff_radius - cutoff) / 2 for safety.
+
+    Returns
+    -------
+    rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
+        Per-system flags: True if any atom in that system moved beyond the skin distance.
+        Can be passed directly to batch neighbor list functions for GPU-side selective rebuild.
+
+    Notes
+    -----
+    - torch.compile compatible custom operation
+    - No CPU-GPU synchronization required; all flag writes happen on GPU
+    - ``num_systems`` is inferred as ``batch_idx.max() + 1``
+    - Returns tensor (not Python bool) for compilation compatibility
+
+    See Also
+    --------
+    neighbor_list_needs_rebuild : Single-system version
+    check_batch_neighbor_list_rebuild_needed : Convenience wrapper returning Python list
+    """
+    return _batch_neighbor_list_needs_rebuild(
+        reference_positions, current_positions, batch_idx, skin_distance_threshold
+    )
+
+
+###########################################################################################
+########################### Batch Cell List Rebuild Detection ############################
+###########################################################################################
+
+
+@torch.library.custom_op(
+    "nvalchemiops::_batch_cell_list_needs_rebuild", mutates_args=()
+)
+def _batch_cell_list_needs_rebuild(
+    current_positions: torch.Tensor,
+    atom_to_cell_mapping: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cells_per_dimension: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+) -> torch.Tensor:
+    """Detect per-system if spatial cell lists require rebuilding due to atomic motion.
+
+    Parameters
+    ----------
+    current_positions : torch.Tensor, shape (total_atoms, 3)
+        Current atomic coordinates in Cartesian space.
+    atom_to_cell_mapping : torch.Tensor, shape (total_atoms, 3), dtype=int32
+        3D cell coordinates for each atom from the existing cell lists.
+    batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    cells_per_dimension : torch.Tensor, shape (num_systems, 3), dtype=int32
+        Number of spatial cells in x, y, z directions for each system.
+    cell : torch.Tensor, shape (num_systems, 3, 3)
+        Per-system unit cell matrices for coordinate transformations.
+    pbc : torch.Tensor, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+
+    Returns
+    -------
+    rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
+        Per-system flags: True if any atom in that system changed cells.
+
+    See Also
+    --------
+    batch_cell_list_needs_rebuild : High-level wrapper function
+    """
+    total_atoms = current_positions.shape[0]
+    num_systems = cell.shape[0]
+    device = current_positions.device
+
+    rebuild_flags = torch.zeros(num_systems, device=device, dtype=torch.bool)
+
+    if total_atoms == 0:
+        return rebuild_flags
+
+    wp_dtype = get_wp_dtype(current_positions.dtype)
+    wp_vec_dtype = get_wp_vec_dtype(current_positions.dtype)
+    wp_mat_dtype = get_wp_mat_dtype(current_positions.dtype)
+    wp_device = str(device)
+
+    wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype, return_ctype=True)
+    wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
+    wp_atom_to_cell_mapping = wp.from_torch(
+        atom_to_cell_mapping, dtype=wp.vec3i, return_ctype=True
+    )
+    wp_batch_idx = wp.from_torch(
+        batch_idx.to(dtype=torch.int32), dtype=wp.int32, return_ctype=True
+    )
+    wp_cells_per_dimension = wp.from_torch(
+        cells_per_dimension, dtype=wp.vec3i, return_ctype=True
+    )
+    # pbc shape (num_systems, 3) → 2D warp array of bool
+    wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+    wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
+
+    check_batch_cell_list_rebuild(
+        current_positions=wp_current,
+        atom_to_cell_mapping=wp_atom_to_cell_mapping,
+        batch_idx=wp_batch_idx,
+        cells_per_dimension=wp_cells_per_dimension,
+        cell=wp_cell,
+        pbc=wp_pbc,
+        rebuild_flags=wp_rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=wp_device,
+    )
+
+    return rebuild_flags
+
+
+@_batch_cell_list_needs_rebuild.register_fake
+def _batch_cell_list_needs_rebuild_fake(
+    current_positions: torch.Tensor,
+    atom_to_cell_mapping: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cells_per_dimension: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for torch.compile compatibility."""
+    num_systems = cell.shape[0]
+    return torch.zeros(num_systems, device=current_positions.device, dtype=torch.bool)
+
+
+def batch_cell_list_needs_rebuild(
+    current_positions: torch.Tensor,
+    atom_to_cell_mapping: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cells_per_dimension: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+) -> torch.Tensor:
+    """Detect per-system if spatial cell lists require rebuilding due to atomic motion.
+
+    This torch.compile-compatible custom operator efficiently determines which systems
+    in a batch need their cell list rebuilt by checking if any atoms have moved between
+    spatial cells. Uses GPU-side flagging with no CPU-GPU synchronization.
+
+    Parameters
+    ----------
+    current_positions : torch.Tensor, shape (total_atoms, 3)
+        Current atomic coordinates in Cartesian space.
+    atom_to_cell_mapping : torch.Tensor, shape (total_atoms, 3), dtype=int32
+        3D cell coordinates for each atom from the existing cell lists.
+        Typically obtained from batch_build_cell_list.
+    batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    cells_per_dimension : torch.Tensor, shape (num_systems, 3), dtype=int32
+        Number of spatial cells in x, y, z directions for each system.
+    cell : torch.Tensor, shape (num_systems, 3, 3)
+        Per-system unit cell matrices for coordinate transformations.
+    pbc : torch.Tensor, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+
+    Returns
+    -------
+    rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
+        Per-system flags: True if any atom in that system changed cells.
+
+    Notes
+    -----
+    - torch.compile compatible custom operation
+    - No CPU-GPU synchronization required; all flag writes happen on GPU
+    - Returns tensor (not Python bool) for compilation compatibility
+
+    See Also
+    --------
+    cell_list_needs_rebuild : Single-system version
+    batch_neighbor_list_needs_rebuild : Skin-distance based alternative
+    """
+    return _batch_cell_list_needs_rebuild(
+        current_positions,
+        atom_to_cell_mapping,
+        batch_idx,
+        cells_per_dimension,
+        cell,
+        pbc,
+    )

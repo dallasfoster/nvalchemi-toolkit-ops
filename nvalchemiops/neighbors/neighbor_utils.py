@@ -53,6 +53,8 @@ __all__ = [
     "NeighborOverflowError",
     "compute_naive_num_shifts",
     "zero_array",
+    "selective_zero_num_neighbors",
+    "selective_zero_num_neighbors_single",
     "estimate_max_neighbors",
 ]
 
@@ -313,6 +315,126 @@ def zero_array(
         kernel=_zero_int32_array_kernel,
         dim=n,
         inputs=[array],
+        device=device,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _selective_zero_num_neighbors(
+    num_neighbors: wp.array(dtype=wp.int32),
+    batch_idx: wp.array(dtype=wp.int32),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Zero num_neighbors entries for atoms in systems that need rebuilding.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors; zeroed for atoms in rebuilt systems.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags. True means this system needs rebuilding.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: num_neighbors (selective zero for rebuilt systems)
+    """
+    tid = wp.tid()
+    isys = batch_idx[tid]
+    if rebuild_flags[isys]:
+        num_neighbors[tid] = 0
+
+
+def selective_zero_num_neighbors(
+    num_neighbors: wp.array,
+    batch_idx: wp.array,
+    rebuild_flags: wp.array,
+    device: str,
+) -> None:
+    """Core warp launcher for selectively zeroing num_neighbors.
+
+    Zeros the num_neighbors count for atoms belonging to systems where
+    rebuild_flags is True, preserving counts for non-rebuilt systems.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Per-atom neighbor counts; selectively zeroed.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system flags indicating which systems need rebuilding.
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    See Also
+    --------
+    _selective_zero_num_neighbors : Kernel that performs the selective zeroing
+    """
+    total_atoms = num_neighbors.shape[0]
+    wp.launch(
+        kernel=_selective_zero_num_neighbors,
+        dim=total_atoms,
+        inputs=[num_neighbors, batch_idx, rebuild_flags],
+        device=device,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _selective_zero_num_neighbors_single(
+    num_neighbors: wp.array(dtype=wp.int32),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Zero num_neighbors entries when the single-system rebuild flag is set.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors; zeroed for all atoms when rebuild_flags[0] is True.
+    rebuild_flags : wp.array, shape (1,) or shape (), dtype=wp.bool
+        Single-system flag. When True, all entries of num_neighbors are zeroed.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: num_neighbors (only when rebuild_flags[0] is True)
+    """
+    tid = wp.tid()
+    if rebuild_flags[0]:
+        num_neighbors[tid] = 0
+
+
+def selective_zero_num_neighbors_single(
+    num_neighbors: wp.array,
+    rebuild_flags: wp.array,
+    device: str,
+) -> None:
+    """Core warp launcher for selectively zeroing num_neighbors for a single system.
+
+    Zeros all num_neighbors entries when rebuild_flags[0] is True.  When False
+    the kernel returns immediately — no CPU-GPU synchronization occurs.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Per-atom neighbor counts; zeroed when rebuild is needed.
+    rebuild_flags : wp.array, shape (1,) or shape (), dtype=wp.bool
+        Single-system rebuild flag.
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    See Also
+    --------
+    _selective_zero_num_neighbors_single : Kernel that performs the selective zeroing
+    selective_zero_num_neighbors : Batch variant using per-atom batch_idx
+    """
+    total_atoms = num_neighbors.shape[0]
+    wp.launch(
+        kernel=_selective_zero_num_neighbors_single,
+        dim=total_atoms,
+        inputs=[num_neighbors, rebuild_flags],
         device=device,
     )
 
