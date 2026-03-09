@@ -32,7 +32,9 @@ from nvalchemiops.neighbors.batch_naive import (
     _fill_batch_naive_neighbor_matrix_pbc_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
+    _compute_inv_cells_overload,
     _expand_naive_shifts,
+    _wrap_positions_batch_overload,
     estimate_max_neighbors,
 )
 
@@ -75,6 +77,34 @@ _jax_expand_naive_shifts = jax_kernel(
     _expand_naive_shifts,
     num_outputs=2,
     in_out_argnames=["shifts", "shift_system_idx"],
+    enable_backward=False,
+)
+
+# Compute inverse cells kernel wrappers
+_jax_compute_inv_cells_f32 = jax_kernel(
+    _compute_inv_cells_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["inv_cell"],
+    enable_backward=False,
+)
+_jax_compute_inv_cells_f64 = jax_kernel(
+    _compute_inv_cells_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["inv_cell"],
+    enable_backward=False,
+)
+
+# Wrap positions batch kernel wrappers
+_jax_wrap_positions_batch_f32 = jax_kernel(
+    _wrap_positions_batch_overload[wp.float32],
+    num_outputs=2,
+    in_out_argnames=["positions_wrapped", "per_atom_cell_offsets"],
+    enable_backward=False,
+)
+_jax_wrap_positions_batch_f64 = jax_kernel(
+    _wrap_positions_batch_overload[wp.float64],
+    num_outputs=2,
+    in_out_argnames=["positions_wrapped", "per_atom_cell_offsets"],
     enable_backward=False,
 )
 
@@ -259,9 +289,13 @@ def batch_naive_neighbor_list(
     if positions.dtype == jnp.float64:
         _jax_fill = _jax_fill_batch_naive_f64
         _jax_fill_pbc = _jax_fill_batch_naive_pbc_f64
+        _jax_inv_cells = _jax_compute_inv_cells_f64
+        _jax_wrap_batch = _jax_wrap_positions_batch_f64
     else:
         _jax_fill = _jax_fill_batch_naive_f32
         _jax_fill_pbc = _jax_fill_batch_naive_pbc_f32
+        _jax_inv_cells = _jax_compute_inv_cells_f32
+        _jax_wrap_batch = _jax_wrap_positions_batch_f32
         positions = positions.astype(jnp.float32)
 
     total_atoms = positions.shape[0]
@@ -306,8 +340,28 @@ def batch_naive_neighbor_list(
                     "Please provide max_atoms_per_system explicitly when using jax.jit."
                 ) from None
 
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
+        # Pre-wrap positions: compute inv_cell then wrap
+        inv_cell = jnp.zeros_like(cell)
+        (inv_cell,) = _jax_inv_cells(
+            cell,
+            inv_cell,
+            launch_dims=(cell.shape[0],),
+        )
+        positions_wrapped = jnp.zeros_like(positions)
+        per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+        positions_wrapped, per_atom_cell_offsets = _jax_wrap_batch(
             positions,
+            cell,
+            inv_cell,
+            batch_idx.astype(jnp.int32),
+            positions_wrapped,
+            per_atom_cell_offsets,
+            launch_dims=(total_atoms,),
+        )
+
+        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
+            positions_wrapped,
+            per_atom_cell_offsets,
             cell,
             float(cutoff * cutoff),
             batch_ptr.astype(jnp.int32),

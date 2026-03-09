@@ -26,6 +26,7 @@ from nvalchemiops.neighbors.batch_naive import (
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     _expand_naive_shifts,
+    _expand_naive_shifts_selective,
     estimate_max_neighbors,
 )
 from nvalchemiops.torch.neighbors.neighbor_utils import (
@@ -150,7 +151,8 @@ def _batch_naive_neighbor_matrix_pbc(
     positions : torch.Tensor, shape (total_atoms, 3), dtype=torch.float32 or torch.float64
         Concatenated atomic coordinates for all systems in Cartesian space.
         Each row represents one atom's (x, y, z) position.
-        Must be wrapped into the unit cell.
+        Unwrapped (box-crossing) coordinates are supported; the kernel wraps
+        positions internally.
     cell : torch.Tensor, shape (num_systems, 3, 3), dtype=torch.float32 or torch.float64
         Cell matrices defining lattice vectors in Cartesian coordinates.
         Each 3x3 matrix represents one system's periodic cell.
@@ -230,14 +232,23 @@ def _batch_naive_neighbor_matrix_pbc(
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
     wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32, return_ctype=True)
 
+    # Build batch_idx from batch_ptr for use in the position-wrapping preprocessing step
+    atoms_per_system = batch_ptr[1:] - batch_ptr[:-1]
+    batch_idx = torch.repeat_interleave(
+        torch.arange(num_systems, dtype=torch.int32, device=device),
+        atoms_per_system,
+    )
+    wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32, return_ctype=True)
+
     if max_atoms_per_system is None:
-        max_atoms_per_system = (batch_ptr[1:] - batch_ptr[:-1]).max().item()
+        max_atoms_per_system = atoms_per_system.max().item()
 
     batch_naive_neighbor_matrix_pbc(
         positions=wp_positions,
         cell=wp_cell,
         cutoff=cutoff,
         batch_ptr=wp_batch_ptr,
+        batch_idx=wp_batch_idx,
         shifts=wp_shifts,
         shift_system_idx=wp_shift_system_idx,
         neighbor_matrix=wp_neighbor_matrix,
@@ -350,14 +361,17 @@ def _batch_naive_neighbor_matrix_pbc_selective(
         shift_system_idx, dtype=wp.int32, return_ctype=True
     )
 
+    wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
+
     wp.launch(
-        kernel=_expand_naive_shifts,
+        kernel=_expand_naive_shifts_selective,
         dim=num_systems,
         inputs=[
             wp.from_torch(shift_range_per_dimension, dtype=wp.vec3i, return_ctype=True),
             wp.from_torch(shift_offset, dtype=wp.int32, return_ctype=True),
             wp_shifts,
             wp_shift_system_idx,
+            wp_rebuild_flags,
         ],
         device=wp_device_obj,
     )
@@ -372,7 +386,6 @@ def _batch_naive_neighbor_matrix_pbc_selective(
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
     wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32, return_ctype=True)
-    wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
     wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32, return_ctype=True)
 
     if max_atoms_per_system is None:
@@ -437,7 +450,8 @@ def batch_naive_neighbor_list(
     positions : torch.Tensor, shape (total_atoms, 3), dtype=torch.float32 or torch.float64
         Concatenated atomic coordinates for all systems in Cartesian space.
         Each row represents one atom's (x, y, z) position.
-        Must be wrapped into the unit cell if PBC is used.
+        Unwrapped (box-crossing) coordinates are supported when PBC is used;
+        the kernel wraps positions internally.
     cutoff : float
         Cutoff distance for neighbor detection in Cartesian units.
         Must be positive. Atoms within this distance are considered neighbors.

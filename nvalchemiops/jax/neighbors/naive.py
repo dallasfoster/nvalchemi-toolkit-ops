@@ -31,7 +31,9 @@ from nvalchemiops.neighbors.naive import (
     _fill_naive_neighbor_matrix_pbc_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
+    _compute_inv_cells_overload,
     _expand_naive_shifts,
+    _wrap_positions_single_overload,
     estimate_max_neighbors,
 )
 
@@ -74,6 +76,34 @@ _jax_expand_naive_shifts = jax_kernel(
     _expand_naive_shifts,
     num_outputs=2,
     in_out_argnames=["shifts", "shift_system_idx"],
+    enable_backward=False,
+)
+
+# Compute inverse cells kernel wrappers
+_jax_compute_inv_cells_f32 = jax_kernel(
+    _compute_inv_cells_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["inv_cell"],
+    enable_backward=False,
+)
+_jax_compute_inv_cells_f64 = jax_kernel(
+    _compute_inv_cells_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["inv_cell"],
+    enable_backward=False,
+)
+
+# Wrap positions single kernel wrappers
+_jax_wrap_positions_single_f32 = jax_kernel(
+    _wrap_positions_single_overload[wp.float32],
+    num_outputs=2,
+    in_out_argnames=["positions_wrapped", "per_atom_cell_offsets"],
+    enable_backward=False,
+)
+_jax_wrap_positions_single_f64 = jax_kernel(
+    _wrap_positions_single_overload[wp.float64],
+    num_outputs=2,
+    in_out_argnames=["positions_wrapped", "per_atom_cell_offsets"],
     enable_backward=False,
 )
 
@@ -306,9 +336,13 @@ def naive_neighbor_list(
     if positions.dtype == jnp.float64:
         _jax_fill = _jax_fill_naive_f64
         _jax_fill_pbc = _jax_fill_naive_pbc_f64
+        _jax_inv_cells = _jax_compute_inv_cells_f64
+        _jax_wrap_single = _jax_wrap_positions_single_f64
     else:
         _jax_fill = _jax_fill_naive_f32
         _jax_fill_pbc = _jax_fill_naive_pbc_f32
+        _jax_inv_cells = _jax_compute_inv_cells_f32
+        _jax_wrap_single = _jax_wrap_positions_single_f32
         positions = positions.astype(jnp.float32)
 
     total_atoms = positions.shape[0]
@@ -339,8 +373,27 @@ def naive_neighbor_list(
         if cell.dtype != positions.dtype:
             cell = cell.astype(positions.dtype)
 
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
+        # Pre-wrap positions: compute inv_cell then wrap
+        inv_cell = jnp.zeros_like(cell)
+        (inv_cell,) = _jax_inv_cells(
+            cell,
+            inv_cell,
+            launch_dims=(cell.shape[0],),
+        )
+        positions_wrapped = jnp.zeros_like(positions)
+        per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+        positions_wrapped, per_atom_cell_offsets = _jax_wrap_single(
             positions,
+            cell,
+            inv_cell,
+            positions_wrapped,
+            per_atom_cell_offsets,
+            launch_dims=(total_atoms,),
+        )
+
+        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
+            positions_wrapped,
+            per_atom_cell_offsets,
             float(cutoff * cutoff),
             cell,
             shifts,

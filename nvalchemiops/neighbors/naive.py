@@ -26,6 +26,8 @@ import warp as wp
 from nvalchemiops.neighbors.neighbor_utils import (
     _update_neighbor_matrix,
     _update_neighbor_matrix_pbc,
+    compute_inv_cells,
+    wrap_positions_single,
 )
 
 
@@ -90,7 +92,8 @@ def _fill_naive_neighbor_matrix(
 
 @wp.kernel(enable_backward=False)
 def _fill_naive_neighbor_matrix_pbc(
-    positions: wp.array(dtype=Any),
+    positions_wrapped: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
     cutoff_sq: Any,
     cell: wp.array(dtype=Any),
     shifts: wp.array(dtype=wp.vec3i),
@@ -105,11 +108,16 @@ def _fill_naive_neighbor_matrix_pbc(
     considering all periodic images within the cutoff distance. Uses a 2D launch
     pattern to parallelize over both atoms and periodic shifts.
 
+    Positions must be pre-wrapped and per-atom cell offsets pre-computed via
+    ``wrap_positions_single`` before calling this kernel.
+
     Parameters
     ----------
-    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Atomic coordinates in Cartesian space. Each row represents one atom's
-        (x, y, z) position.
+    positions_wrapped : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Pre-wrapped atomic coordinates in Cartesian space (inside the primary cell).
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom (floor of fractional coordinates).
+        Used to reconstruct corrected shift vectors for the original positions.
     cutoff_sq : float
         Squared cutoff distance for neighbor detection in Cartesian units.
         Must be positive. Atoms within this distance are considered neighbors.
@@ -149,23 +157,14 @@ def _fill_naive_neighbor_matrix_pbc(
     ishift, iatom = wp.tid()
 
     jatom_start = 0
-    jatom_end = positions.shape[0]
+    jatom_end = positions_wrapped.shape[0]
 
     maxnb = neighbor_matrix.shape[1]
-    _positions = positions[iatom]
     _shift = shifts[ishift]
     _cell = cell[0]
 
-    # Wrap atom i to the primary cell to support unwrapped coordinates.
-    # Fractional coordinates: frac = pos @ inv_cell (row-vector convention).
-    _inv_cell = wp.inverse(_cell)
-    _frac_i = _positions * _inv_cell
-    _int_i = wp.vec3i(
-        wp.int32(wp.floor(_frac_i[0])),
-        wp.int32(wp.floor(_frac_i[1])),
-        wp.int32(wp.floor(_frac_i[2])),
-    )
-    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
+    _pos_i_wrapped = positions_wrapped[iatom]
+    _int_i = per_atom_cell_offsets[iatom]
     positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
 
     _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
@@ -174,20 +173,13 @@ def _fill_naive_neighbor_matrix_pbc(
         jatom_end = iatom
 
     for jatom in range(jatom_start, jatom_end):
-        # Wrap atom j to the primary cell.
-        _pos_j = positions[jatom]
-        _frac_j = _pos_j * _inv_cell
-        _int_j = wp.vec3i(
-            wp.int32(wp.floor(_frac_j[0])),
-            wp.int32(wp.floor(_frac_j[1])),
-            wp.int32(wp.floor(_frac_j[2])),
-        )
-        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
+        _pos_j_wrapped = positions_wrapped[jatom]
         diff = positions_shifted - _pos_j_wrapped
         dist_sq = wp.length_sq(diff)
         if dist_sq < cutoff_sq:
             # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
             # holds for the original (potentially unwrapped) positions.
+            _int_j = per_atom_cell_offsets[jatom]
             _corrected_shift = wp.vec3i(
                 _shift[0] - _int_i[0] + _int_j[0],
                 _shift[1] - _int_i[1] + _int_j[1],
@@ -253,7 +245,8 @@ def _fill_naive_neighbor_matrix_selective(
 
 @wp.kernel(enable_backward=False)
 def _fill_naive_neighbor_matrix_pbc_selective(
-    positions: wp.array(dtype=Any),
+    positions_wrapped: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
     cutoff_sq: Any,
     cell: wp.array(dtype=Any),
     shifts: wp.array(dtype=wp.vec3i),
@@ -265,10 +258,15 @@ def _fill_naive_neighbor_matrix_pbc_selective(
 ) -> None:
     """Selective single-system PBC naive neighbor matrix kernel — skips when not rebuilding.
 
+    Positions must be pre-wrapped and per-atom cell offsets pre-computed via
+    ``wrap_positions_single`` before calling this kernel.
+
     Parameters
     ----------
-    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Atomic coordinates in Cartesian space.
+    positions_wrapped : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Pre-wrapped atomic coordinates in Cartesian space (inside the primary cell).
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom (floor of fractional coordinates).
     cutoff_sq : float
         Squared cutoff distance for neighbor detection.
     cell : wp.array, shape (1, 3, 3), dtype=wp.mat33*
@@ -296,21 +294,14 @@ def _fill_naive_neighbor_matrix_pbc_selective(
         return
 
     jatom_start = 0
-    jatom_end = positions.shape[0]
+    jatom_end = positions_wrapped.shape[0]
 
     maxnb = neighbor_matrix.shape[1]
-    _positions = positions[iatom]
     _shift = shifts[ishift]
     _cell = cell[0]
 
-    _inv_cell = wp.inverse(_cell)
-    _frac_i = _positions * _inv_cell
-    _int_i = wp.vec3i(
-        wp.int32(wp.floor(_frac_i[0])),
-        wp.int32(wp.floor(_frac_i[1])),
-        wp.int32(wp.floor(_frac_i[2])),
-    )
-    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
+    _pos_i_wrapped = positions_wrapped[iatom]
+    _int_i = per_atom_cell_offsets[iatom]
     positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
 
     _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
@@ -319,17 +310,11 @@ def _fill_naive_neighbor_matrix_pbc_selective(
         jatom_end = iatom
 
     for jatom in range(jatom_start, jatom_end):
-        _pos_j = positions[jatom]
-        _frac_j = _pos_j * _inv_cell
-        _int_j = wp.vec3i(
-            wp.int32(wp.floor(_frac_j[0])),
-            wp.int32(wp.floor(_frac_j[1])),
-            wp.int32(wp.floor(_frac_j[2])),
-        )
-        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
+        _pos_j_wrapped = positions_wrapped[jatom]
         diff = positions_shifted - _pos_j_wrapped
         dist_sq = wp.length_sq(diff)
         if dist_sq < cutoff_sq:
+            _int_j = per_atom_cell_offsets[jatom]
             _corrected_shift = wp.vec3i(
                 _shift[0] - _int_i[0] + _int_j[0],
                 _shift[1] - _int_i[1] + _int_j[1],
@@ -370,6 +355,7 @@ for t, v, m in zip(T, V, M):
         _fill_naive_neighbor_matrix_pbc,
         [
             wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
             t,
             wp.array(dtype=m),
             wp.array(dtype=wp.vec3i),
@@ -394,6 +380,7 @@ for t, v, m in zip(T, V, M):
         _fill_naive_neighbor_matrix_pbc_selective,
         [
             wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
             t,
             wp.array(dtype=m),
             wp.array(dtype=wp.vec3i),
@@ -519,11 +506,25 @@ def naive_neighbor_matrix_pbc_selective(
     """
     total_atoms = positions.shape[0]
     total_shifts = shifts.shape[0]
+    inv_cell = wp.empty_like(cell)
+    compute_inv_cells(cell, inv_cell, wp_dtype, device)
+    positions_wrapped = wp.empty_like(positions)
+    per_atom_cell_offsets = wp.empty(total_atoms, dtype=wp.vec3i, device=device)
+    wrap_positions_single(
+        positions,
+        cell,
+        inv_cell,
+        positions_wrapped,
+        per_atom_cell_offsets,
+        wp_dtype,
+        device,
+    )
     wp.launch(
         kernel=_fill_naive_neighbor_matrix_pbc_selective_overload[wp_dtype],
         dim=(total_shifts, total_atoms),
         inputs=[
-            positions,
+            positions_wrapped,
+            per_atom_cell_offsets,
             wp_dtype(cutoff * cutoff),
             cell,
             shifts,
@@ -619,7 +620,8 @@ def naive_neighbor_matrix_pbc(
     Parameters
     ----------
     positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Atomic coordinates in Cartesian space.
+        Atomic coordinates in Cartesian space. May be unwrapped; preprocessing
+        wraps them before neighbor search.
     cutoff : float
         Cutoff distance for neighbor detection in Cartesian units.
         Must be positive. Atoms within this distance are considered neighbors.
@@ -650,6 +652,8 @@ def naive_neighbor_matrix_pbc(
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - Output arrays must be pre-allocated by caller.
     - Shift vectors must be pre-computed using compute_naive_num_shifts and _expand_naive_shifts.
+    - Positions are wrapped into the primary cell in a preprocessing step before the
+      neighbor search kernel to avoid redundant per-thread inversion inside the hot loop.
 
     See Also
     --------
@@ -657,15 +661,49 @@ def naive_neighbor_matrix_pbc(
     _fill_naive_neighbor_matrix_pbc : Kernel that performs the computation
     compute_naive_num_shifts : Computes shift ranges
     _expand_naive_shifts : Expands shift ranges into explicit vectors
+    wrap_positions_single : Preprocessing step that wraps positions
     """
     total_atoms = positions.shape[0]
     total_shifts = shifts.shape[0]
+
+    wp_mat_dtype = (
+        wp.mat33f
+        if wp_dtype == wp.float32
+        else wp.mat33d
+        if wp_dtype == wp.float64
+        else wp.mat33h
+        if wp_dtype == wp.float16
+        else None
+    )
+    wp_vec_dtype = (
+        wp.vec3f
+        if wp_dtype == wp.float32
+        else wp.vec3d
+        if wp_dtype == wp.float64
+        else wp.vec3h
+        if wp_dtype == wp.float16
+        else None
+    )
+    inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+    compute_inv_cells(cell, inv_cell, wp_dtype, device)
+    positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
+    per_atom_cell_offsets = wp.empty((total_atoms,), dtype=wp.vec3i, device=device)
+    wrap_positions_single(
+        positions,
+        cell,
+        inv_cell,
+        positions_wrapped,
+        per_atom_cell_offsets,
+        wp_dtype,
+        device,
+    )
 
     wp.launch(
         kernel=_fill_naive_neighbor_matrix_pbc_overload[wp_dtype],
         dim=(total_shifts, total_atoms),
         inputs=[
-            positions,
+            positions_wrapped,
+            per_atom_cell_offsets,
             wp_dtype(cutoff * cutoff),
             cell,
             shifts,

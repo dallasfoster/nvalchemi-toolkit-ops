@@ -22,11 +22,15 @@ import warp as wp
 
 from nvalchemiops.neighbors.batch_naive import (
     _fill_batch_naive_neighbor_matrix,
-    _fill_batch_naive_neighbor_matrix_pbc,
+    _fill_batch_naive_neighbor_matrix_pbc_overload,
     batch_naive_neighbor_matrix,
     batch_naive_neighbor_matrix_pbc,
 )
-from nvalchemiops.neighbors.neighbor_utils import _expand_naive_shifts
+from nvalchemiops.neighbors.neighbor_utils import (
+    _expand_naive_shifts,
+    compute_inv_cells,
+    wrap_positions_batch,
+)
 from nvalchemiops.torch.neighbors.neighbor_utils import compute_naive_num_shifts
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
@@ -141,14 +145,35 @@ class TestBatchNaiveKernels:
         wp_mat_dtype = get_wp_mat_dtype(dtype)
         wp_device = str(device)
 
+        batch_idx, _ = create_batch_idx_and_ptr(atoms_per_system, device)
+
         wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
         wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
         wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i)
         wp_shift_batch_idx = wp.from_torch(shift_batch_idx, dtype=wp.int32)
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+
+        # Pre-wrap positions
+        total_atoms = positions_batch.shape[0]
+        wp_inv_cell = wp.empty_like(wp_cell)
+        compute_inv_cells(wp_cell, wp_inv_cell, wp_dtype, wp_device)
+        wp_positions_wrapped = wp.empty_like(wp_positions)
+        wp_per_atom_cell_offsets = wp.empty(
+            total_atoms, dtype=wp.vec3i, device=wp_device
+        )
+        wrap_positions_batch(
+            wp_positions,
+            wp_cell,
+            wp_inv_cell,
+            wp_batch_idx,
+            wp_positions_wrapped,
+            wp_per_atom_cell_offsets,
+            wp_dtype,
+            wp_device,
+        )
 
         # Output arrays
-        total_atoms = positions_batch.shape[0]
         neighbor_matrix = torch.full(
             (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
         )
@@ -163,13 +188,14 @@ class TestBatchNaiveKernels:
         )
         wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32)
 
-        # Launch kernel
+        # Launch kernel using the typed overload
         wp.launch(
-            _fill_batch_naive_neighbor_matrix_pbc,
+            _fill_batch_naive_neighbor_matrix_pbc_overload[wp_dtype],
             dim=(len(shifts), total_atoms),
             device=wp_device,
             inputs=[
-                wp_positions,
+                wp_positions_wrapped,
+                wp_per_atom_cell_offsets,
                 wp_cell,
                 wp_dtype(cutoff),
                 wp_batch_ptr,
@@ -248,7 +274,7 @@ class TestBatchNaiveWpLaunchers:
             device=device,
         )
 
-        _, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
         cutoff = 1.2
         max_neighbors = 25
         max_atoms_per_system = max(atoms_per_system)
@@ -291,6 +317,7 @@ class TestBatchNaiveWpLaunchers:
 
         wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
         wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
         wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i)
         wp_shift_system_idx = wp.from_torch(shift_system_idx, dtype=wp.int32)
@@ -306,6 +333,7 @@ class TestBatchNaiveWpLaunchers:
             wp_cell,
             cutoff,
             wp_batch_ptr,
+            wp_batch_idx,
             wp_shifts,
             wp_shift_system_idx,
             wp_neighbor_matrix,

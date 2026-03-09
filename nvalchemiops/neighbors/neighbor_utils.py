@@ -52,10 +52,14 @@ class NeighborOverflowError(Exception):
 __all__ = [
     "NeighborOverflowError",
     "compute_naive_num_shifts",
+    "compute_inv_cells",
     "zero_array",
     "selective_zero_num_neighbors",
     "selective_zero_num_neighbors_single",
     "estimate_max_neighbors",
+    "wrap_positions_single",
+    "wrap_positions_batch",
+    "_expand_naive_shifts_selective",
 ]
 
 
@@ -92,6 +96,53 @@ def _expand_naive_shifts(
     - All shift vectors are integer lattice coordinates
     """
     tid = wp.tid()
+    pos = shift_offset[tid]
+    _shift_range = shift_range[tid]
+    for k0 in range(0, _shift_range[0] + 1):
+        for k1 in range(-_shift_range[1], _shift_range[1] + 1):
+            for k2 in range(-_shift_range[2], _shift_range[2] + 1):
+                if k0 > 0 or (k0 == 0 and k1 > 0) or (k0 == 0 and k1 == 0 and k2 >= 0):
+                    shifts[pos] = wp.vec3i(k0, k1, k2)
+                    shift_system_idx[pos] = tid
+                    pos += 1
+
+
+@wp.kernel(enable_backward=False)
+def _expand_naive_shifts_selective(
+    shift_range: wp.array(dtype=wp.vec3i),
+    shift_offset: wp.array(dtype=int),
+    shifts: wp.array(dtype=wp.vec3i),
+    shift_system_idx: wp.array(dtype=int),
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Expand shift ranges into actual shift vectors, skipping non-rebuilt systems.
+
+    Identical to ``_expand_naive_shifts`` but checks ``rebuild_flags[tid]``
+    on the GPU and exits immediately for systems that do not need rebuilding.
+    No CPU-GPU synchronisation occurs.
+
+    Parameters
+    ----------
+    shift_range : wp.array, shape (num_systems, 3), dtype=wp.vec3i
+        Array of shift ranges in each dimension for each system.
+    shift_offset : wp.array, shape (num_systems+1,), dtype=wp.int32
+        Cumulative sum of number of shifts for each system.
+    shifts : wp.array, shape (total_shifts, 3), dtype=wp.vec3i
+        OUTPUT: Flattened array to store the shift vectors.
+    shift_system_idx : wp.array, shape (total_shifts,), dtype=wp.int32
+        OUTPUT: System index mapping for each shift vector.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags. False → kernel returns immediately for that system.
+
+    Notes
+    -----
+    - Thread launch: One thread per system in the batch (dim=num_systems)
+    - Modifies: shifts, shift_system_idx (only for rebuilt systems)
+    - total_shifts = shift_offset[-1]
+    """
+    tid = wp.tid()
+    if not rebuild_flags[tid]:
+        return
     pos = shift_offset[tid]
     _shift_range = shift_range[tid]
     for k0 in range(0, _shift_range[0] + 1):
@@ -439,6 +490,76 @@ def selective_zero_num_neighbors_single(
     )
 
 
+@wp.kernel(enable_backward=False)
+def _compute_inv_cells_kernel(
+    cell: wp.array(dtype=Any),
+    inv_cell: wp.array(dtype=Any),
+) -> None:
+    """Compute the inverse of each cell matrix.
+
+    Parameters
+    ----------
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Input cell matrices.
+    inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        OUTPUT: Inverse of each cell matrix.
+
+    Notes
+    -----
+    - Thread launch: One thread per system (dim=num_systems)
+    """
+    tid = wp.tid()
+    inv_cell[tid] = wp.inverse(cell[tid])
+
+
+_compute_inv_cells_overload = {}
+for _t, _m in zip(
+    [wp.float32, wp.float64, wp.float16],
+    [wp.mat33f, wp.mat33d, wp.mat33h],
+):
+    _compute_inv_cells_overload[_t] = wp.overload(
+        _compute_inv_cells_kernel,
+        [wp.array(dtype=_m), wp.array(dtype=_m)],
+    )
+
+
+def compute_inv_cells(
+    cell: wp.array,
+    inv_cell: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for computing inverse cell matrices.
+
+    Inverts each cell matrix in the batch using pure warp operations.
+    Call this once before launching naive PBC neighbor-list kernels to
+    avoid redundant per-thread inversions inside those kernels.
+
+    Parameters
+    ----------
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Input cell matrices.
+    inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        OUTPUT: Inverse of each cell matrix. Must be pre-allocated
+        with the same shape and dtype as *cell*.
+    wp_dtype : type
+        Warp scalar dtype (wp.float32, wp.float64, or wp.float16).
+    device : str
+        Warp device string (e.g., ``'cuda:0'``, ``'cpu'``).
+
+    See Also
+    --------
+    _compute_inv_cells_kernel : Underlying warp kernel
+    """
+    num_systems = cell.shape[0]
+    wp.launch(
+        kernel=_compute_inv_cells_overload[wp_dtype],
+        dim=num_systems,
+        inputs=[cell, inv_cell],
+        device=device,
+    )
+
+
 def compute_naive_num_shifts(
     cell: wp.array,
     cutoff: float,
@@ -554,3 +675,249 @@ def estimate_max_neighbors(
     # Round up to multiple of 16 for memory alignment and safety
     max_neighbors_estimate = int(math.ceil(expected_neighbors / 16)) * 16
     return max_neighbors_estimate
+
+
+###########################################################################################
+########################### Position Wrapping Kernels ####################################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _wrap_positions_single_kernel(
+    positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    inv_cell: wp.array(dtype=Any),
+    positions_wrapped: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+) -> None:
+    """Wrap positions into the primary cell for a single system.
+
+    Computes fractional coordinates to determine integer cell offsets, then
+    shifts each atom back into the primary cell. The integer offsets are stored
+    so that corrected shift vectors can be recovered for the original (unwrapped)
+    positions.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space. May be unwrapped.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors in Cartesian coordinates.
+    inv_cell : wp.array, shape (1,), dtype=wp.mat33*
+        Pre-computed inverse of the cell matrix.
+    positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Wrapped positions in Cartesian space.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        OUTPUT: Integer cell offsets for each atom (floor of fractional coordinates).
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: positions_wrapped, per_atom_cell_offsets
+    """
+    i = wp.tid()
+    _cell = cell[0]
+    _inv_cell = inv_cell[0]
+    _pos = positions[i]
+    _frac = _pos * _inv_cell
+    _int = wp.vec3i(
+        wp.int32(wp.floor(_frac[0])),
+        wp.int32(wp.floor(_frac[1])),
+        wp.int32(wp.floor(_frac[2])),
+    )
+    positions_wrapped[i] = _pos - type(_pos)(_int) * _cell
+    per_atom_cell_offsets[i] = _int
+
+
+_wrap_positions_single_overload = {}
+for _t, _v, _m in zip(
+    [wp.float32, wp.float64, wp.float16],
+    [wp.vec3f, wp.vec3d, wp.vec3h],
+    [wp.mat33f, wp.mat33d, wp.mat33h],
+):
+    _wrap_positions_single_overload[_t] = wp.overload(
+        _wrap_positions_single_kernel,
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_m),
+            wp.array(dtype=_m),
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.vec3i),
+        ],
+    )
+
+
+def wrap_positions_single(
+    positions: wp.array,
+    cell: wp.array,
+    inv_cell: wp.array,
+    positions_wrapped: wp.array,
+    per_atom_cell_offsets: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for wrapping positions into the primary cell (single system).
+
+    Computes per-atom integer cell offsets and wrapped positions in a single
+    GPU pass. Call this before naive PBC neighbor-list kernels to move the
+    wrapping out of the hot ishift × iatom loop.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space. May be unwrapped.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors.
+    inv_cell : wp.array, shape (1,), dtype=wp.mat33*
+        Pre-computed inverse cell matrix. Must be pre-allocated with the
+        same shape and dtype as *cell*.
+    positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Wrapped positions. Must be pre-allocated with the same shape
+        and dtype as *positions*.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        OUTPUT: Integer cell offsets per atom. Must be pre-allocated.
+    wp_dtype : type
+        Warp scalar dtype (wp.float32, wp.float64, or wp.float16).
+    device : str
+        Warp device string (e.g., ``'cuda:0'``, ``'cpu'``).
+
+    See Also
+    --------
+    _wrap_positions_single_kernel : Underlying warp kernel
+    wrap_positions_batch : Batch variant for multiple systems
+    """
+    total_atoms = positions.shape[0]
+    wp.launch(
+        kernel=_wrap_positions_single_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[positions, cell, inv_cell, positions_wrapped, per_atom_cell_offsets],
+        device=device,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _wrap_positions_batch_kernel(
+    positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    inv_cell: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    positions_wrapped: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+) -> None:
+    """Wrap positions into the primary cell for a batch of systems.
+
+    Each atom uses the cell matrix of its system (indexed via batch_idx).
+    Computes fractional coordinates to determine integer cell offsets, then
+    shifts each atom back into the primary cell.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems. May be unwrapped.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Cell matrices for each system.
+    inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Pre-computed inverse cell matrices.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Wrapped positions in Cartesian space.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        OUTPUT: Integer cell offsets for each atom (floor of fractional coordinates).
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: positions_wrapped, per_atom_cell_offsets
+    """
+    i = wp.tid()
+    isys = batch_idx[i]
+    _cell = cell[isys]
+    _inv_cell = inv_cell[isys]
+    _pos = positions[i]
+    _frac = _pos * _inv_cell
+    _int = wp.vec3i(
+        wp.int32(wp.floor(_frac[0])),
+        wp.int32(wp.floor(_frac[1])),
+        wp.int32(wp.floor(_frac[2])),
+    )
+    positions_wrapped[i] = _pos - type(_pos)(_int) * _cell
+    per_atom_cell_offsets[i] = _int
+
+
+_wrap_positions_batch_overload = {}
+for _t, _v, _m in zip(
+    [wp.float32, wp.float64, wp.float16],
+    [wp.vec3f, wp.vec3d, wp.vec3h],
+    [wp.mat33f, wp.mat33d, wp.mat33h],
+):
+    _wrap_positions_batch_overload[_t] = wp.overload(
+        _wrap_positions_batch_kernel,
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=_m),
+            wp.array(dtype=_m),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.vec3i),
+        ],
+    )
+
+
+def wrap_positions_batch(
+    positions: wp.array,
+    cell: wp.array,
+    inv_cell: wp.array,
+    batch_idx: wp.array,
+    positions_wrapped: wp.array,
+    per_atom_cell_offsets: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for wrapping positions into the primary cell (batch of systems).
+
+    Each atom uses the cell matrix of its system (indexed via batch_idx).
+    Computes per-atom integer cell offsets and wrapped positions in a single
+    GPU pass. Call this before batch naive PBC neighbor-list kernels to move
+    the wrapping out of the hot ishift × iatom loop.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems. May be unwrapped.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Cell matrices for each system.
+    inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Pre-computed inverse cell matrices. Must be pre-allocated with the
+        same shape and dtype as *cell*.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Wrapped positions. Must be pre-allocated with the same shape
+        and dtype as *positions*.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        OUTPUT: Integer cell offsets per atom. Must be pre-allocated.
+    wp_dtype : type
+        Warp scalar dtype (wp.float32, wp.float64, or wp.float16).
+    device : str
+        Warp device string (e.g., ``'cuda:0'``, ``'cpu'``).
+
+    See Also
+    --------
+    _wrap_positions_batch_kernel : Underlying warp kernel
+    wrap_positions_single : Single-system variant
+    """
+    total_atoms = positions.shape[0]
+    wp.launch(
+        kernel=_wrap_positions_batch_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[
+            positions,
+            cell,
+            inv_cell,
+            batch_idx,
+            positions_wrapped,
+            per_atom_cell_offsets,
+        ],
+        device=device,
+    )

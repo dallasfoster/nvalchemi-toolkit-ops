@@ -83,7 +83,8 @@ def neighbor_list(
     positions : torch.Tensor, shape (total_atoms, 3)
         Concatenated atomic coordinates for all systems in Cartesian space.
         Each row represents one atom's (x, y, z) position.
-        Must be wrapped into the unit cell if PBC is used.
+        Unwrapped (box-crossing) coordinates are supported when PBC is used;
+        the kernel wraps positions internally.
     cutoff : float
         Cutoff distance for neighbor detection in Cartesian units.
         Must be positive. Atoms within this distance are considered neighbors.
