@@ -542,9 +542,6 @@ class TestNaiveDualCutoffSelectiveRebuildFlags:
 
     def test_no_rebuild_preserves_data(self, device, dtype):
         """Flag=False: neighbor data should remain unchanged."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         positions, _, _ = create_simple_cubic_system(dtype=dtype, device=device)
         cutoff1 = 1.0
         cutoff2 = 1.5
@@ -595,9 +592,6 @@ class TestNaiveDualCutoffSelectiveRebuildFlags:
 
     def test_rebuild_updates_data(self, device, dtype):
         """Flag=True: result should match a fresh full rebuild."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         positions, _, _ = create_simple_cubic_system(dtype=dtype, device=device)
         cutoff1 = 1.0
         cutoff2 = 1.5

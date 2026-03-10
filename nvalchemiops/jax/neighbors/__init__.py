@@ -72,7 +72,11 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 
 # Rebuild detection
 from nvalchemiops.jax.neighbors.rebuild_detection import (
+    batch_cell_list_needs_rebuild,
+    batch_neighbor_list_needs_rebuild,
     cell_list_needs_rebuild,
+    check_batch_cell_list_rebuild_needed,
+    check_batch_neighbor_list_rebuild_needed,
     check_cell_list_rebuild_needed,
     check_neighbor_list_rebuild_needed,
     neighbor_list_needs_rebuild,

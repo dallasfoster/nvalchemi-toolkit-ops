@@ -872,10 +872,7 @@ class NeighborListManager:
         Zeros reference positions so the next skin-distance check always exceeds
         the threshold. Use after cell changes (NPT/NPH or variable-cell optimization).
         """
-        self.wp_ref_positions = wp.zeros(
-            self.num_atoms, dtype=self.wp_vec_dtype, device=self.device
-        )
-        # zero_array(self.wp_ref_positions, self.device)
+        self.wp_ref_positions.zero_()
 
     def update(self, positions_wp: wp.array, cell_wp: wp.array) -> None:
         """Check and selectively rebuild the neighbor list (no CPU-GPU sync).
@@ -896,6 +893,8 @@ class NeighborListManager:
             current_positions=positions_wp,
             skin_distance_threshold=self.skin / 2.0,
             rebuild_flag=self.wp_rebuild_flag,
+            wp_dtype=self.wp_dtype,
+            device=self.device,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -1077,9 +1076,7 @@ class BatchedNeighborListManager:
         Zeros reference positions so all atoms will exceed the skin threshold.
         Use after cell changes (NPT/NPH or variable-cell optimization).
         """
-        self.wp_ref_positions = wp.zeros(
-            self.total_atoms, dtype=self.wp_vec_dtype, device=self.device
-        )
+        self.wp_ref_positions.zero_()
 
     def update(self, positions_wp: wp.array, cells_wp: wp.array) -> None:
         """Check and selectively rebuild neighbor lists (no CPU-GPU sync).
@@ -1101,6 +1098,8 @@ class BatchedNeighborListManager:
             batch_idx=self.wp_batch_idx,
             skin_distance_threshold=self.skin / 2.0,
             rebuild_flags=self.wp_rebuild_flags,
+            wp_dtype=self.wp_dtype,
+            device=self.device,
             overwrite_reference_positions=True,
         )
 
@@ -2621,7 +2620,6 @@ class NvalchemiOpsBenchmark:
             self.system.wp_positions = positions
             self.system.wp_cell = cells
             wp_energies = self.system.compute_forces_virial(virial_out)
-            wp.copy(forces, self.system.wp_forces)
 
         dt_array = wp.array(
             [float(dt)] * self.system.num_systems,
@@ -2840,7 +2838,6 @@ class NvalchemiOpsBenchmark:
             self.system.wp_positions = positions
             self.system.wp_cell = cells
             wp_energies = self.system.compute_forces_virial(virial_out)
-            wp.copy(forces, self.system.wp_forces)
 
         dt_array = wp.array(
             [float(dt)] * self.system.num_systems,

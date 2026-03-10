@@ -30,7 +30,7 @@ from nvalchemiops.neighbors.rebuild_detection import (
     check_cell_list_rebuild,
     check_neighbor_list_rebuild,
 )
-from nvalchemiops.torch.types import get_wp_mat_dtype, get_wp_vec_dtype
+from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 __all__ = [
     "cell_list_needs_rebuild",
@@ -87,6 +87,7 @@ def _cell_list_needs_rebuild(
         return torch.tensor([False], device=device, dtype=torch.bool)
 
     # Get warp data types for the input tensor precision
+    wp_dtype = get_wp_dtype(current_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(current_positions.dtype)
     wp_mat_dtype = get_wp_mat_dtype(current_positions.dtype)
 
@@ -115,6 +116,8 @@ def _cell_list_needs_rebuild(
         cell=wp_cell,
         pbc=wp_pbc,
         rebuild_flag=wp_rebuild_flag,
+        wp_dtype=wp_dtype,
+        device=str(device),
     )
 
     return rebuild_needed
@@ -237,6 +240,7 @@ def _neighbor_list_needs_rebuild(
         return torch.tensor([False], device=device, dtype=torch.bool)
 
     # Get warp data types for the input tensor precision
+    wp_dtype = get_wp_dtype(reference_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
 
     # Convert PyTorch tensors to warp arrays
@@ -257,6 +261,8 @@ def _neighbor_list_needs_rebuild(
         current_positions=wp_current_positions,
         skin_distance_threshold=skin_distance_threshold,
         rebuild_flag=wp_rebuild_flag,
+        wp_dtype=wp_dtype,
+        device=str(device),
         overwrite_reference_positions=overwrite_reference_positions,
     )
 
@@ -373,7 +379,7 @@ def check_cell_list_rebuild_needed(
 
     Returns
     -------
-    needs_rebuild : bool
+    needs_rebuild : torch.Tensor, shape (1,), dtype=bool
         True if any atom has moved to a different cell requiring cell list rebuild.
 
     Notes
@@ -397,7 +403,7 @@ def check_cell_list_rebuild_needed(
         pbc,
     )
 
-    return rebuild_tensor.item()
+    return rebuild_tensor
 
 
 def check_neighbor_list_rebuild_needed(
@@ -435,7 +441,7 @@ def check_neighbor_list_rebuild_needed(
         When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
-    needs_rebuild : bool
+    needs_rebuild : torch.Tensor, shape (1,), dtype=bool
         True if any atom has moved beyond skin distance requiring neighbor list rebuild.
 
     Notes
@@ -457,7 +463,7 @@ def check_neighbor_list_rebuild_needed(
         overwrite_reference_positions,
     )
 
-    return rebuild_tensor.item()
+    return rebuild_tensor
 
 
 ###########################################################################################
@@ -514,6 +520,7 @@ def _batch_neighbor_list_needs_rebuild(
     if total_atoms == 0:
         return rebuild_flags
 
+    wp_dtype = get_wp_dtype(reference_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
 
     wp_reference = wp.from_torch(
@@ -531,6 +538,8 @@ def _batch_neighbor_list_needs_rebuild(
         batch_idx=wp_batch_idx,
         skin_distance_threshold=skin_distance_threshold,
         rebuild_flags=wp_rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=str(device),
         overwrite_reference_positions=overwrite_reference_positions,
     )
 
@@ -655,6 +664,7 @@ def _batch_cell_list_needs_rebuild(
     if total_atoms == 0:
         return rebuild_flags
 
+    wp_dtype = get_wp_dtype(current_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(current_positions.dtype)
     wp_mat_dtype = get_wp_mat_dtype(current_positions.dtype)
 
@@ -681,6 +691,8 @@ def _batch_cell_list_needs_rebuild(
         cell=wp_cell,
         pbc=wp_pbc,
         rebuild_flags=wp_rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=str(device),
     )
 
     return rebuild_flags

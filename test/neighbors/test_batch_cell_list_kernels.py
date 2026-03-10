@@ -1063,9 +1063,6 @@ class TestBatchCellListSelectiveRebuildFlags:
 
     def test_no_rebuild_preserves_data(self, device, dtype):
         """All flags False: neighbor data should remain unchanged for all systems."""
-        if device == "cpu":
-            pytest.skip("Warp selective rebuild requires GPU")
-
         positions_torch, cell_torch, pbc_torch, _ = create_batch_systems(
             num_systems=2,
             atoms_per_system=[4, 6],
@@ -1199,9 +1196,6 @@ class TestBatchCellListSelectiveRebuildFlags:
 
     def test_rebuild_updates_data(self, device, dtype):
         """True flags: rebuilt system data should match a fresh full rebuild."""
-        if device == "cpu":
-            pytest.skip("Warp selective rebuild requires GPU")
-
         positions_torch, cell_torch, pbc_torch, _ = create_batch_systems(
             num_systems=2,
             atoms_per_system=[4, 6],

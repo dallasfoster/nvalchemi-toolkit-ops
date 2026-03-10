@@ -29,6 +29,8 @@ from warp.jax_experimental import jax_kernel
 from nvalchemiops.neighbors.rebuild_detection import (
     _check_atoms_changed_cells_overload,
     _check_atoms_moved_beyond_skin_overload,
+    _check_batch_atoms_changed_cells_overload,
+    _check_batch_atoms_moved_beyond_skin_overload,
 )
 
 __all__ = [
@@ -36,6 +38,10 @@ __all__ = [
     "neighbor_list_needs_rebuild",
     "check_cell_list_rebuild_needed",
     "check_neighbor_list_rebuild_needed",
+    "batch_neighbor_list_needs_rebuild",
+    "batch_cell_list_needs_rebuild",
+    "check_batch_neighbor_list_rebuild_needed",
+    "check_batch_cell_list_rebuild_needed",
 ]
 
 # ==============================================================================
@@ -67,6 +73,34 @@ _jax_check_skin_f64 = jax_kernel(
     _check_atoms_moved_beyond_skin_overload[wp.float64],
     num_outputs=1,
     in_out_argnames=["rebuild_flag"],
+    enable_backward=False,
+)
+
+# Batch neighbor list rebuild detection kernel wrappers
+_jax_batch_check_skin_f32 = jax_kernel(
+    _check_batch_atoms_moved_beyond_skin_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
+    enable_backward=False,
+)
+_jax_batch_check_skin_f64 = jax_kernel(
+    _check_batch_atoms_moved_beyond_skin_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
+    enable_backward=False,
+)
+
+# Batch cell list rebuild detection kernel wrappers
+_jax_batch_check_cells_f32 = jax_kernel(
+    _check_batch_atoms_changed_cells_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
+    enable_backward=False,
+)
+_jax_batch_check_cells_f64 = jax_kernel(
+    _check_batch_atoms_changed_cells_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
     enable_backward=False,
 )
 
@@ -160,6 +194,7 @@ def neighbor_list_needs_rebuild(
     reference_positions: jax.Array,
     current_positions: jax.Array,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> jax.Array:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
 
@@ -171,6 +206,8 @@ def neighbor_list_needs_rebuild(
         Current atomic positions to compare against reference.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
+    overwrite_reference_positions : bool, optional
+        Whether to overwrite the reference positions with the current positions.
 
     Returns
     -------
@@ -216,6 +253,7 @@ def neighbor_list_needs_rebuild(
         current_positions,
         float(skin_distance_threshold),
         rebuild_flag,
+        overwrite_reference_positions,
         launch_dims=(total_atoms,),
     )
 
@@ -282,6 +320,7 @@ def check_neighbor_list_rebuild_needed(
     reference_positions: jax.Array,
     current_positions: jax.Array,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> bool:
     """Determine if neighbor list requires rebuilding based on atomic motion.
 
@@ -302,7 +341,8 @@ def check_neighbor_list_rebuild_needed(
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
-
+    overwrite_reference_positions : bool, optional
+        Whether to overwrite the reference positions with the current positions.
     Returns
     -------
     needs_rebuild : bool
@@ -318,7 +358,262 @@ def check_neighbor_list_rebuild_needed(
     neighbor_list_needs_rebuild : Returns jax.Array instead of bool
     """
     rebuild_tensor = neighbor_list_needs_rebuild(
-        reference_positions, current_positions, skin_distance_threshold
+        reference_positions,
+        current_positions,
+        skin_distance_threshold,
+        overwrite_reference_positions,
     )
 
     return bool(rebuild_tensor[0])
+
+
+# ==============================================================================
+# Batch Rebuild Detection
+# ==============================================================================
+
+
+def batch_neighbor_list_needs_rebuild(
+    reference_positions: jax.Array,
+    current_positions: jax.Array,
+    batch_idx: jax.Array,
+    skin_distance_threshold: float,
+    num_systems: int,
+    overwrite_reference_positions: bool = False,
+) -> jax.Array:
+    """Detect per-system if neighbor lists require rebuilding due to excessive atomic motion.
+
+    Parameters
+    ----------
+    reference_positions : jax.Array, shape (total_atoms, 3)
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : jax.Array, shape (total_atoms, 3)
+        Current atomic positions to compare against reference.
+    batch_idx : jax.Array, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    skin_distance_threshold : float
+        Maximum allowed displacement before neighbor list becomes invalid.
+    num_systems : int
+        Number of systems in the batch.
+    overwrite_reference_positions : bool, optional
+        Whether to overwrite reference positions with current positions for rebuilt systems.
+
+    Returns
+    -------
+    rebuild_flags : jax.Array, shape (num_systems,), dtype=bool
+        Per-system flags; True if any atom in that system moved beyond skin distance.
+
+    Notes
+    -----
+    This function is not differentiable and should not be used in JAX transformations
+    that require gradients.
+
+    See Also
+    --------
+    neighbor_list_needs_rebuild : Single-system version
+    check_batch_neighbor_list_rebuild_needed : Convenience wrapper returning list[bool]
+    """
+    total_atoms = reference_positions.shape[0]
+
+    if total_atoms == 0:
+        return jnp.zeros(num_systems, dtype=jnp.bool_)
+
+    rebuild_flags = jnp.zeros(num_systems, dtype=jnp.bool_)
+
+    if reference_positions.dtype == jnp.float64:
+        _jax_check = _jax_batch_check_skin_f64
+    else:
+        _jax_check = _jax_batch_check_skin_f32
+        reference_positions = reference_positions.astype(jnp.float32)
+        current_positions = current_positions.astype(jnp.float32)
+
+    (rebuild_flags,) = _jax_check(
+        reference_positions,
+        current_positions,
+        batch_idx,
+        float(skin_distance_threshold),
+        rebuild_flags,
+        overwrite_reference_positions,
+        launch_dims=(total_atoms,),
+    )
+
+    return rebuild_flags
+
+
+def batch_cell_list_needs_rebuild(
+    current_positions: jax.Array,
+    atom_to_cell_mapping: jax.Array,
+    batch_idx: jax.Array,
+    cells_per_dimension: jax.Array,
+    cell: jax.Array,
+    pbc: jax.Array,
+) -> jax.Array:
+    """Detect per-system if cell lists require rebuilding due to atomic motion.
+
+    Parameters
+    ----------
+    current_positions : jax.Array, shape (total_atoms, 3)
+        Current atomic coordinates in Cartesian space.
+    atom_to_cell_mapping : jax.Array, shape (total_atoms, 3), dtype=int32
+        3D cell coordinates for each atom from the existing cell lists.
+    batch_idx : jax.Array, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    cells_per_dimension : jax.Array, shape (num_systems, 3), dtype=int32
+        Number of spatial cells in x, y, z directions per system.
+    cell : jax.Array, shape (num_systems, 3, 3)
+        Per-system unit cell matrices for coordinate transformations.
+    pbc : jax.Array, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+
+    Returns
+    -------
+    rebuild_flags : jax.Array, shape (num_systems,), dtype=bool
+        Per-system flags; True if any atom in that system changed cells.
+
+    Notes
+    -----
+    This function is not differentiable and should not be used in JAX transformations
+    that require gradients.
+
+    See Also
+    --------
+    cell_list_needs_rebuild : Single-system version
+    check_batch_cell_list_rebuild_needed : Convenience wrapper returning list[bool]
+    """
+    total_atoms = current_positions.shape[0]
+    num_systems = cell.shape[0]
+
+    if total_atoms == 0:
+        return jnp.zeros(num_systems, dtype=jnp.bool_)
+
+    if cell.dtype != current_positions.dtype:
+        cell = cell.astype(current_positions.dtype)
+
+    pbc = pbc.astype(jnp.bool_)
+
+    rebuild_flags = jnp.zeros(num_systems, dtype=jnp.bool_)
+
+    if current_positions.dtype == jnp.float64:
+        _jax_check = _jax_batch_check_cells_f64
+    else:
+        _jax_check = _jax_batch_check_cells_f32
+        current_positions = current_positions.astype(jnp.float32)
+
+    (rebuild_flags,) = _jax_check(
+        current_positions,
+        cell,
+        atom_to_cell_mapping,
+        batch_idx,
+        cells_per_dimension,
+        pbc,
+        rebuild_flags,
+        launch_dims=(total_atoms,),
+    )
+
+    return rebuild_flags
+
+
+# ==============================================================================
+# High-level Batch API Functions
+# ==============================================================================
+
+
+def check_batch_neighbor_list_rebuild_needed(
+    reference_positions: jax.Array,
+    current_positions: jax.Array,
+    batch_idx: jax.Array,
+    skin_distance_threshold: float,
+    num_systems: int,
+    overwrite_reference_positions: bool = False,
+) -> list[bool]:
+    """Determine per-system if neighbor lists require rebuilding based on atomic motion.
+
+    Parameters
+    ----------
+    reference_positions : jax.Array, shape (total_atoms, 3)
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : jax.Array, shape (total_atoms, 3)
+        Current atomic positions to compare against reference.
+    batch_idx : jax.Array, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    skin_distance_threshold : float
+        Maximum allowed displacement before neighbor list becomes invalid.
+    num_systems : int
+        Number of systems in the batch.
+    overwrite_reference_positions : bool, optional
+        Whether to overwrite reference positions with current positions for rebuilt systems.
+
+    Returns
+    -------
+    needs_rebuild : list[bool]
+        Per-system flags; True if neighbor list for that system needs rebuilding.
+
+    Notes
+    -----
+    This function is not differentiable and should not be used in JAX transformations
+    that require gradients.
+
+    See Also
+    --------
+    batch_neighbor_list_needs_rebuild : Returns jax.Array instead of list[bool]
+    """
+    rebuild_flags = batch_neighbor_list_needs_rebuild(
+        reference_positions,
+        current_positions,
+        batch_idx,
+        skin_distance_threshold,
+        num_systems,
+        overwrite_reference_positions,
+    )
+
+    return [bool(flag) for flag in rebuild_flags]
+
+
+def check_batch_cell_list_rebuild_needed(
+    current_positions: jax.Array,
+    atom_to_cell_mapping: jax.Array,
+    batch_idx: jax.Array,
+    cells_per_dimension: jax.Array,
+    cell: jax.Array,
+    pbc: jax.Array,
+) -> list[bool]:
+    """Determine per-system if cell lists require rebuilding based on atomic motion.
+
+    Parameters
+    ----------
+    current_positions : jax.Array, shape (total_atoms, 3)
+        Current atomic coordinates in Cartesian space.
+    atom_to_cell_mapping : jax.Array, shape (total_atoms, 3), dtype=int32
+        3D cell coordinates for each atom from the existing cell lists.
+    batch_idx : jax.Array, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    cells_per_dimension : jax.Array, shape (num_systems, 3), dtype=int32
+        Number of spatial cells in x, y, z directions per system.
+    cell : jax.Array, shape (num_systems, 3, 3)
+        Per-system unit cell matrices for coordinate transformations.
+    pbc : jax.Array, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+
+    Returns
+    -------
+    needs_rebuild : list[bool]
+        Per-system flags; True if cell list for that system needs rebuilding.
+
+    Notes
+    -----
+    This function is not differentiable and should not be used in JAX transformations
+    that require gradients.
+
+    See Also
+    --------
+    batch_cell_list_needs_rebuild : Returns jax.Array instead of list[bool]
+    """
+    rebuild_flags = batch_cell_list_needs_rebuild(
+        current_positions,
+        atom_to_cell_mapping,
+        batch_idx,
+        cells_per_dimension,
+        cell,
+        pbc,
+    )
+
+    return [bool(flag) for flag in rebuild_flags]

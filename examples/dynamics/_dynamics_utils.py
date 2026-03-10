@@ -463,9 +463,7 @@ class NeighborListManager:
         Zeros reference positions so the next skin-distance check always exceeds
         the threshold. Use after cell changes (NPT/NPH or variable-cell optimization).
         """
-        self.wp_ref_positions = wp.zeros(
-            self.num_atoms, dtype=self.wp_vec_dtype, device=self.device
-        )
+        self.wp_ref_positions.zero_()
 
     def update(self, positions_wp: wp.array, cell_wp: wp.array) -> None:
         """Check and selectively rebuild the neighbor list (no CPU-GPU sync).
@@ -486,6 +484,8 @@ class NeighborListManager:
             current_positions=positions_wp,
             skin_distance_threshold=self.skin / 2.0,
             rebuild_flag=self.wp_rebuild_flag,
+            wp_dtype=self.wp_dtype,
+            device=self.device,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -659,9 +659,7 @@ class BatchedNeighborListManager:
         Zeros reference positions so the next skin-distance check always exceeds
         the threshold for every system.
         """
-        self.wp_ref_positions = wp.zeros(
-            self.total_atoms, dtype=self.wp_vec_dtype, device=self.device
-        )
+        self.wp_ref_positions.zero_()
 
     def update(self, positions_wp: wp.array, cells_wp: wp.array) -> None:
         """Check and selectively rebuild neighbor lists (no CPU-GPU sync).
@@ -687,6 +685,8 @@ class BatchedNeighborListManager:
             skin_distance_threshold=self.skin / 2.0,
             rebuild_flags=self.wp_rebuild_flags,
             overwrite_reference_positions=True,
+            wp_dtype=self.wp_dtype,
+            device=self.device,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)

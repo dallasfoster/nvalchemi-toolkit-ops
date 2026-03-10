@@ -343,8 +343,12 @@ class TestRebuildDetection:
             pbc=pbc_typed.squeeze(0),
         )
 
-        assert isinstance(rebuild_needed, bool)
-        assert not rebuild_needed, "Should not need rebuild when atoms don't move"
+        assert isinstance(rebuild_needed, torch.Tensor)
+        assert rebuild_needed.shape == (1,)
+        assert rebuild_needed.dtype == torch.bool
+        assert not rebuild_needed.item(), (
+            "Should not need rebuild when atoms don't move"
+        )
 
         # Test with large movement
         new_positions = positions_typed.clone()
@@ -357,8 +361,12 @@ class TestRebuildDetection:
             pbc=pbc_typed.squeeze(0),
         )
 
-        assert isinstance(rebuild_needed, bool)
-        assert rebuild_needed, "Should need rebuild when atoms move significantly"
+        assert isinstance(rebuild_needed, torch.Tensor)
+        assert rebuild_needed.shape == (1,)
+        assert rebuild_needed.dtype == torch.bool
+        assert rebuild_needed.item(), (
+            "Should need rebuild when atoms move significantly"
+        )
 
     @pytest.mark.parametrize("device", devices)
     @pytest.mark.parametrize("dtype", dtypes)
@@ -376,8 +384,12 @@ class TestRebuildDetection:
             current_positions=current_positions,
             skin_distance_threshold=skin_distance,
         )
-        assert isinstance(rebuild_needed, bool)
-        assert not rebuild_needed, "Should not need rebuild when atoms don't move"
+        assert isinstance(rebuild_needed, torch.Tensor)
+        assert rebuild_needed.shape == (1,)
+        assert rebuild_needed.dtype == torch.bool
+        assert not rebuild_needed.item(), (
+            "Should not need rebuild when atoms don't move"
+        )
         current_positions = reference_positions.clone()
         current_positions[0] += 1.0  # Beyond skin distance
         rebuild_needed = check_neighbor_list_rebuild_needed(
@@ -385,8 +397,10 @@ class TestRebuildDetection:
             current_positions=current_positions,
             skin_distance_threshold=skin_distance,
         )
-        assert isinstance(rebuild_needed, bool)
-        assert rebuild_needed, (
+        assert isinstance(rebuild_needed, torch.Tensor)
+        assert rebuild_needed.shape == (1,)
+        assert rebuild_needed.dtype == torch.bool
+        assert rebuild_needed.item(), (
             "Should need rebuild when atoms move beyond skin distance"
         )
 

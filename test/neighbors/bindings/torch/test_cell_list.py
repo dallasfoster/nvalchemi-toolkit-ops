@@ -930,9 +930,6 @@ class TestCellListSelectiveRebuildFlags:
 
     def test_no_rebuild_preserves_data(self, device, dtype):
         """Flag=False: neighbor data should remain unchanged."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         positions, cell, pbc = create_simple_cubic_system(
             num_atoms=8, cell_size=2.0, dtype=dtype, device=device
         )
@@ -1029,9 +1026,6 @@ class TestCellListSelectiveRebuildFlags:
 
     def test_rebuild_updates_data(self, device, dtype):
         """Flag=True: result should match a fresh full rebuild."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         positions, cell, pbc = create_simple_cubic_system(
             num_atoms=8, cell_size=2.0, dtype=dtype, device=device
         )

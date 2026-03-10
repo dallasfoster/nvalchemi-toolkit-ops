@@ -889,9 +889,6 @@ class TestBatchNaiveDualCutoffSelectiveRebuildFlags:
 
     def test_no_rebuild_preserves_data(self, device, dtype, half_fill):
         """All flags False: neighbor data should remain unchanged for all systems."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         atoms_per_system = [5, 6]
         positions_batch, _, _, _ = create_batch_systems(
             num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
@@ -954,9 +951,6 @@ class TestBatchNaiveDualCutoffSelectiveRebuildFlags:
 
     def test_rebuild_updates_data(self, device, dtype, half_fill):
         """True flags: rebuilt system data should match a fresh full rebuild."""
-        if device == "cpu":
-            pytest.skip("Selective rebuild requires GPU (warp)")
-
         atoms_per_system = [5, 6]
         positions_batch, _, _, _ = create_batch_systems(
             num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device

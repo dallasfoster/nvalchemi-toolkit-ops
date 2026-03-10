@@ -28,7 +28,7 @@ from nvalchemiops.neighbors.rebuild_detection import (
 )
 from nvalchemiops.torch.neighbors.cell_list import estimate_cell_list_sizes
 from nvalchemiops.torch.neighbors.neighbor_utils import allocate_cell_list
-from nvalchemiops.torch.types import get_wp_mat_dtype, get_wp_vec_dtype
+from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 from .test_utils import create_simple_cubic_system
 
@@ -52,6 +52,7 @@ class TestRebuildDetectionWpLaunchers:
         cutoff = 1.0
 
         # Convert to warp arrays
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
         wp_mat_dtype = get_wp_mat_dtype(dtype)
 
@@ -93,6 +94,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_atoms_per_cell_count,
             wp_cell_atom_start_indices,
             wp_cell_atom_list,
+            wp_dtype,
+            str(device),
         )
 
         # Prepare rebuild flag output
@@ -107,6 +110,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_cell,
             wp_pbc,
             wp_rebuild_needed,
+            wp_dtype,
+            str(device),
         )
 
         # Should not need rebuild
@@ -121,6 +126,7 @@ class TestRebuildDetectionWpLaunchers:
         cutoff = 1.0
 
         # Convert to warp arrays
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
         wp_mat_dtype = get_wp_mat_dtype(dtype)
 
@@ -162,6 +168,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_atoms_per_cell_count,
             wp_cell_atom_start_indices,
             wp_cell_atom_list,
+            wp_dtype,
+            str(device),
         )
 
         # Move first atom significantly
@@ -181,6 +189,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_cell,
             wp_pbc,
             wp_rebuild_needed,
+            wp_dtype,
+            str(device),
         )
 
         # Should need rebuild
@@ -200,6 +210,7 @@ class TestRebuildDetectionWpLaunchers:
         rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
 
         # Convert to warp arrays
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
@@ -212,6 +223,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_current,
             (skin_distance * skin_distance),
             wp_rebuild_needed,
+            wp_dtype,
+            str(device),
         )
 
         # Should not need rebuild
@@ -232,6 +245,7 @@ class TestRebuildDetectionWpLaunchers:
         rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
 
         # Convert to warp arrays
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
@@ -244,6 +258,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_current,
             (skin_distance * skin_distance),
             wp_rebuild_needed,
+            wp_dtype,
+            str(device),
         )
 
         # Should need rebuild
@@ -259,6 +275,7 @@ class TestRebuildDetectionWpLaunchers:
         rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
 
         # Convert to warp arrays
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
@@ -271,6 +288,8 @@ class TestRebuildDetectionWpLaunchers:
             wp_current,
             (skin_distance * skin_distance),
             wp_rebuild_needed,
+            wp_dtype,
+            str(device),
         )
 
         # Should not need rebuild
@@ -313,6 +332,7 @@ class TestBatchRebuildDetectionWpLaunchers:
 
         rebuild_flags = torch.zeros(3, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(
@@ -330,6 +350,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             batch_idx=wp_batch_idx,
             skin_distance_threshold=0.5,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert rebuild_flags.shape == (3,)
@@ -348,6 +370,7 @@ class TestBatchRebuildDetectionWpLaunchers:
 
         rebuild_flags = torch.zeros(3, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(
@@ -365,6 +388,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             batch_idx=wp_batch_idx,
             skin_distance_threshold=0.5,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert not rebuild_flags[0], "System 0 should not need rebuild"
@@ -384,6 +409,7 @@ class TestBatchRebuildDetectionWpLaunchers:
 
         rebuild_flags = torch.zeros(3, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(
@@ -401,6 +427,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             batch_idx=wp_batch_idx,
             skin_distance_threshold=0.5,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert rebuild_flags.all(), "All systems should need rebuild"
@@ -412,6 +440,7 @@ class TestBatchRebuildDetectionWpLaunchers:
         batch_idx = torch.empty(0, dtype=torch.int32, device=device)
         rebuild_flags = torch.zeros(2, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
 
         wp_reference = wp.from_torch(
@@ -429,6 +458,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             batch_idx=wp_batch_idx,
             skin_distance_threshold=0.5,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert not rebuild_flags.any(), "Empty batch should not set any rebuild flags"
@@ -478,6 +509,7 @@ class TestBatchRebuildDetectionWpLaunchers:
 
         rebuild_flags = torch.zeros(num_systems, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
         wp_mat_dtype = get_wp_mat_dtype(dtype)
 
@@ -499,6 +531,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             cell=wp_cell,
             pbc=wp_pbc,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert not rebuild_flags.any(), (
@@ -516,7 +550,6 @@ class TestBatchRebuildDetectionWpLaunchers:
         positions, cell, pbc, batch_idx, ptr, _ = self._make_batch_positions(
             device, dtype
         )
-
         num_systems = 3
         max_total_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
             cell, pbc, cutoff=1.0
@@ -554,6 +587,7 @@ class TestBatchRebuildDetectionWpLaunchers:
 
         rebuild_flags = torch.zeros(num_systems, dtype=torch.bool, device=device)
 
+        wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
         wp_mat_dtype = get_wp_mat_dtype(dtype)
 
@@ -577,6 +611,8 @@ class TestBatchRebuildDetectionWpLaunchers:
             cell=wp_cell,
             pbc=wp_pbc,
             rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
         )
 
         assert rebuild_flags[0], (
