@@ -133,6 +133,7 @@ def _naive_neighbor_matrix_pbc(
     total_shifts: int,
     half_fill: bool = False,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> None:
     """Compute neighbor matrix with periodic boundary conditions using naive O(N^2) algorithm.
 
@@ -171,6 +172,11 @@ def _naive_neighbor_matrix_pbc(
         Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
         is True are processed; others are skipped on the GPU without CPU sync.
         Call selective_zero_num_neighbors before this launcher to reset counts.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     Notes
     -----
@@ -246,6 +252,7 @@ def _naive_neighbor_matrix_pbc(
         device=str(device),
         half_fill=half_fill,
         rebuild_flags=wp_rebuild_flags,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -265,6 +272,7 @@ def naive_neighbor_list(
     shift_offset: torch.Tensor | None = None,
     total_shifts: int | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -327,6 +335,11 @@ def naive_neighbor_list(
         kernel launches are skipped.  When the flag is True (or when this argument
         is None) the neighbor list is recomputed as normal.
         Note: providing this argument disables torch.compile compatibility.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
     return_neighbor_list : bool, optional - default = False
         If True, convert the neighbor matrix to a neighbor list (idx_i, idx_j) format by
         creating a mask over the fill_value, which can incur a performance penalty.
@@ -517,6 +530,7 @@ def naive_neighbor_list(
             total_shifts=total_shifts,
             half_fill=half_fill,
             rebuild_flags=rebuild_flags,
+            wrap_positions=wrap_positions,
         )
         if return_neighbor_list:
             neighbor_list, neighbor_ptr, neighbor_list_shifts = (

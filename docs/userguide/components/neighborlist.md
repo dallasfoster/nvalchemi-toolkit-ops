@@ -227,6 +227,13 @@ neighbor_matrix, num_neighbors, shifts = neighbor_list(
 : Maximum number of spatial cells for cell list decomposition. Default is 1000.
   Limits memory usage for very large simulation boxes.
 
+`wrap_positions`
+: Controls whether positions are wrapped into the primary cell before neighbor
+  search. Default is `True`. Set to `False` when positions are already wrapped
+  (e.g. after an integration step that keeps coordinates inside the box) to skip
+  two GPU kernel launches per call.
+  Only applies to naive methods; cell list methods handle wrapping internally.
+
 ### Estimation Utilities
 
 The {func}`~nvalchemiops.neighbors.neighbor_utils.estimate_max_neighbors` function estimates

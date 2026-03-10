@@ -70,6 +70,7 @@ def neighbor_list(
     fill_value: int | None = None,
     return_neighbor_list: bool = False,
     method: str | None = None,
+    wrap_positions: bool = True,
     **kwargs: dict,
 ):
     """Compute neighbor list using the appropriate method based on the provided parameters.
@@ -118,6 +119,12 @@ def neighbor_list(
         auto-selection reads ``batch_idx[-1]`` which triggers a
         device-to-host synchronization. To avoid this, pass ``batch_ptr``,
         a 3-D ``cell`` array, or specify ``method`` explicitly.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call. Only applies to naive methods; cell list
+        methods handle wrapping internally.
     **kwargs : dict, optional
         Additional keyword arguments to pass to the method.
 
@@ -290,6 +297,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "cell_list":
@@ -323,6 +331,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "batch_cell_list":
@@ -377,6 +386,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "batch_naive_dual_cutoff":
@@ -391,6 +401,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case _:

@@ -158,6 +158,7 @@ def batch_naive_neighbor_list(
     total_shifts: int | None = None,
     max_atoms_per_system: int | None = None,
     rebuild_flags: jax.Array | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[jax.Array, jax.Array, jax.Array, jax.Array]
     | tuple[jax.Array, jax.Array, jax.Array]
@@ -205,6 +206,11 @@ def batch_naive_neighbor_list(
         Total number of shifts for PBC.
     max_atoms_per_system : int, optional
         Maximum atoms in any system.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     Returns
     -------
@@ -396,24 +402,27 @@ def batch_naive_neighbor_list(
                     "Please provide max_atoms_per_system explicitly when using jax.jit."
                 ) from None
 
-        # Pre-wrap positions: compute inv_cell then wrap
-        inv_cell = jnp.zeros_like(cell)
-        (inv_cell,) = _jax_inv_cells(
-            cell,
-            inv_cell,
-            launch_dims=(cell.shape[0],),
-        )
-        positions_wrapped = jnp.zeros_like(positions)
-        per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
-        positions_wrapped, per_atom_cell_offsets = _jax_wrap_batch(
-            positions,
-            cell,
-            inv_cell,
-            batch_idx_i32,
-            positions_wrapped,
-            per_atom_cell_offsets,
-            launch_dims=(total_atoms,),
-        )
+        if wrap_positions:
+            inv_cell = jnp.zeros_like(cell)
+            (inv_cell,) = _jax_inv_cells(
+                cell,
+                inv_cell,
+                launch_dims=(cell.shape[0],),
+            )
+            positions_wrapped = jnp.zeros_like(positions)
+            per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+            positions_wrapped, per_atom_cell_offsets = _jax_wrap_batch(
+                positions,
+                cell,
+                inv_cell,
+                batch_idx_i32,
+                positions_wrapped,
+                per_atom_cell_offsets,
+                launch_dims=(total_atoms,),
+            )
+        else:
+            positions_wrapped = positions
+            per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
 
         if rebuild_flags is not None:
             rf = rebuild_flags.astype(jnp.bool_)

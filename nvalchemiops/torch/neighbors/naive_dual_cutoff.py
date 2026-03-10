@@ -120,6 +120,7 @@ def _naive_neighbor_matrix_pbc_dual_cutoff(
     shift_offset: torch.Tensor,
     total_shifts: int,
     half_fill: bool = False,
+    wrap_positions: bool = True,
 ) -> None:
     """Compute two neighbor matrices with periodic boundary conditions using dual cutoffs.
 
@@ -189,6 +190,7 @@ def _naive_neighbor_matrix_pbc_dual_cutoff(
         wp_dtype=wp_dtype,
         device=str(device),
         half_fill=half_fill,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -288,6 +290,7 @@ def _naive_neighbor_matrix_pbc_dual_cutoff_selective(
     total_shifts: int,
     rebuild_flags: torch.Tensor,
     half_fill: bool = False,
+    wrap_positions: bool = True,
 ) -> None:
     """Selective naive dual cutoff PBC neighbor matrix custom op.
 
@@ -368,6 +371,7 @@ def _naive_neighbor_matrix_pbc_dual_cutoff_selective(
         device=str(wp_device),
         half_fill=half_fill,
         rebuild_flags=wp_rebuild_flags,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -392,6 +396,7 @@ def naive_neighbor_list_dual_cutoff(
     shift_offset: torch.Tensor | None = None,
     total_shifts: int | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[
         torch.Tensor,
@@ -574,6 +579,7 @@ def naive_neighbor_list_dual_cutoff(
                 total_shifts=total_shifts,
                 rebuild_flags=rebuild_flags,
                 half_fill=half_fill,
+                wrap_positions=wrap_positions,
             )
         else:
             _naive_neighbor_matrix_pbc_dual_cutoff(
@@ -591,6 +597,7 @@ def naive_neighbor_list_dual_cutoff(
                 shift_offset=shift_offset,
                 total_shifts=total_shifts,
                 half_fill=half_fill,
+                wrap_positions=wrap_positions,
             )
         if return_neighbor_list:
             neighbor_list1, neighbor_ptr1, unit_shifts1 = (

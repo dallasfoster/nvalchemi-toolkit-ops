@@ -130,6 +130,7 @@ def _batch_naive_neighbor_matrix_pbc_dual_cutoff(
     total_shifts: int,
     half_fill: bool = False,
     max_atoms_per_system: int | None = None,
+    wrap_positions: bool = True,
 ) -> None:
     """Compute batch neighbor matrices with PBC using dual cutoffs.
 
@@ -209,6 +210,7 @@ def _batch_naive_neighbor_matrix_pbc_dual_cutoff(
         device=str(device),
         max_atoms_per_system=max_atoms_per_system,
         half_fill=half_fill,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -309,6 +311,7 @@ def _batch_naive_neighbor_matrix_pbc_dual_cutoff_selective(
     rebuild_flags: torch.Tensor,
     half_fill: bool = False,
     max_atoms_per_system: int | None = None,
+    wrap_positions: bool = True,
 ) -> None:
     """Selective batched naive dual cutoff PBC neighbor matrix custom op.
 
@@ -392,6 +395,7 @@ def _batch_naive_neighbor_matrix_pbc_dual_cutoff_selective(
         max_atoms_per_system=max_atoms_per_system,
         half_fill=half_fill,
         rebuild_flags=wp_rebuild_flags,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -419,6 +423,7 @@ def batch_naive_neighbor_list_dual_cutoff(
     total_shifts: int | None = None,
     max_atoms_per_system: int | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[
         torch.Tensor,
@@ -621,6 +626,7 @@ def batch_naive_neighbor_list_dual_cutoff(
                 rebuild_flags=rebuild_flags,
                 half_fill=half_fill,
                 max_atoms_per_system=max_atoms_per_system,
+                wrap_positions=wrap_positions,
             )
         else:
             _batch_naive_neighbor_matrix_pbc_dual_cutoff(
@@ -641,6 +647,7 @@ def batch_naive_neighbor_list_dual_cutoff(
                 total_shifts=total_shifts,
                 half_fill=half_fill,
                 max_atoms_per_system=max_atoms_per_system,
+                wrap_positions=wrap_positions,
             )
         if return_neighbor_list:
             neighbor_list1, neighbor_ptr1, unit_shifts1 = (

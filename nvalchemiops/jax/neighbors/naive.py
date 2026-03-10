@@ -154,6 +154,7 @@ def naive_neighbor_list(
     shift_offset: jax.Array | None = None,
     total_shifts: int | None = None,
     rebuild_flags: jax.Array | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[jax.Array, jax.Array, jax.Array, jax.Array]
     | tuple[jax.Array, jax.Array, jax.Array]
@@ -212,6 +213,11 @@ def naive_neighbor_list(
     return_neighbor_list : bool, optional - default = False
         If True, convert the neighbor matrix to a neighbor list (idx_i, idx_j) format by
         creating a mask over the fill_value, which can incur a performance penalty.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     Returns
     -------
@@ -423,23 +429,26 @@ def naive_neighbor_list(
         if cell.dtype != positions.dtype:
             cell = cell.astype(positions.dtype)
 
-        # Pre-wrap positions: compute inv_cell then wrap
-        inv_cell = jnp.zeros_like(cell)
-        (inv_cell,) = _jax_inv_cells(
-            cell,
-            inv_cell,
-            launch_dims=(cell.shape[0],),
-        )
-        positions_wrapped = jnp.zeros_like(positions)
-        per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
-        positions_wrapped, per_atom_cell_offsets = _jax_wrap_single(
-            positions,
-            cell,
-            inv_cell,
-            positions_wrapped,
-            per_atom_cell_offsets,
-            launch_dims=(total_atoms,),
-        )
+        if wrap_positions:
+            inv_cell = jnp.zeros_like(cell)
+            (inv_cell,) = _jax_inv_cells(
+                cell,
+                inv_cell,
+                launch_dims=(cell.shape[0],),
+            )
+            positions_wrapped = jnp.zeros_like(positions)
+            per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+            positions_wrapped, per_atom_cell_offsets = _jax_wrap_single(
+                positions,
+                cell,
+                inv_cell,
+                positions_wrapped,
+                per_atom_cell_offsets,
+                launch_dims=(total_atoms,),
+            )
+        else:
+            positions_wrapped = positions
+            per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
 
         if rebuild_flags is not None:
             rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)

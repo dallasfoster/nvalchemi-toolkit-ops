@@ -148,6 +148,7 @@ def _batch_naive_neighbor_matrix_pbc(
     half_fill: bool = False,
     max_atoms_per_system: int | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> None:
     """Compute batch neighbor matrix with periodic boundary conditions using naive O(N^2) algorithm.
 
@@ -207,6 +208,11 @@ def _batch_naive_neighbor_matrix_pbc(
         non-rebuilt systems entirely on the GPU (no CPU-GPU sync). When this is used,
         pre-allocated ``neighbor_matrix`` and ``num_neighbors`` tensors must be provided
         and will not be globally zeroed — only rebuilt-system entries are reset.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     See Also
     --------
@@ -290,6 +296,7 @@ def _batch_naive_neighbor_matrix_pbc(
         max_atoms_per_system=max_atoms_per_system,
         half_fill=half_fill,
         rebuild_flags=wp_rebuild_flags,
+        wrap_positions=wrap_positions,
     )
 
 
@@ -312,6 +319,7 @@ def batch_naive_neighbor_list(
     total_shifts: int | None = None,
     max_atoms_per_system: int | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    wrap_positions: bool = True,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -393,6 +401,11 @@ def batch_naive_neighbor_list(
         non-rebuilt systems entirely on the GPU (no CPU-GPU sync). When this is used,
         pre-allocated ``neighbor_matrix`` and ``num_neighbors`` tensors must be provided
         and will not be globally zeroed — only rebuilt-system entries are reset.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     Returns
     -------
@@ -516,6 +529,7 @@ def batch_naive_neighbor_list(
             half_fill=half_fill,
             max_atoms_per_system=max_atoms_per_system,
             rebuild_flags=rebuild_flags,
+            wrap_positions=wrap_positions,
         )
         if return_neighbor_list:
             neighbor_list, neighbor_ptr, neighbor_list_shifts = (

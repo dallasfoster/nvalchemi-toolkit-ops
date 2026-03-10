@@ -601,6 +601,7 @@ def batch_naive_neighbor_matrix_pbc(
     max_atoms_per_system: int,
     half_fill: bool = False,
     rebuild_flags: wp.array | None = None,
+    wrap_positions: bool = True,
 ) -> None:
     """Core warp launcher for batched naive neighbor matrix construction with PBC.
 
@@ -612,7 +613,6 @@ def batch_naive_neighbor_matrix_pbc(
     ----------
     positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
         Concatenated atomic coordinates for all systems in Cartesian space.
-        May be unwrapped; preprocessing wraps them before neighbor search.
     cell : wp.array, shape (num_systems, 3, 3), dtype=wp.mat33*
         Array of cell matrices for each system in the batch.
     cutoff : float
@@ -643,15 +643,19 @@ def batch_naive_neighbor_matrix_pbc(
     rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool, optional
         Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
         is True are processed; others are skipped on the GPU without CPU sync.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call.
 
     Notes
     -----
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - Output arrays must be pre-allocated by caller.
     - Shift vectors must be pre-computed using compute_naive_num_shifts and _expand_naive_shifts.
-    - Positions are wrapped into the primary cell in a preprocessing step (one kernel launch
-      per call) before the neighbor search kernel to avoid redundant per-thread inversion
-      inside the hot loop.
+    - When ``wrap_positions`` is True, positions are wrapped into the primary cell in a
+      preprocessing step before the neighbor search kernel.
 
     See Also
     --------
@@ -681,20 +685,30 @@ def batch_naive_neighbor_matrix_pbc(
         if wp_dtype == wp.float16
         else None
     )
-    inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
-    compute_inv_cells(cell, inv_cell, wp_dtype, device)
-    positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
-    per_atom_cell_offsets = wp.empty(total_atoms, dtype=wp.vec3i, device=device)
-    wrap_positions_batch(
-        positions,
-        cell,
-        inv_cell,
-        batch_idx,
-        positions_wrapped,
-        per_atom_cell_offsets,
-        wp_dtype,
-        device,
-    )
+    if wrap_positions:
+        inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+        compute_inv_cells(cell, inv_cell, wp_dtype, device)
+        positions_wrapped = wp.empty(
+            (total_atoms,), dtype=wp_vec_dtype, device=device
+        )
+        per_atom_cell_offsets = wp.empty(
+            total_atoms, dtype=wp.vec3i, device=device
+        )
+        wrap_positions_batch(
+            positions,
+            cell,
+            inv_cell,
+            batch_idx,
+            positions_wrapped,
+            per_atom_cell_offsets,
+            wp_dtype,
+            device,
+        )
+    else:
+        positions_wrapped = positions
+        per_atom_cell_offsets = wp.zeros(
+            total_atoms, dtype=wp.vec3i, device=device
+        )
 
     if rebuild_flags is not None:
         selective_zero_num_neighbors(num_neighbors, batch_idx, rebuild_flags, device)
