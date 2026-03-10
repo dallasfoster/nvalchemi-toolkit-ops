@@ -816,3 +816,101 @@ class TestNaivePerformance:
             if device.startswith("cuda"):
                 torch.cuda.empty_cache()
             gc.collect()
+
+
+class TestNaiveSelectiveRebuildFlags:
+    """Test selective rebuild (rebuild_flags) for naive_neighbor_list torch binding."""
+
+    def test_no_rebuild_preserves_data(self, device, dtype):
+        """Flag=False: neighbor data should remain unchanged."""
+        if device == "cpu":
+            pytest.skip("Selective rebuild requires GPU (warp)")
+
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+
+        # Initial full build (pre-allocated output)
+        neighbor_matrix = torch.full(
+            (positions.shape[0], max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        num_neighbors = torch.zeros(
+            positions.shape[0], dtype=torch.int32, device=device
+        )
+
+        naive_neighbor_list(
+            positions=positions,
+            cutoff=cutoff,
+            max_neighbors=max_neighbors,
+            neighbor_matrix=neighbor_matrix,
+            num_neighbors=num_neighbors,
+        )
+
+        saved_nm = neighbor_matrix.clone()
+        saved_nn = num_neighbors.clone()
+
+        # Selective rebuild with flag=False: data should be unchanged
+        rebuild_flags = torch.zeros(1, dtype=torch.bool, device=device)
+        naive_neighbor_list(
+            positions=positions,
+            cutoff=cutoff,
+            max_neighbors=max_neighbors,
+            neighbor_matrix=neighbor_matrix,
+            num_neighbors=num_neighbors,
+            rebuild_flags=rebuild_flags,
+        )
+
+        assert torch.equal(num_neighbors, saved_nn), (
+            "num_neighbors must be unchanged when rebuild_flags is False"
+        )
+        for i in range(positions.shape[0]):
+            n = num_neighbors[i].item()
+            assert torch.equal(neighbor_matrix[i, :n], saved_nm[i, :n]), (
+                f"neighbor_matrix row {i} should be unchanged"
+            )
+
+    def test_rebuild_updates_data(self, device, dtype):
+        """Flag=True: result should match a fresh full rebuild."""
+        if device == "cpu":
+            pytest.skip("Selective rebuild requires GPU (warp)")
+
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+
+        # Reference: full build
+        nm_ref = torch.full(
+            (positions.shape[0], max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+        naive_neighbor_list(
+            positions=positions,
+            cutoff=cutoff,
+            max_neighbors=max_neighbors,
+            neighbor_matrix=nm_ref,
+            num_neighbors=nn_ref,
+        )
+
+        # Selective rebuild with flag=True: should match reference
+        nm_sel = torch.full(
+            (positions.shape[0], max_neighbors), 99, dtype=torch.int32, device=device
+        )
+        nn_sel = torch.full((positions.shape[0],), 99, dtype=torch.int32, device=device)
+
+        rebuild_flags = torch.ones(1, dtype=torch.bool, device=device)
+        naive_neighbor_list(
+            positions=positions,
+            cutoff=cutoff,
+            max_neighbors=max_neighbors,
+            neighbor_matrix=nm_sel,
+            num_neighbors=nn_sel,
+            rebuild_flags=rebuild_flags,
+        )
+
+        assert torch.equal(nn_sel, nn_ref), (
+            "num_neighbors should match full rebuild when flag=True"
+        )

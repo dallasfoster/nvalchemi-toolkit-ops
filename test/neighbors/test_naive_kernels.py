@@ -689,3 +689,119 @@ class TestNaiveWpLaunchers:
             assert torch.all(torch.abs(valid_shifts) <= 5), (
                 "Unit shifts should be small integers"
             )
+
+
+class TestNaiveSelectiveRebuildFlags:
+    """Test selective rebuild (rebuild_flags) for naive neighbor list warp launchers."""
+
+    def test_no_rebuild_preserves_data(self):
+        """All flags False: neighbor data should remain unchanged."""
+        device = "cuda:0"
+        dtype = torch.float32
+        wp_device = device
+
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+
+        # Initial full build
+        neighbor_matrix = torch.full(
+            (positions.shape[0], max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        num_neighbors = torch.zeros(
+            positions.shape[0], dtype=torch.int32, device=device
+        )
+        wp_nm = wp.from_torch(neighbor_matrix, dtype=wp.int32)
+        wp_nn = wp.from_torch(num_neighbors, dtype=wp.int32)
+
+        naive_neighbor_matrix(
+            wp_positions, cutoff, wp_nm, wp_nn, wp_dtype, wp_device, False
+        )
+
+        saved_nm = neighbor_matrix.clone()
+        saved_nn = num_neighbors.clone()
+
+        # Rebuild with flag=False: nothing should change
+        rebuild_flags = torch.zeros(1, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_nm,
+            wp_nn,
+            wp_dtype,
+            wp_device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(num_neighbors, saved_nn), (
+            "num_neighbors must be unchanged when rebuild_flags is False"
+        )
+        for i in range(positions.shape[0]):
+            n = num_neighbors[i].item()
+            assert torch.equal(neighbor_matrix[i, :n], saved_nm[i, :n]), (
+                f"neighbor_matrix row {i} should be unchanged"
+            )
+
+    def test_rebuild_updates_data(self):
+        """Flag=True: result should match a fresh full rebuild."""
+        device = "cuda:0"
+        dtype = torch.float32
+        wp_device = device
+
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+
+        # Full build reference
+        nm_ref = torch.full(
+            (positions.shape[0], max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+        wp_nm_ref = wp.from_torch(nm_ref, dtype=wp.int32)
+        wp_nn_ref = wp.from_torch(nn_ref, dtype=wp.int32)
+        naive_neighbor_matrix(
+            wp_positions, cutoff, wp_nm_ref, wp_nn_ref, wp_dtype, wp_device, False
+        )
+
+        # Build with stale data, then selective rebuild with flag=True
+        nm_sel = torch.full(
+            (positions.shape[0], max_neighbors), 0, dtype=torch.int32, device=device
+        )
+        nn_sel = torch.full((positions.shape[0],), 0, dtype=torch.int32, device=device)
+        wp_nm_sel = wp.from_torch(nm_sel, dtype=wp.int32)
+        wp_nn_sel = wp.from_torch(nn_sel, dtype=wp.int32)
+
+        rebuild_flags = torch.ones(1, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_nm_sel,
+            wp_nn_sel,
+            wp_dtype,
+            wp_device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(nn_sel, nn_ref), (
+            "num_neighbors should match full rebuild when flag=True"
+        )

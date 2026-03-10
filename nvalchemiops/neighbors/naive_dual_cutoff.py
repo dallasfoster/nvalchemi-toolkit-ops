@@ -26,6 +26,8 @@ import warp as wp
 from nvalchemiops.neighbors.neighbor_utils import (
     _update_neighbor_matrix,
     _update_neighbor_matrix_pbc,
+    compute_inv_cells,
+    wrap_positions_single,
 )
 
 __all__ = [
@@ -36,6 +38,158 @@ __all__ = [
 ###########################################################################################
 ########################### Naive Dual Cutoff Kernels #####################################
 ###########################################################################################
+
+
+@wp.func
+def _naive_dual_cutoff_body(
+    tid: int,
+    positions: wp.array(dtype=Any),
+    cutoff1_sq: Any,
+    cutoff2_sq: Any,
+    neighbor_matrix1: wp.array2d(dtype=wp.int32),
+    num_neighbors1: wp.array(dtype=wp.int32),
+    neighbor_matrix2: wp.array2d(dtype=wp.int32),
+    num_neighbors2: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+):
+    """Body function for naive dual cutoff neighbor search (no PBC).
+
+    Parameters
+    ----------
+    tid : int
+        Thread index (atom index i).
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cutoff1_sq : float
+        Squared first cutoff distance (typically smaller).
+    cutoff2_sq : float
+        Squared second cutoff distance (typically larger).
+    neighbor_matrix1 : wp.array2d, shape (total_atoms, max_neighbors1), dtype=wp.int32
+        OUTPUT: First neighbor matrix for cutoff1.
+    num_neighbors1 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff1.
+    neighbor_matrix2 : wp.array2d, shape (total_atoms, max_neighbors2), dtype=wp.int32
+        OUTPUT: Second neighbor matrix for cutoff2.
+    num_neighbors2 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff2.
+    half_fill : wp.bool
+        If True, only store relationships where i < j.
+    """
+    i = tid
+    j_end = positions.shape[0]
+    positions_i = positions[i]
+    maxnb1 = neighbor_matrix1.shape[1]
+    maxnb2 = neighbor_matrix2.shape[1]
+    for j in range(i + 1, j_end):
+        diff = positions_i - positions[j]
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff2_sq:
+            _update_neighbor_matrix(
+                i, j, neighbor_matrix2, num_neighbors2, maxnb2, half_fill
+            )
+            if dist_sq < cutoff1_sq:
+                _update_neighbor_matrix(
+                    i, j, neighbor_matrix1, num_neighbors1, maxnb1, half_fill
+                )
+
+
+@wp.func
+def _naive_dual_cutoff_pbc_body(
+    ishift: int,
+    iatom: int,
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cutoff1_sq: Any,
+    cutoff2_sq: Any,
+    cell: wp.array(dtype=Any),
+    shifts: wp.array(dtype=wp.vec3i),
+    neighbor_matrix1: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix2: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts1: wp.array(dtype=wp.vec3i, ndim=2),
+    neighbor_matrix_shifts2: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors1: wp.array(dtype=wp.int32),
+    num_neighbors2: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+):
+    """Body function for naive dual cutoff neighbor search with PBC.
+
+    Parameters
+    ----------
+    ishift : int
+        Shift index (first dimension of 2D thread grid).
+    iatom : int
+        Atom index (second dimension of 2D thread grid).
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Wrapped atomic coordinates in Cartesian space.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom.
+    cutoff1_sq : float
+        Squared first cutoff distance (typically smaller).
+    cutoff2_sq : float
+        Squared second cutoff distance (typically larger).
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix for the system.
+    shifts : wp.array, shape (total_shifts,), dtype=wp.vec3i
+        Integer shift vectors for periodic images.
+    neighbor_matrix1 : wp.array, ndim=2, dtype=wp.int32
+        OUTPUT: First neighbor matrix for cutoff1.
+    neighbor_matrix2 : wp.array, ndim=2, dtype=wp.int32
+        OUTPUT: Second neighbor matrix for cutoff2.
+    neighbor_matrix_shifts1 : wp.array, ndim=2, dtype=wp.vec3i
+        OUTPUT: Shift vectors for first neighbor matrix.
+    neighbor_matrix_shifts2 : wp.array, ndim=2, dtype=wp.vec3i
+        OUTPUT: Shift vectors for second neighbor matrix.
+    num_neighbors1 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff1.
+    num_neighbors2 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff2.
+    half_fill : wp.bool
+        If True, only store relationships where i < j.
+    """
+    jatom_start = wp.int32(0)
+    jatom_end = positions.shape[0]
+    maxnb1 = neighbor_matrix1.shape[1]
+    maxnb2 = neighbor_matrix2.shape[1]
+    _shift = shifts[ishift]
+    _cell = cell[0]
+    _pos_i = positions[iatom]
+    _int_i = per_atom_cell_offsets[iatom]
+    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i
+    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
+    if _zero_shift:
+        jatom_end = iatom
+    for jatom in range(jatom_start, jatom_end):
+        _pos_j = positions[jatom]
+        diff = positions_shifted - _pos_j
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff2_sq:
+            _int_j = per_atom_cell_offsets[jatom]
+            _corrected_shift = wp.vec3i(
+                _shift[0] - _int_i[0] + _int_j[0],
+                _shift[1] - _int_i[1] + _int_j[1],
+                _shift[2] - _int_i[2] + _int_j[2],
+            )
+            _update_neighbor_matrix_pbc(
+                jatom,
+                iatom,
+                neighbor_matrix2,
+                neighbor_matrix_shifts2,
+                num_neighbors2,
+                _corrected_shift,
+                maxnb2,
+                half_fill,
+            )
+            if dist_sq < cutoff1_sq:
+                _update_neighbor_matrix_pbc(
+                    jatom,
+                    iatom,
+                    neighbor_matrix1,
+                    neighbor_matrix_shifts1,
+                    num_neighbors1,
+                    _corrected_shift,
+                    maxnb1,
+                    half_fill,
+                )
 
 
 @wp.kernel(enable_backward=False)
@@ -98,28 +252,23 @@ def _fill_naive_neighbor_matrix_dual_cutoff(
     _fill_naive_neighbor_matrix_pbc_dual_cutoff : Version with periodic boundaries
     """
     tid = wp.tid()
-    i = tid
-    j_end = positions.shape[0]
-
-    positions_i = positions[i]
-    maxnb1 = neighbor_matrix1.shape[1]
-    maxnb2 = neighbor_matrix2.shape[1]
-    for j in range(i + 1, j_end):
-        diff = positions_i - positions[j]
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff2_sq:
-            _update_neighbor_matrix(
-                i, j, neighbor_matrix2, num_neighbors2, maxnb2, half_fill
-            )
-            if dist_sq < cutoff1_sq:
-                _update_neighbor_matrix(
-                    i, j, neighbor_matrix1, num_neighbors1, maxnb1, half_fill
-                )
+    _naive_dual_cutoff_body(
+        tid,
+        positions,
+        cutoff1_sq,
+        cutoff2_sq,
+        neighbor_matrix1,
+        num_neighbors1,
+        neighbor_matrix2,
+        num_neighbors2,
+        half_fill,
+    )
 
 
 @wp.kernel(enable_backward=False)
 def _fill_naive_neighbor_matrix_pbc_dual_cutoff(
     positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
     cutoff1_sq: Any,
     cutoff2_sq: Any,
     cell: wp.array(dtype=Any),
@@ -142,8 +291,11 @@ def _fill_naive_neighbor_matrix_pbc_dual_cutoff(
     Parameters
     ----------
     positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Atomic coordinates in Cartesian space. Each row represents one atom's
-        (x, y, z) position.
+        Concatenated atomic coordinates for all systems in Cartesian space.
+        Assumed to be wrapped into the primary cell before calling this kernel via wrap_positions_single.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom (floor of fractional coordinates).
+        Used to reconstruct corrected shift vectors for the original positions.
     cutoff1_sq : float
         Squared first cutoff distance in Cartesian units (typically the smaller cutoff).
         Must be positive. Atoms within this distance are considered neighbors.
@@ -196,74 +348,159 @@ def _fill_naive_neighbor_matrix_pbc_dual_cutoff(
     _fill_naive_neighbor_matrix_pbc : Single cutoff PBC version
     """
     ishift, iatom = wp.tid()
-
-    jatom_start = 0
-    jatom_end = positions.shape[0]
-
-    maxnb1 = neighbor_matrix1.shape[1]
-    maxnb2 = neighbor_matrix2.shape[1]
-
-    # Get the atom coordinates and shift vector
-    _positions = positions[iatom]
-    _cell = cell[0]
-    _shift = shifts[ishift]
-
-    # Wrap atom i to the primary cell to support unwrapped coordinates.
-    _inv_cell = wp.inverse(_cell)
-    _frac_i = _positions * _inv_cell
-    _int_i = wp.vec3i(
-        wp.int32(wp.floor(_frac_i[0])),
-        wp.int32(wp.floor(_frac_i[1])),
-        wp.int32(wp.floor(_frac_i[2])),
+    _naive_dual_cutoff_pbc_body(
+        ishift,
+        iatom,
+        positions,
+        per_atom_cell_offsets,
+        cutoff1_sq,
+        cutoff2_sq,
+        cell,
+        shifts,
+        neighbor_matrix1,
+        neighbor_matrix2,
+        neighbor_matrix_shifts1,
+        neighbor_matrix_shifts2,
+        num_neighbors1,
+        num_neighbors2,
+        half_fill,
     )
-    _pos_i_wrapped = _positions - type(_positions)(_int_i) * _cell
-    positions_shifted = wp.transpose(_cell) * type(_cell[0])(_shift) + _pos_i_wrapped
 
-    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
-    if _zero_shift:
-        jatom_end = iatom
 
-    for jatom in range(jatom_start, jatom_end):
-        # Wrap atom j to the primary cell.
-        _pos_j = positions[jatom]
-        _frac_j = _pos_j * _inv_cell
-        _int_j = wp.vec3i(
-            wp.int32(wp.floor(_frac_j[0])),
-            wp.int32(wp.floor(_frac_j[1])),
-            wp.int32(wp.floor(_frac_j[2])),
-        )
-        _pos_j_wrapped = _pos_j - type(_positions)(_int_j) * _cell
-        diff = positions_shifted - _pos_j_wrapped
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff2_sq:
-            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
-            # holds for the original (potentially unwrapped) positions.
-            _corrected_shift = wp.vec3i(
-                _shift[0] - _int_i[0] + _int_j[0],
-                _shift[1] - _int_i[1] + _int_j[1],
-                _shift[2] - _int_i[2] + _int_j[2],
-            )
-            _update_neighbor_matrix_pbc(
-                jatom,
-                iatom,
-                neighbor_matrix2,
-                neighbor_matrix_shifts2,
-                num_neighbors2,
-                _corrected_shift,
-                maxnb2,
-                half_fill,
-            )
-            if dist_sq < cutoff1_sq:
-                _update_neighbor_matrix_pbc(
-                    jatom,
-                    iatom,
-                    neighbor_matrix1,
-                    neighbor_matrix_shifts1,
-                    num_neighbors1,
-                    _corrected_shift,
-                    maxnb1,
-                    half_fill,
-                )
+@wp.kernel(enable_backward=False)
+def _fill_naive_neighbor_matrix_dual_cutoff_selective(
+    positions: wp.array(dtype=Any),
+    cutoff1_sq: Any,
+    cutoff2_sq: Any,
+    neighbor_matrix1: wp.array2d(dtype=wp.int32, ndim=2),
+    num_neighbors1: wp.array(dtype=wp.int32),
+    neighbor_matrix2: wp.array2d(dtype=wp.int32, ndim=2),
+    num_neighbors2: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective naive dual cutoff kernel — skips when rebuild_flags[0] is False.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cutoff1_sq : float
+        Squared first cutoff distance (typically smaller).
+    cutoff2_sq : float
+        Squared second cutoff distance (typically larger).
+    neighbor_matrix1 : wp.array2d, shape (total_atoms, max_neighbors1), dtype=wp.int32
+        OUTPUT: First neighbor matrix for cutoff1.
+    num_neighbors1 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff1.
+    neighbor_matrix2 : wp.array2d, shape (total_atoms, max_neighbors2), dtype=wp.int32
+        OUTPUT: Second neighbor matrix for cutoff2.
+    num_neighbors2 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff2.
+    half_fill : wp.bool
+        If True, only store relationships where i < j.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        When False the kernel returns immediately — no recomputation.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - GPU-side conditional: no CPU-GPU synchronization occurs
+    """
+    tid = wp.tid()
+    if not rebuild_flags[0]:
+        return
+    _naive_dual_cutoff_body(
+        tid,
+        positions,
+        cutoff1_sq,
+        cutoff2_sq,
+        neighbor_matrix1,
+        num_neighbors1,
+        neighbor_matrix2,
+        num_neighbors2,
+        half_fill,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _fill_naive_neighbor_matrix_pbc_dual_cutoff_selective(
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cutoff1_sq: Any,
+    cutoff2_sq: Any,
+    cell: wp.array(dtype=Any),
+    shifts: wp.array(dtype=wp.vec3i),
+    neighbor_matrix1: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix2: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts1: wp.array(dtype=wp.vec3i, ndim=2),
+    neighbor_matrix_shifts2: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors1: wp.array(dtype=wp.int32),
+    num_neighbors2: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective PBC naive dual cutoff kernel — skips when rebuild_flags[0] is False.
+
+    Positions must be pre-wrapped and per-atom cell offsets pre-computed via
+    ``wrap_positions_single`` before calling this kernel.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Wrapped atomic coordinates for all systems in Cartesian space.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom.
+    cutoff1_sq : float
+        Squared first cutoff distance (typically smaller).
+    cutoff2_sq : float
+        Squared second cutoff distance (typically larger).
+    cell : wp.array, shape (1, 3, 3), dtype=wp.mat33*
+        Cell matrix for the system.
+    shifts : wp.array, shape (total_shifts, 3), dtype=wp.vec3i
+        Integer shift vectors for periodic images.
+    neighbor_matrix1 : wp.array, ndim=2, dtype=wp.int32
+        OUTPUT: First neighbor matrix for cutoff1.
+    neighbor_matrix2 : wp.array, ndim=2, dtype=wp.int32
+        OUTPUT: Second neighbor matrix for cutoff2.
+    neighbor_matrix_shifts1 : wp.array, ndim=2, dtype=wp.vec3i
+        OUTPUT: Shift vectors for first neighbor matrix.
+    neighbor_matrix_shifts2 : wp.array, ndim=2, dtype=wp.vec3i
+        OUTPUT: Shift vectors for second neighbor matrix.
+    num_neighbors1 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff1.
+    num_neighbors2 : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Neighbor counts for cutoff2.
+    half_fill : wp.bool
+        If True, only store relationships where i < j.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        When False the kernel returns immediately — no recomputation.
+
+    Notes
+    -----
+    - Thread launch: 2D (total_shifts, total_atoms)
+    - GPU-side conditional: no CPU-GPU synchronization occurs
+    """
+    ishift, iatom = wp.tid()
+    if not rebuild_flags[0]:
+        return
+    _naive_dual_cutoff_pbc_body(
+        ishift,
+        iatom,
+        positions,
+        per_atom_cell_offsets,
+        cutoff1_sq,
+        cutoff2_sq,
+        cell,
+        shifts,
+        neighbor_matrix1,
+        neighbor_matrix2,
+        neighbor_matrix_shifts1,
+        neighbor_matrix_shifts2,
+        num_neighbors1,
+        num_neighbors2,
+        half_fill,
+    )
 
 
 ## Generate overloads for all kernels
@@ -272,6 +509,8 @@ V = [wp.vec3f, wp.vec3d, wp.vec3h]
 M = [wp.mat33f, wp.mat33d, wp.mat33h]
 _fill_naive_neighbor_matrix_dual_cutoff_overload = {}
 _fill_naive_neighbor_matrix_pbc_dual_cutoff_overload = {}
+_fill_naive_neighbor_matrix_dual_cutoff_selective_overload = {}
+_fill_naive_neighbor_matrix_pbc_dual_cutoff_selective_overload = {}
 for t, v, m in zip(T, V, M):
     _fill_naive_neighbor_matrix_dual_cutoff_overload[t] = wp.overload(
         _fill_naive_neighbor_matrix_dual_cutoff,
@@ -291,6 +530,7 @@ for t, v, m in zip(T, V, M):
         _fill_naive_neighbor_matrix_pbc_dual_cutoff,
         [
             wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
             t,
             t,
             wp.array(dtype=m),
@@ -302,6 +542,41 @@ for t, v, m in zip(T, V, M):
             wp.array(dtype=wp.int32),
             wp.array(dtype=wp.int32),
             wp.bool,
+        ],
+    )
+
+    _fill_naive_neighbor_matrix_dual_cutoff_selective_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_dual_cutoff_selective,
+        [
+            wp.array(dtype=v),
+            t,
+            t,
+            wp.array2d(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+
+    _fill_naive_neighbor_matrix_pbc_dual_cutoff_selective_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_pbc_dual_cutoff_selective,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
+            t,
+            t,
+            wp.array(dtype=m),
+            wp.array(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
         ],
     )
 
@@ -321,6 +596,7 @@ def naive_neighbor_matrix_dual_cutoff(
     wp_dtype: type,
     device: str,
     half_fill: bool = False,
+    rebuild_flags: wp.array | None = None,
 ) -> None:
     """Core warp launcher for naive dual cutoff neighbor matrix construction (no PBC).
 
@@ -350,6 +626,9 @@ def naive_neighbor_matrix_dual_cutoff(
         Warp device string (e.g., 'cuda:0', 'cpu').
     half_fill : bool, default=False
         If True, only store relationships where i < j to avoid double counting.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool, optional
+        Per-system rebuild flags. If provided, only rebuilds when rebuild_flags[0]
+        is True; otherwise skips on the GPU without CPU sync.
 
     Notes
     -----
@@ -360,24 +639,43 @@ def naive_neighbor_matrix_dual_cutoff(
     --------
     naive_neighbor_matrix_pbc_dual_cutoff : Version with periodic boundary conditions
     _fill_naive_neighbor_matrix_dual_cutoff : Kernel that performs the computation
+    _fill_naive_neighbor_matrix_dual_cutoff_selective : Selective-skip kernel variant
     """
     total_atoms = positions.shape[0]
 
-    wp.launch(
-        kernel=_fill_naive_neighbor_matrix_dual_cutoff_overload[wp_dtype],
-        dim=total_atoms,
-        inputs=[
-            positions,
-            wp_dtype(cutoff1 * cutoff1),
-            wp_dtype(cutoff2 * cutoff2),
-            neighbor_matrix1,
-            num_neighbors1,
-            neighbor_matrix2,
-            num_neighbors2,
-            half_fill,
-        ],
-        device=device,
-    )
+    if rebuild_flags is None:
+        wp.launch(
+            kernel=_fill_naive_neighbor_matrix_dual_cutoff_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                positions,
+                wp_dtype(cutoff1 * cutoff1),
+                wp_dtype(cutoff2 * cutoff2),
+                neighbor_matrix1,
+                num_neighbors1,
+                neighbor_matrix2,
+                num_neighbors2,
+                half_fill,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_fill_naive_neighbor_matrix_dual_cutoff_selective_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                positions,
+                wp_dtype(cutoff1 * cutoff1),
+                wp_dtype(cutoff2 * cutoff2),
+                neighbor_matrix1,
+                num_neighbors1,
+                neighbor_matrix2,
+                num_neighbors2,
+                half_fill,
+                rebuild_flags,
+            ],
+            device=device,
+        )
 
 
 def naive_neighbor_matrix_pbc_dual_cutoff(
@@ -395,6 +693,7 @@ def naive_neighbor_matrix_pbc_dual_cutoff(
     wp_dtype: type,
     device: str,
     half_fill: bool = False,
+    rebuild_flags: wp.array | None = None,
 ) -> None:
     """Core warp launcher for naive dual cutoff neighbor matrix construction with PBC.
 
@@ -432,37 +731,102 @@ def naive_neighbor_matrix_pbc_dual_cutoff(
         Warp device string (e.g., 'cuda:0', 'cpu').
     half_fill : bool, default=False
         If True, only store relationships where i < j to avoid double counting.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool, optional
+        Per-system rebuild flags. If provided, only rebuilds when rebuild_flags[0]
+        is True; otherwise skips on the GPU without CPU sync.
 
     Notes
     -----
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - Output arrays must be pre-allocated by caller.
     - Shift vectors must be pre-computed using compute_naive_num_shifts and _expand_naive_shifts.
+    - Positions are wrapped into the primary cell in a preprocessing step before the
+      neighbor search kernel to avoid redundant per-thread inversion inside the hot loop.
 
     See Also
     --------
     naive_neighbor_matrix_dual_cutoff : Version without periodic boundary conditions
     _fill_naive_neighbor_matrix_pbc_dual_cutoff : Kernel that performs the computation
+    _fill_naive_neighbor_matrix_pbc_dual_cutoff_selective : Selective-skip kernel variant
+    wrap_positions_single : Preprocessing step that wraps positions
     """
     total_atoms = positions.shape[0]
     total_shifts = shifts.shape[0]
 
-    wp.launch(
-        kernel=_fill_naive_neighbor_matrix_pbc_dual_cutoff_overload[wp_dtype],
-        dim=(total_shifts, total_atoms),
-        inputs=[
-            positions,
-            wp_dtype(cutoff1 * cutoff1),
-            wp_dtype(cutoff2 * cutoff2),
-            cell,
-            shifts,
-            neighbor_matrix1,
-            neighbor_matrix2,
-            neighbor_matrix_shifts1,
-            neighbor_matrix_shifts2,
-            num_neighbors1,
-            num_neighbors2,
-            half_fill,
-        ],
-        device=device,
+    wp_mat_dtype = (
+        wp.mat33f
+        if wp_dtype == wp.float32
+        else wp.mat33d
+        if wp_dtype == wp.float64
+        else wp.mat33h
+        if wp_dtype == wp.float16
+        else None
     )
+    wp_vec_dtype = (
+        wp.vec3f
+        if wp_dtype == wp.float32
+        else wp.vec3d
+        if wp_dtype == wp.float64
+        else wp.vec3h
+        if wp_dtype == wp.float16
+        else None
+    )
+    inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+    compute_inv_cells(cell, inv_cell, wp_dtype, device)
+    positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
+    per_atom_cell_offsets = wp.empty((total_atoms,), dtype=wp.vec3i, device=device)
+    wrap_positions_single(
+        positions,
+        cell,
+        inv_cell,
+        positions_wrapped,
+        per_atom_cell_offsets,
+        wp_dtype,
+        device,
+    )
+
+    if rebuild_flags is None:
+        wp.launch(
+            kernel=_fill_naive_neighbor_matrix_pbc_dual_cutoff_overload[wp_dtype],
+            dim=(total_shifts, total_atoms),
+            inputs=[
+                positions_wrapped,
+                per_atom_cell_offsets,
+                wp_dtype(cutoff1 * cutoff1),
+                wp_dtype(cutoff2 * cutoff2),
+                cell,
+                shifts,
+                neighbor_matrix1,
+                neighbor_matrix2,
+                neighbor_matrix_shifts1,
+                neighbor_matrix_shifts2,
+                num_neighbors1,
+                num_neighbors2,
+                half_fill,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_fill_naive_neighbor_matrix_pbc_dual_cutoff_selective_overload[
+                wp_dtype
+            ],
+            dim=(total_shifts, total_atoms),
+            inputs=[
+                positions_wrapped,
+                per_atom_cell_offsets,
+                wp_dtype(cutoff1 * cutoff1),
+                wp_dtype(cutoff2 * cutoff2),
+                cell,
+                shifts,
+                neighbor_matrix1,
+                neighbor_matrix2,
+                neighbor_matrix_shifts1,
+                neighbor_matrix_shifts2,
+                num_neighbors1,
+                num_neighbors2,
+                half_fill,
+                rebuild_flags,
+            ],
+            device=device,
+        )

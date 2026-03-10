@@ -355,3 +355,147 @@ class TestBatchNaiveWpLaunchers:
             assert torch.all(torch.abs(valid_shifts) <= 5), (
                 "Unit shifts should be small integers"
             )
+
+
+class TestBatchNaiveSelectiveRebuildFlags:
+    """Test selective rebuild (rebuild_flags) for batch naive neighbor list warp launchers."""
+
+    def test_no_rebuild_preserves_data(self):
+        """All flags False: neighbor data should remain unchanged for all systems."""
+        device = "cuda:0"
+        dtype = torch.float32
+
+        atoms_per_system = [5, 6]
+        positions_batch, _, _, _ = create_batch_systems(
+            num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+
+        cutoff = 1.2
+        max_neighbors = 20
+        total_atoms = positions_batch.shape[0]
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+
+        # Initial full build
+        neighbor_matrix = torch.full(
+            (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        num_neighbors = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        wp_nm = wp.from_torch(neighbor_matrix, dtype=wp.int32)
+        wp_nn = wp.from_torch(num_neighbors, dtype=wp.int32)
+
+        batch_naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm,
+            wp_nn,
+            wp_dtype,
+            device,
+            False,
+        )
+
+        saved_nm = neighbor_matrix.clone()
+        saved_nn = num_neighbors.clone()
+
+        # Selective rebuild with all flags=False: data should be unchanged
+        rebuild_flags = torch.zeros(2, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        batch_naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm,
+            wp_nn,
+            wp_dtype,
+            device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(num_neighbors, saved_nn), (
+            "num_neighbors must be unchanged when all rebuild_flags are False"
+        )
+        for i in range(total_atoms):
+            n = num_neighbors[i].item()
+            assert torch.equal(neighbor_matrix[i, :n], saved_nm[i, :n]), (
+                f"neighbor_matrix row {i} should be unchanged"
+            )
+
+    def test_rebuild_updates_data(self):
+        """True flags: rebuilt system data should match a fresh full rebuild."""
+        device = "cuda:0"
+        dtype = torch.float32
+
+        atoms_per_system = [5, 6]
+        positions_batch, _, _, _ = create_batch_systems(
+            num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+
+        cutoff = 1.2
+        max_neighbors = 20
+        total_atoms = positions_batch.shape[0]
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+
+        # Full build reference
+        nm_ref = torch.full(
+            (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        wp_nm_ref = wp.from_torch(nm_ref, dtype=wp.int32)
+        wp_nn_ref = wp.from_torch(nn_ref, dtype=wp.int32)
+        batch_naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm_ref,
+            wp_nn_ref,
+            wp_dtype,
+            device,
+            False,
+        )
+
+        # Selective rebuild with all flags=True: result should match reference
+        nm_sel = torch.full(
+            (total_atoms, max_neighbors), 99, dtype=torch.int32, device=device
+        )
+        nn_sel = torch.full((total_atoms,), 99, dtype=torch.int32, device=device)
+        wp_nm_sel = wp.from_torch(nm_sel, dtype=wp.int32)
+        wp_nn_sel = wp.from_torch(nn_sel, dtype=wp.int32)
+
+        rebuild_flags = torch.ones(2, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        batch_naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm_sel,
+            wp_nn_sel,
+            wp_dtype,
+            device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(nn_sel, nn_ref), (
+            "num_neighbors should match full rebuild when all flags=True"
+        )

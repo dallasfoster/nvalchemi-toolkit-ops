@@ -30,6 +30,7 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 from nvalchemiops.neighbors.batch_cell_list import (
     _batch_cell_list_bin_atoms_overload,
     _batch_cell_list_build_neighbor_matrix_overload,
+    _batch_cell_list_build_neighbor_matrix_selective_overload,
     _batch_cell_list_construct_bin_size_overload,
     _batch_cell_list_count_atoms_per_bin_overload,
     _compute_cells_per_system,
@@ -99,6 +100,20 @@ _jax_batch_build_neighbor_matrix_f32 = jax_kernel(
 )
 _jax_batch_build_neighbor_matrix_f64 = jax_kernel(
     _batch_cell_list_build_neighbor_matrix_overload[wp.float64],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+
+# Selective query: Build neighbor matrix from batch cell list (skips non-rebuilt systems)
+_jax_batch_build_neighbor_matrix_selective_f32 = jax_kernel(
+    _batch_cell_list_build_neighbor_matrix_selective_overload[wp.float32],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_batch_build_neighbor_matrix_selective_f64 = jax_kernel(
+    _batch_cell_list_build_neighbor_matrix_selective_overload[wp.float64],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
@@ -417,6 +432,7 @@ def batch_query_cell_list(
     neighbor_matrix: jax.Array | None = None,
     num_neighbors: jax.Array | None = None,
     neighbor_matrix_shifts: jax.Array | None = None,
+    rebuild_flags: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Query batch cell lists to find neighbors.
 
@@ -482,19 +498,21 @@ def batch_query_cell_list(
             positions.shape[0],
             dtype=jnp.int32,
         )
-    else:
+    elif rebuild_flags is None:
         neighbor_matrix = neighbor_matrix.at[:].set(positions.shape[0])
 
     if num_neighbors is None:
         num_neighbors = jnp.zeros(positions.shape[0], dtype=jnp.int32)
-    else:
+    elif rebuild_flags is None:
         num_neighbors = num_neighbors.at[:].set(0)
 
     # Select kernel based on dtype
     if positions.dtype == jnp.float64:
         _query_kernel = _jax_batch_build_neighbor_matrix_f64
+        _query_kernel_selective = _jax_batch_build_neighbor_matrix_selective_f64
     else:
         _query_kernel = _jax_batch_build_neighbor_matrix_f32
+        _query_kernel_selective = _jax_batch_build_neighbor_matrix_selective_f32
         positions = positions.astype(jnp.float32)
 
     # Ensure cell dtype matches positions
@@ -514,7 +532,7 @@ def batch_query_cell_list(
             (total_atoms, max_neighbors, 3),
             dtype=jnp.int32,
         )
-    else:
+    elif rebuild_flags is None:
         neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(0)
 
     if atoms_per_cell_count is None:
@@ -530,26 +548,58 @@ def batch_query_cell_list(
         ]
     )
 
-    neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _query_kernel(
-        positions,
-        cell,
-        pbc_bool,
-        batch_idx,
-        float(cutoff),
-        cells_per_dimension,
-        neighbor_search_radius,
-        atom_periodic_shifts,
-        atom_to_cell_mapping,
-        atoms_per_cell_count,
-        cell_atom_start_indices,
-        cell_atom_list,
-        cell_offsets,
-        neighbor_matrix,
-        neighbor_matrix_shifts,
-        num_neighbors,
-        False,  # half_fill
-        launch_dims=(total_atoms,),
-    )
+    batch_idx_i32 = batch_idx.astype(jnp.int32)
+
+    if rebuild_flags is not None:
+        rf = rebuild_flags.astype(jnp.bool_)
+        atom_rebuild = rf[batch_idx_i32]
+        num_neighbors = jnp.where(
+            atom_rebuild, jnp.zeros_like(num_neighbors), num_neighbors
+        )
+        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
+            _query_kernel_selective(
+                positions,
+                cell,
+                pbc_bool,
+                batch_idx_i32,
+                float(cutoff),
+                cells_per_dimension,
+                neighbor_search_radius,
+                atom_periodic_shifts,
+                atom_to_cell_mapping,
+                atoms_per_cell_count,
+                cell_atom_start_indices,
+                cell_atom_list,
+                cell_offsets,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                False,  # half_fill
+                rf,
+                launch_dims=(total_atoms,),
+            )
+        )
+    else:
+        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _query_kernel(
+            positions,
+            cell,
+            pbc_bool,
+            batch_idx_i32,
+            float(cutoff),
+            cells_per_dimension,
+            neighbor_search_radius,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            cell_offsets,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+            num_neighbors,
+            False,  # half_fill
+            launch_dims=(total_atoms,),
+        )
 
     return neighbor_matrix, num_neighbors, neighbor_matrix_shifts
 

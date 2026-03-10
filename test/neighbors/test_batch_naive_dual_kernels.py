@@ -26,7 +26,11 @@ from nvalchemiops.neighbors.batch_naive_dual_cutoff import (
     batch_naive_neighbor_matrix_dual_cutoff,
     batch_naive_neighbor_matrix_pbc_dual_cutoff,
 )
-from nvalchemiops.neighbors.neighbor_utils import _expand_naive_shifts
+from nvalchemiops.neighbors.neighbor_utils import (
+    _expand_naive_shifts,
+    compute_inv_cells,
+    wrap_positions_batch,
+)
 from nvalchemiops.torch.neighbors.neighbor_utils import compute_naive_num_shifts
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
@@ -145,7 +149,7 @@ class TestBatchNaiveDualCutoffKernels:
         positions_batch, cell_batch, pbc_batch, _ = create_batch_systems(
             num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
         )
-        _, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
 
         cutoff1 = 1.0
         cutoff2 = 1.5
@@ -167,6 +171,30 @@ class TestBatchNaiveDualCutoffKernels:
         wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
         wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+
+        # Pre-wrap positions
+        inv_cell_arr = torch.zeros_like(cell_batch)
+        wp_inv_cell = wp.from_torch(inv_cell_arr, dtype=wp_mat_dtype)
+        compute_inv_cells(wp_cell, wp_inv_cell, wp_dtype, wp_device)
+        positions_wrapped_arr = torch.zeros_like(positions_batch)
+        per_atom_cell_offsets_arr = torch.zeros(
+            positions_batch.shape[0], 3, dtype=torch.int32, device=device
+        )
+        wp_positions_wrapped = wp.from_torch(positions_wrapped_arr, dtype=wp_vec_dtype)
+        wp_per_atom_cell_offsets = wp.from_torch(
+            per_atom_cell_offsets_arr, dtype=wp.vec3i
+        )
+        wrap_positions_batch(
+            wp_positions,
+            wp_cell,
+            wp_inv_cell,
+            wp_batch_idx,
+            wp_positions_wrapped,
+            wp_per_atom_cell_offsets,
+            wp_dtype,
+            wp_device,
+        )
 
         # Create shift arrays (simplified for testing)
         shifts = torch.zeros(total_shifts, 3, dtype=torch.int32, device=device)
@@ -226,10 +254,11 @@ class TestBatchNaiveDualCutoffKernels:
             dim=(total_shifts, positions_batch.shape[0]),
             device=wp_device,
             inputs=[
-                wp_positions,
+                wp_positions_wrapped,
+                wp_per_atom_cell_offsets,
                 wp_cell,
-                wp_dtype(cutoff1),
-                wp_dtype(cutoff2),
+                wp_dtype(cutoff1 * cutoff1),
+                wp_dtype(cutoff2 * cutoff2),
                 wp_batch_ptr,
                 wp_shifts,
                 wp_shift_system_idx,
@@ -333,7 +362,7 @@ class TestBatchNaiveDualCutoffWpLaunchers:
             dtype=dtype,
             device=device,
         )
-        _, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
 
         cutoff1 = 1.0
         cutoff2 = 1.5
@@ -407,6 +436,7 @@ class TestBatchNaiveDualCutoffWpLaunchers:
         wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
         wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
         wp_neighbor_matrix1 = wp.from_torch(neighbor_matrix1, dtype=wp.int32)
         wp_neighbor_matrix2 = wp.from_torch(neighbor_matrix2, dtype=wp.int32)
         wp_neighbor_matrix_shifts1 = wp.from_torch(
@@ -425,6 +455,7 @@ class TestBatchNaiveDualCutoffWpLaunchers:
             cutoff1,
             cutoff2,
             wp_batch_ptr,
+            wp_batch_idx,
             wp_shifts,
             wp_shift_system_idx,
             wp_neighbor_matrix1,
@@ -451,3 +482,178 @@ class TestBatchNaiveDualCutoffWpLaunchers:
             assert torch.all(torch.abs(valid_shifts1) <= 5)
         if len(valid_shifts2) > 0:
             assert torch.all(torch.abs(valid_shifts2) <= 5)
+
+
+class TestBatchNaiveDualCutoffSelectiveRebuildFlags:
+    """Test selective rebuild (rebuild_flags) for batch naive dual cutoff warp launchers."""
+
+    def test_no_rebuild_preserves_data(self):
+        """All flags False: neighbor data should remain unchanged for all systems."""
+        device = "cuda:0"
+        dtype = torch.float32
+
+        atoms_per_system = [5, 6]
+        positions_batch, _, _, _ = create_batch_systems(
+            num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+
+        cutoff1 = 1.0
+        cutoff2 = 1.5
+        max_neighbors1 = 20
+        max_neighbors2 = 30
+        total_atoms = positions_batch.shape[0]
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+
+        # Initial full build
+        nm1 = torch.full(
+            (total_atoms, max_neighbors1), -1, dtype=torch.int32, device=device
+        )
+        nm2 = torch.full(
+            (total_atoms, max_neighbors2), -1, dtype=torch.int32, device=device
+        )
+        nn1 = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        nn2 = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        wp_nm1 = wp.from_torch(nm1, dtype=wp.int32)
+        wp_nm2 = wp.from_torch(nm2, dtype=wp.int32)
+        wp_nn1 = wp.from_torch(nn1, dtype=wp.int32)
+        wp_nn2 = wp.from_torch(nn2, dtype=wp.int32)
+
+        batch_naive_neighbor_matrix_dual_cutoff(
+            wp_positions,
+            cutoff1,
+            cutoff2,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm1,
+            wp_nn1,
+            wp_nm2,
+            wp_nn2,
+            wp_dtype,
+            device,
+            False,
+        )
+
+        saved_nn1 = nn1.clone()
+        saved_nn2 = nn2.clone()
+
+        # Selective rebuild with all flags=False: data should be unchanged
+        rebuild_flags = torch.zeros(2, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        batch_naive_neighbor_matrix_dual_cutoff(
+            wp_positions,
+            cutoff1,
+            cutoff2,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm1,
+            wp_nn1,
+            wp_nm2,
+            wp_nn2,
+            wp_dtype,
+            device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(nn1, saved_nn1), "nn1 must be unchanged when flags are False"
+        assert torch.equal(nn2, saved_nn2), "nn2 must be unchanged when flags are False"
+
+    def test_rebuild_updates_data(self):
+        """True flags: rebuilt system data should match a fresh full rebuild."""
+        device = "cuda:0"
+        dtype = torch.float32
+
+        atoms_per_system = [5, 6]
+        positions_batch, _, _, _ = create_batch_systems(
+            num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+
+        cutoff1 = 1.0
+        cutoff2 = 1.5
+        max_neighbors1 = 20
+        max_neighbors2 = 30
+        total_atoms = positions_batch.shape[0]
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+
+        # Reference: full build
+        nm1_ref = torch.full(
+            (total_atoms, max_neighbors1), -1, dtype=torch.int32, device=device
+        )
+        nm2_ref = torch.full(
+            (total_atoms, max_neighbors2), -1, dtype=torch.int32, device=device
+        )
+        nn1_ref = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        nn2_ref = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        wp_nm1_ref = wp.from_torch(nm1_ref, dtype=wp.int32)
+        wp_nm2_ref = wp.from_torch(nm2_ref, dtype=wp.int32)
+        wp_nn1_ref = wp.from_torch(nn1_ref, dtype=wp.int32)
+        wp_nn2_ref = wp.from_torch(nn2_ref, dtype=wp.int32)
+        batch_naive_neighbor_matrix_dual_cutoff(
+            wp_positions,
+            cutoff1,
+            cutoff2,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm1_ref,
+            wp_nn1_ref,
+            wp_nm2_ref,
+            wp_nn2_ref,
+            wp_dtype,
+            device,
+            False,
+        )
+
+        # Selective rebuild with all flags=True
+        nm1_sel = torch.full(
+            (total_atoms, max_neighbors1), 99, dtype=torch.int32, device=device
+        )
+        nm2_sel = torch.full(
+            (total_atoms, max_neighbors2), 99, dtype=torch.int32, device=device
+        )
+        nn1_sel = torch.full((total_atoms,), 99, dtype=torch.int32, device=device)
+        nn2_sel = torch.full((total_atoms,), 99, dtype=torch.int32, device=device)
+        wp_nm1_sel = wp.from_torch(nm1_sel, dtype=wp.int32)
+        wp_nm2_sel = wp.from_torch(nm2_sel, dtype=wp.int32)
+        wp_nn1_sel = wp.from_torch(nn1_sel, dtype=wp.int32)
+        wp_nn2_sel = wp.from_torch(nn2_sel, dtype=wp.int32)
+
+        rebuild_flags = torch.ones(2, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+
+        batch_naive_neighbor_matrix_dual_cutoff(
+            wp_positions,
+            cutoff1,
+            cutoff2,
+            wp_batch_idx,
+            wp_batch_ptr,
+            wp_nm1_sel,
+            wp_nn1_sel,
+            wp_nm2_sel,
+            wp_nn2_sel,
+            wp_dtype,
+            device,
+            False,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(nn1_sel, nn1_ref), (
+            "nn1 should match full rebuild when all flags=True"
+        )
+        assert torch.equal(nn2_sel, nn2_ref), (
+            "nn2 should match full rebuild when all flags=True"
+        )

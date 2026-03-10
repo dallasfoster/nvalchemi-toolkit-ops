@@ -23,8 +23,6 @@ import warp as wp
 from nvalchemiops.neighbors.naive import (
     naive_neighbor_matrix,
     naive_neighbor_matrix_pbc,
-    naive_neighbor_matrix_pbc_selective,
-    naive_neighbor_matrix_selective,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     _expand_naive_shifts,
@@ -50,6 +48,7 @@ def _naive_neighbor_matrix_no_pbc(
     neighbor_matrix: torch.Tensor,
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
+    rebuild_flags: torch.Tensor | None = None,
 ) -> None:
     """Fill neighbor matrix for atoms using naive O(N^2) algorithm.
 
@@ -78,7 +77,10 @@ def _naive_neighbor_matrix_no_pbc(
     half_fill : bool
         If True, only store relationships where i < j to avoid double counting.
         If False, store all neighbor relationships symmetrically.
-
+    rebuild_flags : torch.Tensor, shape (1,), dtype=torch.bool, optional
+        Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
+        is True are processed; others are skipped on the GPU without CPU sync.
+        Call selective_zero_num_neighbors before this launcher to reset counts.
     See Also
     --------
     nvalchemiops.neighbors.naive.naive_neighbor_matrix : Core warp launcher
@@ -93,6 +95,15 @@ def _naive_neighbor_matrix_no_pbc(
         neighbor_matrix, dtype=wp.int32, return_ctype=True
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
+    if rebuild_flags is not None:
+        wp_rebuild_flags = wp.from_torch(
+            rebuild_flags, dtype=wp.bool, return_ctype=True
+        )
+        selective_zero_num_neighbors_single(
+            wp_num_neighbors, wp_rebuild_flags, str(device)
+        )
+    else:
+        wp_rebuild_flags = None
 
     naive_neighbor_matrix(
         positions=wp_positions,
@@ -102,6 +113,7 @@ def _naive_neighbor_matrix_no_pbc(
         wp_dtype=wp_dtype,
         device=str(device),
         half_fill=half_fill,
+        rebuild_flags=wp_rebuild_flags,
     )
 
 
@@ -120,6 +132,7 @@ def _naive_neighbor_matrix_pbc(
     shift_offset: torch.Tensor,
     total_shifts: int,
     half_fill: bool = False,
+    rebuild_flags: torch.Tensor | None = None,
 ) -> None:
     """Compute neighbor matrix with periodic boundary conditions using naive O(N^2) algorithm.
 
@@ -154,6 +167,10 @@ def _naive_neighbor_matrix_pbc(
     half_fill : bool, optional
         If True, only store relationships where i < j to avoid double counting.
         If False, store all neighbor relationships symmetrically. Default is False.
+    rebuild_flags : torch.Tensor, shape (1,), dtype=torch.bool, optional
+        Per-system rebuild flags. If provided, only systems where rebuild_flags[i]
+        is True are processed; others are skipped on the GPU without CPU sync.
+        Call selective_zero_num_neighbors before this launcher to reset counts.
 
     Notes
     -----
@@ -207,6 +224,16 @@ def _naive_neighbor_matrix_pbc(
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
 
+    if rebuild_flags is not None:
+        wp_rebuild_flags = wp.from_torch(
+            rebuild_flags, dtype=wp.bool, return_ctype=True
+        )
+        selective_zero_num_neighbors_single(
+            wp_num_neighbors, wp_rebuild_flags, str(wp_device)
+        )
+    else:
+        wp_rebuild_flags = None
+
     naive_neighbor_matrix_pbc(
         positions=wp_positions,
         cutoff=cutoff,
@@ -218,143 +245,7 @@ def _naive_neighbor_matrix_pbc(
         wp_dtype=wp_dtype,
         device=str(device),
         half_fill=half_fill,
-    )
-
-
-@torch.library.custom_op(
-    "nvalchemiops::_naive_neighbor_matrix_no_pbc_selective",
-    mutates_args=("neighbor_matrix", "num_neighbors"),
-)
-def _naive_neighbor_matrix_no_pbc_selective(
-    positions: torch.Tensor,
-    cutoff: float,
-    neighbor_matrix: torch.Tensor,
-    num_neighbors: torch.Tensor,
-    rebuild_flags: torch.Tensor,
-    half_fill: bool = False,
-) -> None:
-    """Selective single-system naive neighbor matrix custom op (no PBC).
-
-    Wraps the GPU-side selective kernel: ``rebuild_flags[0]`` is checked on the
-    device — no CPU-GPU synchronisation occurs.
-
-    See Also
-    --------
-    nvalchemiops.neighbors.naive.naive_neighbor_matrix_selective : Core warp launcher
-    naive_neighbor_list : High-level wrapper that dispatches here when rebuild_flags is set
-    """
-    device = positions.device
-    wp_device = wp.device_from_torch(device)
-    wp_dtype = get_wp_dtype(positions.dtype)
-    wp_vec_dtype = get_wp_vec_dtype(positions.dtype)
-
-    wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype, return_ctype=True)
-    wp_neighbor_matrix = wp.from_torch(
-        neighbor_matrix, dtype=wp.int32, return_ctype=True
-    )
-    wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
-    wp_rebuild_flags = wp.from_torch(
-        rebuild_flags.view(-1)[:1].contiguous(), dtype=wp.bool, return_ctype=True
-    )
-
-    selective_zero_num_neighbors_single(
-        wp_num_neighbors, wp_rebuild_flags, str(wp_device)
-    )
-    naive_neighbor_matrix_selective(
-        positions=wp_positions,
-        cutoff=cutoff,
-        neighbor_matrix=wp_neighbor_matrix,
-        num_neighbors=wp_num_neighbors,
         rebuild_flags=wp_rebuild_flags,
-        wp_dtype=wp_dtype,
-        device=str(wp_device),
-        half_fill=half_fill,
-    )
-
-
-@torch.library.custom_op(
-    "nvalchemiops::_naive_neighbor_matrix_pbc_selective",
-    mutates_args=("neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"),
-)
-def _naive_neighbor_matrix_pbc_selective(
-    positions: torch.Tensor,
-    cutoff: float,
-    cell: torch.Tensor,
-    neighbor_matrix: torch.Tensor,
-    neighbor_matrix_shifts: torch.Tensor,
-    num_neighbors: torch.Tensor,
-    shift_range_per_dimension: torch.Tensor,
-    shift_offset: torch.Tensor,
-    total_shifts: int,
-    rebuild_flags: torch.Tensor,
-    half_fill: bool = False,
-) -> None:
-    """Selective single-system naive neighbor matrix custom op (with PBC).
-
-    Wraps the GPU-side selective kernel: ``rebuild_flags[0]`` is checked on the
-    device — no CPU-GPU synchronisation occurs.
-
-    See Also
-    --------
-    nvalchemiops.neighbors.naive.naive_neighbor_matrix_pbc_selective : Core warp launcher
-    naive_neighbor_list : High-level wrapper that dispatches here when rebuild_flags is set
-    """
-    device = positions.device
-    wp_device = wp.device_from_torch(device)
-    wp_dtype = get_wp_dtype(positions.dtype)
-    wp_vec_dtype = get_wp_vec_dtype(positions.dtype)
-    wp_mat_dtype = get_wp_mat_dtype(cell.dtype)
-
-    shifts = torch.empty((total_shifts, 3), dtype=torch.int32, device=device)
-    shift_system_idx = torch.empty((total_shifts,), dtype=torch.int32, device=device)
-    wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i, return_ctype=True)
-    wp_shift_system_idx = wp.from_torch(
-        shift_system_idx, dtype=wp.int32, return_ctype=True
-    )
-    wp_shift_range_per_dimension = wp.from_torch(
-        shift_range_per_dimension, dtype=wp.vec3i, return_ctype=True
-    )
-    wp_shift_offset = wp.from_torch(shift_offset, dtype=wp.int32, return_ctype=True)
-    wp.launch(
-        kernel=_expand_naive_shifts,
-        dim=1,
-        inputs=[
-            wp_shift_range_per_dimension,
-            wp_shift_offset,
-            wp_shifts,
-            wp_shift_system_idx,
-        ],
-        device=wp_device,
-    )
-
-    wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype, return_ctype=True)
-    wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
-    wp_neighbor_matrix = wp.from_torch(
-        neighbor_matrix, dtype=wp.int32, return_ctype=True
-    )
-    wp_neighbor_matrix_shifts = wp.from_torch(
-        neighbor_matrix_shifts, dtype=wp.vec3i, return_ctype=True
-    )
-    wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
-    wp_rebuild_flags = wp.from_torch(
-        rebuild_flags.view(-1)[:1].contiguous(), dtype=wp.bool, return_ctype=True
-    )
-
-    selective_zero_num_neighbors_single(
-        wp_num_neighbors, wp_rebuild_flags, str(wp_device)
-    )
-    naive_neighbor_matrix_pbc_selective(
-        positions=wp_positions,
-        cutoff=cutoff,
-        cell=wp_cell,
-        shifts=wp_shifts,
-        neighbor_matrix=wp_neighbor_matrix,
-        neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
-        num_neighbors=wp_num_neighbors,
-        rebuild_flags=wp_rebuild_flags,
-        wp_dtype=wp_dtype,
-        device=str(wp_device),
-        half_fill=half_fill,
     )
 
 
@@ -596,23 +487,14 @@ def naive_neighbor_list(
                 return neighbor_matrix, num_neighbors
 
     if pbc is None:
-        if rebuild_flags is not None:
-            _naive_neighbor_matrix_no_pbc_selective(
-                positions=positions,
-                cutoff=cutoff,
-                neighbor_matrix=neighbor_matrix,
-                num_neighbors=num_neighbors,
-                rebuild_flags=rebuild_flags,
-                half_fill=half_fill,
-            )
-        else:
-            _naive_neighbor_matrix_no_pbc(
-                positions=positions,
-                cutoff=cutoff,
-                neighbor_matrix=neighbor_matrix,
-                num_neighbors=num_neighbors,
-                half_fill=half_fill,
-            )
+        _naive_neighbor_matrix_no_pbc(
+            positions=positions,
+            cutoff=cutoff,
+            neighbor_matrix=neighbor_matrix,
+            num_neighbors=num_neighbors,
+            half_fill=half_fill,
+            rebuild_flags=rebuild_flags,
+        )
         if return_neighbor_list:
             neighbor_list, neighbor_ptr = get_neighbor_list_from_neighbor_matrix(
                 neighbor_matrix,
@@ -623,33 +505,19 @@ def naive_neighbor_list(
         else:
             return neighbor_matrix, num_neighbors
     else:
-        if rebuild_flags is not None:
-            _naive_neighbor_matrix_pbc_selective(
-                positions=positions,
-                cutoff=cutoff,
-                cell=cell,
-                neighbor_matrix=neighbor_matrix,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                num_neighbors=num_neighbors,
-                shift_range_per_dimension=shift_range_per_dimension,
-                shift_offset=shift_offset,
-                total_shifts=total_shifts,
-                rebuild_flags=rebuild_flags,
-                half_fill=half_fill,
-            )
-        else:
-            _naive_neighbor_matrix_pbc(
-                positions=positions,
-                cutoff=cutoff,
-                cell=cell,
-                neighbor_matrix=neighbor_matrix,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                num_neighbors=num_neighbors,
-                shift_range_per_dimension=shift_range_per_dimension,
-                shift_offset=shift_offset,
-                total_shifts=total_shifts,
-                half_fill=half_fill,
-            )
+        _naive_neighbor_matrix_pbc(
+            positions=positions,
+            cutoff=cutoff,
+            cell=cell,
+            neighbor_matrix=neighbor_matrix,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
+            num_neighbors=num_neighbors,
+            shift_range_per_dimension=shift_range_per_dimension,
+            shift_offset=shift_offset,
+            total_shifts=total_shifts,
+            half_fill=half_fill,
+            rebuild_flags=rebuild_flags,
+        )
         if return_neighbor_list:
             neighbor_list, neighbor_ptr, neighbor_list_shifts = (
                 get_neighbor_list_from_neighbor_matrix(

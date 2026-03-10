@@ -29,6 +29,8 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 from nvalchemiops.neighbors.naive import (
     _fill_naive_neighbor_matrix_overload,
     _fill_naive_neighbor_matrix_pbc_overload,
+    _fill_naive_neighbor_matrix_pbc_selective_overload,
+    _fill_naive_neighbor_matrix_selective_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     _compute_inv_cells_overload,
@@ -66,6 +68,34 @@ _jax_fill_naive_pbc_f32 = jax_kernel(
 )
 _jax_fill_naive_pbc_f64 = jax_kernel(
     _fill_naive_neighbor_matrix_pbc_overload[wp.float64],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+
+# Selective no-PBC naive neighbor matrix kernel wrappers
+_jax_fill_naive_selective_f32 = jax_kernel(
+    _fill_naive_neighbor_matrix_selective_overload[wp.float32],
+    num_outputs=2,
+    in_out_argnames=["neighbor_matrix", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_fill_naive_selective_f64 = jax_kernel(
+    _fill_naive_neighbor_matrix_selective_overload[wp.float64],
+    num_outputs=2,
+    in_out_argnames=["neighbor_matrix", "num_neighbors"],
+    enable_backward=False,
+)
+
+# Selective PBC naive neighbor matrix kernel wrappers
+_jax_fill_naive_pbc_selective_f32 = jax_kernel(
+    _fill_naive_neighbor_matrix_pbc_selective_overload[wp.float32],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_fill_naive_pbc_selective_f64 = jax_kernel(
+    _fill_naive_neighbor_matrix_pbc_selective_overload[wp.float64],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
@@ -123,6 +153,7 @@ def naive_neighbor_list(
     shift_range_per_dimension: jax.Array | None = None,
     shift_offset: jax.Array | None = None,
     total_shifts: int | None = None,
+    rebuild_flags: jax.Array | None = None,
 ) -> (
     tuple[jax.Array, jax.Array, jax.Array, jax.Array]
     | tuple[jax.Array, jax.Array, jax.Array]
@@ -282,12 +313,12 @@ def naive_neighbor_list(
             fill_value,
             dtype=jnp.int32,
         )
-    else:
+    elif rebuild_flags is None:
         neighbor_matrix = neighbor_matrix.at[:].set(fill_value)
 
     if num_neighbors is None:
         num_neighbors = jnp.zeros(positions.shape[0], dtype=jnp.int32)
-    else:
+    elif rebuild_flags is None:
         num_neighbors = num_neighbors.at[:].set(0)
 
     if pbc is not None:
@@ -296,7 +327,7 @@ def naive_neighbor_list(
                 (positions.shape[0], max_neighbors, 3),
                 dtype=jnp.int32,
             )
-        else:
+        elif rebuild_flags is None:
             neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(0)
         if (
             total_shifts is None
@@ -336,11 +367,15 @@ def naive_neighbor_list(
     if positions.dtype == jnp.float64:
         _jax_fill = _jax_fill_naive_f64
         _jax_fill_pbc = _jax_fill_naive_pbc_f64
+        _jax_fill_selective = _jax_fill_naive_selective_f64
+        _jax_fill_pbc_selective = _jax_fill_naive_pbc_selective_f64
         _jax_inv_cells = _jax_compute_inv_cells_f64
         _jax_wrap_single = _jax_wrap_positions_single_f64
     else:
         _jax_fill = _jax_fill_naive_f32
         _jax_fill_pbc = _jax_fill_naive_pbc_f32
+        _jax_fill_selective = _jax_fill_naive_selective_f32
+        _jax_fill_pbc_selective = _jax_fill_naive_pbc_selective_f32
         _jax_inv_cells = _jax_compute_inv_cells_f32
         _jax_wrap_single = _jax_wrap_positions_single_f32
         positions = positions.astype(jnp.float32)
@@ -349,14 +384,29 @@ def naive_neighbor_list(
 
     if pbc is None:
         # No PBC case
-        neighbor_matrix, num_neighbors = _jax_fill(
-            positions,
-            float(cutoff * cutoff),
-            neighbor_matrix,
-            num_neighbors,
-            half_fill,
-            launch_dims=(total_atoms,),
-        )
+        if rebuild_flags is not None:
+            rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)
+            num_neighbors = jnp.where(
+                rf[0], jnp.zeros_like(num_neighbors), num_neighbors
+            )
+            neighbor_matrix, num_neighbors = _jax_fill_selective(
+                positions,
+                float(cutoff * cutoff),
+                neighbor_matrix,
+                num_neighbors,
+                half_fill,
+                rf,
+                launch_dims=(total_atoms,),
+            )
+        else:
+            neighbor_matrix, num_neighbors = _jax_fill(
+                positions,
+                float(cutoff * cutoff),
+                neighbor_matrix,
+                num_neighbors,
+                half_fill,
+                launch_dims=(total_atoms,),
+            )
     else:
         # PBC case - expand shifts first
         shifts = jnp.zeros((total_shifts, 3), dtype=jnp.int32)
@@ -391,18 +441,39 @@ def naive_neighbor_list(
             launch_dims=(total_atoms,),
         )
 
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
-            positions_wrapped,
-            per_atom_cell_offsets,
-            float(cutoff * cutoff),
-            cell,
-            shifts,
-            neighbor_matrix,
-            neighbor_matrix_shifts,
-            num_neighbors,
-            half_fill,
-            launch_dims=(total_shifts, total_atoms),
-        )
+        if rebuild_flags is not None:
+            rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)
+            num_neighbors = jnp.where(
+                rf[0], jnp.zeros_like(num_neighbors), num_neighbors
+            )
+            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
+                _jax_fill_pbc_selective(
+                    positions_wrapped,
+                    per_atom_cell_offsets,
+                    float(cutoff * cutoff),
+                    cell,
+                    shifts,
+                    neighbor_matrix,
+                    neighbor_matrix_shifts,
+                    num_neighbors,
+                    half_fill,
+                    rf,
+                    launch_dims=(total_shifts, total_atoms),
+                )
+            )
+        else:
+            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
+                positions_wrapped,
+                per_atom_cell_offsets,
+                float(cutoff * cutoff),
+                cell,
+                shifts,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                half_fill,
+                launch_dims=(total_shifts, total_atoms),
+            )
 
     if return_neighbor_list:
         if pbc is not None:

@@ -41,6 +41,82 @@ __all__ = [
 ###########################################################################################
 
 
+@wp.func
+def _batch_naive_neighbor_body(
+    tid: int,
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+):
+    isys = batch_idx[tid]
+    j_end = batch_ptr[isys + 1]
+    positions_i = positions[tid]
+    max_neighbors = neighbor_matrix.shape[1]
+    for j in range(tid + 1, j_end):
+        diff = positions_i - positions[j]
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff_sq:
+            _update_neighbor_matrix(
+                tid, j, neighbor_matrix, num_neighbors, max_neighbors, half_fill
+            )
+
+
+@wp.func
+def _batch_naive_neighbor_pbc_body(
+    ishift: int,
+    iatom_global: int,
+    isys: int,
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cell: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_ptr: wp.array(dtype=wp.int32),
+    shifts: wp.array(dtype=wp.vec3i),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+):
+    jatom_start = batch_ptr[isys]
+    jatom_end = batch_ptr[isys + 1]
+    maxnb = neighbor_matrix.shape[1]
+    _shift = shifts[ishift]
+    _cell = cell[isys]
+    _pos_i = positions[iatom_global]
+    _int_i = per_atom_cell_offsets[iatom_global]
+    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i
+    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
+    if _zero_shift:
+        jatom_end = iatom_global
+    for jatom in range(jatom_start, jatom_end):
+        _pos_j = positions[jatom]
+        diff = positions_shifted - _pos_j
+        dist_sq = wp.length_sq(diff)
+        if dist_sq < cutoff_sq:
+            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
+            # holds for the original (potentially unwrapped) positions.
+            _int_j = per_atom_cell_offsets[jatom]
+            _corrected_shift = wp.vec3i(
+                _shift[0] - _int_i[0] + _int_j[0],
+                _shift[1] - _int_i[1] + _int_j[1],
+                _shift[2] - _int_i[2] + _int_j[2],
+            )
+            _update_neighbor_matrix_pbc(
+                jatom,
+                iatom_global,
+                neighbor_matrix,
+                neighbor_matrix_shifts,
+                num_neighbors,
+                _corrected_shift,
+                maxnb,
+                half_fill,
+            )
+
+
 @wp.kernel(enable_backward=False)
 def _fill_batch_naive_neighbor_matrix(
     positions: wp.array(dtype=Any),
@@ -95,23 +171,21 @@ def _fill_batch_naive_neighbor_matrix(
     _fill_batch_naive_neighbor_matrix_pbc : Version with periodic boundary conditions
     """
     tid = wp.tid()
-    isys = batch_idx[tid]
-    j_end = batch_ptr[isys + 1]
-
-    positions_i = positions[tid]
-    max_neighbors = neighbor_matrix.shape[1]
-    for j in range(tid + 1, j_end):
-        diff = positions_i - positions[j]
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff_sq:
-            _update_neighbor_matrix(
-                tid, j, neighbor_matrix, num_neighbors, max_neighbors, half_fill
-            )
+    _batch_naive_neighbor_body(
+        tid,
+        positions,
+        cutoff_sq,
+        batch_idx,
+        batch_ptr,
+        neighbor_matrix,
+        num_neighbors,
+        half_fill,
+    )
 
 
 @wp.kernel(enable_backward=False)
 def _fill_batch_naive_neighbor_matrix_pbc(
-    positions_wrapped: wp.array(dtype=Any),
+    positions: wp.array(dtype=Any),
     per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
     cell: wp.array(dtype=Any),
     cutoff_sq: Any,
@@ -134,8 +208,9 @@ def _fill_batch_naive_neighbor_matrix_pbc(
 
     Parameters
     ----------
-    positions_wrapped : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Pre-wrapped concatenated atomic coordinates for all systems (inside primary cells).
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems in Cartesian space.
+        Assumed to be wrapped into the primary cell before calling this kernel via wrap_positions_batch.
     per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
         Integer cell offsets for each atom (floor of fractional coordinates).
         Used to reconstruct corrected shift vectors for the original positions.
@@ -189,45 +264,22 @@ def _fill_batch_naive_neighbor_matrix_pbc(
     if iatom >= _natom:
         return
 
-    start = batch_ptr[isys]
-    iatom = iatom + start
-    jatom_start = start
-    jatom_end = batch_ptr[isys + 1]
-
-    maxnb = neighbor_matrix.shape[1]
-    _shift = shifts[ishift]
-    _cell = cell[isys]
-
-    _pos_i_wrapped = positions_wrapped[iatom]
-    _int_i = per_atom_cell_offsets[iatom]
-    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
-
-    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
-    if _zero_shift:
-        jatom_end = iatom
-    for jatom in range(jatom_start, jatom_end):
-        _pos_j_wrapped = positions_wrapped[jatom]
-        diff = positions_shifted - _pos_j_wrapped
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff_sq:
-            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
-            # holds for the original (potentially unwrapped) positions.
-            _int_j = per_atom_cell_offsets[jatom]
-            _corrected_shift = wp.vec3i(
-                _shift[0] - _int_i[0] + _int_j[0],
-                _shift[1] - _int_i[1] + _int_j[1],
-                _shift[2] - _int_i[2] + _int_j[2],
-            )
-            _update_neighbor_matrix_pbc(
-                jatom,
-                iatom,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                _corrected_shift,
-                maxnb,
-                half_fill,
-            )
+    iatom_global = iatom + batch_ptr[isys]
+    _batch_naive_neighbor_pbc_body(
+        ishift,
+        iatom_global,
+        isys,
+        positions,
+        per_atom_cell_offsets,
+        cell,
+        cutoff_sq,
+        batch_ptr,
+        shifts,
+        neighbor_matrix,
+        neighbor_matrix_shifts,
+        num_neighbors,
+        half_fill,
+    )
 
 
 T = [wp.float32, wp.float64, wp.float16]
@@ -311,21 +363,21 @@ def _fill_batch_naive_neighbor_matrix_selective(
     isys = batch_idx[tid]
     if not rebuild_flags[isys]:
         return
-    j_end = batch_ptr[isys + 1]
-    positions_i = positions[tid]
-    max_neighbors = neighbor_matrix.shape[1]
-    for j in range(tid + 1, j_end):
-        diff = positions_i - positions[j]
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff_sq:
-            _update_neighbor_matrix(
-                tid, j, neighbor_matrix, num_neighbors, max_neighbors, half_fill
-            )
+    _batch_naive_neighbor_body(
+        tid,
+        positions,
+        cutoff_sq,
+        batch_idx,
+        batch_ptr,
+        neighbor_matrix,
+        num_neighbors,
+        half_fill,
+    )
 
 
 @wp.kernel(enable_backward=False)
 def _fill_batch_naive_neighbor_matrix_pbc_selective(
-    positions_wrapped: wp.array(dtype=Any),
+    positions: wp.array(dtype=Any),
     per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
     cell: wp.array(dtype=Any),
     cutoff_sq: Any,
@@ -345,8 +397,9 @@ def _fill_batch_naive_neighbor_matrix_pbc_selective(
 
     Parameters
     ----------
-    positions_wrapped : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Pre-wrapped concatenated atomic coordinates for all systems (inside primary cells).
+    positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
+        Concatenated atomic coordinates for all systems in Cartesian space.
+        Assumed to be wrapped into the primary cell before calling this kernel via wrap_positions_batch.
     per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
         Integer cell offsets for each atom (floor of fractional coordinates).
     cell : wp.array, shape (num_systems, 3, 3), dtype=wp.mat33*
@@ -386,45 +439,22 @@ def _fill_batch_naive_neighbor_matrix_pbc_selective(
     if iatom >= _natom:
         return
 
-    start = batch_ptr[isys]
-    iatom = iatom + start
-    jatom_start = start
-    jatom_end = batch_ptr[isys + 1]
-
-    maxnb = neighbor_matrix.shape[1]
-    _shift = shifts[ishift]
-    _cell = cell[isys]
-
-    _pos_i_wrapped = positions_wrapped[iatom]
-    _int_i = per_atom_cell_offsets[iatom]
-    positions_shifted = type(_cell[0])(_shift) * _cell + _pos_i_wrapped
-
-    _zero_shift = _shift[0] == 0 and _shift[1] == 0 and _shift[2] == 0
-    if _zero_shift:
-        jatom_end = iatom
-    for jatom in range(jatom_start, jatom_end):
-        _pos_j_wrapped = positions_wrapped[jatom]
-        diff = positions_shifted - _pos_j_wrapped
-        dist_sq = wp.length_sq(diff)
-        if dist_sq < cutoff_sq:
-            # Correct the stored shift so that dist = pos_i - pos_j - shift*cell
-            # holds for the original (potentially unwrapped) positions.
-            _int_j = per_atom_cell_offsets[jatom]
-            _corrected_shift = wp.vec3i(
-                _shift[0] - _int_i[0] + _int_j[0],
-                _shift[1] - _int_i[1] + _int_j[1],
-                _shift[2] - _int_i[2] + _int_j[2],
-            )
-            _update_neighbor_matrix_pbc(
-                jatom,
-                iatom,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                _corrected_shift,
-                maxnb,
-                half_fill,
-            )
+    iatom_global = iatom + batch_ptr[isys]
+    _batch_naive_neighbor_pbc_body(
+        ishift,
+        iatom_global,
+        isys,
+        positions,
+        per_atom_cell_offsets,
+        cell,
+        cutoff_sq,
+        batch_ptr,
+        shifts,
+        neighbor_matrix,
+        neighbor_matrix_shifts,
+        num_neighbors,
+        half_fill,
+    )
 
 
 _fill_batch_naive_neighbor_matrix_selective_overload = {}

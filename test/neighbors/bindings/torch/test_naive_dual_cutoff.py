@@ -535,3 +535,127 @@ class TestNaiveDualCutoffOutputFormats:
 
         # cutoff2 should find at least as many neighbors as cutoff1
         assert torch.all(num_neighbors2 >= num_neighbors1)
+
+
+class TestNaiveDualCutoffSelectiveRebuildFlags:
+    """Test selective rebuild (rebuild_flags) for naive_neighbor_list_dual_cutoff torch binding."""
+
+    def test_no_rebuild_preserves_data(self, device, dtype):
+        """Flag=False: neighbor data should remain unchanged."""
+        if device == "cpu":
+            pytest.skip("Selective rebuild requires GPU (warp)")
+
+        positions, _, _ = create_simple_cubic_system(dtype=dtype, device=device)
+        cutoff1 = 1.0
+        cutoff2 = 1.5
+        max_neighbors1 = 15
+        max_neighbors2 = 25
+
+        # Initial full build (pre-allocated output)
+        nm1 = torch.full(
+            (positions.shape[0], max_neighbors1), -1, dtype=torch.int32, device=device
+        )
+        nm2 = torch.full(
+            (positions.shape[0], max_neighbors2), -1, dtype=torch.int32, device=device
+        )
+        nn1 = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+        nn2 = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+
+        naive_neighbor_list_dual_cutoff(
+            positions,
+            cutoff1,
+            cutoff2,
+            max_neighbors1=max_neighbors1,
+            max_neighbors2=max_neighbors2,
+            neighbor_matrix1=nm1,
+            neighbor_matrix2=nm2,
+            num_neighbors1=nn1,
+            num_neighbors2=nn2,
+        )
+
+        saved_nn1 = nn1.clone()
+        saved_nn2 = nn2.clone()
+
+        rebuild_flags = torch.zeros(1, dtype=torch.bool, device=device)
+        naive_neighbor_list_dual_cutoff(
+            positions,
+            cutoff1,
+            cutoff2,
+            max_neighbors1=max_neighbors1,
+            max_neighbors2=max_neighbors2,
+            neighbor_matrix1=nm1,
+            neighbor_matrix2=nm2,
+            num_neighbors1=nn1,
+            num_neighbors2=nn2,
+            rebuild_flags=rebuild_flags,
+        )
+
+        assert torch.equal(nn1, saved_nn1), "nn1 must be unchanged when flag=False"
+        assert torch.equal(nn2, saved_nn2), "nn2 must be unchanged when flag=False"
+
+    def test_rebuild_updates_data(self, device, dtype):
+        """Flag=True: result should match a fresh full rebuild."""
+        if device == "cpu":
+            pytest.skip("Selective rebuild requires GPU (warp)")
+
+        positions, _, _ = create_simple_cubic_system(dtype=dtype, device=device)
+        cutoff1 = 1.0
+        cutoff2 = 1.5
+        max_neighbors1 = 15
+        max_neighbors2 = 25
+
+        # Reference: full build
+        nm1_ref = torch.full(
+            (positions.shape[0], max_neighbors1), -1, dtype=torch.int32, device=device
+        )
+        nm2_ref = torch.full(
+            (positions.shape[0], max_neighbors2), -1, dtype=torch.int32, device=device
+        )
+        nn1_ref = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+        nn2_ref = torch.zeros(positions.shape[0], dtype=torch.int32, device=device)
+        naive_neighbor_list_dual_cutoff(
+            positions,
+            cutoff1,
+            cutoff2,
+            max_neighbors1=max_neighbors1,
+            max_neighbors2=max_neighbors2,
+            neighbor_matrix1=nm1_ref,
+            neighbor_matrix2=nm2_ref,
+            num_neighbors1=nn1_ref,
+            num_neighbors2=nn2_ref,
+        )
+
+        # Selective rebuild with flag=True
+        nm1_sel = torch.full(
+            (positions.shape[0], max_neighbors1), 99, dtype=torch.int32, device=device
+        )
+        nm2_sel = torch.full(
+            (positions.shape[0], max_neighbors2), 99, dtype=torch.int32, device=device
+        )
+        nn1_sel = torch.full(
+            (positions.shape[0],), 99, dtype=torch.int32, device=device
+        )
+        nn2_sel = torch.full(
+            (positions.shape[0],), 99, dtype=torch.int32, device=device
+        )
+
+        rebuild_flags = torch.ones(1, dtype=torch.bool, device=device)
+        naive_neighbor_list_dual_cutoff(
+            positions,
+            cutoff1,
+            cutoff2,
+            max_neighbors1=max_neighbors1,
+            max_neighbors2=max_neighbors2,
+            neighbor_matrix1=nm1_sel,
+            neighbor_matrix2=nm2_sel,
+            num_neighbors1=nn1_sel,
+            num_neighbors2=nn2_sel,
+            rebuild_flags=rebuild_flags,
+        )
+
+        assert torch.equal(nn1_sel, nn1_ref), (
+            "nn1 should match full rebuild when flag=True"
+        )
+        assert torch.equal(nn2_sel, nn2_ref), (
+            "nn2 should match full rebuild when flag=True"
+        )
