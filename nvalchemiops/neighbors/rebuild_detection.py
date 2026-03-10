@@ -368,14 +368,14 @@ def _check_batch_atoms_moved_beyond_skin(
         Typically set to (cutoff_radius - cutoff) / 2.
     rebuild_flags : wp.array, shape (num_systems,), dtype=bool
         OUTPUT: Per-system flags set to True if any atom in that system moved beyond
-        skin distance (modified atomically per system).
+        skin distance (modified per system).
     overwrite_reference_positions : bool, optional
         If True, overwrite reference positions with current positions.
         When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
-    - Modifies: rebuild_flags (atomic write per system)
+    - Modifies: rebuild_flags
     - Early termination: Threads exit if their system's rebuild flag is already set
     - Displacement calculation uses Euclidean distance
     - No CPU-GPU synchronization required; flags are set entirely on GPU
@@ -454,12 +454,12 @@ def _check_batch_atoms_changed_cells(
     pbc : wp.array2d, shape (num_systems, 3), dtype=bool
         Per-system periodic boundary condition flags.
     rebuild_flags : wp.array, shape (num_systems,), dtype=bool
-        OUTPUT: Per-system flags set to True if any atom changed cells (modified atomically).
+        OUTPUT: Per-system flags set to True if any atom changed cells.
 
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
-    - Modifies: rebuild_flags (atomic write per system)
+    - Modifies: rebuild_flags
     - Early termination: Threads exit if their system's rebuild flag is already set
     - Handles periodic boundaries with proper wrapping per system
     - No CPU-GPU synchronization required; flags are set entirely on GPU
