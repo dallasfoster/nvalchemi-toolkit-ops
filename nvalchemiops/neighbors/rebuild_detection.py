@@ -24,6 +24,8 @@ from typing import Any
 
 import warp as wp
 
+from nvalchemiops.torch.types import get_wp_dtype
+
 __all__ = [
     "check_cell_list_rebuild",
     "check_neighbor_list_rebuild",
@@ -124,45 +126,6 @@ def _check_atoms_changed_cells(
         rebuild_flag[0] = True
 
 
-@wp.overload
-def _check_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3d),
-    cell: wp.array(dtype=wp.mat33d),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    cells_per_dimension: wp.array(dtype=wp.int32),
-    pbc: wp.array(dtype=wp.bool),
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float64 precision overload for atom cell change detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3f),
-    cell: wp.array(dtype=wp.mat33f),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    cells_per_dimension: wp.array(dtype=wp.int32),
-    pbc: wp.array(dtype=wp.bool),
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float32 precision overload for atom cell change detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3h),
-    cell: wp.array(dtype=wp.mat33h),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    cells_per_dimension: wp.array(dtype=wp.int32),
-    pbc: wp.array(dtype=wp.bool),
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float16 precision overload for atom cell change detection kernel."""
-    ...
-
-
 # Generate overload dictionary for cell list rebuild kernel
 _T = [wp.float32, wp.float64, wp.float16]
 _V = [wp.vec3f, wp.vec3d, wp.vec3h]
@@ -193,6 +156,7 @@ def _check_atoms_moved_beyond_skin(
     current_positions: wp.array(dtype=Any),
     skin_distance_threshold: Any,
     rebuild_flag: wp.array(dtype=wp.bool),
+    overwrite_reference_positions: bool = False,
 ) -> None:
     """Detect if atoms have moved beyond skin distance requiring neighbor list rebuild.
 
@@ -211,6 +175,9 @@ def _check_atoms_moved_beyond_skin(
         Typically set to (cutoff_radius - cutoff) / 2.
     rebuild_flag : wp.array, shape (1,), dtype=bool
         OUTPUT: Flag set to True if any atom moved beyond skin distance (modified atomically).
+    overwrite_reference_positions : bool, optional
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
 
     Notes
     -----
@@ -227,6 +194,8 @@ def _check_atoms_moved_beyond_skin(
 
     # Skip computation if rebuild already flagged by another thread
     if rebuild_flag[0]:
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     # Calculate displacement vector from reference to current position
@@ -237,39 +206,7 @@ def _check_atoms_moved_beyond_skin(
     if displacement_magnitude > skin_distance_threshold:
         # Neighbor list is no longer valid - flag for rebuild
         rebuild_flag[0] = True
-
-
-@wp.overload
-def _check_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3d),
-    current_positions: wp.array(dtype=wp.vec3d),
-    skin_distance_threshold: wp.float64,
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float64 precision overload for skin distance movement detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3f),
-    current_positions: wp.array(dtype=wp.vec3f),
-    skin_distance_threshold: wp.float32,
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float32 precision overload for skin distance movement detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3h),
-    current_positions: wp.array(dtype=wp.vec3h),
-    skin_distance_threshold: wp.float16,
-    rebuild_flag: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float16 precision overload for skin distance movement detection kernel."""
-    ...
+        reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 # Generate overload dictionary for neighbor list rebuild kernel
@@ -282,6 +219,7 @@ for t, v in zip(_T, _V):
             wp.array(dtype=v),
             t,
             wp.array(dtype=wp.bool),
+            wp.bool,
         ],
     )
 
@@ -319,11 +257,6 @@ def check_cell_list_rebuild(
         Periodic boundary condition flags.
     rebuild_flag : wp.array, shape (1,), dtype=wp.bool
         OUTPUT: Flag set to True if rebuild is needed.
-    wp_dtype : type
-        Warp dtype (wp.float32, wp.float64, or wp.float16).
-    device : str
-        Warp device string (e.g., 'cuda:0', 'cpu').
-
     Notes
     -----
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
@@ -334,7 +267,8 @@ def check_cell_list_rebuild(
     _check_atoms_changed_cells : Kernel that performs the check
     """
     total_atoms = current_positions.shape[0]
-
+    device = str(current_positions.device)
+    wp_dtype = get_wp_dtype(current_positions.dtype)
     wp.launch(
         kernel=_check_atoms_changed_cells_overload[wp_dtype],
         dim=total_atoms,
@@ -355,8 +289,7 @@ def check_neighbor_list_rebuild(
     current_positions: wp.array,
     skin_distance_threshold: float,
     rebuild_flag: wp.array,
-    wp_dtype: type,
-    device: str,
+    overwrite_reference_positions: bool = False,
 ) -> None:
     """Core warp launcher for detecting if neighbor list needs rebuilding.
 
@@ -372,10 +305,9 @@ def check_neighbor_list_rebuild(
         Maximum allowed displacement before neighbor list becomes invalid.
     rebuild_flag : wp.array, shape (1,), dtype=wp.bool
         OUTPUT: Flag set to True if rebuild is needed.
-    wp_dtype : type
-        Warp dtype (wp.float32, wp.float64, or wp.float16).
-    device : str
-        Warp device string (e.g., 'cuda:0', 'cpu').
+    overwrite_reference_positions : bool, optional
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
 
     Notes
     -----
@@ -387,7 +319,19 @@ def check_neighbor_list_rebuild(
     _check_atoms_moved_beyond_skin : Kernel that performs the check
     """
     total_atoms = reference_positions.shape[0]
-
+    device = str(reference_positions.device)
+    wp_vec_dtype = reference_positions.dtype()
+    wp_dtype = (
+        wp.float32
+        if isinstance(wp_vec_dtype, wp.vec3f)
+        else wp.float64
+        if isinstance(wp_vec_dtype, wp.vec3d)
+        else wp.float16
+        if isinstance(wp_vec_dtype, wp.vec3h)
+        else None
+    )
+    if wp_dtype is None:
+        raise ValueError(f"Unsupported dtype: {wp_vec_dtype}")
     wp.launch(
         kernel=_check_atoms_moved_beyond_skin_overload[wp_dtype],
         dim=total_atoms,
@@ -396,6 +340,7 @@ def check_neighbor_list_rebuild(
             current_positions,
             wp_dtype(skin_distance_threshold),
             rebuild_flag,
+            overwrite_reference_positions,
         ],
         device=device,
     )
@@ -413,6 +358,7 @@ def _check_batch_atoms_moved_beyond_skin(
     batch_idx: wp.array(dtype=wp.int32),
     skin_distance_threshold: Any,
     rebuild_flags: wp.array(dtype=wp.bool),
+    overwrite_reference_positions: bool = False,
 ) -> None:
     """Detect per-system if atoms moved beyond skin distance requiring neighbor list rebuild.
 
@@ -434,7 +380,9 @@ def _check_batch_atoms_moved_beyond_skin(
     rebuild_flags : wp.array, shape (num_systems,), dtype=bool
         OUTPUT: Per-system flags set to True if any atom in that system moved beyond
         skin distance (modified atomically per system).
-
+    overwrite_reference_positions : bool, optional
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
@@ -452,6 +400,8 @@ def _check_batch_atoms_moved_beyond_skin(
 
     # Skip computation if rebuild already flagged for this system
     if rebuild_flags[isys]:
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     displacement_vector = current_positions[atom_idx] - reference_positions[atom_idx]
@@ -459,42 +409,8 @@ def _check_batch_atoms_moved_beyond_skin(
 
     if displacement_magnitude > skin_distance_threshold:
         rebuild_flags[isys] = True
-
-
-@wp.overload
-def _check_batch_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3d),
-    current_positions: wp.array(dtype=wp.vec3d),
-    batch_idx: wp.array(dtype=wp.int32),
-    skin_distance_threshold: wp.float64,
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float64 precision overload for batch skin distance movement detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_batch_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3f),
-    current_positions: wp.array(dtype=wp.vec3f),
-    batch_idx: wp.array(dtype=wp.int32),
-    skin_distance_threshold: wp.float32,
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float32 precision overload for batch skin distance movement detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_batch_atoms_moved_beyond_skin(
-    reference_positions: wp.array(dtype=wp.vec3h),
-    current_positions: wp.array(dtype=wp.vec3h),
-    batch_idx: wp.array(dtype=wp.int32),
-    skin_distance_threshold: wp.float16,
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float16 precision overload for batch skin distance movement detection kernel."""
-    ...
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 # Generate overload dictionary for batch neighbor list rebuild kernel
@@ -508,6 +424,7 @@ for t, v in zip(_T, _V):
             wp.array(dtype=wp.int32),
             t,
             wp.array(dtype=wp.bool),
+            bool,
         ],
     )
 
@@ -606,48 +523,6 @@ def _check_batch_atoms_changed_cells(
         rebuild_flags[isys] = True
 
 
-@wp.overload
-def _check_batch_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3d),
-    cell: wp.array(dtype=wp.mat33d),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    batch_idx: wp.array(dtype=wp.int32),
-    cells_per_dimension: wp.array(dtype=wp.vec3i),
-    pbc: wp.array2d(dtype=wp.bool),
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float64 precision overload for batch atom cell change detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_batch_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3f),
-    cell: wp.array(dtype=wp.mat33f),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    batch_idx: wp.array(dtype=wp.int32),
-    cells_per_dimension: wp.array(dtype=wp.vec3i),
-    pbc: wp.array2d(dtype=wp.bool),
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float32 precision overload for batch atom cell change detection kernel."""
-    ...
-
-
-@wp.overload
-def _check_batch_atoms_changed_cells(
-    current_positions: wp.array(dtype=wp.vec3h),
-    cell: wp.array(dtype=wp.mat33h),
-    atom_to_cell_mapping: wp.array(dtype=wp.vec3i),
-    batch_idx: wp.array(dtype=wp.int32),
-    cells_per_dimension: wp.array(dtype=wp.vec3i),
-    pbc: wp.array2d(dtype=wp.bool),
-    rebuild_flags: wp.array(dtype=wp.bool),
-) -> None:  # pragma: no cover
-    """Float16 precision overload for batch atom cell change detection kernel."""
-    ...
-
-
 # Generate overload dictionary for batch cell list rebuild kernel
 _check_batch_atoms_changed_cells_overload = {}
 for t, v, m in zip(_T, _V, _M):
@@ -676,8 +551,7 @@ def check_batch_neighbor_list_rebuild(
     batch_idx: wp.array,
     skin_distance_threshold: float,
     rebuild_flags: wp.array,
-    wp_dtype: type,
-    device: str,
+    overwrite_reference_positions: bool = False,
 ) -> None:
     """Core warp launcher for detecting per-system neighbor list rebuild needs.
 
@@ -698,10 +572,9 @@ def check_batch_neighbor_list_rebuild(
     rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
         OUTPUT: Per-system flags set to True if rebuild is needed.
         Must be pre-allocated and initialized to False by caller.
-    wp_dtype : type
-        Warp dtype (wp.float32, wp.float64, or wp.float16).
-    device : str
-        Warp device string (e.g., 'cuda:0', 'cpu').
+    overwrite_reference_positions : bool, optional
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
 
     Notes
     -----
@@ -714,7 +587,18 @@ def check_batch_neighbor_list_rebuild(
     _check_batch_atoms_moved_beyond_skin : Kernel that performs the check
     """
     total_atoms = reference_positions.shape[0]
-
+    wp_vec_dtype = reference_positions.dtype()
+    wp_dtype = (
+        wp.float32
+        if isinstance(wp_vec_dtype, wp.vec3f)
+        else wp.float64
+        if isinstance(wp_vec_dtype, wp.vec3d)
+        else wp.float16
+        if isinstance(wp_vec_dtype, wp.vec3h)
+        else None
+    )
+    if wp_dtype is None:
+        raise ValueError(f"Unsupported dtype: {wp_vec_dtype}")
     wp.launch(
         kernel=_check_batch_atoms_moved_beyond_skin_overload[wp_dtype],
         dim=total_atoms,
@@ -724,8 +608,8 @@ def check_batch_neighbor_list_rebuild(
             batch_idx,
             wp_dtype(skin_distance_threshold),
             rebuild_flags,
+            overwrite_reference_positions,
         ],
-        device=device,
     )
 
 
@@ -737,8 +621,6 @@ def check_batch_cell_list_rebuild(
     cell: wp.array,
     pbc: wp.array,
     rebuild_flags: wp.array,
-    wp_dtype: type,
-    device: str,
 ) -> None:
     """Core warp launcher for detecting per-system cell list rebuild needs.
 
@@ -763,10 +645,6 @@ def check_batch_cell_list_rebuild(
     rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
         OUTPUT: Per-system flags set to True if rebuild is needed.
         Must be pre-allocated and initialized to False by caller.
-    wp_dtype : type
-        Warp dtype (wp.float32, wp.float64, or wp.float16).
-    device : str
-        Warp device string (e.g., 'cuda:0', 'cpu').
 
     Notes
     -----
@@ -779,7 +657,19 @@ def check_batch_cell_list_rebuild(
     _check_batch_atoms_changed_cells : Kernel that performs the check
     """
     total_atoms = current_positions.shape[0]
-
+    device = str(current_positions.device)
+    wp_vec_dtype = current_positions.dtype
+    wp_dtype = (
+        wp.float32
+        if isinstance(wp_vec_dtype, wp.vec3f)
+        else wp.float64
+        if isinstance(wp_vec_dtype, wp.vec3d)
+        else wp.float16
+        if isinstance(wp_vec_dtype, wp.vec3h)
+        else None
+    )
+    if wp_dtype is None:
+        raise ValueError(f"Unsupported dtype: {wp_vec_dtype}")
     wp.launch(
         kernel=_check_batch_atoms_changed_cells_overload[wp_dtype],
         dim=total_atoms,

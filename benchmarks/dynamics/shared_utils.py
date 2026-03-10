@@ -61,8 +61,24 @@ from nvalchemiops.dynamics.utils import (
     wrap_positions_to_cell,
 )
 from nvalchemiops.interactions import lj_energy_forces, lj_energy_forces_virial
-from nvalchemiops.torch.neighbors import batch_cell_list, cell_list
-from nvalchemiops.torch.neighbors.rebuild_detection import neighbor_list_needs_rebuild
+from nvalchemiops.neighbors.batch_cell_list import (
+    batch_build_cell_list,
+    batch_query_cell_list,
+)
+from nvalchemiops.neighbors.cell_list import build_cell_list, query_cell_list
+from nvalchemiops.neighbors.neighbor_utils import (
+    selective_zero_num_neighbors,
+    selective_zero_num_neighbors_single,
+    update_ref_positions,
+    update_ref_positions_batch,
+    zero_array,
+)
+from nvalchemiops.neighbors.rebuild_detection import (
+    check_batch_neighbor_list_rebuild,
+    check_neighbor_list_rebuild,
+)
+from nvalchemiops.torch.neighbors.batch_cell_list import estimate_batch_cell_list_sizes
+from nvalchemiops.torch.neighbors.cell_list import estimate_cell_list_sizes
 
 wp.init()
 
@@ -752,10 +768,11 @@ def virial_to_stress(
 
 
 class NeighborListManager:
-    """Manages neighbor list construction and updates.
+    """Manages neighbor list construction and updates (warp-native, zero CPU-GPU sync).
 
-    Uses the cell list algorithm for O(N) neighbor finding with periodic
-    boundary conditions.
+    Uses the cell list algorithm for O(N) neighbor finding with periodic boundary
+    conditions. All neighbor data lives in pre-allocated warp arrays; the rebuild
+    decision is made entirely on the GPU via skin-distance checking.
 
     Parameters
     ----------
@@ -766,10 +783,20 @@ class NeighborListManager:
     skin : float
         Neighbor list skin distance (Angstrom). Rebuild when any atom
         moves more than skin/2.
+    initial_cell : np.ndarray, shape (3, 3)
+        Initial cell matrix used to estimate cell list buffer sizes.
+    pbc : list of bool, length 3
+        Periodic boundary conditions in each dimension.
     max_neighbors : int, optional
         Maximum number of neighbors per atom.
+    half_fill : bool, optional
+        If True, only fill half of the neighbor matrix (Newton's 3rd law).
+    wp_dtype : type
+        Warp scalar dtype (wp.float32 or wp.float64).
+    wp_vec_dtype : type
+        Warp vector dtype (wp.vec3f or wp.vec3d).
     device : str, optional
-        Device for warp arrays (e.g., "cuda:0", "cpu").
+        Warp device string (e.g., "cuda:0", "cpu").
     """
 
     def __init__(
@@ -777,8 +804,12 @@ class NeighborListManager:
         num_atoms: int,
         cutoff: float,
         skin: float,
+        initial_cell: np.ndarray,
+        pbc: list,
         max_neighbors: int = 100,
         half_fill: bool = True,
+        wp_dtype: type = wp.float64,
+        wp_vec_dtype: type = wp.vec3d,
         device: str = "cuda:0",
     ):
         self.num_atoms = num_atoms
@@ -786,170 +817,356 @@ class NeighborListManager:
         self.skin = skin
         self.max_neighbors = max_neighbors
         self.half_fill = half_fill
+        self.wp_dtype = wp_dtype
+        self.wp_vec_dtype = wp_vec_dtype
         self.device = device
 
-        # Track positions at last rebuild
-        self.positions_at_rebuild: torch.Tensor | None = None
+        # Store pbc as warp 1D bool array (shape (3,))
+        self.wp_pbc = wp.array(pbc, dtype=wp.bool, device=device)
 
-        # Torch tensors (from cell_list)
-        self.torch_neighbor_matrix: torch.Tensor | None = None
-        self.torch_neighbor_shifts: torch.Tensor | None = None
-        self.torch_num_neighbors: torch.Tensor | None = None
+        # Estimate cell list sizes at init (one-time CPU sync is acceptable here)
+        torch_dtype = torch.float64 if wp_dtype == wp.float64 else torch.float32
+        cell_torch = torch.tensor(
+            initial_cell.reshape(1, 3, 3), dtype=torch_dtype, device=str(device)
+        )
+        pbc_torch = torch.tensor([pbc], dtype=torch.bool, device=str(device))  # (1, 3)
+        max_total_cells, neighbor_search_radius = estimate_cell_list_sizes(
+            cell_torch, pbc_torch, cutoff + skin
+        )
 
-        # Warp arrays (converted from torch)
-        self.wp_neighbor_matrix: wp.array | None = None
-        self.wp_neighbor_shifts: wp.array | None = None
-        self.wp_num_neighbors: wp.array | None = None
+        # Cell list internal buffers (pre-allocated once, reused each step)
+        self.wp_cells_per_dimension = wp.zeros(3, dtype=wp.int32, device=device)
+        self.wp_atom_periodic_shifts = wp.zeros(
+            num_atoms, dtype=wp.vec3i, device=device
+        )
+        self.wp_atom_to_cell_mapping = wp.zeros(
+            num_atoms, dtype=wp.vec3i, device=device
+        )
+        self.wp_atoms_per_cell_count = wp.zeros(
+            max_total_cells, dtype=wp.int32, device=device
+        )
+        self.wp_cell_atom_start_indices = wp.zeros(
+            max_total_cells, dtype=wp.int32, device=device
+        )
+        self.wp_cell_atom_list = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+        self.wp_neighbor_search_radius = wp.from_torch(
+            neighbor_search_radius, dtype=wp.int32
+        )
 
-    def needs_rebuild(self, positions: torch.Tensor) -> bool:
-        """Check if neighbor list needs rebuilding.
+        # Neighbor output buffers (pre-allocated once)
+        self.wp_neighbor_matrix = wp.zeros(
+            (num_atoms, max_neighbors), dtype=wp.int32, device=device
+        )
+        self.wp_neighbor_shifts = wp.zeros(
+            (num_atoms, max_neighbors), dtype=wp.vec3i, device=device
+        )
+        self.wp_num_neighbors = wp.zeros(num_atoms, dtype=wp.int32, device=device)
+
+        # Rebuild detection: reference positions and per-system flag
+        self.wp_ref_positions = wp.zeros(num_atoms, dtype=wp_vec_dtype, device=device)
+        self.wp_rebuild_flag = wp.zeros(1, dtype=wp.bool, device=device)
+
+    def mark_stale(self) -> None:
+        """Force a full rebuild on the next update() call.
+
+        Zeros reference positions so the next skin-distance check always exceeds
+        the threshold. Use after cell changes (NPT/NPH or variable-cell optimization).
+        """
+        self.wp_ref_positions = wp.zeros(
+            self.num_atoms, dtype=self.wp_vec_dtype, device=self.device
+        )
+        # zero_array(self.wp_ref_positions, self.device)
+
+    def update(self, positions_wp: wp.array, cell_wp: wp.array) -> None:
+        """Check and selectively rebuild the neighbor list (no CPU-GPU sync).
 
         Parameters
         ----------
-        positions : torch.Tensor, shape (N, 3)
+        positions_wp : wp.array, shape (N,), dtype=wp.vec3*
             Current atomic positions.
-
-        Returns
-        -------
-        bool
-            True if rebuild needed (any atom moved > skin/2).
+        cell_wp : wp.array, shape (1,), dtype=wp.mat33*
+            Current cell matrix.
         """
-        if self.positions_at_rebuild is None:
-            return True
+        # 1. Zero rebuild flag — kernel only sets True, never clears
+        zero_array(self.wp_rebuild_flag, self.device)
 
-        # Use the package's GPU rebuild detection kernel (early-termination).
-        # Note: the returned tensor is on-device; calling .item() syncs, but this
-        # is still cheaper than a full max-reduction in Python.
-        rebuild = neighbor_list_needs_rebuild(
-            reference_positions=self.positions_at_rebuild,
-            current_positions=positions,
-            skin_distance_threshold=float(self.skin / 2.0),
+        # 2. GPU-side displacement check — writes True if any atom moved > skin/2
+        check_neighbor_list_rebuild(
+            reference_positions=self.wp_ref_positions,
+            current_positions=positions_wp,
+            skin_distance_threshold=self.skin / 2.0,
+            rebuild_flag=self.wp_rebuild_flag,
         )
-        return bool(rebuild.item())
 
-    def build(
-        self,
-        positions: torch.Tensor,
-        cell: torch.Tensor,
-        pbc: torch.Tensor,
-    ) -> None:
-        """Build neighbor list from positions.
+        # 3. Always rebuild cell structure (cheap O(N) spatial binning)
+        zero_array(self.wp_atoms_per_cell_count, self.device)
+        build_cell_list(
+            positions_wp,
+            cell_wp,
+            self.wp_pbc,
+            self.cutoff + self.skin,
+            self.wp_cells_per_dimension,
+            self.wp_atom_periodic_shifts,
+            self.wp_atom_to_cell_mapping,
+            self.wp_atoms_per_cell_count,
+            self.wp_cell_atom_start_indices,
+            self.wp_cell_atom_list,
+            self.wp_dtype,
+            self.device,
+        )
 
-        Parameters
-        ----------
-        positions : torch.Tensor, shape (N, 3)
-            Atomic positions.
-        cell : torch.Tensor, shape (3, 3)
-            Unit cell matrix.
-        pbc : torch.Tensor, shape (3,), dtype=bool
-            Periodic boundary conditions in each dimension.
-        """
-        # Use cell_list for efficient neighbor finding
-        neighbor_matrix, num_neighbors, neighbor_shifts = cell_list(
-            positions=positions,
-            cutoff=self.cutoff + self.skin,
-            cell=cell,
-            pbc=pbc,
-            max_neighbors=self.max_neighbors,
+        # 4. Selectively zero num_neighbors and query neighbor matrix
+        selective_zero_num_neighbors_single(
+            self.wp_num_neighbors, self.wp_rebuild_flag, self.device
+        )
+        query_cell_list(
+            positions_wp,
+            cell_wp,
+            self.wp_pbc,
+            self.cutoff + self.skin,
+            self.wp_cells_per_dimension,
+            self.wp_neighbor_search_radius,
+            self.wp_atom_periodic_shifts,
+            self.wp_atom_to_cell_mapping,
+            self.wp_atoms_per_cell_count,
+            self.wp_cell_atom_start_indices,
+            self.wp_cell_atom_list,
+            self.wp_neighbor_matrix,
+            self.wp_neighbor_shifts,
+            self.wp_num_neighbors,
+            self.wp_dtype,
+            self.device,
             half_fill=self.half_fill,
-            fill_value=self.num_atoms,
+            rebuild_flags=self.wp_rebuild_flag,
         )
 
-        self.torch_neighbor_matrix = neighbor_matrix
-        self.torch_neighbor_shifts = neighbor_shifts
-        self.torch_num_neighbors = num_neighbors
-        self.positions_at_rebuild = positions.clone()
-
-        # Convert to warp arrays
-        self._convert_to_warp()
-
-    def _convert_to_warp(self) -> None:
-        """Convert torch tensors to warp arrays."""
-        # Neighbor matrix (int32)
-        self.wp_neighbor_matrix = wp.from_torch(
-            self.torch_neighbor_matrix, dtype=wp.int32
+        # 5. Update reference positions for rebuilt atoms — GPU-side, no sync
+        update_ref_positions(
+            positions_wp,
+            self.wp_rebuild_flag,
+            self.wp_ref_positions,
+            self.wp_dtype,
+            self.device,
         )
-
-        # Shifts (vec3i)
-        self.wp_neighbor_shifts = wp.from_torch(
-            self.torch_neighbor_shifts, dtype=wp.vec3i
-        )
-
-        # Num neighbors (int32)
-        self.wp_num_neighbors = wp.from_torch(self.torch_num_neighbors, dtype=wp.int32)
 
     def total_neighbors(self) -> int:
         """Get total number of neighbors across all atoms."""
-        if self.torch_num_neighbors is None:
-            return 0
-        return int(self.torch_num_neighbors.sum().item())
+        return int(wp.to_torch(self.wp_num_neighbors).sum().item())
 
 
 class BatchedNeighborListManager:
-    """Neighbor list manager for batched systems (multiple independent cells)."""
+    """Neighbor list manager for batched systems (warp-native, zero CPU-GPU sync).
+
+    Uses per-system skin-distance rebuild detection entirely on the GPU.
+    All neighbor data lives in pre-allocated warp arrays reused each step.
+
+    Parameters
+    ----------
+    total_atoms : int
+        Total number of atoms across all systems.
+    cutoff : float
+        Cutoff distance for neighbor detection (Angstrom).
+    skin : float
+        Neighbor list skin distance (Angstrom). Rebuild system when any atom
+        in it moves more than skin/2.
+    batch_idx : np.ndarray, shape (total_atoms,), dtype=int32
+        System index for each atom.
+    num_systems : int
+        Number of systems in the batch.
+    initial_cells : np.ndarray, shape (num_systems, 3, 3)
+        Initial cell matrices used to estimate cell list buffer sizes.
+    pbc : np.ndarray, shape (num_systems, 3), dtype=bool
+        Periodic boundary conditions for each system and dimension.
+    max_neighbors : int, optional
+        Maximum number of neighbors per atom.
+    half_fill : bool, optional
+        If True, only fill half of the neighbor matrix (Newton's 3rd law).
+    wp_dtype : type
+        Warp scalar dtype (wp.float32 or wp.float64).
+    wp_vec_dtype : type
+        Warp vector dtype (wp.vec3f or wp.vec3d).
+    device : str, optional
+        Warp device string (e.g., "cuda:0", "cpu").
+    """
 
     def __init__(
         self,
         total_atoms: int,
         cutoff: float,
         skin: float,
-        batch_idx: torch.Tensor,
+        batch_idx: np.ndarray,
         num_systems: int,
+        initial_cells: np.ndarray,
+        pbc: np.ndarray,
         max_neighbors: int = 100,
         half_fill: bool = True,
+        wp_dtype: type = wp.float64,
+        wp_vec_dtype: type = wp.vec3d,
         device: str = "cuda:0",
     ):
         self.total_atoms = int(total_atoms)
         self.cutoff = float(cutoff)
         self.skin = float(skin)
-        self.batch_idx = batch_idx.to(dtype=torch.int32)
         self.num_systems = int(num_systems)
         self.max_neighbors = int(max_neighbors)
         self.half_fill = bool(half_fill)
+        self.wp_dtype = wp_dtype
+        self.wp_vec_dtype = wp_vec_dtype
         self.device = device
 
-        self.positions_at_rebuild: torch.Tensor | None = None
+        # batch_idx as warp int32 array
+        self.wp_batch_idx = wp.array(
+            np.asarray(batch_idx, dtype=np.int32), dtype=wp.int32, device=device
+        )
 
-        self.torch_neighbor_matrix: torch.Tensor | None = None
-        self.torch_neighbor_shifts: torch.Tensor | None = None
-        self.torch_num_neighbors: torch.Tensor | None = None
+        # pbc as warp 2D bool array (shape (num_systems, 3))
+        pbc_np = np.asarray(pbc, dtype=bool)
+        pbc_torch = torch.tensor(pbc_np, dtype=torch.bool, device=str(device)).reshape(
+            -1, 3
+        )
+        self.wp_pbc = wp.from_torch(pbc_torch, dtype=wp.bool)
 
-        self.wp_neighbor_matrix: wp.array | None = None
-        self.wp_neighbor_shifts: wp.array | None = None
-        self.wp_num_neighbors: wp.array | None = None
+        # Estimate cell list sizes at init (one-time CPU sync is acceptable here)
+        torch_dtype = torch.float64 if wp_dtype == wp.float64 else torch.float32
+        cells_torch = torch.tensor(
+            np.asarray(initial_cells), dtype=torch_dtype, device=str(device)
+        )
+        max_total_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
+            cells_torch, pbc_torch, cutoff + skin
+        )
 
-    def build(
-        self, positions: torch.Tensor, cells: torch.Tensor, pbc: torch.Tensor
-    ) -> None:
-        neighbor_matrix, num_neighbors, neighbor_shifts = batch_cell_list(
-            positions=positions,
-            cutoff=self.cutoff + self.skin,
-            cell=cells,
-            pbc=pbc,
-            batch_idx=self.batch_idx,
-            max_neighbors=self.max_neighbors,
+        # Cell list internal buffers (pre-allocated once, reused each step)
+        self.wp_cells_per_dimension = wp.zeros(
+            num_systems, dtype=wp.vec3i, device=device
+        )
+        self.wp_cell_offsets = wp.zeros(num_systems, dtype=wp.int32, device=device)
+        self.wp_cells_per_system = wp.zeros(num_systems, dtype=wp.int32, device=device)
+        self.wp_atom_periodic_shifts = wp.zeros(
+            total_atoms, dtype=wp.vec3i, device=device
+        )
+        self.wp_atom_to_cell_mapping = wp.zeros(
+            total_atoms, dtype=wp.vec3i, device=device
+        )
+        self.wp_atoms_per_cell_count = wp.zeros(
+            max_total_cells, dtype=wp.int32, device=device
+        )
+        self.wp_cell_atom_start_indices = wp.zeros(
+            max_total_cells, dtype=wp.int32, device=device
+        )
+        self.wp_cell_atom_list = wp.zeros(total_atoms, dtype=wp.int32, device=device)
+        self.wp_neighbor_search_radius = wp.from_torch(
+            neighbor_search_radius, dtype=wp.vec3i
+        )
+
+        # Neighbor output buffers (pre-allocated once)
+        self.wp_neighbor_matrix = wp.zeros(
+            (total_atoms, max_neighbors), dtype=wp.int32, device=device
+        )
+        self.wp_neighbor_shifts = wp.zeros(
+            (total_atoms, max_neighbors), dtype=wp.vec3i, device=device
+        )
+        self.wp_num_neighbors = wp.zeros(total_atoms, dtype=wp.int32, device=device)
+
+        # Rebuild detection: reference positions and per-system flags
+        self.wp_ref_positions = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=device)
+        self.wp_rebuild_flags = wp.zeros(num_systems, dtype=wp.bool, device=device)
+
+    def mark_stale(self) -> None:
+        """Force a full rebuild of all systems on the next update() call.
+
+        Zeros reference positions so all atoms will exceed the skin threshold.
+        Use after cell changes (NPT/NPH or variable-cell optimization).
+        """
+        self.wp_ref_positions = wp.zeros(
+            self.total_atoms, dtype=self.wp_vec_dtype, device=self.device
+        )
+
+    def update(self, positions_wp: wp.array, cells_wp: wp.array) -> None:
+        """Check and selectively rebuild neighbor lists (no CPU-GPU sync).
+
+        Parameters
+        ----------
+        positions_wp : wp.array, shape (total_atoms,), dtype=wp.vec3*
+            Current atomic positions for all systems.
+        cells_wp : wp.array, shape (num_systems,), dtype=wp.mat33*
+            Current cell matrices.
+        """
+        # 1. Zero per-system flags — kernel only sets True, never clears
+        zero_array(self.wp_rebuild_flags, self.device)
+
+        # 2. GPU-side per-system displacement check — no CPU sync
+        check_batch_neighbor_list_rebuild(
+            reference_positions=self.wp_ref_positions,
+            current_positions=positions_wp,
+            batch_idx=self.wp_batch_idx,
+            skin_distance_threshold=self.skin / 2.0,
+            rebuild_flags=self.wp_rebuild_flags,
+            overwrite_reference_positions=True,
+        )
+
+        # 3. Always rebuild cell structure (cheap O(N) spatial binning)
+        zero_array(self.wp_atoms_per_cell_count, self.device)
+        batch_build_cell_list(
+            positions_wp,
+            cells_wp,
+            self.wp_pbc,
+            self.cutoff + self.skin,
+            self.wp_batch_idx,
+            self.wp_cells_per_dimension,
+            self.wp_cell_offsets,
+            self.wp_cells_per_system,
+            self.wp_atom_periodic_shifts,
+            self.wp_atom_to_cell_mapping,
+            self.wp_atoms_per_cell_count,
+            self.wp_cell_atom_start_indices,
+            self.wp_cell_atom_list,
+            self.wp_dtype,
+            self.device,
+        )
+
+        # 4. Selectively zero num_neighbors and query — GPU skips unchanged systems
+        selective_zero_num_neighbors(
+            self.wp_num_neighbors,
+            self.wp_batch_idx,
+            self.wp_rebuild_flags,
+            self.device,
+        )
+        batch_query_cell_list(
+            positions_wp,
+            cells_wp,
+            self.wp_pbc,
+            self.cutoff + self.skin,
+            self.wp_batch_idx,
+            self.wp_cells_per_dimension,
+            self.wp_neighbor_search_radius,
+            self.wp_cell_offsets,
+            self.wp_atom_periodic_shifts,
+            self.wp_atom_to_cell_mapping,
+            self.wp_atoms_per_cell_count,
+            self.wp_cell_atom_start_indices,
+            self.wp_cell_atom_list,
+            self.wp_neighbor_matrix,
+            self.wp_neighbor_shifts,
+            self.wp_num_neighbors,
+            self.wp_dtype,
+            self.device,
             half_fill=self.half_fill,
-            fill_value=self.total_atoms,
+            rebuild_flags=self.wp_rebuild_flags,
         )
-        self.torch_neighbor_matrix = neighbor_matrix
-        self.torch_neighbor_shifts = neighbor_shifts
-        self.torch_num_neighbors = num_neighbors
-        self.positions_at_rebuild = positions.clone()
-        self._convert_to_warp()
 
-    def _convert_to_warp(self) -> None:
-        self.wp_neighbor_matrix = wp.from_torch(
-            self.torch_neighbor_matrix, dtype=wp.int32
+        # 5. Update reference positions for rebuilt atoms — GPU-side, no sync
+        update_ref_positions_batch(
+            positions_wp,
+            self.wp_rebuild_flags,
+            self.wp_batch_idx,
+            self.wp_ref_positions,
+            self.wp_dtype,
+            self.device,
         )
-        self.wp_neighbor_shifts = wp.from_torch(
-            self.torch_neighbor_shifts, dtype=wp.vec3i
-        )
-        self.wp_num_neighbors = wp.from_torch(self.torch_num_neighbors, dtype=wp.int32)
 
     def total_neighbors(self) -> int:
-        if self.torch_num_neighbors is None:
-            return 0
-        return int(self.torch_num_neighbors.sum().item())
+        """Get total number of neighbors across all atoms."""
+        return int(wp.to_torch(self.wp_num_neighbors).sum().item())
 
 
 # ==============================================================================
@@ -1196,7 +1413,7 @@ class MDSystem:
     This class owns the *state* needed for many MD algorithms:
     - positions / velocities / forces / masses (Warp arrays)
     - cell + inverse (Warp arrays)
-    - neighbor list manager (Torch → Warp conversion)
+    - neighbor list manager (warp-native, zero CPU-GPU sync)
     - LJ force evaluation (via :func:`nvalchemiops.interactions.lj_energy_forces`)
 
     Integrators (Langevin, Velocity Verlet, NPT, NPH, ...) should be implemented
@@ -1248,11 +1465,6 @@ class MDSystem:
         # Convert masses to internal MD units (so KE is in eV when v is Å/fs)
         masses = mass_amu_to_internal(masses)
 
-        # Create torch tensors (for neighbor list - uses PyTorch interface)
-        self.positions = positions
-        self.cell = cell
-        self.pbc = pbc
-
         # Create warp arrays for dynamics
         self.wp_positions = wp.from_torch(positions, dtype=self.wp_vec_dtype)
         self.wp_velocities = wp.zeros(
@@ -1271,40 +1483,28 @@ class MDSystem:
         self.wp_cell_inv = wp.empty_like(self.wp_cell)
         compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.wp_device)
 
-        # Set up neighbor list manager
+        # Set up neighbor list manager (initial_cell from torch tensor)
+        initial_cell_np = cell.reshape(3, 3).cpu().numpy()
+        pbc_list = pbc.cpu().tolist()
         self.neighbor_manager = NeighborListManager(
             num_atoms=self.num_atoms,
             cutoff=cutoff,
             skin=skin,
-            device=device,
+            initial_cell=initial_cell_np,
+            pbc=pbc_list,
+            max_neighbors=100,
             half_fill=self.half_neighbor_list,
+            wp_dtype=self.wp_dtype,
+            wp_vec_dtype=self.wp_vec_dtype,
+            device=self.wp_device,
         )
 
-        # Build initial neighbor list
-        self._rebuild_neighbors()
+        # Build initial neighbor list (ref_positions=zeros guarantees full rebuild)
+        self._update_neighbors()
 
-    def _rebuild_neighbors(self) -> None:
-        """Rebuild neighbor list from current positions."""
-        # Sync warp positions to torch
-        self.torch_positions = wp.to_torch(self.wp_positions)
-
-        # Sync warp cell to torch (cell may change for NPT/NPH)
-        self.torch_cell = wp.to_torch(self.wp_cell).squeeze(0)
-
-        self.neighbor_manager.build(
-            positions=self.positions,
-            cell=self.cell,
-            pbc=self.pbc,
-        )
-
-    def _check_rebuild(self) -> bool:
-        """Check if neighbor list needs rebuilding and rebuild if so."""
-        self.positions = wp.to_torch(self.wp_positions)
-
-        if self.neighbor_manager.needs_rebuild(self.positions):
-            self._rebuild_neighbors()
-            return True
-        return False
+    def _update_neighbors(self) -> None:
+        """Check and selectively rebuild neighbor list (no CPU-GPU sync)."""
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
 
     def compute_forces(self) -> wp.array:
         """Compute LJ forces and return per-atom potential energies (device array).
@@ -1315,8 +1515,8 @@ class MDSystem:
         the host. Host-side reductions (e.g., PE sum) should be done only at
         logging / analysis points.
         """
-        # Check neighbor list
-        self._check_rebuild()
+        # Check and selectively rebuild neighbor list (no CPU-GPU sync)
+        self._update_neighbors()
 
         # Compute LJ energy and forces using the interactions module
         wp_energies, wp_forces = lj_energy_forces(
@@ -1364,8 +1564,9 @@ class MDSystem:
         For barostat integrators (NPT/NPH), provide virial_tensors parameter.
         For variable-cell optimization, call without parameter to get flat virial.
         """
-        # Always rebuild neighbors (cell may have changed)
-        self._rebuild_neighbors()
+        # Mark stale to force full rebuild (cell may have changed)
+        self.neighbor_manager.mark_stale()
+        self._update_neighbors()
 
         wp_energies, wp_forces, wp_virial_flat = lj_energy_forces_virial(
             positions=self.wp_positions,
@@ -1407,10 +1608,8 @@ class MDSystem:
         """
         wp.copy(self.wp_cell, cell)
         compute_cell_inverse(self.wp_cell, self.wp_cell_inv, device=self.device)
-        # Update torch cell for neighbor list
-        self.cell = wp.to_torch(self.wp_cell)
-        # Force neighbor rebuild on next force computation
-        self.neighbor_manager.positions_at_rebuild = None
+        # Force full rebuild on next force computation (cell geometry changed)
+        self.neighbor_manager.mark_stale()
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""
@@ -1517,13 +1716,11 @@ class BatchedMDSystem:
             )
         masses = mass_amu_to_internal(masses)
 
-        self.positions = positions
-        self.cell = cells
-        self.pbc = pbc
-        self.batch_idx = batch_idx
-
-        self.num_atoms_per_system = torch.bincount(
-            batch_idx, minlength=self.num_systems
+        batch_idx_np = batch_idx.cpu().numpy().astype(np.int32)
+        self.num_atoms_per_system = torch.tensor(
+            np.bincount(batch_idx_np, minlength=self.num_systems).astype(np.int32),
+            dtype=torch.int32,
+            device=str(device),
         )
 
         self.wp_positions = wp.from_torch(positions, dtype=self.wp_vec_dtype)
@@ -1541,20 +1738,24 @@ class BatchedMDSystem:
 
         self.wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
 
+        initial_cells_np = cells.cpu().numpy()
+        pbc_np = pbc.cpu().numpy()
         self.neighbor_manager = BatchedNeighborListManager(
             total_atoms=self.total_atoms,
             cutoff=self.cutoff,
             skin=self.skin,
-            batch_idx=self.batch_idx,
+            batch_idx=batch_idx_np,
             num_systems=self.num_systems,
+            initial_cells=initial_cells_np,
+            pbc=pbc_np,
             max_neighbors=100,
             half_fill=self.half_neighbor_list,
-            device=device,
+            wp_dtype=self.wp_dtype,
+            wp_vec_dtype=self.wp_vec_dtype,
+            device=self.wp_device,
         )
-        self._rebuild_neighbors()
-
-    def _rebuild_neighbors(self) -> None:
-        self.neighbor_manager.build(self.positions, self.cell, self.pbc)
+        # Initial neighbor list build (ref_positions=zeros guarantees full rebuild)
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
 
     def initialize_temperature(self, temperatures_K: np.ndarray, seed: int = 0) -> None:
         """Initialize velocities to target temperature (batched mode).
@@ -1624,7 +1825,7 @@ class BatchedMDSystem:
         the host. Host-side reductions (e.g., PE sum) should be done only at
         logging / analysis points.
         """
-        self._rebuild_neighbors()
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
         wp_energies, wp_forces = lj_energy_forces(
             positions=self.wp_positions,
             cell=self.wp_cell,
@@ -1669,8 +1870,9 @@ class BatchedMDSystem:
         For barostat integrators (NPT/NPH), provide virial_tensors parameter.
         For variable-cell optimization, call without parameter to get flat virial.
         """
-        # Always rebuild neighbors (cell may have changed)
-        self._rebuild_neighbors()
+        # Mark stale to force full rebuild (cell may have changed)
+        self.neighbor_manager.mark_stale()
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
 
         wp_energies, wp_forces, wp_virial_flat = lj_energy_forces_virial(
             positions=self.wp_positions,
@@ -1820,7 +2022,6 @@ class NvalchemiOpsBenchmark:
     - For batched mode, positions/velocities/masses should be concatenated across all systems.
     - Supports integrators: VelocityVerlet, Langevin, NoseHoover, NPT, NPH.
     - Supports optimizer: FIRE.
-    - If model is None, automatically creates NvalchemiopsLJModel with epsilon/sigma/cutoff.
     """
 
     def __init__(
@@ -2299,6 +2500,11 @@ class NvalchemiOpsBenchmark:
             dtype=self.system.wp_dtype,
             device=self.system.wp_device,
         )
+        wp_tau = wp.array(
+            [float(tdamp_fs)] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
         wp_target_pressure = wp.array(
             [p_ext] * self.system.num_systems,
             dtype=self.system.wp_dtype,
@@ -2312,9 +2518,9 @@ class NvalchemiOpsBenchmark:
         )
         batch_idx = None if not self.is_batched else self.system.wp_batch_idx
         nhc_compute_masses(
-            ndof=3 * self.system.num_atoms_per_system[0].item() - 3,
-            target_temp=kT,
-            tau=float(tdamp_fs),
+            ndof=3 * self.system.num_atoms_per_system - 3,
+            target_temp=wp_target_temperature,
+            tau=wp_tau,
             chain_length=int(chain_length),
             masses=thermostat_masses,
             num_systems=self.system.num_systems,
@@ -2417,6 +2623,17 @@ class NvalchemiOpsBenchmark:
             wp_energies = self.system.compute_forces_virial(virial_out)
             wp.copy(forces, self.system.wp_forces)
 
+        dt_array = wp.array(
+            [float(dt)] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        num_atom_array = wp.array(
+            [self.system.num_atoms] * self.system.num_systems,
+            dtype=wp.int32,
+            device=self.system.wp_device,
+        )
+
         def step():
             run_npt_step(
                 positions=self.system.wp_positions,
@@ -2432,9 +2649,9 @@ class NvalchemiOpsBenchmark:
                 cell_masses=cell_masses,
                 target_temperature=wp_target_temperature,
                 target_pressure=wp_target_pressure,
-                num_atoms=self.system.num_atoms,
+                num_atoms=num_atom_array,
                 chain_length=int(chain_length),
-                dt=float(dt),
+                dt=dt_array,
                 pressure_tensors=npt_pressure_tensors,
                 volumes=npt_volumes,
                 kinetic_energy=npt_kinetic_energy,
@@ -2546,10 +2763,8 @@ class NvalchemiOpsBenchmark:
             dtype=self.system.wp_dtype,
             device=self.system.wp_device,
         )
-        nph_num_atoms_per_system = wp.array(
-            self.system.num_atoms_per_system.to(torch.int32),
-            dtype=wp.int32,
-            device=self.system.wp_device,
+        nph_num_atoms_per_system = wp.from_torch(
+            self.system.num_atoms_per_system,
         )
         cell_masses = wp.empty(
             self.system.num_systems,
@@ -2627,6 +2842,17 @@ class NvalchemiOpsBenchmark:
             wp_energies = self.system.compute_forces_virial(virial_out)
             wp.copy(forces, self.system.wp_forces)
 
+        dt_array = wp.array(
+            [float(dt)] * self.system.num_systems,
+            dtype=self.system.wp_dtype,
+            device=self.system.wp_device,
+        )
+        num_atom_array = wp.array(
+            [self.system.num_atoms] * self.system.num_systems,
+            dtype=wp.int32,
+            device=self.system.wp_device,
+        )
+
         # Warmup
         def step():
             run_nph_step(
@@ -2639,8 +2865,8 @@ class NvalchemiOpsBenchmark:
                 virial_tensors=virial_tensors,
                 cell_masses=cell_masses,
                 target_pressure=wp_target_pressure,
-                num_atoms=self.system.num_atoms,
-                dt=float(dt),
+                num_atoms=num_atom_array,
+                dt=dt_array,
                 pressure_tensors=nph_pressure_tensors,
                 volumes=nph_volumes,
                 kinetic_energy=nph_kinetic_energy,
@@ -3201,16 +3427,22 @@ class NvalchemiOpsBenchmark:
         from nvalchemiops.dynamics.utils.cell_filter import stress_to_cell_force
         from nvalchemiops.dynamics.utils.cell_utils import compute_cell_volume
 
-        M = self.num_systems
+        M = self.system.num_systems
         virial_torch = wp.to_torch(wp_virial)
         virial_mat = virial_torch.reshape(M, 3, 3)
         volume = torch.det(cell_torch).to(self.dtype)
         stress_torch = virial_mat / volume.reshape(-1, 1, 1)
-        stress_wp = wp.from_torch(stress_torch.contiguous(), dtype=self.wp_mat_dtype)
-        wp_cell_cur = wp.from_torch(cell_torch.contiguous(), dtype=self.wp_mat_dtype)
-        wp_volume = wp.empty(M, dtype=self.wp_dtype, device=self.wp_device)
+        stress_wp = wp.from_torch(
+            stress_torch.contiguous(), dtype=self.system.wp_mat_dtype
+        )
+        wp_cell_cur = wp.from_torch(
+            cell_torch.contiguous(), dtype=self.system.wp_mat_dtype
+        )
+        wp_volume = wp.empty(M, dtype=self.system.wp_dtype, device=self.wp_device)
         compute_cell_volume(wp_cell_cur, wp_volume, device=self.wp_device)
-        cell_force_wp = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        cell_force_wp = wp.empty(
+            M, dtype=self.system.wp_mat_dtype, device=self.wp_device
+        )
         stress_to_cell_force(
             stress_wp,
             wp_cell_cur,
@@ -3315,27 +3547,26 @@ class NvalchemiOpsBenchmark:
             unpack_positions_with_cell,
         )
 
-        M = self.num_systems
-        N = self.total_atoms
+        M = self.system.num_systems if self.is_batched else 1
+        N = self.system.total_atoms
 
         # Clone state
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(),
-            dtype=self.wp_vec_dtype,
-        )
-        wp_cell = wp.from_torch(
-            self.torch_cell.clone(),
-            dtype=self.wp_mat_dtype,
-        )
+        wp_positions = self.system.wp_positions
+        wp_cell = self.system.wp_cell
 
         # batch_idx
-        if self.wp_batch_idx is not None:
-            wp_bidx = self.wp_batch_idx
+        if (
+            hasattr(self.system, "wp_batch_idx")
+            and self.system.wp_batch_idx is not None
+        ):
+            wp_bidx = self.system.wp_batch_idx
         else:
             wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
 
-        # Align cell (one-time preprocessing)
-        wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        # Align cell (one-time preprocessing; modifies wp_positions and wp_cell in-place)
+        wp_transform = wp.empty(
+            M, dtype=self.system.wp_mat_dtype, device=self.wp_device
+        )
         align_cell(
             wp_positions,
             wp_cell,
@@ -3343,12 +3574,9 @@ class NvalchemiOpsBenchmark:
             batch_idx=wp_bidx,
             device=self.wp_device,
         )
-        self.wp_cell = wp_cell
-        self.model.wp_cell = self.wp_cell
-        wp.synchronize()
-        self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
-        self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
-        self._rebuild_neighbors()
+        # Force full neighbor rebuild since cell geometry changed
+        self.system.neighbor_manager.mark_stale()
+        self.system._update_neighbors()
 
         # Extended batch_idx: atoms + 2 extra DOFs per system
         N_ext = N + 2 * M
@@ -3362,60 +3590,64 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pack initial positions into extended array
-        ext_positions = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_positions = wp.empty(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
         pack_positions_with_cell(
             wp_positions,
             wp_cell,
             ext_positions,
             device=self.wp_device,
         )
-        ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_velocities = wp.zeros(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
 
         # Extended masses: atomic masses + cell_mass for cell DOFs
-        masses_np = wp.to_torch(self.wp_masses).cpu().numpy()
+        masses_np = wp.to_torch(self.system.wp_masses).cpu().numpy()
         ext_masses_list = list(masses_np)
         for _ in range(M):
             ext_masses_list.extend([cell_mass, cell_mass])
         ext_masses = wp.array(
             ext_masses_list,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
 
         # FIRE1 per-system state (all as per-system arrays)
         wp_alpha = wp.array(
             [alpha_start] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_dt = wp.array(
             [dt_start] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_alpha_start = wp.array(
             [alpha_start] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_f_alpha = wp.array(
             [f_alpha] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_dt_min = wp.array(
             [dt_min] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_dt_max = wp.array(
             [dt_max] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_maxstep = wp.array(
             [maxstep] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_n_steps_positive = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
@@ -3426,37 +3658,36 @@ class NvalchemiOpsBenchmark:
         )
         wp_f_dec = wp.array(
             [f_dec] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_f_inc = wp.array(
             [f_inc] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
 
         # Accumulators
-        wp_vf = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
-        wp_vv = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
-        wp_ff = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_vf = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
+        wp_vv = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
+        wp_ff = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
         wp_uphill_flag = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
 
-        # Initial forces + virial
-        _, wp_forces, wp_virial = self._compute_forces(
-            wp_positions,
-            compute_virial=True,
-        )
+        # Initial forces + virial (compute_forces_virial handles mark_stale + rebuild)
+        wp_energies, wp_forces, wp_virial = self.system.compute_forces_virial()
 
         # Cell force from virial
         cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
         cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
         cell_force_wp = wp.from_torch(
             cell_force.contiguous(),
-            dtype=self.wp_mat_dtype,
+            dtype=self.system.wp_mat_dtype,
         )
 
         # Pack forces into extended array
-        ext_forces = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_forces = wp.empty(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
         pack_forces_with_cell(
             wp_forces,
             cell_force_wp,
@@ -3465,11 +3696,13 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pre-allocate scratch buffers for unpack/repack in the loop
-        wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_cell_inv = wp.empty(M, dtype=self.system.wp_mat_dtype, device=self.wp_device)
         wp_positions_scratch = wp.empty(
-            N, dtype=self.wp_vec_dtype, device=self.wp_device
+            N, dtype=self.system.wp_vec_dtype, device=self.wp_device
         )
-        wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_cell_scratch = wp.empty(
+            M, dtype=self.system.wp_mat_dtype, device=self.wp_device
+        )
 
         # Timed loop
         import time
@@ -3517,7 +3750,6 @@ class NvalchemiOpsBenchmark:
                 vv=wp_vv,
                 ff=wp_ff,
                 batch_idx=ext_bidx,
-                device=self.wp_device,
             )
 
             # Unpack extended positions → atom positions + cell
@@ -3528,10 +3760,11 @@ class NvalchemiOpsBenchmark:
                 num_atoms=self.system.num_atoms,
                 device=self.wp_device,
             )
-            wp_positions = wp_positions_scratch
-            wp_cell = wp_cell_scratch
-            self.wp_cell = wp_cell
-            self.model.wp_cell = self.wp_cell
+            # Sync unpacked positions/cell back into the system arrays
+            wp.copy(self.system.wp_positions, wp_positions_scratch)
+            wp.copy(self.system.wp_cell, wp_cell_scratch)
+            wp_positions = self.system.wp_positions
+            wp_cell = self.system.wp_cell
 
             # Wrap positions
             compute_cell_inverse(wp_cell, wp_cell_inv, device=self.wp_device)
@@ -3551,19 +3784,15 @@ class NvalchemiOpsBenchmark:
             )
 
             # Compute new forces + virial
-            self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
-            self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
-            _, wp_forces, wp_virial = self._compute_forces(
-                wp_positions,
-                compute_virial=True,
-            )
+            # compute_forces_virial calls mark_stale + _update_neighbors internally
+            wp_energies, wp_forces, wp_virial = self.system.compute_forces_virial()
 
             # Cell force from virial
             cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
             cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
             cell_force_wp = wp.from_torch(
                 cell_force.contiguous(),
-                dtype=self.wp_mat_dtype,
+                dtype=self.system.wp_mat_dtype,
             )
             pack_forces_with_cell(
                 wp_forces,
@@ -3571,12 +3800,6 @@ class NvalchemiOpsBenchmark:
                 ext_forces,
                 device=self.wp_device,
             )
-
-            # Rebuild neighbors if needed
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self._rebuild_neighbors()
 
         wp.synchronize()
         total_time = time.perf_counter() - start_time
@@ -3587,13 +3810,13 @@ class NvalchemiOpsBenchmark:
             name="fire_cell",
             backend="nvalchemiops",
             ensemble="optimization",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=actual_steps,
             dt=dt_start,
             warmup_steps=0,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )
 
     def run_fire2_cell(
@@ -3705,27 +3928,26 @@ class NvalchemiOpsBenchmark:
             unpack_positions_with_cell,
         )
 
-        M = self.num_systems
-        N = self.total_atoms
+        M = self.system.num_systems if self.is_batched else 1
+        N = self.system.total_atoms
 
         # Clone state
-        wp_positions = wp.from_torch(
-            self.torch_positions.clone(),
-            dtype=self.wp_vec_dtype,
-        )
-        wp_cell = wp.from_torch(
-            self.torch_cell.clone(),
-            dtype=self.wp_mat_dtype,
-        )
+        wp_positions = self.system.wp_positions
+        wp_cell = self.system.wp_cell
 
         # batch_idx
-        if self.wp_batch_idx is not None:
-            wp_bidx = self.wp_batch_idx
+        if (
+            hasattr(self.system, "wp_batch_idx")
+            and self.system.wp_batch_idx is not None
+        ):
+            wp_bidx = self.system.wp_batch_idx
         else:
             wp_bidx = wp.zeros(N, dtype=wp.int32, device=self.wp_device)
 
-        # Align cell (one-time preprocessing)
-        wp_transform = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        # Align cell (one-time preprocessing; modifies wp_positions and wp_cell in-place)
+        wp_transform = wp.empty(
+            M, dtype=self.system.wp_mat_dtype, device=self.wp_device
+        )
         align_cell(
             wp_positions,
             wp_cell,
@@ -3733,12 +3955,9 @@ class NvalchemiOpsBenchmark:
             batch_idx=wp_bidx,
             device=self.wp_device,
         )
-        self.wp_cell = wp_cell
-        self.model.wp_cell = self.wp_cell
-        wp.synchronize()
-        self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
-        self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
-        self._rebuild_neighbors()
+        # Force full neighbor rebuild since cell geometry changed
+        self.system.neighbor_manager.mark_stale()
+        self.system._update_neighbors()
 
         # Extended batch_idx: atoms + 2 extra DOFs per system
         N_ext = N + 2 * M
@@ -3752,50 +3971,53 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pack initial positions into extended array
-        ext_positions = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_positions = wp.empty(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
         pack_positions_with_cell(
             wp_positions,
             wp_cell,
             ext_positions,
             device=self.wp_device,
         )
-        ext_velocities = wp.zeros(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_velocities = wp.zeros(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
 
         # FIRE2 per-system state (mass-free)
         wp_alpha = wp.array(
             [alpha0] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_dt = wp.array(
             [dt_start] * M,
-            dtype=self.wp_dtype,
+            dtype=self.system.wp_dtype,
             device=self.wp_device,
         )
         wp_nsteps_inc = wp.zeros(M, dtype=wp.int32, device=self.wp_device)
 
         # Scratch buffers
-        wp_vf = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
-        wp_v_sumsq = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
-        wp_f_sumsq = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
-        wp_max_norm = wp.zeros(M, dtype=self.wp_dtype, device=self.wp_device)
+        wp_vf = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
+        wp_v_sumsq = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
+        wp_f_sumsq = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
+        wp_max_norm = wp.zeros(M, dtype=self.system.wp_dtype, device=self.wp_device)
 
         # Initial forces + virial
-        _, wp_forces, wp_virial = self._compute_forces(
-            wp_positions,
-            compute_virial=True,
-        )
+        wp_energies, wp_forces, wp_virial = self.system.compute_forces_virial()
 
         # Cell force from virial
         cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
         cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
         cell_force_wp = wp.from_torch(
             cell_force.contiguous(),
-            dtype=self.wp_mat_dtype,
+            dtype=self.system.wp_mat_dtype,
         )
 
         # Pack forces into extended array
-        ext_forces = wp.empty(N_ext, dtype=self.wp_vec_dtype, device=self.wp_device)
+        ext_forces = wp.empty(
+            N_ext, dtype=self.system.wp_vec_dtype, device=self.wp_device
+        )
         pack_forces_with_cell(
             wp_forces,
             cell_force_wp,
@@ -3804,11 +4026,13 @@ class NvalchemiOpsBenchmark:
         )
 
         # Pre-allocate scratch buffers for unpack/repack in the loop
-        wp_cell_inv = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_cell_inv = wp.empty(M, dtype=self.system.wp_mat_dtype, device=self.wp_device)
         wp_positions_scratch = wp.empty(
-            N, dtype=self.wp_vec_dtype, device=self.wp_device
+            N, dtype=self.system.wp_vec_dtype, device=self.wp_device
         )
-        wp_cell_scratch = wp.empty(M, dtype=self.wp_mat_dtype, device=self.wp_device)
+        wp_cell_scratch = wp.empty(
+            M, dtype=self.system.wp_mat_dtype, device=self.wp_device
+        )
 
         # Timed loop
         import time
@@ -3866,10 +4090,11 @@ class NvalchemiOpsBenchmark:
                 num_atoms=N,
                 device=self.wp_device,
             )
-            wp_positions = wp_positions_scratch
-            wp_cell = wp_cell_scratch
-            self.wp_cell = wp_cell
-            self.model.wp_cell = self.wp_cell
+            # Sync unpacked positions/cell back into the system arrays
+            wp.copy(self.system.wp_positions, wp_positions_scratch)
+            wp.copy(self.system.wp_cell, wp_cell_scratch)
+            wp_positions = self.system.wp_positions
+            wp_cell = self.system.wp_cell
 
             # Wrap positions
             compute_cell_inverse(wp_cell, wp_cell_inv, device=self.wp_device)
@@ -3889,19 +4114,14 @@ class NvalchemiOpsBenchmark:
             )
 
             # Compute new forces + virial
-            self.torch_positions = wp.to_torch(wp_positions).reshape(-1, 3)
-            self.torch_cell = wp.to_torch(wp_cell).reshape(M, 3, 3)
-            _, wp_forces, wp_virial = self._compute_forces(
-                wp_positions,
-                compute_virial=True,
-            )
+            wp_energies, wp_forces, wp_virial = self.system.compute_forces_virial()
 
             # Cell force from virial
             cell_torch = wp.to_torch(wp_cell).reshape(M, 3, 3)
             cell_force, stress = self._virial_to_cell_force(wp_virial, cell_torch)
             cell_force_wp = wp.from_torch(
                 cell_force.contiguous(),
-                dtype=self.wp_mat_dtype,
+                dtype=self.system.wp_mat_dtype,
             )
             pack_forces_with_cell(
                 wp_forces,
@@ -3909,12 +4129,6 @@ class NvalchemiOpsBenchmark:
                 ext_forces,
                 device=self.wp_device,
             )
-
-            # Rebuild neighbors if needed
-            if self.neighbor_rebuild_interval > 0:
-                self._steps_since_rebuild += 1
-                if self._steps_since_rebuild >= self.neighbor_rebuild_interval:
-                    self._rebuild_neighbors()
 
         wp.synchronize()
         total_time = time.perf_counter() - start_time
@@ -3925,11 +4139,11 @@ class NvalchemiOpsBenchmark:
             name="fire2_cell",
             backend="nvalchemiops",
             ensemble="optimization",
-            num_atoms=self.num_atoms,
+            num_atoms=self.system.num_atoms,
             num_steps=actual_steps,
             dt=dt_start,
             warmup_steps=0,
             total_time=total_time,
             step_times=step_times,
-            batch_size=self.num_systems if self.is_batched else None,
+            batch_size=self.system.num_systems if self.is_batched else None,
         )

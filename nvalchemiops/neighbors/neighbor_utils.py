@@ -60,6 +60,8 @@ __all__ = [
     "wrap_positions_single",
     "wrap_positions_batch",
     "_expand_naive_shifts_selective",
+    "update_ref_positions",
+    "update_ref_positions_batch",
 ]
 
 
@@ -317,14 +319,14 @@ for t, v, m in zip(T, V, M):
 
 
 @wp.kernel(enable_backward=False)
-def _zero_int32_array_kernel(
-    array: wp.array(dtype=wp.int32),
+def _zero_array_kernel(
+    array: wp.array(dtype=Any),
 ) -> None:
-    """Zero an int32 array in parallel.
+    """Zero an array in parallel.
 
     Parameters
     ----------
-    array : wp.array, dtype=wp.int32
+    array : wp.array, dtype=Any
         OUTPUT: Array to be zeroed.
 
     Notes
@@ -333,20 +335,20 @@ def _zero_int32_array_kernel(
     - Modifies: array (sets all elements to 0)
     """
     tid = wp.tid()
-    array[tid] = 0
+    array[tid] = type(array[tid])(0)
 
 
 def zero_array(
     array: wp.array,
     device: str,
 ) -> None:
-    """Core warp launcher for zeroing an int32 array.
+    """Core warp launcher for zeroing an array.
 
-    Zeros all elements of an int32 array in parallel using pure warp operations.
+    Zeros all elements of an array in parallel using pure warp operations.
 
     Parameters
     ----------
-    array : wp.array, dtype=wp.int32
+    array : wp.array, dtype=Any
         OUTPUT: Array to be zeroed.
     device : str
         Warp device string (e.g., 'cuda:0', 'cpu').
@@ -354,16 +356,16 @@ def zero_array(
     Notes
     -----
     - This is a low-level warp interface.
-    - Operates on int32 arrays only.
+    - Operates on arrays of any dtype.
 
     See Also
     --------
-    _zero_int32_array_kernel : Kernel that performs the zeroing
+    _zero_array_kernel : Kernel that performs the zeroing
     """
     n = array.shape[0]
 
     wp.launch(
-        kernel=_zero_int32_array_kernel,
+        kernel=_zero_array_kernel,
         dim=n,
         inputs=[array],
         device=device,
@@ -919,5 +921,169 @@ def wrap_positions_batch(
             positions_wrapped,
             per_atom_cell_offsets,
         ],
+        device=device,
+    )
+
+
+###########################################################################################
+########################### Reference Position Update Kernels ############################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _update_ref_positions_kernel(
+    positions: wp.array(dtype=Any),
+    rebuild_flag: wp.array(dtype=wp.bool),
+    ref_positions: wp.array(dtype=Any),
+) -> None:
+    """Conditionally copy positions to ref_positions when rebuild_flag[0] is True.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates.
+    rebuild_flag : wp.array, shape (1,), dtype=wp.bool
+        Single-system rebuild flag. When True, ref_positions is updated.
+    ref_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Reference positions updated when rebuild_flag[0] is True.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: ref_positions (only when rebuild_flag[0] is True)
+    """
+    i = wp.tid()
+    if rebuild_flag[0]:
+        ref_positions[i] = positions[i]
+
+
+_update_ref_positions_overload = {}
+for _t, _v in zip([wp.float32, wp.float64], [wp.vec3f, wp.vec3d]):
+    _update_ref_positions_overload[_t] = wp.overload(
+        _update_ref_positions_kernel,
+        [wp.array(dtype=_v), wp.array(dtype=wp.bool), wp.array(dtype=_v)],
+    )
+
+
+def update_ref_positions(
+    positions: wp.array,
+    rebuild_flag: wp.array,
+    ref_positions: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for conditionally updating reference positions (single system).
+
+    Copies current positions into reference positions only when rebuild_flag[0] is True.
+    No CPU-GPU synchronization required.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates.
+    rebuild_flag : wp.array, shape (1,), dtype=wp.bool
+        Single-system rebuild flag.
+    ref_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Reference positions to update selectively.
+    wp_dtype : type
+        Warp scalar dtype (wp.float32 or wp.float64).
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    See Also
+    --------
+    _update_ref_positions_kernel : Underlying warp kernel
+    update_ref_positions_batch : Batch variant
+    """
+    total_atoms = positions.shape[0]
+    wp.launch(
+        kernel=_update_ref_positions_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[positions, rebuild_flag, ref_positions],
+        device=device,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _update_ref_positions_batch_kernel(
+    positions: wp.array(dtype=Any),
+    rebuild_flags: wp.array(dtype=wp.bool),
+    batch_idx: wp.array(dtype=wp.int32),
+    ref_positions: wp.array(dtype=Any),
+) -> None:
+    """Conditionally copy positions to ref_positions per-system (batch, no CPU sync).
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates for all systems.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    ref_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Reference positions; updated for atoms in rebuilt systems.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: ref_positions (only for atoms in rebuilt systems)
+    """
+    i = wp.tid()
+    if rebuild_flags[batch_idx[i]]:
+        ref_positions[i] = positions[i]
+
+
+_update_ref_positions_batch_overload = {}
+for _t, _v in zip([wp.float32, wp.float64], [wp.vec3f, wp.vec3d]):
+    _update_ref_positions_batch_overload[_t] = wp.overload(
+        _update_ref_positions_batch_kernel,
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.bool),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=_v),
+        ],
+    )
+
+
+def update_ref_positions_batch(
+    positions: wp.array,
+    rebuild_flags: wp.array,
+    batch_idx: wp.array,
+    ref_positions: wp.array,
+    wp_dtype: type,
+    device: str,
+) -> None:
+    """Core warp launcher for conditionally updating reference positions (batch).
+
+    Updates reference positions only for atoms in systems where rebuild_flags is True.
+    No CPU-GPU synchronization required.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic coordinates for all systems.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    ref_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        OUTPUT: Reference positions to update selectively.
+    wp_dtype : type
+        Warp scalar dtype (wp.float32 or wp.float64).
+    device : str
+        Warp device string (e.g., 'cuda:0', 'cpu').
+
+    See Also
+    --------
+    _update_ref_positions_batch_kernel : Underlying warp kernel
+    update_ref_positions : Single-system variant
+    """
+    total_atoms = positions.shape[0]
+    wp.launch(
+        kernel=_update_ref_positions_batch_overload[wp_dtype],
+        dim=total_atoms,
+        inputs=[positions, rebuild_flags, batch_idx, ref_positions],
         device=device,
     )

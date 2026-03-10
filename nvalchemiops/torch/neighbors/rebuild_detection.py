@@ -30,7 +30,7 @@ from nvalchemiops.neighbors.rebuild_detection import (
     check_cell_list_rebuild,
     check_neighbor_list_rebuild,
 )
-from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
+from nvalchemiops.torch.types import get_wp_mat_dtype, get_wp_vec_dtype
 
 __all__ = [
     "cell_list_needs_rebuild",
@@ -87,10 +87,8 @@ def _cell_list_needs_rebuild(
         return torch.tensor([False], device=device, dtype=torch.bool)
 
     # Get warp data types for the input tensor precision
-    wp_dtype = get_wp_dtype(current_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(current_positions.dtype)
     wp_mat_dtype = get_wp_mat_dtype(current_positions.dtype)
-    wp_device = str(device)
 
     # Convert PyTorch tensors to warp arrays
     wp_current_positions = wp.from_torch(
@@ -117,8 +115,6 @@ def _cell_list_needs_rebuild(
         cell=wp_cell,
         pbc=wp_pbc,
         rebuild_flag=wp_rebuild_flag,
-        wp_dtype=wp_dtype,
-        device=wp_device,
     )
 
     return rebuild_needed
@@ -205,6 +201,7 @@ def _neighbor_list_needs_rebuild(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
 
@@ -216,7 +213,9 @@ def _neighbor_list_needs_rebuild(
         Current atomic positions to compare against reference.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
-
+    overwrite_reference_positions : bool, default=False
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
     rebuild_needed : torch.Tensor, shape (1,), dtype=bool
@@ -238,9 +237,7 @@ def _neighbor_list_needs_rebuild(
         return torch.tensor([False], device=device, dtype=torch.bool)
 
     # Get warp data types for the input tensor precision
-    wp_dtype = get_wp_dtype(reference_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
-    wp_device = str(device)
 
     # Convert PyTorch tensors to warp arrays
     wp_reference_positions = wp.from_torch(
@@ -260,8 +257,7 @@ def _neighbor_list_needs_rebuild(
         current_positions=wp_current_positions,
         skin_distance_threshold=skin_distance_threshold,
         rebuild_flag=wp_rebuild_flag,
-        wp_dtype=wp_dtype,
-        device=wp_device,
+        overwrite_reference_positions=overwrite_reference_positions,
     )
 
     return rebuild_needed
@@ -272,6 +268,7 @@ def _neighbor_list_needs_rebuild_fake(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile compatibility.
 
@@ -285,6 +282,7 @@ def neighbor_list_needs_rebuild(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
 
@@ -304,7 +302,9 @@ def neighbor_list_needs_rebuild(
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
-
+    overwrite_reference_positions : bool, default=False
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
     rebuild_needed : torch.Tensor, shape (1,), dtype=bool
@@ -325,7 +325,10 @@ def neighbor_list_needs_rebuild(
     check_neighbor_list_rebuild_needed : Convenience wrapper that returns Python bool
     """
     return _neighbor_list_needs_rebuild(
-        reference_positions, current_positions, skin_distance_threshold
+        reference_positions,
+        current_positions,
+        skin_distance_threshold,
+        overwrite_reference_positions,
     )
 
 
@@ -401,6 +404,7 @@ def check_neighbor_list_rebuild_needed(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> bool:
     """Determine if neighbor list requires rebuilding based on atomic motion.
 
@@ -426,7 +430,9 @@ def check_neighbor_list_rebuild_needed(
         Maximum allowed atomic displacement before neighbor list becomes invalid.
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
         Units should match the coordinate system.
-
+    overwrite_reference_positions : bool, default=False
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
     needs_rebuild : bool
@@ -445,7 +451,10 @@ def check_neighbor_list_rebuild_needed(
     nvalchemiops.neighborlist.rebuild_detection.wp_check_neighbor_list_rebuild : Core warp launcher
     """
     rebuild_tensor = neighbor_list_needs_rebuild(
-        reference_positions, current_positions, skin_distance_threshold
+        reference_positions,
+        current_positions,
+        skin_distance_threshold,
+        overwrite_reference_positions,
     )
 
     return rebuild_tensor.item()
@@ -464,6 +473,7 @@ def _batch_neighbor_list_needs_rebuild(
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Detect per-system if neighbor lists require rebuilding due to atomic motion.
 
@@ -477,7 +487,9 @@ def _batch_neighbor_list_needs_rebuild(
         System index for each atom.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
-
+    overwrite_reference_positions : bool, default=False
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
     rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
@@ -502,9 +514,7 @@ def _batch_neighbor_list_needs_rebuild(
     if total_atoms == 0:
         return rebuild_flags
 
-    wp_dtype = get_wp_dtype(reference_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
-    wp_device = str(device)
 
     wp_reference = wp.from_torch(
         reference_positions, dtype=wp_vec_dtype, return_ctype=True
@@ -521,8 +531,7 @@ def _batch_neighbor_list_needs_rebuild(
         batch_idx=wp_batch_idx,
         skin_distance_threshold=skin_distance_threshold,
         rebuild_flags=wp_rebuild_flags,
-        wp_dtype=wp_dtype,
-        device=wp_device,
+        overwrite_reference_positions=overwrite_reference_positions,
     )
 
     return rebuild_flags
@@ -534,6 +543,7 @@ def _batch_neighbor_list_needs_rebuild_fake(
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile compatibility."""
     num_systems = batch_idx.max() + 1 if batch_idx.numel() > 0 else 1
@@ -545,6 +555,7 @@ def batch_neighbor_list_needs_rebuild(
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
+    overwrite_reference_positions: bool = False,
 ) -> torch.Tensor:
     """Detect per-system if neighbor lists require rebuilding due to atomic motion.
 
@@ -563,7 +574,9 @@ def batch_neighbor_list_needs_rebuild(
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
-
+    overwrite_reference_positions : bool, default=False
+        If True, overwrite reference positions with current positions.
+        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
     Returns
     -------
     rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
@@ -583,7 +596,11 @@ def batch_neighbor_list_needs_rebuild(
     check_batch_neighbor_list_rebuild_needed : Convenience wrapper returning Python list
     """
     return _batch_neighbor_list_needs_rebuild(
-        reference_positions, current_positions, batch_idx, skin_distance_threshold
+        reference_positions,
+        current_positions,
+        batch_idx,
+        skin_distance_threshold,
+        overwrite_reference_positions,
     )
 
 
@@ -638,10 +655,8 @@ def _batch_cell_list_needs_rebuild(
     if total_atoms == 0:
         return rebuild_flags
 
-    wp_dtype = get_wp_dtype(current_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(current_positions.dtype)
     wp_mat_dtype = get_wp_mat_dtype(current_positions.dtype)
-    wp_device = str(device)
 
     wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype, return_ctype=True)
     wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
@@ -666,8 +681,6 @@ def _batch_cell_list_needs_rebuild(
         cell=wp_cell,
         pbc=wp_pbc,
         rebuild_flags=wp_rebuild_flags,
-        wp_dtype=wp_dtype,
-        device=wp_device,
     )
 
     return rebuild_flags
