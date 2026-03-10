@@ -112,7 +112,12 @@ def neighbor_list(
     method : str | None, optional
         Method to use for neighbor list computation.
         Choices: "naive", "cell_list", "batch_naive", "batch_cell_list", "naive_dual_cutoff", "batch_naive_dual_cutoff".
-        If None, a default method will be chosen based on the number of atoms.
+        If None, a default method will be chosen based on average atoms per
+        system (cell_list when >= 2000, naive otherwise). When only
+        ``batch_idx`` is provided (no ``batch_ptr`` or 3-D ``cell``),
+        auto-selection reads ``batch_idx[-1]`` which triggers a
+        device-to-host synchronization. To avoid this, pass ``batch_ptr``,
+        a 3-D ``cell`` array, or specify ``method`` explicitly.
     **kwargs : dict, optional
         Additional keyword arguments to pass to the method.
 

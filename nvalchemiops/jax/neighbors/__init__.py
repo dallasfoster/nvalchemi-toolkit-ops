@@ -137,7 +137,12 @@ def neighbor_list(
     method : str | None, optional
         Method to use for neighbor list computation.
         Choices: "naive", "cell_list", "batch_naive", "batch_cell_list", "naive_dual_cutoff", "batch_naive_dual_cutoff".
-        If None, a default method will be chosen based on the number of atoms.
+        If None, a default method will be chosen based on average atoms per
+        system (cell_list when >= 2000, naive otherwise). When only
+        ``batch_idx`` is provided (no ``batch_ptr`` or 3-D ``cell``),
+        auto-selection reads ``batch_idx[-1]`` which triggers a
+        device-to-host synchronization. To avoid this, pass ``batch_ptr``,
+        a 3-D ``cell`` array, or specify ``method`` explicitly.
     **kwargs : dict, optional
         Additional keyword arguments to pass to the method.
 
@@ -265,10 +270,20 @@ def neighbor_list(
     """
     if method is None:
         total_atoms = positions.shape[0]
+
+        num_systems = 1
+        if cell is not None and cell.ndim == 3:
+            num_systems = cell.shape[0]
+        elif batch_ptr is not None:
+            num_systems = batch_ptr.shape[0] - 1
+        elif batch_idx is not None:
+            num_systems = max(1, int(batch_idx[-1]) + 1)
+        avg_atoms = total_atoms // num_systems
+
         if cutoff2 is not None:
             method = "naive_dual_cutoff"
 
-        elif total_atoms >= 5000:
+        elif avg_atoms >= 2000:
             method = "cell_list"
             if cell is None or pbc is None:
                 cell = jnp.eye(3, dtype=positions.dtype).reshape(1, 3, 3)
