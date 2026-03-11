@@ -672,7 +672,7 @@ def _check_batch_atoms_changed_cells(
     Parameters
     ----------
     current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
-        Current atomic coordinates in Cartesian space.
+        Current Cartesian coordinates.
     cell : wp.array, shape (num_systems,), dtype=wp.mat33*
         Per-system unit cell matrices for coordinate transformations.
     atom_to_cell_mapping : wp.array, shape (total_atoms,), dtype=wp.vec3i
@@ -883,7 +883,7 @@ def check_batch_cell_list_rebuild(
     Parameters
     ----------
     current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
-        Current atomic coordinates in Cartesian space.
+        Current Cartesian coordinates.
     atom_to_cell_mapping : wp.array, shape (total_atoms,), dtype=wp.vec3i
         Previously computed cell coordinates for each atom.
     batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32

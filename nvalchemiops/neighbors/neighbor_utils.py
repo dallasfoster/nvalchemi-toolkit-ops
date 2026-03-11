@@ -157,6 +157,51 @@ def _expand_naive_shifts_selective(
 
 
 @wp.func
+def _decode_shift_index(local_idx: int, shift_range: wp.vec3i) -> wp.vec3i:
+    """Decode a flat shift index into (kx, ky, kz) lattice shift vector.
+
+    Reverses the enumeration order used by ``_expand_naive_shifts`` so that
+    shift vectors can be computed on-the-fly from a thread index without
+    materialising the full shifts array.
+
+    Parameters
+    ----------
+    local_idx : int
+        Zero-based index into the per-system shift enumeration.
+    shift_range : wp.vec3i
+        Shift range in each dimension (from ``_compute_naive_num_shifts``).
+
+    Returns
+    -------
+    wp.vec3i
+        The integer lattice shift vector ``(kx, ky, kz)``.
+    """
+    k2_size = 2 * shift_range[2] + 1
+    k1_size = 2 * shift_range[1] + 1
+    group0_size = shift_range[1] * k2_size + shift_range[2] + 1
+
+    k0 = wp.int32(0)
+    k1 = wp.int32(0)
+    k2 = wp.int32(0)
+
+    if local_idx < group0_size:
+        if local_idx <= shift_range[2]:
+            k2 = local_idx
+        else:
+            rem = local_idx - (shift_range[2] + 1)
+            k1 = rem / k2_size + 1
+            k2 = rem % k2_size - shift_range[2]
+    else:
+        rem = local_idx - group0_size
+        k0 = rem / (k1_size * k2_size) + 1
+        rem2 = rem % (k1_size * k2_size)
+        k1 = rem2 / k2_size - shift_range[1]
+        k2 = rem2 % k2_size - shift_range[2]
+
+    return wp.vec3i(k0, k1, k2)
+
+
+@wp.func
 def _update_neighbor_matrix(
     i: int,
     j: int,

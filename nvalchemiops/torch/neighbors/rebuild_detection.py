@@ -631,7 +631,7 @@ def batch_neighbor_list_needs_rebuild(
     reference_positions : torch.Tensor, shape (total_atoms, 3)
         Atomic positions when each system's neighbor list was last built.
     current_positions : torch.Tensor, shape (total_atoms, 3)
-        Current atomic coordinates to compare against reference.
+        Current Cartesian coordinates to compare against reference.
     batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
         System index for each atom.
     skin_distance_threshold : float
@@ -660,7 +660,6 @@ def batch_neighbor_list_needs_rebuild(
     See Also
     --------
     neighbor_list_needs_rebuild : Single-system version
-    check_batch_neighbor_list_rebuild_needed : Convenience wrapper
     """
     return _batch_neighbor_list_needs_rebuild(
         reference_positions,
@@ -695,7 +694,7 @@ def _batch_cell_list_needs_rebuild(
     Parameters
     ----------
     current_positions : torch.Tensor, shape (total_atoms, 3)
-        Current atomic coordinates in Cartesian space.
+        Current Cartesian coordinates.
     atom_to_cell_mapping : torch.Tensor, shape (total_atoms, 3), dtype=int32
         3D cell coordinates for each atom from the existing cell lists.
     batch_idx : torch.Tensor, shape (total_atoms,), dtype=int32
@@ -790,7 +789,7 @@ def batch_cell_list_needs_rebuild(
     Parameters
     ----------
     current_positions : torch.Tensor, shape (total_atoms, 3)
-        Current atomic coordinates in Cartesian space.
+        Current Cartesian coordinates.
     atom_to_cell_mapping : torch.Tensor, shape (total_atoms, 3), dtype=int32
         3D cell coordinates for each atom from the existing cell lists.
         Typically obtained from batch_build_cell_list.

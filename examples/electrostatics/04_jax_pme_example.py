@@ -370,9 +370,9 @@ print(f"  Cl- charge gradients mean: {float(cl_grads.mean()):.4f}")
 # - ``compute_forces`` and other boolean flags must be static
 # - Parameter estimation (``estimate_pme_parameters``) should happen **outside**
 #   the jitted function since it determines array shapes
-# - Periodic shift information (``shift_range``, ``shift_offset``,
-#   ``total_shifts``) must be pre-computed outside jit using
-#   ``compute_naive_num_shifts``, since shift counts depend on concrete values
+# - Periodic shift metadata (``shift_range``, ``num_shifts_per_system``,
+#   ``max_shifts_per_system``) must be pre-computed outside jit using
+#   ``compute_naive_num_shifts``, since the launch dimensions must be concrete
 
 print("\n" + "=" * 70)
 print("JIT COMPILATION")
@@ -385,8 +385,8 @@ jit_cutoff = float(jit_params.real_space_cutoff[0])
 jit_mesh_dims = tuple(int(x) for x in jit_params.mesh_dimensions)
 jit_alpha = jit_params.alpha
 
-# Pre-compute shift information outside jit (shift sizes must be concrete)
-shift_range, shift_offset, total_shifts = compute_naive_num_shifts(
+# Pre-compute shift metadata outside jit (launch sizes must be concrete)
+shift_range, num_shifts_per_system, max_shifts_per_system = compute_naive_num_shifts(
     jit_cell, jit_cutoff, jit_pbc
 )
 
@@ -400,15 +400,15 @@ def compute_pme_energy_forces(
     pbc: jax.Array,
     alpha: jax.Array,
     shift_range: jax.Array = shift_range,
-    shift_offset: jax.Array = shift_offset,
+    num_shifts_per_system: jax.Array = num_shifts_per_system,
     cutoff: float = jit_cutoff,
     max_neighbors: int = 128,
-    total_shifts: int = total_shifts,
+    max_shifts_per_system: int = max_shifts_per_system,
     mesh_dimensions: tuple[int, int, int] = jit_mesh_dims,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled neighbor list + PME pipeline."""
     # Build neighbor matrix inside jit (max_neighbors must be static,
-    # shift info pre-computed outside jit)
+    # shift metadata pre-computed outside jit)
     neighbor_matrix, _, neighbor_matrix_shifts = naive_neighbor_list(
         positions,
         cutoff,
@@ -416,8 +416,8 @@ def compute_pme_energy_forces(
         pbc=pbc,
         max_neighbors=max_neighbors,
         shift_range_per_dimension=shift_range,
-        shift_offset=shift_offset,
-        total_shifts=total_shifts,
+        num_shifts_per_system=num_shifts_per_system,
+        max_shifts_per_system=max_shifts_per_system,
     )
 
     # Compute PME (mesh_dimensions is static, alpha is traced)

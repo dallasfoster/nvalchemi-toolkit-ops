@@ -234,6 +234,13 @@ neighbor_matrix, num_neighbors, shifts = neighbor_list(
   two GPU kernel launches per call.
   Only applies to naive methods; cell list methods handle wrapping internally.
 
+`shift_range_per_dimension`, `num_shifts_per_system`, `max_shifts_per_system`
+: Optional cached naive-PBC metadata for advanced workflows. Use
+  `compute_naive_num_shifts()` to compute these values outside repeated calls,
+  especially for JAX where `max_shifts_per_system` must be concrete outside
+  `jax.jit`. Older `shift_offset` and `total_shifts` inputs are no longer part
+  of the public Torch/JAX API.
+
 ### Estimation Utilities
 
 The {func}`~nvalchemiops.neighbors.neighbor_utils.estimate_max_neighbors` function estimates

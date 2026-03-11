@@ -651,7 +651,7 @@ def _batch_cell_list_build_neighbor_matrix_selective(
     Parameters
     ----------
     positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Concatenated atomic coordinates for all systems in the batch.
+        Concatenated Cartesian coordinates for all systems in the batch.
     cell : wp.array, shape (num_systems, 3, 3), dtype=wp.mat33*
         Unit cell matrices for each system in the batch.
     pbc : wp.array2d, shape (num_systems, 3), dtype=bool

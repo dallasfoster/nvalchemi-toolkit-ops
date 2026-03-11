@@ -465,8 +465,8 @@ class TestNaiveOutputFormats:
         max_neighbors = 20
         fill_value = -1
 
-        shift_range_per_dimension, shift_offset, total_shifts = (
-            compute_naive_num_shifts(cell, cutoff, pbc)
+        shift_range_per_dimension, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
         )
 
         # Preallocate tensors
@@ -495,8 +495,8 @@ class TestNaiveOutputFormats:
             num_neighbors=num_neighbors,
             neighbor_matrix_shifts=neighbor_matrix_shifts,
             shift_range_per_dimension=shift_range_per_dimension,
-            shift_offset=shift_offset,
-            total_shifts=total_shifts,
+            num_shifts_per_system=num_shifts,
+            max_shifts_per_system=max_shifts,
             half_fill=half_fill,
             return_neighbor_list=False,
         )
@@ -605,8 +605,8 @@ class TestNaiveCompile:
         max_neighbors = 50
         cell = cell.reshape(1, 3, 3)
         pbc = pbc.reshape(1, 3)
-        shift_range_per_dimension, shift_offset, total_shifts = (
-            compute_naive_num_shifts(cell, cutoff, pbc)
+        shift_range_per_dimension, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
         )
 
         neighbor_matrix = torch.full(
@@ -635,8 +635,8 @@ class TestNaiveCompile:
             neighbor_matrix_shifts,
             num_neighbors,
             shift_range_per_dimension,
-            shift_offset,
-            total_shifts,
+            num_shifts,
+            max_shifts,
             half_fill,
         ):
             return naive_neighbor_list(
@@ -648,8 +648,8 @@ class TestNaiveCompile:
                 neighbor_matrix_shifts=neighbor_matrix_shifts,
                 num_neighbors=num_neighbors,
                 shift_range_per_dimension=shift_range_per_dimension,
-                shift_offset=shift_offset,
-                total_shifts=total_shifts,
+                num_shifts_per_system=num_shifts,
+                max_shifts_per_system=max_shifts,
                 half_fill=half_fill,
             )
 
@@ -662,8 +662,8 @@ class TestNaiveCompile:
             neighbor_matrix_shifts,
             num_neighbors,
             shift_range_per_dimension,
-            shift_offset,
-            total_shifts,
+            num_shifts,
+            max_shifts,
             half_fill,
         )
 

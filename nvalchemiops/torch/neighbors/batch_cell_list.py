@@ -562,7 +562,7 @@ def batch_query_cell_list(
     Parameters
     ----------
     positions : torch.Tensor, shape (total_atoms, 3)
-        Concatenated atomic coordinates for all systems in the batch.
+        Concatenated Cartesian coordinates for all systems in the batch.
     cell : torch.Tensor, shape (num_systems, 3, 3)
         Unit cell matrices for each system in the batch.
     pbc : torch.Tensor, shape (num_systems, 3), dtype=bool

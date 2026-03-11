@@ -413,9 +413,14 @@ class TestNaiveKernels:
             1, 3
         )
         cutoff = 1.5
-        shift_range_per_dimension, shift_offset, total_shifts = (
-            compute_naive_num_shifts(cell, cutoff, pbc)
+        shift_range_per_dimension, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
         )
+        shift_offset = torch.zeros(
+            num_shifts.shape[0] + 1, dtype=torch.int32, device=device
+        )
+        shift_offset[1:] = torch.cumsum(num_shifts, dim=0)
+        total_shifts = shift_offset[-1].item()
 
         # Output arrays
         shifts = torch.zeros(total_shifts, 3, dtype=torch.int32, device=device)
@@ -612,29 +617,11 @@ class TestNaiveWpLaunchers:
 
         max_neighbors = 30
         # Compute shift ranges
-        shift_range_per_dimension, shift_offset, total_shifts = (
-            compute_naive_num_shifts(cell, cutoff, pbc)
+        shift_range_per_dimension, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
         )
 
-        # Expand shifts
-        shifts = torch.zeros((total_shifts, 3), dtype=torch.int32, device=device)
-        shift_system_idx = torch.zeros(total_shifts, dtype=torch.int32, device=device)
         wp_shift_range = wp.from_torch(shift_range_per_dimension, dtype=wp.vec3i)
-        wp_shift_offset = wp.from_torch(shift_offset, dtype=wp.int32)
-        wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i)
-        wp_shift_system_idx = wp.from_torch(shift_system_idx, dtype=wp.int32)
-
-        wp.launch(
-            _expand_naive_shifts,
-            dim=cell.shape[0],  # num_systems
-            device=str(device),
-            inputs=[
-                wp_shift_range,
-                wp_shift_offset,
-                wp_shifts,
-                wp_shift_system_idx,
-            ],
-        )
 
         # Prepare output arrays
         neighbor_matrix = torch.full(
@@ -670,7 +657,8 @@ class TestNaiveWpLaunchers:
             wp_positions,
             cutoff,
             wp_cell,
-            wp_shifts,
+            wp_shift_range,
+            max_shifts,
             wp_neighbor_matrix,
             wp_neighbor_matrix_shifts,
             wp_num_neighbors,
@@ -684,6 +672,66 @@ class TestNaiveWpLaunchers:
         assert num_neighbors.sum() > 0, "Should find some neighbors"
 
         # Check that unit_shifts are reasonable
+        valid_shifts = neighbor_matrix_shifts[neighbor_matrix != -1]
+        if len(valid_shifts) > 0:
+            assert torch.all(torch.abs(valid_shifts) <= 5), (
+                "Unit shifts should be small integers"
+            )
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_naive_neighbor_matrix_pbc_prewrapped(self, device, dtype, half_fill):
+        """Test naive_neighbor_matrix_pbc with wrap_positions=False."""
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 30
+
+        shift_range_per_dimension, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell, cutoff, pbc
+        )
+        wp_shift_range = wp.from_torch(shift_range_per_dimension, dtype=wp.vec3i)
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
+
+        neighbor_matrix = torch.full(
+            (positions.shape[0], max_neighbors),
+            positions.shape[0],
+            dtype=torch.int32,
+            device=device,
+        )
+        neighbor_matrix_shifts = torch.zeros(
+            (positions.shape[0], max_neighbors, 3),
+            dtype=torch.int32,
+            device=device,
+        )
+        num_neighbors = torch.zeros(
+            positions.shape[0], dtype=torch.int32, device=device
+        )
+        naive_neighbor_matrix_pbc(
+            wp_positions,
+            cutoff,
+            wp_cell,
+            wp_shift_range,
+            max_shifts,
+            wp.from_torch(neighbor_matrix, dtype=wp.int32),
+            wp.from_torch(neighbor_matrix_shifts, dtype=wp.vec3i),
+            wp.from_torch(num_neighbors, dtype=wp.int32),
+            wp_dtype,
+            str(device),
+            half_fill,
+            wrap_positions=False,
+        )
+
+        assert torch.all(num_neighbors >= 0), "Neighbor counts should be non-negative"
+        assert num_neighbors.sum() > 0, "Should find some neighbors"
+
         valid_shifts = neighbor_matrix_shifts[neighbor_matrix != -1]
         if len(valid_shifts) > 0:
             assert torch.all(torch.abs(valid_shifts) <= 5), (

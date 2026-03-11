@@ -171,11 +171,11 @@ def neighbor_list(
         shift_range_per_dimension : jax.Array, optional
             Pre-computed array of shape (1, 3) for shift range in each dimension.
             Can be provided to avoid recomputation for naive methods.
-        shift_offset : jax.Array, optional
-            Pre-computed array of shape (2,) for cumulative sum of number of shifts
-            for each system. Can be provided to avoid recomputation for naive methods.
-        total_shifts : int, optional
-            Total number of shifts.
+        num_shifts_per_system : jax.Array, optional
+            Pre-computed array of shape (num_systems,) for the number of periodic
+            shifts per system. Can be provided to avoid recomputation for naive methods.
+        max_shifts_per_system : int, optional
+            Maximum per-system shift count.
             Can be provided to avoid recomputation for naive methods.
         cells_per_dimension : jax.Array, optional
             Pre-computed array of shape (3,) for number of cells in x, y, z directions.

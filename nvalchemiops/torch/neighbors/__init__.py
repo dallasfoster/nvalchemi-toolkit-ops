@@ -146,12 +146,12 @@ def neighbor_list(
         shift_range_per_dimension : torch.Tensor, optional
             Pre-allocated tensor of shape (1, 3) for shift range in each dimension.
             Can be provided to avoid reallocation for naive methods.
-        shift_offset : torch.Tensor, optional
-            Pre-allocated tensor of shape (2,) for cumulative sum of number of shifts
-            for each system. Can be provided to avoid reallocation for naive methods.
-        total_shifts : int, optional
-            Total number of shifts.
-            Can be provided to avoid reallocation for naive methods.
+        num_shifts_per_system : torch.Tensor, optional
+            Pre-computed tensor of shape (num_systems,) for the number of periodic
+            shifts per system. Can be provided to avoid recomputation for naive methods.
+        max_shifts_per_system : int, optional
+            Maximum per-system shift count.
+            Can be provided to avoid recomputation for naive methods.
         cells_per_dimension : torch.Tensor, optional
             Pre-allocated tensor of shape (3,) for number of cells in x, y, z directions.
             Can be provided to avoid reallocation for cell list construction.

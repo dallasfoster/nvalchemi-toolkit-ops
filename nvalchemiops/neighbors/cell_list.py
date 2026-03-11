@@ -610,7 +610,7 @@ def _cell_list_build_neighbor_matrix_selective(
     Parameters
     ----------
     positions : wp.array, shape (total_atoms, 3), dtype=wp.vec3*
-        Atomic coordinates in Cartesian space.
+        Cartesian coordinates.
     cell : wp.array, shape (1, 3, 3), dtype=wp.mat33*
         Unit cell matrix for periodic boundary coordinate shifts.
     pbc : wp.array, shape (3,), dtype=bool

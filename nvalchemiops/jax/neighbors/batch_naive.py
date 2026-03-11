@@ -30,12 +30,13 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 from nvalchemiops.neighbors.batch_naive import (
     _fill_batch_naive_neighbor_matrix_overload,
     _fill_batch_naive_neighbor_matrix_pbc_overload,
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_overload,
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_selective_overload,
     _fill_batch_naive_neighbor_matrix_pbc_selective_overload,
     _fill_batch_naive_neighbor_matrix_selective_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     _compute_inv_cells_overload,
-    _expand_naive_shifts,
     _wrap_positions_batch_overload,
     estimate_max_neighbors,
 )
@@ -102,11 +103,29 @@ _jax_fill_batch_naive_pbc_selective_f64 = jax_kernel(
     enable_backward=False,
 )
 
-# Expand shifts kernel wrapper (no overloads — single kernel)
-_jax_expand_naive_shifts = jax_kernel(
-    _expand_naive_shifts,
-    num_outputs=2,
-    in_out_argnames=["shifts", "shift_system_idx"],
+# Prewrapped PBC batch naive neighbor matrix kernel wrappers
+_jax_fill_batch_naive_pbc_prewrapped_f32 = jax_kernel(
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_overload[wp.float32],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_fill_batch_naive_pbc_prewrapped_f64 = jax_kernel(
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_overload[wp.float64],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_fill_batch_naive_pbc_prewrapped_selective_f32 = jax_kernel(
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_selective_overload[wp.float32],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    enable_backward=False,
+)
+_jax_fill_batch_naive_pbc_prewrapped_selective_f64 = jax_kernel(
+    _fill_batch_naive_neighbor_matrix_pbc_prewrapped_selective_overload[wp.float64],
+    num_outputs=3,
+    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
 )
 
@@ -154,8 +173,8 @@ def batch_naive_neighbor_list(
     neighbor_matrix_shifts: jax.Array | None = None,
     num_neighbors: jax.Array | None = None,
     shift_range_per_dimension: jax.Array | None = None,
-    shift_offset: jax.Array | None = None,
-    total_shifts: int | None = None,
+    num_shifts_per_system: jax.Array | None = None,
+    max_shifts_per_system: int | None = None,
     max_atoms_per_system: int | None = None,
     rebuild_flags: jax.Array | None = None,
     wrap_positions: bool = True,
@@ -173,7 +192,7 @@ def batch_naive_neighbor_list(
     Parameters
     ----------
     positions : jax.Array, shape (total_atoms, 3), dtype=float32 or float64
-        Concatenated atomic coordinates for all systems in Cartesian space.
+        Concatenated Cartesian coordinates for all systems.
     cutoff : float
         Cutoff distance for neighbor detection in Cartesian units.
         Must be positive. Atoms within this distance are considered neighbors.
@@ -200,10 +219,10 @@ def batch_naive_neighbor_list(
         Pre-allocated neighbors count array.
     shift_range_per_dimension : jax.Array, optional
         Pre-computed shift range for PBC systems.
-    shift_offset : jax.Array, optional
-        Pre-computed shift offsets for PBC systems.
-    total_shifts : int, optional
-        Total number of shifts for PBC.
+    num_shifts_per_system : jax.Array, optional
+        Number of periodic shifts per system.
+    max_shifts_per_system : int, optional
+        Maximum per-system shift count (launch dimension).
     max_atoms_per_system : int, optional
         Maximum atoms in any system.
     wrap_positions : bool, default=True
@@ -295,11 +314,11 @@ def batch_naive_neighbor_list(
         elif rebuild_flags is None:
             neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
         if (
-            total_shifts is None
-            or shift_offset is None
+            max_shifts_per_system is None
+            or num_shifts_per_system is None
             or shift_range_per_dimension is None
         ):
-            shift_range_per_dimension, shift_offset, total_shifts = (
+            shift_range_per_dimension, num_shifts_per_system, max_shifts_per_system = (
                 compute_naive_num_shifts(cell, cutoff, pbc)
             )
 
@@ -328,6 +347,10 @@ def batch_naive_neighbor_list(
         _jax_fill_pbc = _jax_fill_batch_naive_pbc_f64
         _jax_fill_selective = _jax_fill_batch_naive_selective_f64
         _jax_fill_pbc_selective = _jax_fill_batch_naive_pbc_selective_f64
+        _jax_fill_pbc_prewrapped = _jax_fill_batch_naive_pbc_prewrapped_f64
+        _jax_fill_pbc_prewrapped_selective = (
+            _jax_fill_batch_naive_pbc_prewrapped_selective_f64
+        )
         _jax_inv_cells = _jax_compute_inv_cells_f64
         _jax_wrap_batch = _jax_wrap_positions_batch_f64
     else:
@@ -335,6 +358,10 @@ def batch_naive_neighbor_list(
         _jax_fill_pbc = _jax_fill_batch_naive_pbc_f32
         _jax_fill_selective = _jax_fill_batch_naive_selective_f32
         _jax_fill_pbc_selective = _jax_fill_batch_naive_pbc_selective_f32
+        _jax_fill_pbc_prewrapped = _jax_fill_batch_naive_pbc_prewrapped_f32
+        _jax_fill_pbc_prewrapped_selective = (
+            _jax_fill_batch_naive_pbc_prewrapped_selective_f32
+        )
         _jax_inv_cells = _jax_compute_inv_cells_f32
         _jax_wrap_batch = _jax_wrap_positions_batch_f32
         positions = positions.astype(jnp.float32)
@@ -375,18 +402,6 @@ def batch_naive_neighbor_list(
                 launch_dims=(total_atoms,),
             )
     else:
-        # PBC case - expand shifts first
-        shifts = jnp.zeros((total_shifts, 3), dtype=jnp.int32)
-        shift_system_idx = jnp.zeros(total_shifts, dtype=jnp.int32)
-
-        shifts, shift_system_idx = _jax_expand_naive_shifts(
-            shift_range_per_dimension,
-            shift_offset,
-            shifts,
-            shift_system_idx,
-            launch_dims=(num_systems,),  # batched — one thread per system
-        )
-
         if cell.dtype != positions.dtype:
             cell = cell.astype(positions.dtype)
 
@@ -420,48 +435,100 @@ def batch_naive_neighbor_list(
                 per_atom_cell_offsets,
                 launch_dims=(total_atoms,),
             )
-        else:
-            positions_wrapped = positions
-            per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
 
-        if rebuild_flags is not None:
-            rf = rebuild_flags.astype(jnp.bool_)
-            atom_rebuild = rf[batch_idx_i32]
-            num_neighbors = jnp.where(
-                atom_rebuild, jnp.zeros_like(num_neighbors), num_neighbors
-            )
-            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
-                _jax_fill_pbc_selective(
+            if rebuild_flags is not None:
+                rf = rebuild_flags.astype(jnp.bool_)
+                atom_rebuild = rf[batch_idx_i32]
+                num_neighbors = jnp.where(
+                    atom_rebuild, jnp.zeros_like(num_neighbors), num_neighbors
+                )
+                neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
+                    _jax_fill_pbc_selective(
+                        positions_wrapped,
+                        per_atom_cell_offsets,
+                        cell,
+                        float(cutoff * cutoff),
+                        batch_ptr_i32,
+                        shift_range_per_dimension,
+                        num_shifts_per_system,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rf,
+                        launch_dims=(
+                            num_systems,
+                            max_shifts_per_system,
+                            max_atoms_per_system,
+                        ),
+                    )
+                )
+            else:
+                neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
                     positions_wrapped,
                     per_atom_cell_offsets,
                     cell,
                     float(cutoff * cutoff),
                     batch_ptr_i32,
-                    shifts,
-                    shift_system_idx,
+                    shift_range_per_dimension,
+                    num_shifts_per_system,
                     neighbor_matrix,
                     neighbor_matrix_shifts,
                     num_neighbors,
                     half_fill,
-                    rf,
-                    launch_dims=(total_shifts, max_atoms_per_system),
+                    launch_dims=(
+                        num_systems,
+                        max_shifts_per_system,
+                        max_atoms_per_system,
+                    ),
                 )
-            )
         else:
-            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _jax_fill_pbc(
-                positions_wrapped,
-                per_atom_cell_offsets,
-                cell,
-                float(cutoff * cutoff),
-                batch_ptr_i32,
-                shifts,
-                shift_system_idx,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                half_fill,
-                launch_dims=(total_shifts, max_atoms_per_system),
-            )
+            if rebuild_flags is not None:
+                rf = rebuild_flags.astype(jnp.bool_)
+                atom_rebuild = rf[batch_idx_i32]
+                num_neighbors = jnp.where(
+                    atom_rebuild, jnp.zeros_like(num_neighbors), num_neighbors
+                )
+                neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
+                    _jax_fill_pbc_prewrapped_selective(
+                        positions,
+                        cell,
+                        float(cutoff * cutoff),
+                        batch_ptr_i32,
+                        shift_range_per_dimension,
+                        num_shifts_per_system,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rf,
+                        launch_dims=(
+                            num_systems,
+                            max_shifts_per_system,
+                            max_atoms_per_system,
+                        ),
+                    )
+                )
+            else:
+                neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
+                    _jax_fill_pbc_prewrapped(
+                        positions,
+                        cell,
+                        float(cutoff * cutoff),
+                        batch_ptr_i32,
+                        shift_range_per_dimension,
+                        num_shifts_per_system,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        launch_dims=(
+                            num_systems,
+                            max_shifts_per_system,
+                            max_atoms_per_system,
+                        ),
+                    )
+                )
 
     if return_neighbor_list:
         if pbc is not None:

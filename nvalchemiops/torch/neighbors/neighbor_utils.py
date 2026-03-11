@@ -65,10 +65,15 @@ def compute_naive_num_shifts(
     -------
     shift_range : torch.Tensor, shape (num_systems, 3), dtype=int32
         Maximum shift indices in each dimension for each system.
-    shift_offset : torch.Tensor, shape (num_systems + 1,), dtype=int32
-        Cumulative sum of number of shifts for each system.
-    total_shifts : int
-        Total number of periodic shifts needed across all systems.
+    num_shifts : torch.Tensor, shape (num_systems,), dtype=int32
+        Number of periodic shifts for each system.
+    max_shifts : int
+        Maximum per-system shift count across all systems.
+
+    Raises
+    ------
+    ValueError
+        If any per-system shift count exceeds int32 range.
 
     See Also
     --------
@@ -77,7 +82,7 @@ def compute_naive_num_shifts(
     num_systems = cell.shape[0]
     device = cell.device
 
-    num_shifts = torch.empty(num_systems, dtype=torch.int32, device=device)
+    num_shifts_i32 = torch.empty(num_systems, dtype=torch.int32, device=device)
     shift_range = torch.empty((num_systems, 3), dtype=torch.int32, device=device)
 
     wp_dtype = get_wp_dtype(cell.dtype)
@@ -86,7 +91,7 @@ def compute_naive_num_shifts(
 
     wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
     wp_pbc = wp.from_torch(pbc, dtype=wp.bool)
-    wp_num_shifts = wp.from_torch(num_shifts, dtype=wp.int32)
+    wp_num_shifts = wp.from_torch(num_shifts_i32, dtype=wp.int32)
     wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i)
 
     wp_compute_naive_num_shifts(
@@ -99,10 +104,21 @@ def compute_naive_num_shifts(
         device=str(wp_device),
     )
 
-    shift_offset = torch.empty((num_systems + 1,), dtype=torch.int32, device=device)
-    shift_offset[0] = 0
-    torch.cumsum(num_shifts, dim=0, out=shift_offset[1:])
-    return shift_range, shift_offset, shift_offset[-1].item()
+    s = shift_range.to(torch.int64)
+    k1 = 2 * s[:, 1] + 1
+    k2 = 2 * s[:, 2] + 1
+    num_shifts_i64 = s[:, 0] * k1 * k2 + s[:, 1] * k2 + s[:, 2] + 1
+
+    max_shifts_i64 = num_shifts_i64.max().item() if num_systems > 0 else 0
+    if max_shifts_i64 > 2**31 - 1:
+        raise ValueError(
+            f"Per-system shift count ({max_shifts_i64}) exceeds int32 max "
+            f"(2^31 - 1). Reduce the cutoff, increase cell size, or use a "
+            f"cell-list method for very small cells."
+        )
+
+    num_shifts = num_shifts_i64.to(torch.int32)
+    return shift_range, num_shifts, int(max_shifts_i64)
 
 
 def get_neighbor_list_from_neighbor_matrix(
