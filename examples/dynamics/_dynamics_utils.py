@@ -1442,9 +1442,10 @@ class BatchedMDSystem:
 
         Note
         ----
-        :func:`nvalchemiops.dynamics.utils.compute_temperature` currently takes a
-        single `num_atoms` value (per system). For heterogeneous batches this is
-        ambiguous, so we require uniform system sizes here.
+        :func:`nvalchemiops.dynamics.utils.compute_temperature` takes a
+        ``num_atoms_per_system`` warp array (shape ``(B,)``).  For heterogeneous
+        batches this works element-wise, but we still validate uniform sizes
+        here for safety.
         """
         n = np.asarray(self.num_atoms_per_system, dtype=np.int64)
         if not np.all(n == n[0]):
@@ -1461,7 +1462,6 @@ class BatchedMDSystem:
             num_atoms_per_system=wp.array(
                 self.num_atoms_per_system, dtype=wp.int32, device=self.device
             ),
-            batch_idx=self.wp_batch_idx,
         )
         return temp
 
