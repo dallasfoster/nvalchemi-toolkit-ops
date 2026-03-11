@@ -205,6 +205,9 @@ def _neighbor_list_needs_rebuild(
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
 
@@ -218,7 +221,16 @@ def _neighbor_list_needs_rebuild(
         Maximum allowed displacement before neighbor list becomes invalid.
     overwrite_reference_positions : bool, default=False
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+        When rebuild_flag is True, this is used to overwrite the reference
+        positions with the current positions.
+    cell : torch.Tensor or None, optional
+        Unit cell matrix, shape (1, 3, 3).  Required together with
+        ``cell_inv`` and ``pbc`` to enable MIC displacement.
+    cell_inv : torch.Tensor or None, optional
+        Inverse cell matrix, same shape as ``cell``.
+    pbc : torch.Tensor or None, optional
+        PBC flags, shape (1, 3) or (3,), dtype=bool.
+
     Returns
     -------
     rebuild_needed : torch.Tensor, shape (1,), dtype=bool
@@ -226,10 +238,8 @@ def _neighbor_list_needs_rebuild(
 
     See Also
     --------
-    nvalchemiops.neighborlist.rebuild_detection.wp_check_neighbor_list_rebuild : Core warp launcher
     neighbor_list_needs_rebuild : High-level wrapper function
     """
-    # Check for shape compatibility
     if reference_positions.shape != current_positions.shape:
         return torch.tensor([True], device=current_positions.device, dtype=torch.bool)
 
@@ -239,11 +249,9 @@ def _neighbor_list_needs_rebuild(
     if total_atoms == 0:
         return torch.tensor([False], device=device, dtype=torch.bool)
 
-    # Get warp data types for the input tensor precision
     wp_dtype = get_wp_dtype(reference_positions.dtype)
     wp_vec_dtype = get_wp_vec_dtype(reference_positions.dtype)
 
-    # Convert PyTorch tensors to warp arrays
     wp_reference_positions = wp.from_torch(
         reference_positions, dtype=wp_vec_dtype, return_ctype=True
     )
@@ -251,11 +259,16 @@ def _neighbor_list_needs_rebuild(
         current_positions, dtype=wp_vec_dtype, return_ctype=True
     )
 
-    # Initialize rebuild flag (False = no rebuild needed)
     rebuild_needed = torch.tensor([False], device=device, dtype=torch.bool)
     wp_rebuild_flag = wp.from_torch(rebuild_needed, dtype=wp.bool, return_ctype=True)
 
-    # Call core warp launcher
+    wp_cell = wp_cell_inv = wp_pbc = None
+    if cell is not None and cell_inv is not None and pbc is not None:
+        wp_mat_dtype = get_wp_mat_dtype(reference_positions.dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
+        wp_cell_inv = wp.from_torch(cell_inv, dtype=wp_mat_dtype, return_ctype=True)
+        wp_pbc = wp.from_torch(pbc.squeeze(0), dtype=wp.bool, return_ctype=True)
+
     check_neighbor_list_rebuild(
         reference_positions=wp_reference_positions,
         current_positions=wp_current_positions,
@@ -264,6 +277,9 @@ def _neighbor_list_needs_rebuild(
         wp_dtype=wp_dtype,
         device=str(device),
         overwrite_reference_positions=overwrite_reference_positions,
+        cell=wp_cell,
+        cell_inv=wp_cell_inv,
+        pbc=wp_pbc,
     )
 
     return rebuild_needed
@@ -275,12 +291,11 @@ def _neighbor_list_needs_rebuild_fake(
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fake implementation for torch.compile compatibility.
-
-    Returns a conservative default (no rebuild needed) for compilation tracing.
-    The actual implementation will be called during runtime execution.
-    """
+    """Fake implementation for torch.compile compatibility."""
     return torch.tensor([False], device=current_positions.device, dtype=torch.bool)
 
 
@@ -289,6 +304,9 @@ def neighbor_list_needs_rebuild(
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
 
@@ -296,8 +314,9 @@ def neighbor_list_needs_rebuild(
     have moved beyond the skin distance since the neighbor list was last built. Uses
     GPU acceleration with early termination for optimal performance in MD simulations.
 
-    The skin distance approach allows neighbor lists to remain valid even when atoms
-    move slightly, reducing the frequency of expensive neighbor list reconstructions.
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses minimum-image
+    convention (MIC) so atoms crossing periodic boundaries are not spuriously
+    flagged.
 
     Parameters
     ----------
@@ -310,7 +329,16 @@ def neighbor_list_needs_rebuild(
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
     overwrite_reference_positions : bool, default=False
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+        When rebuild_flag is True, this is used to overwrite the reference
+        positions with the current positions.
+    cell : torch.Tensor or None, optional
+        Unit cell matrix, shape (1, 3, 3).  Required together with
+        ``cell_inv`` and ``pbc`` to enable MIC displacement.
+    cell_inv : torch.Tensor or None, optional
+        Inverse cell matrix, same shape as ``cell``.
+    pbc : torch.Tensor or None, optional
+        PBC flags, shape (1, 3) or (3,), dtype=bool.
+
     Returns
     -------
     rebuild_needed : torch.Tensor, shape (1,), dtype=bool
@@ -322,12 +350,12 @@ def neighbor_list_needs_rebuild(
     - torch.compile compatible custom operation
     - Uses GPU kernels for parallel displacement computation
     - Early termination optimization stops computation once rebuild is detected
-    - Displacement calculation uses Euclidean distance
+    - When cell/cell_inv/pbc are supplied, uses MIC displacement; otherwise
+      Euclidean distance.
     - Returns tensor (not Python bool) for compilation compatibility
 
     See Also
     --------
-    nvalchemiops.neighborlist.rebuild_detection.wp_check_neighbor_list_rebuild : Core warp launcher
     check_neighbor_list_rebuild_needed : Convenience wrapper that returns Python bool
     """
     return _neighbor_list_needs_rebuild(
@@ -335,6 +363,9 @@ def neighbor_list_needs_rebuild(
         current_positions,
         skin_distance_threshold,
         overwrite_reference_positions,
+        cell,
+        cell_inv,
+        pbc,
     )
 
 
@@ -411,16 +442,14 @@ def check_neighbor_list_rebuild_needed(
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> bool:
     """Determine if neighbor list requires rebuilding based on atomic motion.
 
-    This high-level function provides a convenient interface to check if a neighbor
-    list needs reconstruction due to excessive atomic movement. Uses the skin distance
-    approach to minimize unnecessary neighbor list rebuilds during MD simulations.
-
-    The skin distance technique allows atoms to move slightly without invalidating
-    the neighbor list, reducing computational overhead. When any atom moves beyond
-    the skin distance, the neighbor list must be rebuilt to maintain accuracy.
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
+    displacement so periodic boundary crossings are handled correctly.
 
     This function is not torch.compile compatible.
 
@@ -428,39 +457,36 @@ def check_neighbor_list_rebuild_needed(
     ----------
     reference_positions : torch.Tensor, shape (total_atoms, 3)
         Atomic coordinates when the neighbor list was last constructed.
-        Used as the reference point for displacement calculations.
     current_positions : torch.Tensor, shape (total_atoms, 3)
         Current atomic coordinates to compare against reference positions.
-        Must have the same shape as reference_positions.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-        Typically set to (cutoff_radius - cutoff) / 2 for safety.
-        Units should match the coordinate system.
     overwrite_reference_positions : bool, default=False
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+    cell : torch.Tensor or None, optional
+        Unit cell matrix, shape (1, 3, 3).
+    cell_inv : torch.Tensor or None, optional
+        Inverse cell matrix, same shape as ``cell``.
+    pbc : torch.Tensor or None, optional
+        PBC flags, shape (1, 3) or (3,), dtype=bool.
+
     Returns
     -------
     needs_rebuild : torch.Tensor, shape (1,), dtype=bool
-        True if any atom has moved beyond skin distance requiring neighbor list rebuild.
-
-    Notes
-    -----
-    - Currently only supports single system.
-    - Uses GPU acceleration for efficient displacement computation
-    - Early termination optimization for performance
-    - Essential for efficient molecular dynamics simulations
+        True if any atom has moved beyond skin distance requiring rebuild.
 
     See Also
     --------
-    neighbor_list_needs_rebuild : Returns tensor instead of bool
-    nvalchemiops.neighborlist.rebuild_detection.wp_check_neighbor_list_rebuild : Core warp launcher
+    neighbor_list_needs_rebuild : Returns tensor (torch.compile compatible)
     """
     rebuild_tensor = neighbor_list_needs_rebuild(
         reference_positions,
         current_positions,
         skin_distance_threshold,
         overwrite_reference_positions,
+        cell,
+        cell_inv,
+        pbc,
     )
 
     return rebuild_tensor
@@ -480,6 +506,9 @@ def _batch_neighbor_list_needs_rebuild(
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Detect per-system if neighbor lists require rebuilding due to atomic motion.
 
@@ -495,7 +524,13 @@ def _batch_neighbor_list_needs_rebuild(
         Maximum allowed displacement before neighbor list becomes invalid.
     overwrite_reference_positions : bool, default=False
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+    cell : torch.Tensor or None, optional
+        Per-system cell matrices, shape (num_systems, 3, 3).
+    cell_inv : torch.Tensor or None, optional
+        Inverse cell matrices, same shape as ``cell``.
+    pbc : torch.Tensor or None, optional
+        PBC flags, shape (num_systems, 3), dtype=bool.
+
     Returns
     -------
     rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
@@ -532,6 +567,13 @@ def _batch_neighbor_list_needs_rebuild(
     )
     wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
 
+    wp_cell = wp_cell_inv = wp_pbc = None
+    if cell is not None and cell_inv is not None and pbc is not None:
+        wp_mat_dtype = get_wp_mat_dtype(reference_positions.dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
+        wp_cell_inv = wp.from_torch(cell_inv, dtype=wp_mat_dtype, return_ctype=True)
+        wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+
     check_batch_neighbor_list_rebuild(
         reference_positions=wp_reference,
         current_positions=wp_current,
@@ -541,6 +583,9 @@ def _batch_neighbor_list_needs_rebuild(
         wp_dtype=wp_dtype,
         device=str(device),
         overwrite_reference_positions=overwrite_reference_positions,
+        cell=wp_cell,
+        cell_inv=wp_cell_inv,
+        pbc=wp_pbc,
     )
 
     return rebuild_flags
@@ -553,6 +598,9 @@ def _batch_neighbor_list_needs_rebuild_fake(
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile compatibility."""
     num_systems = batch_idx.max() + 1 if batch_idx.numel() > 0 else 1
@@ -565,12 +613,18 @@ def batch_neighbor_list_needs_rebuild(
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: torch.Tensor | None = None,
+    cell_inv: torch.Tensor | None = None,
+    pbc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Detect per-system if neighbor lists require rebuilding due to atomic motion.
 
     This torch.compile-compatible custom operator efficiently determines which systems
     in a batch need their neighbor list rebuilt based on atomic displacements. Uses
     GPU-side flagging with no CPU-GPU synchronization.
+
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
+    displacement so periodic boundary crossings are handled correctly.
 
     Parameters
     ----------
@@ -582,27 +636,31 @@ def batch_neighbor_list_needs_rebuild(
         System index for each atom.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-        Typically set to (cutoff_radius - cutoff) / 2 for safety.
     overwrite_reference_positions : bool, default=False
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+    cell : torch.Tensor or None, optional
+        Per-system cell matrices, shape (num_systems, 3, 3).
+    cell_inv : torch.Tensor or None, optional
+        Inverse cell matrices, same shape as ``cell``.
+    pbc : torch.Tensor or None, optional
+        PBC flags, shape (num_systems, 3), dtype=bool.
+
     Returns
     -------
     rebuild_flags : torch.Tensor, shape (num_systems,), dtype=bool
-        Per-system flags: True if any atom in that system moved beyond the skin distance.
-        Can be passed directly to batch neighbor list functions for GPU-side selective rebuild.
+        Per-system flags: True if any atom in that system moved beyond the skin
+        distance.
 
     Notes
     -----
     - torch.compile compatible custom operation
     - No CPU-GPU synchronization required; all flag writes happen on GPU
     - ``num_systems`` is inferred as ``batch_idx.max() + 1``
-    - Returns tensor (not Python bool) for compilation compatibility
 
     See Also
     --------
     neighbor_list_needs_rebuild : Single-system version
-    check_batch_neighbor_list_rebuild_needed : Convenience wrapper returning Python list
+    check_batch_neighbor_list_rebuild_needed : Convenience wrapper
     """
     return _batch_neighbor_list_needs_rebuild(
         reference_positions,
@@ -610,6 +668,9 @@ def batch_neighbor_list_needs_rebuild(
         batch_idx,
         skin_distance_threshold,
         overwrite_reference_positions,
+        cell,
+        cell_inv,
+        pbc,
     )
 
 

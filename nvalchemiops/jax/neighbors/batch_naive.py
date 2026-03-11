@@ -270,7 +270,7 @@ def batch_naive_neighbor_list(
         max_neighbors = estimate_max_neighbors(cutoff)
 
     if fill_value is None:
-        fill_value = positions.shape[0]
+        fill_value = jnp.int32(positions.shape[0])
 
     if neighbor_matrix is None:
         neighbor_matrix = jnp.full(
@@ -284,7 +284,7 @@ def batch_naive_neighbor_list(
     if num_neighbors is None:
         num_neighbors = jnp.zeros(positions.shape[0], dtype=jnp.int32)
     elif rebuild_flags is None:
-        num_neighbors = num_neighbors.at[:].set(0)
+        num_neighbors = num_neighbors.at[:].set(jnp.int32(0))
 
     if pbc is not None:
         if neighbor_matrix_shifts is None:
@@ -293,7 +293,7 @@ def batch_naive_neighbor_list(
                 dtype=jnp.int32,
             )
         elif rebuild_flags is None:
-            neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(0)
+            neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
         if (
             total_shifts is None
             or shift_offset is None

@@ -333,7 +333,7 @@ def batch_naive_neighbor_list_dual_cutoff(
         max_neighbors2 = estimate_max_neighbors(cutoff2)  # Use larger cutoff
 
     if fill_value is None:
-        fill_value = positions.shape[0]
+        fill_value = jnp.int32(positions.shape[0])
 
     # Allocate first neighbor matrix
     if neighbor_matrix1 is None:
@@ -359,13 +359,13 @@ def batch_naive_neighbor_list_dual_cutoff(
     if num_neighbors1 is None:
         num_neighbors1 = jnp.zeros(positions.shape[0], dtype=jnp.int32)
     elif rebuild_flags is None:
-        num_neighbors1 = num_neighbors1.at[:].set(0)
+        num_neighbors1 = num_neighbors1.at[:].set(jnp.int32(0))
 
     # Allocate second num_neighbors
     if num_neighbors2 is None:
         num_neighbors2 = jnp.zeros(positions.shape[0], dtype=jnp.int32)
     elif rebuild_flags is None:
-        num_neighbors2 = num_neighbors2.at[:].set(0)
+        num_neighbors2 = num_neighbors2.at[:].set(jnp.int32(0))
 
     if pbc is not None:
         # Allocate shift matrices
@@ -375,7 +375,7 @@ def batch_naive_neighbor_list_dual_cutoff(
                 dtype=jnp.int32,
             )
         elif rebuild_flags is None:
-            neighbor_matrix_shifts1 = neighbor_matrix_shifts1.at[:].set(0)
+            neighbor_matrix_shifts1 = neighbor_matrix_shifts1.at[:].set(jnp.int32(0))
 
         if neighbor_matrix_shifts2 is None:
             neighbor_matrix_shifts2 = jnp.zeros(
@@ -383,7 +383,7 @@ def batch_naive_neighbor_list_dual_cutoff(
                 dtype=jnp.int32,
             )
         elif rebuild_flags is None:
-            neighbor_matrix_shifts2 = neighbor_matrix_shifts2.at[:].set(0)
+            neighbor_matrix_shifts2 = neighbor_matrix_shifts2.at[:].set(jnp.int32(0))
 
         if (
             total_shifts is None

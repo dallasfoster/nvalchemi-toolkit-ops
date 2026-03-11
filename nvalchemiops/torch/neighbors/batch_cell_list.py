@@ -50,7 +50,7 @@ def estimate_batch_cell_list_sizes(
     cell: torch.Tensor,
     pbc: torch.Tensor,
     cutoff: float,
-    max_nbins: int = 1000,
+    max_nbins: int = 8192,
 ) -> tuple[int, torch.Tensor]:
     """Estimate memory allocation sizes for batch cell list construction.
 
@@ -66,7 +66,7 @@ def estimate_batch_cell_list_sizes(
         Periodic boundary condition flags for each system and dimension.
     cutoff : float
         Neighbor search cutoff distance.
-    max_nbins : int, default=1000
+    max_nbins : int, default=8192
         Maximum number of cells to allocate per system.
 
     Returns

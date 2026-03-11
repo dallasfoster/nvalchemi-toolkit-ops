@@ -223,6 +223,101 @@ for t, v in zip(_T, _V):
 
 
 ###########################################################################################
+############### PBC Neighbor List Rebuild Detection (Periodic-Aware) #####################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _check_atoms_moved_beyond_skin_pbc(
+    reference_positions: wp.array(dtype=Any),
+    current_positions: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    pbc: wp.array(dtype=wp.bool),
+    skin_distance_threshold: Any,
+    rebuild_flag: wp.array(dtype=wp.bool),
+    overwrite_reference_positions: bool = False,
+) -> None:
+    """Detect if atoms moved beyond skin distance using minimum-image convention.
+
+    Unlike ``_check_atoms_moved_beyond_skin`` which uses raw Euclidean
+    displacement, this kernel applies the minimum-image convention (MIC)
+    so that atoms crossing periodic boundaries are not spuriously flagged.
+
+    Parameters
+    ----------
+    reference_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic positions when the neighbor list was last built.
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic positions to compare against reference.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Unit cell matrix (basis vectors as rows).
+    cell_inv : wp.array, shape (1,), dtype=wp.mat33*
+        Precomputed inverse of the cell matrix.
+    pbc : wp.array, shape (3,), dtype=bool
+        Periodic boundary condition flags for x, y, z directions.
+    skin_distance_threshold : float*/int*
+        Maximum allowed displacement before neighbor list becomes invalid.
+    rebuild_flag : wp.array, shape (1,), dtype=bool
+        OUTPUT: Flag set to True if any atom moved beyond skin distance.
+    overwrite_reference_positions : bool, optional
+        If True, overwrite reference positions with current positions
+        when rebuild_flag is True.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: rebuild_flag (atomic write), optionally reference_positions
+    - Correct for triclinic cells; avoids per-thread matrix inversion
+    """
+    atom_idx = wp.tid()
+
+    if atom_idx >= reference_positions.shape[0]:
+        return
+
+    if rebuild_flag[0]:
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
+        return
+
+    delta = current_positions[atom_idx] - reference_positions[atom_idx]
+
+    # Convert displacement to fractional coordinates (row-vector convention)
+    delta_frac = delta * cell_inv[0]
+
+    # Apply minimum-image convention on periodic dimensions
+    for dim in range(3):
+        if pbc[dim]:
+            delta_frac[dim] -= wp.floor(delta_frac[dim] + type(delta_frac[dim])(0.5))
+
+    # Convert back to Cartesian
+    delta_cart = delta_frac * cell[0]
+    displacement_magnitude = wp.length(delta_cart)
+
+    if displacement_magnitude > skin_distance_threshold:
+        rebuild_flag[0] = True
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
+
+
+_check_atoms_moved_beyond_skin_pbc_overload = {}
+for t, v, m in zip(_T, _V, _M):
+    _check_atoms_moved_beyond_skin_pbc_overload[t] = wp.overload(
+        _check_atoms_moved_beyond_skin_pbc,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+            wp.array(dtype=wp.bool),
+            t,
+            wp.array(dtype=wp.bool),
+            wp.bool,
+        ],
+    )
+
+
+###########################################################################################
 ########################### Warp Launchers ###############################################
 ###########################################################################################
 
@@ -288,10 +383,16 @@ def check_neighbor_list_rebuild(
     wp_dtype: type,
     device: str,
     overwrite_reference_positions: bool = False,
+    cell: wp.array | None = None,
+    cell_inv: wp.array | None = None,
+    pbc: wp.array | None = None,
 ) -> None:
     """Core warp launcher for detecting if neighbor list needs rebuilding.
 
-    Checks if any atoms have moved beyond the skin distance since the neighbor list was built.
+    Checks if any atoms have moved beyond the skin distance since the neighbor
+    list was built.  When ``cell``, ``cell_inv`` and ``pbc`` are all provided
+    the check uses minimum-image convention (MIC) so that atoms crossing
+    periodic boundaries are not spuriously flagged.
 
     Parameters
     ----------
@@ -309,7 +410,15 @@ def check_neighbor_list_rebuild(
         Warp device string (e.g., 'cuda:0', 'cpu').
     overwrite_reference_positions : bool, optional
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+        When rebuild_flag is True, this is used to overwrite the reference
+        positions with the current positions.
+    cell : wp.array or None, optional
+        Unit cell matrix, shape (1,), dtype=wp.mat33*.  Required together with
+        ``cell_inv`` and ``pbc`` to enable MIC displacement.
+    cell_inv : wp.array or None, optional
+        Precomputed inverse of the cell matrix, same shape/dtype as ``cell``.
+    pbc : wp.array or None, optional
+        Periodic boundary condition flags, shape (3,), dtype=wp.bool.
 
     Notes
     -----
@@ -318,21 +427,40 @@ def check_neighbor_list_rebuild(
 
     See Also
     --------
-    _check_atoms_moved_beyond_skin : Kernel that performs the check
+    _check_atoms_moved_beyond_skin : Euclidean kernel
+    _check_atoms_moved_beyond_skin_pbc : PBC kernel for periodic systems
     """
     total_atoms = reference_positions.shape[0]
-    wp.launch(
-        kernel=_check_atoms_moved_beyond_skin_overload[wp_dtype],
-        dim=total_atoms,
-        inputs=[
-            reference_positions,
-            current_positions,
-            wp_dtype(skin_distance_threshold),
-            rebuild_flag,
-            overwrite_reference_positions,
-        ],
-        device=device,
-    )
+    use_pbc = cell is not None and cell_inv is not None and pbc is not None
+    if use_pbc:
+        wp.launch(
+            kernel=_check_atoms_moved_beyond_skin_pbc_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                reference_positions,
+                current_positions,
+                cell,
+                cell_inv,
+                pbc,
+                wp_dtype(skin_distance_threshold),
+                rebuild_flag,
+                overwrite_reference_positions,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_check_atoms_moved_beyond_skin_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                reference_positions,
+                current_positions,
+                wp_dtype(skin_distance_threshold),
+                rebuild_flag,
+                overwrite_reference_positions,
+            ],
+            device=device,
+        )
 
 
 ###########################################################################################
@@ -411,6 +539,108 @@ for t, v in zip(_T, _V):
             wp.array(dtype=v),
             wp.array(dtype=v),
             wp.array(dtype=wp.int32),
+            t,
+            wp.array(dtype=wp.bool),
+            bool,
+        ],
+    )
+
+
+###########################################################################################
+############ PBC Batch Neighbor List Rebuild Detection (Periodic-Aware) ##################
+###########################################################################################
+
+
+@wp.kernel(enable_backward=False)
+def _check_batch_atoms_moved_beyond_skin_pbc(
+    reference_positions: wp.array(dtype=Any),
+    current_positions: wp.array(dtype=Any),
+    batch_idx: wp.array(dtype=wp.int32),
+    cell: wp.array(dtype=Any),
+    cell_inv: wp.array(dtype=Any),
+    pbc: wp.array2d(dtype=wp.bool),
+    skin_distance_threshold: Any,
+    rebuild_flags: wp.array(dtype=wp.bool),
+    overwrite_reference_positions: bool,
+) -> None:
+    """Per-system PBC-aware skin-distance rebuild detection.
+
+    Like ``_check_batch_atoms_moved_beyond_skin`` but applies minimum-image
+    convention per system so atoms wrapping across periodic boundaries are
+    not spuriously flagged.
+
+    Parameters
+    ----------
+    reference_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic positions when each system's neighbor list was last built.
+    current_positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Current atomic positions to compare against reference.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Per-system unit cell matrices (basis vectors as rows).
+    cell_inv : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Precomputed per-system inverse cell matrices.
+    pbc : wp.array2d, shape (num_systems, 3), dtype=bool
+        Per-system periodic boundary condition flags.
+    skin_distance_threshold : float*
+        Maximum allowed displacement before neighbor list becomes invalid.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=bool
+        OUTPUT: Per-system flags set to True if any atom moved beyond skin
+        distance.
+    overwrite_reference_positions : bool
+        If True, overwrite reference positions with current positions
+        when the system's rebuild_flag is True.
+
+    Notes
+    -----
+    - Thread launch: One thread per atom (dim=total_atoms)
+    - Modifies: rebuild_flags, optionally reference_positions
+    - Correct for triclinic cells; avoids per-thread matrix inversion
+    """
+    atom_idx = wp.tid()
+
+    if atom_idx >= reference_positions.shape[0]:
+        return
+
+    isys = batch_idx[atom_idx]
+
+    if rebuild_flags[isys]:
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
+        return
+
+    delta = current_positions[atom_idx] - reference_positions[atom_idx]
+
+    # Convert displacement to fractional coordinates (row-vector convention)
+    delta_frac = delta * cell_inv[isys]
+
+    # Apply minimum-image convention on periodic dimensions
+    for dim in range(3):
+        if pbc[isys, dim]:
+            delta_frac[dim] -= wp.floor(delta_frac[dim] + type(delta_frac[dim])(0.5))
+
+    # Convert back to Cartesian
+    delta_cart = delta_frac * cell[isys]
+    displacement_magnitude = wp.length(delta_cart)
+
+    if displacement_magnitude > skin_distance_threshold:
+        rebuild_flags[isys] = True
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
+
+
+_check_batch_atoms_moved_beyond_skin_pbc_overload = {}
+for t, v, m in zip(_T, _V, _M):
+    _check_batch_atoms_moved_beyond_skin_pbc_overload[t] = wp.overload(
+        _check_batch_atoms_moved_beyond_skin_pbc,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=v),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=m),
+            wp.array(dtype=m),
+            wp.array2d(dtype=wp.bool),
             t,
             wp.array(dtype=wp.bool),
             bool,
@@ -543,12 +773,19 @@ def check_batch_neighbor_list_rebuild(
     wp_dtype: type,
     device: str,
     overwrite_reference_positions: bool = False,
+    cell: wp.array | None = None,
+    cell_inv: wp.array | None = None,
+    pbc: wp.array | None = None,
 ) -> None:
     """Core warp launcher for detecting per-system neighbor list rebuild needs.
 
     Checks if any atoms in each system have moved beyond the skin distance since
     the neighbor list was built. Sets per-system rebuild flags on GPU without
     requiring CPU synchronization.
+
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided the check uses
+    minimum-image convention (MIC) so that atoms crossing periodic boundaries
+    are not spuriously flagged.
 
     Parameters
     ----------
@@ -569,7 +806,16 @@ def check_batch_neighbor_list_rebuild(
         Warp device string (e.g., 'cuda:0', 'cpu').
     overwrite_reference_positions : bool, optional
         If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+        When rebuild_flag is True, this is used to overwrite the reference
+        positions with the current positions.
+    cell : wp.array or None, optional
+        Per-system cell matrices, shape (num_systems,), dtype=wp.mat33*.
+        Required together with ``cell_inv`` and ``pbc`` to enable MIC.
+    cell_inv : wp.array or None, optional
+        Precomputed per-system inverse cell matrices, same shape/dtype as
+        ``cell``.
+    pbc : wp.array or None, optional
+        Per-system PBC flags, shape (num_systems, 3), dtype=wp.bool (2D).
 
     Notes
     -----
@@ -579,22 +825,42 @@ def check_batch_neighbor_list_rebuild(
 
     See Also
     --------
-    _check_batch_atoms_moved_beyond_skin : Kernel that performs the check
+    _check_batch_atoms_moved_beyond_skin : Euclidean kernel
+    _check_batch_atoms_moved_beyond_skin_pbc : PBC kernel for periodic systems
     """
     total_atoms = reference_positions.shape[0]
-    wp.launch(
-        kernel=_check_batch_atoms_moved_beyond_skin_overload[wp_dtype],
-        dim=total_atoms,
-        inputs=[
-            reference_positions,
-            current_positions,
-            batch_idx,
-            wp_dtype(skin_distance_threshold),
-            rebuild_flags,
-            overwrite_reference_positions,
-        ],
-        device=device,
-    )
+    use_pbc = cell is not None and cell_inv is not None and pbc is not None
+    if use_pbc:
+        wp.launch(
+            kernel=_check_batch_atoms_moved_beyond_skin_pbc_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                reference_positions,
+                current_positions,
+                batch_idx,
+                cell,
+                cell_inv,
+                pbc,
+                wp_dtype(skin_distance_threshold),
+                rebuild_flags,
+                overwrite_reference_positions,
+            ],
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel=_check_batch_atoms_moved_beyond_skin_overload[wp_dtype],
+            dim=total_atoms,
+            inputs=[
+                reference_positions,
+                current_positions,
+                batch_idx,
+                wp_dtype(skin_distance_threshold),
+                rebuild_flags,
+                overwrite_reference_positions,
+            ],
+            device=device,
+        )
 
 
 def check_batch_cell_list_rebuild(

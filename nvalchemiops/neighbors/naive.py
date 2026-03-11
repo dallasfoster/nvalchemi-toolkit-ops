@@ -578,9 +578,7 @@ def naive_neighbor_matrix_pbc(
         inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
         compute_inv_cells(cell, inv_cell, wp_dtype, device)
         positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
-        per_atom_cell_offsets = wp.empty(
-            (total_atoms,), dtype=wp.vec3i, device=device
-        )
+        per_atom_cell_offsets = wp.empty((total_atoms,), dtype=wp.vec3i, device=device)
         wrap_positions_single(
             positions,
             cell,
@@ -592,9 +590,7 @@ def naive_neighbor_matrix_pbc(
         )
     else:
         positions_wrapped = positions
-        per_atom_cell_offsets = wp.zeros(
-            (total_atoms,), dtype=wp.vec3i, device=device
-        )
+        per_atom_cell_offsets = wp.zeros((total_atoms,), dtype=wp.vec3i, device=device)
 
     if rebuild_flags is None:
         wp.launch(
