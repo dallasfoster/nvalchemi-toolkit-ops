@@ -125,7 +125,7 @@ class TestNaiveDualCutoffCorrectness:
         max_neighbors2 = 25
 
         if preallocate:
-            shift_range_per_dimension, shift_offset, total_shifts = (
+            shift_range_per_dimension, num_shifts, max_shifts = (
                 compute_naive_num_shifts(cell, cutoff2, pbc)
             )
             neighbor_matrix1 = torch.full(
@@ -171,8 +171,8 @@ class TestNaiveDualCutoffCorrectness:
                 num_neighbors2=num_neighbors2,
                 neighbor_matrix_shifts2=neighbor_matrix_shifts2,
                 shift_range_per_dimension=shift_range_per_dimension,
-                shift_offset=shift_offset,
-                total_shifts=total_shifts,
+                num_shifts_per_system=num_shifts,
+                max_shifts_per_system=max_shifts,
             )
         else:
             (

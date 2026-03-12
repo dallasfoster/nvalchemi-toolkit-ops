@@ -620,3 +620,233 @@ class TestBatchRebuildDetectionWpLaunchers:
         )
         assert not rebuild_flags[1], "System 1 should not need rebuild"
         assert not rebuild_flags[2], "System 2 should not need rebuild"
+
+
+@pytest.mark.parametrize("device", devices)
+@pytest.mark.parametrize("dtype", dtypes)
+class TestPBCRebuildDetection:
+    """Tests for PBC-aware rebuild detection kernels."""
+
+    def test_pbc_no_spurious_rebuild_at_boundary(self, device, dtype):
+        """Atom wrapped from x=0 to x=L-eps must NOT trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, cell_size=cell_size, dtype=dtype, device=device
+        )
+        pbc = pbc.squeeze(0)
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        reference_positions = positions.clone()
+        current_positions = positions.clone()
+        # Simulate a boundary crossing: atom was near x=0, now wrapped to x=L-0.01
+        current_positions[0, 0] = cell_size - 0.01
+
+        wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
+        wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
+
+        cell_inv = (
+            torch.linalg.inv(cell.squeeze(0))
+            .unsqueeze(0)
+            .to(dtype=dtype, device=device)
+            .contiguous()
+        )
+        wp_cell_inv = wp.from_torch(cell_inv, dtype=wp_mat_dtype)
+        wp_pbc = wp.from_torch(pbc, dtype=wp.bool)
+
+        rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
+        wp_rebuild_flag = wp.from_torch(rebuild_needed, dtype=wp.bool)
+
+        check_neighbor_list_rebuild(
+            reference_positions=wp_reference,
+            current_positions=wp_current,
+            skin_distance_threshold=skin / 2.0,
+            rebuild_flag=wp_rebuild_flag,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            cell=wp_cell,
+            cell_inv=wp_cell_inv,
+            pbc=wp_pbc,
+        )
+
+        # PBC displacement is ~0.01, well below skin/2=0.5 → no rebuild
+        assert not rebuild_needed.item(), (
+            "PBC should prevent spurious rebuild at periodic boundary"
+        )
+
+    def test_pbc_genuine_large_displacement_triggers_rebuild(self, device, dtype):
+        """Atom truly moving beyond skin should still trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, cell_size=cell_size, dtype=dtype, device=device
+        )
+        pbc = pbc.squeeze(0)
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        reference_positions = positions.clone()
+        current_positions = positions.clone()
+        current_positions[0, 0] += 2.0  # Move 2 Å — well beyond skin/2
+
+        wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
+        wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
+
+        cell_inv = (
+            torch.linalg.inv(cell.squeeze(0))
+            .unsqueeze(0)
+            .to(dtype=dtype, device=device)
+            .contiguous()
+        )
+        wp_cell_inv = wp.from_torch(cell_inv, dtype=wp_mat_dtype)
+        wp_pbc = wp.from_torch(pbc, dtype=wp.bool)
+
+        rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
+        wp_rebuild_flag = wp.from_torch(rebuild_needed, dtype=wp.bool)
+
+        check_neighbor_list_rebuild(
+            reference_positions=wp_reference,
+            current_positions=wp_current,
+            skin_distance_threshold=skin / 2.0,
+            rebuild_flag=wp_rebuild_flag,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            cell=wp_cell,
+            cell_inv=wp_cell_inv,
+            pbc=wp_pbc,
+        )
+
+        assert rebuild_needed.item(), (
+            "PBC should still trigger rebuild for genuinely large displacement"
+        )
+
+    def test_pbc_non_periodic_dim_uses_raw_displacement(self, device, dtype):
+        """Non-periodic dimensions should use raw displacement, not PBC wrapping."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, _ = create_simple_cubic_system(
+            num_atoms=8, cell_size=cell_size, dtype=dtype, device=device
+        )
+        # Only x is periodic, y and z are not
+        pbc = torch.tensor([True, False, False], dtype=torch.bool, device=device)
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        reference_positions = positions.clone()
+        current_positions = positions.clone()
+        # Large jump in non-periodic y dimension
+        current_positions[0, 1] = cell_size - 0.01
+
+        wp_reference = wp.from_torch(reference_positions, dtype=wp_vec_dtype)
+        wp_current = wp.from_torch(current_positions, dtype=wp_vec_dtype)
+        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype)
+
+        cell_inv = (
+            torch.linalg.inv(cell.squeeze(0))
+            .unsqueeze(0)
+            .to(dtype=dtype, device=device)
+            .contiguous()
+        )
+        wp_cell_inv = wp.from_torch(cell_inv, dtype=wp_mat_dtype)
+        wp_pbc = wp.from_torch(pbc, dtype=wp.bool)
+
+        rebuild_needed = torch.zeros(1, dtype=torch.bool, device=device)
+        wp_rebuild_flag = wp.from_torch(rebuild_needed, dtype=wp.bool)
+
+        check_neighbor_list_rebuild(
+            reference_positions=wp_reference,
+            current_positions=wp_current,
+            skin_distance_threshold=skin / 2.0,
+            rebuild_flag=wp_rebuild_flag,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            cell=wp_cell,
+            cell_inv=wp_cell_inv,
+            pbc=wp_pbc,
+        )
+
+        # Non-periodic y dimension: raw displacement is ~10 Å, triggers rebuild
+        assert rebuild_needed.item(), (
+            "Non-periodic dimension should use raw displacement and trigger rebuild"
+        )
+
+    def test_batch_pbc_no_spurious_rebuild(self, device, dtype):
+        """Batch PBC: boundary-crossing atoms must not trigger rebuild."""
+        cell_size = 10.0
+        skin = 1.0
+        atoms_per = [4, 5, 3]
+
+        n_side = 2
+        spacing = cell_size / n_side
+        grid_coords = [
+            [i * spacing, j * spacing, k * spacing]
+            for i in range(n_side)
+            for j in range(n_side)
+            for k in range(n_side)
+        ]
+        all_pos = []
+        cells_list = []
+        for n in atoms_per:
+            pos = torch.tensor(grid_coords[:n], dtype=dtype, device=device)
+            all_pos.append(pos)
+            cells_list.append(torch.eye(3, dtype=dtype, device=device) * cell_size)
+
+        positions = torch.cat(all_pos, dim=0)
+        cells = torch.stack(cells_list, dim=0)
+        pbc = torch.ones(3, 3, dtype=torch.bool, device=device)
+        batch_idx = torch.repeat_interleave(
+            torch.arange(3, dtype=torch.int32, device=device),
+            torch.tensor(atoms_per, dtype=torch.int32, device=device),
+        )
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        reference_positions = positions.clone()
+        current_positions = positions.clone()
+        # Simulate boundary wrapping in system 1 (atom index 5)
+        current_positions[5, 0] = cell_size - 0.01
+
+        cells_inv = torch.linalg.inv(cells).to(dtype=dtype, device=device).contiguous()
+
+        rebuild_flags = torch.zeros(3, dtype=torch.bool, device=device)
+
+        wp_reference = wp.from_torch(
+            reference_positions, dtype=wp_vec_dtype, return_ctype=True
+        )
+        wp_current = wp.from_torch(
+            current_positions, dtype=wp_vec_dtype, return_ctype=True
+        )
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32, return_ctype=True)
+        wp_cells = wp.from_torch(cells, dtype=wp_mat_dtype, return_ctype=True)
+        wp_cells_inv = wp.from_torch(cells_inv, dtype=wp_mat_dtype, return_ctype=True)
+        wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+        wp_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
+
+        check_batch_neighbor_list_rebuild(
+            reference_positions=wp_reference,
+            current_positions=wp_current,
+            batch_idx=wp_batch_idx,
+            skin_distance_threshold=skin / 2.0,
+            rebuild_flags=wp_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            cell=wp_cells,
+            cell_inv=wp_cells_inv,
+            pbc=wp_pbc,
+        )
+
+        # PBC displacement for atom 5 is small → no rebuild for any system
+        assert not rebuild_flags.any(), (
+            "Batch PBC should prevent spurious rebuilds at boundaries"
+        )

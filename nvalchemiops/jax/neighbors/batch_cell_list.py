@@ -357,7 +357,7 @@ def batch_build_cell_list(
     cell_offsets = jnp.concatenate(
         [
             jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(cells_per_system[:-1]),
+            jnp.cumsum(cells_per_system[:-1], dtype=jnp.int32),
         ]
     )
 
@@ -378,7 +378,7 @@ def batch_build_cell_list(
     cell_atom_start_indices = jnp.concatenate(
         [
             jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(atoms_per_cell_count[:-1]),
+            jnp.cumsum(atoms_per_cell_count[:-1], dtype=jnp.int32),
         ]
     )
 
@@ -499,12 +499,12 @@ def batch_query_cell_list(
             dtype=jnp.int32,
         )
     elif rebuild_flags is None:
-        neighbor_matrix = neighbor_matrix.at[:].set(positions.shape[0])
+        neighbor_matrix = neighbor_matrix.at[:].set(jnp.int32(positions.shape[0]))
 
     if num_neighbors is None:
         num_neighbors = jnp.zeros(positions.shape[0], dtype=jnp.int32)
     elif rebuild_flags is None:
-        num_neighbors = num_neighbors.at[:].set(0)
+        num_neighbors = num_neighbors.at[:].set(jnp.int32(0))
 
     # Select kernel based on dtype
     if positions.dtype == jnp.float64:
@@ -533,7 +533,7 @@ def batch_query_cell_list(
             dtype=jnp.int32,
         )
     elif rebuild_flags is None:
-        neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(0)
+        neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
 
     if atoms_per_cell_count is None:
         max_total_cells = cell_atom_start_indices.shape[0]

@@ -262,6 +262,9 @@ class BenchmarkResult:
     final_ke: float | None = None
     final_pe: float | None = None
     final_temp: float | None = None
+    neighbor_rebuilds: int | None = None
+    cells_per_dimension: str | None = None
+    total_cells: int | None = None
 
     @property
     def avg_step_time_ms(self) -> float:
@@ -357,6 +360,14 @@ class BenchmarkResult:
             row["batch_throughput_system_steps_per_s"] = (
                 self.batch_throughput_system_steps_per_s
             )
+
+        # Add neighbor list instrumentation when populated
+        if self.neighbor_rebuilds is not None:
+            row["neighbor_rebuilds"] = self.neighbor_rebuilds
+        if self.cells_per_dimension is not None:
+            row["cells_per_dimension"] = self.cells_per_dimension
+        if self.total_cells is not None:
+            row["total_cells"] = self.total_cells
 
         return row
 
@@ -866,6 +877,9 @@ class NeighborListManager:
         self.wp_ref_positions = wp.zeros(num_atoms, dtype=wp_vec_dtype, device=device)
         self.wp_rebuild_flag = wp.zeros(1, dtype=wp.bool, device=device)
 
+        # Instrumentation counters (benchmark-only)
+        self.rebuild_count = 0
+
     def mark_stale(self) -> None:
         """Force a full rebuild on the next update() call.
 
@@ -874,7 +888,12 @@ class NeighborListManager:
         """
         self.wp_ref_positions.zero_()
 
-    def update(self, positions_wp: wp.array, cell_wp: wp.array) -> None:
+    def update(
+        self,
+        positions_wp: wp.array,
+        cell_wp: wp.array,
+        cell_inv_wp: wp.array | None = None,
+    ) -> None:
         """Check and selectively rebuild the neighbor list (no CPU-GPU sync).
 
         Parameters
@@ -883,6 +902,9 @@ class NeighborListManager:
             Current atomic positions.
         cell_wp : wp.array, shape (1,), dtype=wp.mat33*
             Current cell matrix.
+        cell_inv_wp : wp.array or None, optional
+            Precomputed inverse of the cell matrix.  When provided the
+            rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero rebuild flag — kernel only sets True, never clears
         zero_array(self.wp_rebuild_flag, self.device)
@@ -895,6 +917,9 @@ class NeighborListManager:
             rebuild_flag=self.wp_rebuild_flag,
             wp_dtype=self.wp_dtype,
             device=self.device,
+            cell=cell_wp if cell_inv_wp is not None else None,
+            cell_inv=cell_inv_wp,
+            pbc=self.wp_pbc if cell_inv_wp is not None else None,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -1070,6 +1095,9 @@ class BatchedNeighborListManager:
         self.wp_ref_positions = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=device)
         self.wp_rebuild_flags = wp.zeros(num_systems, dtype=wp.bool, device=device)
 
+        # Instrumentation counters (benchmark-only)
+        self.rebuild_count = 0
+
     def mark_stale(self) -> None:
         """Force a full rebuild of all systems on the next update() call.
 
@@ -1078,7 +1106,12 @@ class BatchedNeighborListManager:
         """
         self.wp_ref_positions.zero_()
 
-    def update(self, positions_wp: wp.array, cells_wp: wp.array) -> None:
+    def update(
+        self,
+        positions_wp: wp.array,
+        cells_wp: wp.array,
+        cells_inv_wp: wp.array | None = None,
+    ) -> None:
         """Check and selectively rebuild neighbor lists (no CPU-GPU sync).
 
         Parameters
@@ -1087,6 +1120,9 @@ class BatchedNeighborListManager:
             Current atomic positions for all systems.
         cells_wp : wp.array, shape (num_systems,), dtype=wp.mat33*
             Current cell matrices.
+        cells_inv_wp : wp.array or None, optional
+            Precomputed per-system inverse cell matrices.  When provided
+            the rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero per-system flags — kernel only sets True, never clears
         zero_array(self.wp_rebuild_flags, self.device)
@@ -1101,6 +1137,9 @@ class BatchedNeighborListManager:
             wp_dtype=self.wp_dtype,
             device=self.device,
             overwrite_reference_positions=True,
+            cell=cells_wp if cells_inv_wp is not None else None,
+            cell_inv=cells_inv_wp,
+            pbc=self.wp_pbc if cells_inv_wp is not None else None,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -1473,6 +1512,10 @@ class MDSystem:
             self.num_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
         )
         self.wp_masses = wp.from_torch(masses, dtype=self.wp_dtype)
+        self.wp_energies = wp.zeros(
+            self.num_atoms, dtype=self.wp_dtype, device=self.wp_device
+        )
+        self.wp_virial_flat = wp.zeros(9, dtype=self.wp_dtype, device=self.wp_device)
 
         # Cell matrix (shape (1,) for single system)
         cell_reshaped = cell.reshape(1, 3, 3).to(dtype=self.torch_dtype)
@@ -1503,7 +1546,7 @@ class MDSystem:
 
     def _update_neighbors(self) -> None:
         """Check and selectively rebuild neighbor list (no CPU-GPU sync)."""
-        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell, self.wp_cell_inv)
 
     def compute_forces(self) -> wp.array:
         """Compute LJ forces and return per-atom potential energies (device array).
@@ -1518,7 +1561,7 @@ class MDSystem:
         self._update_neighbors()
 
         # Compute LJ energy and forces using the interactions module
-        wp_energies, wp_forces = lj_energy_forces(
+        wp_energies, _ = lj_energy_forces(
             positions=self.wp_positions,
             cell=self.wp_cell,
             epsilon=self.epsilon,
@@ -1531,10 +1574,9 @@ class MDSystem:
             num_neighbors=self.neighbor_manager.wp_num_neighbors,
             fill_value=self.num_atoms,
             device=self.wp_device,
+            energies_out=self.wp_energies,
+            forces_out=self.wp_forces,
         )
-
-        # Copy computed forces to our force array
-        wp.copy(self.wp_forces, wp_forces)
         return wp_energies
 
     def compute_forces_virial(
@@ -1580,9 +1622,10 @@ class MDSystem:
             num_neighbors=self.neighbor_manager.wp_num_neighbors,
             fill_value=self.num_atoms,
             device=self.wp_device,
+            energies_out=self.wp_energies,
+            forces_out=self.wp_forces,
+            virial_out=self.wp_virial_flat,
         )
-
-        wp.copy(self.wp_forces, wp_forces)
 
         if virial_tensors is not None:
             # Pack float64[9] into vec9[f/d] expected by the MTK integrators
@@ -1730,6 +1773,12 @@ class BatchedMDSystem:
             self.total_atoms, dtype=self.wp_vec_dtype, device=self.wp_device
         )
         self.wp_masses = wp.from_torch(masses, dtype=self.wp_dtype)
+        self.wp_energies = wp.zeros(
+            self.total_atoms, dtype=self.wp_dtype, device=self.wp_device
+        )
+        self.wp_virial_flat = wp.zeros(
+            (self.num_systems, 9), dtype=self.wp_dtype, device=self.wp_device
+        )
 
         self.wp_cell = wp.from_torch(cells, dtype=self.wp_mat_dtype)
         self.wp_cell_inv = wp.empty_like(self.wp_cell)
@@ -1754,7 +1803,7 @@ class BatchedMDSystem:
             device=self.wp_device,
         )
         # Initial neighbor list build (ref_positions=zeros guarantees full rebuild)
-        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell, self.wp_cell_inv)
 
     def initialize_temperature(self, temperatures_K: np.ndarray, seed: int = 0) -> None:
         """Initialize velocities to target temperature (batched mode).
@@ -1824,8 +1873,8 @@ class BatchedMDSystem:
         the host. Host-side reductions (e.g., PE sum) should be done only at
         logging / analysis points.
         """
-        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
-        wp_energies, wp_forces = lj_energy_forces(
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell, self.wp_cell_inv)
+        wp_energies, _ = lj_energy_forces(
             positions=self.wp_positions,
             cell=self.wp_cell,
             epsilon=self.epsilon,
@@ -1839,8 +1888,9 @@ class BatchedMDSystem:
             fill_value=self.total_atoms,
             batch_idx=self.wp_batch_idx,
             device=self.wp_device,
+            energies_out=self.wp_energies,
+            forces_out=self.wp_forces,
         )
-        wp.copy(self.wp_forces, wp_forces)
         return wp_energies
 
     def compute_forces_virial(
@@ -1871,7 +1921,7 @@ class BatchedMDSystem:
         """
         # Mark stale to force full rebuild (cell may have changed)
         self.neighbor_manager.mark_stale()
-        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell, self.wp_cell_inv)
 
         wp_energies, wp_forces, wp_virial_flat = lj_energy_forces_virial(
             positions=self.wp_positions,
@@ -1887,9 +1937,11 @@ class BatchedMDSystem:
             fill_value=self.total_atoms,
             device=self.wp_device,
             batch_idx=self.wp_batch_idx,
+            energies_out=self.wp_energies,
+            forces_out=self.wp_forces,
+            virial_out=self.wp_virial_flat,
         )
 
-        wp.copy(self.wp_forces, wp_forces)
         if virial_tensors is not None:
             # Copy LJ (num_systems, 9) output into caller's (num_systems,) vec9 buffer.
             num_sys = virial_tensors.shape[0]
@@ -2619,6 +2671,11 @@ class NvalchemiOpsBenchmark:
             nonlocal wp_energies
             self.system.wp_positions = positions
             self.system.wp_cell = cells
+            compute_cell_inverse(
+                self.system.wp_cell,
+                self.system.wp_cell_inv,
+                device=self.system.wp_device,
+            )
             wp_energies = self.system.compute_forces_virial(virial_out)
 
         dt_array = wp.array(
@@ -2837,6 +2894,11 @@ class NvalchemiOpsBenchmark:
             # Ensure the system points at the integrator-updated arrays
             self.system.wp_positions = positions
             self.system.wp_cell = cells
+            compute_cell_inverse(
+                self.system.wp_cell,
+                self.system.wp_cell_inv,
+                device=self.system.wp_device,
+            )
             wp_energies = self.system.compute_forces_virial(virial_out)
 
         dt_array = wp.array(

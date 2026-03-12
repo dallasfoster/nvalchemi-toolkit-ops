@@ -70,6 +70,7 @@ def neighbor_list(
     fill_value: int | None = None,
     return_neighbor_list: bool = False,
     method: str | None = None,
+    wrap_positions: bool = True,
     **kwargs: dict,
 ):
     """Compute neighbor list using the appropriate method based on the provided parameters.
@@ -112,7 +113,18 @@ def neighbor_list(
     method : str | None, optional
         Method to use for neighbor list computation.
         Choices: "naive", "cell_list", "batch_naive", "batch_cell_list", "naive_dual_cutoff", "batch_naive_dual_cutoff".
-        If None, a default method will be chosen based on the number of atoms.
+        If None, a default method will be chosen based on average atoms per
+        system (cell_list when >= 2000, naive otherwise). When only
+        ``batch_idx`` is provided (no ``batch_ptr`` or 3-D ``cell``),
+        auto-selection reads ``batch_idx[-1]`` which triggers a
+        device-to-host synchronization. To avoid this, pass ``batch_ptr``,
+        a 3-D ``cell`` array, or specify ``method`` explicitly.
+    wrap_positions : bool, default=True
+        If True, wrap input positions into the primary cell before
+        neighbor search. Set to False when positions are already
+        wrapped (e.g. by a preceding integration step) to save two
+        GPU kernel launches per call. Only applies to naive methods; cell list
+        methods handle wrapping internally.
     **kwargs : dict, optional
         Additional keyword arguments to pass to the method.
 
@@ -134,12 +146,12 @@ def neighbor_list(
         shift_range_per_dimension : torch.Tensor, optional
             Pre-allocated tensor of shape (1, 3) for shift range in each dimension.
             Can be provided to avoid reallocation for naive methods.
-        shift_offset : torch.Tensor, optional
-            Pre-allocated tensor of shape (2,) for cumulative sum of number of shifts
-            for each system. Can be provided to avoid reallocation for naive methods.
-        total_shifts : int, optional
-            Total number of shifts.
-            Can be provided to avoid reallocation for naive methods.
+        num_shifts_per_system : torch.Tensor, optional
+            Pre-computed tensor of shape (num_systems,) for the number of periodic
+            shifts per system. Can be provided to avoid recomputation for naive methods.
+        max_shifts_per_system : int, optional
+            Maximum per-system shift count.
+            Can be provided to avoid recomputation for naive methods.
         cells_per_dimension : torch.Tensor, optional
             Pre-allocated tensor of shape (3,) for number of cells in x, y, z directions.
             Can be provided to avoid reallocation for cell list construction.
@@ -285,6 +297,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "cell_list":
@@ -318,6 +331,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "batch_cell_list":
@@ -372,6 +386,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case "batch_naive_dual_cutoff":
@@ -386,6 +401,7 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                wrap_positions=wrap_positions,
                 **kwargs,
             )
         case _:

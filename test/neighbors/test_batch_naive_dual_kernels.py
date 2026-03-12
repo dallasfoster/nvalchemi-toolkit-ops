@@ -27,7 +27,6 @@ from nvalchemiops.neighbors.batch_naive_dual_cutoff import (
     batch_naive_neighbor_matrix_pbc_dual_cutoff,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
-    _expand_naive_shifts,
     compute_inv_cells,
     wrap_positions_batch,
 )
@@ -146,8 +145,12 @@ class TestBatchNaiveDualCutoffKernels:
         """Test _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff kernel."""
         # Create batch system with PBC
         atoms_per_system = [4, 4]
+        num_systems = 2
         positions_batch, cell_batch, pbc_batch, _ = create_batch_systems(
-            num_systems=2, atoms_per_system=atoms_per_system, dtype=dtype, device=device
+            num_systems=num_systems,
+            atoms_per_system=atoms_per_system,
+            dtype=dtype,
+            device=device,
         )
         batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
 
@@ -155,12 +158,11 @@ class TestBatchNaiveDualCutoffKernels:
         cutoff2 = 1.5
         max_neighbors1 = 15
         max_neighbors2 = 20
+        max_atoms_per_system = max(atoms_per_system)
 
-        # Compute shifts for both cutoffs
-        _, shift_offset, total_shifts = compute_naive_num_shifts(
+        shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
             cell_batch, cutoff2, pbc_batch
         )
-        total_shifts = shift_offset[-1].item()
 
         # Convert to warp types
         wp_dtype = get_wp_dtype(dtype)
@@ -172,6 +174,8 @@ class TestBatchNaiveDualCutoffKernels:
         wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
         wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i)
+        wp_num_shifts = wp.from_torch(num_shifts, dtype=wp.int32)
 
         # Pre-wrap positions
         inv_cell_arr = torch.zeros_like(cell_batch)
@@ -195,13 +199,6 @@ class TestBatchNaiveDualCutoffKernels:
             wp_dtype,
             wp_device,
         )
-
-        # Create shift arrays (simplified for testing)
-        shifts = torch.zeros(total_shifts, 3, dtype=torch.int32, device=device)
-        shift_system_idx = torch.zeros(total_shifts, dtype=torch.int32, device=device)
-
-        wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i)
-        wp_shift_system_idx = wp.from_torch(shift_system_idx, dtype=wp.int32)
 
         # Output arrays
         neighbor_matrix1 = torch.full(
@@ -248,10 +245,10 @@ class TestBatchNaiveDualCutoffKernels:
         wp_num_neighbors1 = wp.from_torch(num_neighbors1, dtype=wp.int32)
         wp_num_neighbors2 = wp.from_torch(num_neighbors2, dtype=wp.int32)
 
-        # Launch kernel
+        # Launch kernel with 3D dims: (num_systems, max_shifts, max_atoms_per_system)
         wp.launch(
             _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff,
-            dim=(total_shifts, positions_batch.shape[0]),
+            dim=(num_systems, max_shifts, max_atoms_per_system),
             device=wp_device,
             inputs=[
                 wp_positions_wrapped,
@@ -260,8 +257,8 @@ class TestBatchNaiveDualCutoffKernels:
                 wp_dtype(cutoff1 * cutoff1),
                 wp_dtype(cutoff2 * cutoff2),
                 wp_batch_ptr,
-                wp_shifts,
-                wp_shift_system_idx,
+                wp_shift_range,
+                wp_num_shifts,
                 wp_neighbor_matrix1,
                 wp_neighbor_matrix2,
                 wp_neighbor_matrix_shifts1,
@@ -370,32 +367,9 @@ class TestBatchNaiveDualCutoffWpLaunchers:
         max_neighbors2 = 40
         max_atoms_per_system = max(atoms_per_system)
 
-        # Compute shift ranges
-        shift_range_per_dimension, shift_offset, total_shifts = (
-            compute_naive_num_shifts(cell_batch, cutoff2, pbc_batch)
-        )
-
-        # Expand shift ranges into actual shift vectors
-        shifts = torch.zeros(total_shifts, 3, dtype=torch.int32, device=device)
-        shift_system_idx = torch.zeros(total_shifts, dtype=torch.int32, device=device)
-
-        wp_shift_range_per_dimension = wp.from_torch(
-            shift_range_per_dimension, dtype=wp.vec3i
-        )
-        wp_shift_offset = wp.from_torch(shift_offset, dtype=wp.int32)
-        wp_shifts = wp.from_torch(shifts, dtype=wp.vec3i)
-        wp_shift_system_idx = wp.from_torch(shift_system_idx, dtype=wp.int32)
-
-        wp.launch(
-            _expand_naive_shifts,
-            dim=num_systems,
-            device=device,
-            inputs=[
-                wp_shift_range_per_dimension,
-                wp_shift_offset,
-                wp_shifts,
-                wp_shift_system_idx,
-            ],
+        # Compute shift ranges (on-the-fly API)
+        shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell_batch, cutoff2, pbc_batch
         )
 
         # Prepare output arrays
@@ -431,12 +405,13 @@ class TestBatchNaiveDualCutoffWpLaunchers:
         # Convert to warp arrays
         wp_dtype = get_wp_dtype(dtype)
         wp_vec_dtype = get_wp_vec_dtype(dtype)
-        wp_mat_dtype = get_wp_mat_dtype(dtype)
 
         wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
-        wp_cell = wp.from_torch(cell_batch, dtype=wp_mat_dtype)
+        wp_cell = wp.from_torch(cell_batch, dtype=get_wp_mat_dtype(dtype))
         wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
         wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i)
+        wp_num_shifts = wp.from_torch(num_shifts, dtype=wp.int32)
         wp_neighbor_matrix1 = wp.from_torch(neighbor_matrix1, dtype=wp.int32)
         wp_neighbor_matrix2 = wp.from_torch(neighbor_matrix2, dtype=wp.int32)
         wp_neighbor_matrix_shifts1 = wp.from_torch(
@@ -450,24 +425,25 @@ class TestBatchNaiveDualCutoffWpLaunchers:
 
         # Call launcher
         batch_naive_neighbor_matrix_pbc_dual_cutoff(
-            wp_positions,
-            wp_cell,
-            cutoff1,
-            cutoff2,
-            wp_batch_ptr,
-            wp_batch_idx,
-            wp_shifts,
-            wp_shift_system_idx,
-            wp_neighbor_matrix1,
-            wp_neighbor_matrix2,
-            wp_neighbor_matrix_shifts1,
-            wp_neighbor_matrix_shifts2,
-            wp_num_neighbors1,
-            wp_num_neighbors2,
-            wp_dtype,
-            device,
-            max_atoms_per_system,
-            half_fill,
+            positions=wp_positions,
+            cell=wp_cell,
+            cutoff1=cutoff1,
+            cutoff2=cutoff2,
+            batch_ptr=wp_batch_ptr,
+            batch_idx=wp_batch_idx,
+            shift_range=wp_shift_range,
+            num_shifts_arr=wp_num_shifts,
+            max_shifts_per_system=max_shifts,
+            neighbor_matrix1=wp_neighbor_matrix1,
+            neighbor_matrix2=wp_neighbor_matrix2,
+            neighbor_matrix_shifts1=wp_neighbor_matrix_shifts1,
+            neighbor_matrix_shifts2=wp_neighbor_matrix_shifts2,
+            num_neighbors1=wp_num_neighbors1,
+            num_neighbors2=wp_num_neighbors2,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            max_atoms_per_system=max_atoms_per_system,
+            half_fill=half_fill,
         )
 
         # Verify results
@@ -476,6 +452,95 @@ class TestBatchNaiveDualCutoffWpLaunchers:
         assert torch.all(num_neighbors2 >= num_neighbors1)
 
         # Check that unit_shifts are reasonable
+        valid_shifts1 = neighbor_matrix_shifts1[neighbor_matrix1 != -1]
+        valid_shifts2 = neighbor_matrix_shifts2[neighbor_matrix2 != -1]
+        if len(valid_shifts1) > 0:
+            assert torch.all(torch.abs(valid_shifts1) <= 5)
+        if len(valid_shifts2) > 0:
+            assert torch.all(torch.abs(valid_shifts2) <= 5)
+
+    def test_batch_naive_neighbor_matrix_pbc_dual_cutoff_prewrapped(
+        self, device, dtype, half_fill
+    ):
+        """Test batch_naive_neighbor_matrix_pbc_dual_cutoff with wrap_positions=False."""
+        atoms_per_system = [4, 6]
+        num_systems = 2
+        positions_batch, cell_batch, pbc_batch, _ = create_batch_systems(
+            num_systems=num_systems,
+            atoms_per_system=atoms_per_system,
+            dtype=dtype,
+            device=device,
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+
+        cutoff1 = 1.0
+        cutoff2 = 1.5
+        max_neighbors1 = 30
+        max_neighbors2 = 40
+        max_atoms_per_system = max(atoms_per_system)
+
+        shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell_batch, cutoff2, pbc_batch
+        )
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+
+        wp_positions = wp.from_torch(positions_batch, dtype=wp_vec_dtype)
+        wp_cell = wp.from_torch(cell_batch, dtype=get_wp_mat_dtype(dtype))
+        wp_batch_ptr = wp.from_torch(batch_ptr, dtype=wp.int32)
+        wp_batch_idx = wp.from_torch(batch_idx, dtype=wp.int32)
+        wp_shift_range = wp.from_torch(shift_range, dtype=wp.vec3i)
+        wp_num_shifts = wp.from_torch(num_shifts, dtype=wp.int32)
+
+        total_atoms = positions_batch.shape[0]
+
+        neighbor_matrix1 = torch.full(
+            (total_atoms, max_neighbors1), -1, dtype=torch.int32, device=device
+        )
+        neighbor_matrix2 = torch.full(
+            (total_atoms, max_neighbors2), -1, dtype=torch.int32, device=device
+        )
+        neighbor_matrix_shifts1 = torch.zeros(
+            (total_atoms, max_neighbors1, 3), dtype=torch.int32, device=device
+        )
+        neighbor_matrix_shifts2 = torch.zeros(
+            (total_atoms, max_neighbors2, 3), dtype=torch.int32, device=device
+        )
+        num_neighbors1 = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+        num_neighbors2 = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+
+        batch_naive_neighbor_matrix_pbc_dual_cutoff(
+            positions=wp_positions,
+            cell=wp_cell,
+            cutoff1=cutoff1,
+            cutoff2=cutoff2,
+            batch_ptr=wp_batch_ptr,
+            batch_idx=wp_batch_idx,
+            shift_range=wp_shift_range,
+            num_shifts_arr=wp_num_shifts,
+            max_shifts_per_system=max_shifts,
+            neighbor_matrix1=wp.from_torch(neighbor_matrix1, dtype=wp.int32),
+            neighbor_matrix2=wp.from_torch(neighbor_matrix2, dtype=wp.int32),
+            neighbor_matrix_shifts1=wp.from_torch(
+                neighbor_matrix_shifts1, dtype=wp.vec3i
+            ),
+            neighbor_matrix_shifts2=wp.from_torch(
+                neighbor_matrix_shifts2, dtype=wp.vec3i
+            ),
+            num_neighbors1=wp.from_torch(num_neighbors1, dtype=wp.int32),
+            num_neighbors2=wp.from_torch(num_neighbors2, dtype=wp.int32),
+            wp_dtype=wp_dtype,
+            device=str(device),
+            max_atoms_per_system=max_atoms_per_system,
+            half_fill=half_fill,
+            wrap_positions=False,
+        )
+
+        assert torch.all(num_neighbors1 >= 0)
+        assert torch.all(num_neighbors2 >= 0)
+        assert torch.all(num_neighbors2 >= num_neighbors1)
+
         valid_shifts1 = neighbor_matrix_shifts1[neighbor_matrix1 != -1]
         valid_shifts2 = neighbor_matrix_shifts2[neighbor_matrix2 != -1]
         if len(valid_shifts1) > 0:

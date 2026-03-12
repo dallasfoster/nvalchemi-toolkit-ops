@@ -32,7 +32,11 @@ from nvalchemiops.jax.neighbors.rebuild_detection import (
     neighbor_list_needs_rebuild,
 )
 
-from .conftest import create_batch_idx_and_ptr_jax, requires_gpu
+from .conftest import (
+    create_batch_idx_and_ptr_jax,
+    create_simple_cubic_system_jax,
+    requires_gpu,
+)
 
 dtypes = [jnp.float32, jnp.float64]
 
@@ -655,3 +659,109 @@ class TestCheckBatchRebuildNeededWrappers:
         assert result[0]
         assert not result[1]
         assert not result[2]
+
+
+@pytest.mark.parametrize("dtype", dtypes)
+class TestJaxPBCRebuildDetection:
+    """Test PBC-aware rebuild detection via JAX bindings."""
+
+    def test_pbc_no_spurious_rebuild(self, dtype):
+        """Boundary-crossing atom must not trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system_jax(
+            num_atoms=8,
+            cell_size=cell_size,
+            dtype=dtype,
+        )
+        pbc = pbc.squeeze(0)
+        cell_inv = jnp.array(np.eye(3) / cell_size, dtype=dtype).reshape(1, 3, 3)
+
+        reference = positions
+        current = positions.at[0, 0].set(cell_size - 0.01)
+
+        result = neighbor_list_needs_rebuild(
+            reference,
+            current,
+            skin / 2.0,
+            cell=cell,
+            cell_inv=cell_inv,
+            pbc=pbc,
+        )
+        assert not bool(result[0]), (
+            "PBC should prevent spurious rebuild at periodic boundary"
+        )
+
+    def test_pbc_genuine_rebuild(self, dtype):
+        """Large genuine displacement should still trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system_jax(
+            num_atoms=8,
+            cell_size=cell_size,
+            dtype=dtype,
+        )
+        pbc = pbc.squeeze(0)
+        cell_inv = jnp.array(np.eye(3) / cell_size, dtype=dtype).reshape(1, 3, 3)
+
+        reference = positions
+        current = positions.at[0, 0].add(2.0)
+
+        result = neighbor_list_needs_rebuild(
+            reference,
+            current,
+            skin / 2.0,
+            cell=cell,
+            cell_inv=cell_inv,
+            pbc=pbc,
+        )
+        assert bool(result[0]), (
+            "PBC should still trigger rebuild for genuinely large displacement"
+        )
+
+    def test_batch_pbc_no_spurious_rebuild(self, dtype):
+        """Batch PBC: boundary-crossing atoms must not trigger rebuild."""
+        cell_size = 10.0
+        skin = 1.0
+        num_systems = 3
+        atoms_per = [4, 5, 3]
+        total_atoms = sum(atoms_per)
+
+        n_side = 2
+        spacing = cell_size / n_side
+        grid_coords = [
+            [i * spacing, j * spacing, k * spacing]
+            for i in range(n_side)
+            for j in range(n_side)
+            for k in range(n_side)
+        ]
+        all_coords = []
+        for n_atoms in atoms_per:
+            all_coords.extend(grid_coords[:n_atoms])
+        positions = jnp.array(all_coords[:total_atoms], dtype=dtype)
+
+        cells = jnp.array(np.stack([np.eye(3) * cell_size] * num_systems), dtype=dtype)
+        cells_inv = jnp.array(
+            np.stack([np.eye(3) / cell_size] * num_systems), dtype=dtype
+        )
+        pbc = jnp.ones((num_systems, 3), dtype=jnp.bool_)
+        batch_idx = jnp.array(
+            np.repeat(np.arange(num_systems), atoms_per), dtype=jnp.int32
+        )
+
+        reference = positions
+        current = positions.at[5, 0].set(cell_size - 0.01)
+
+        result = batch_neighbor_list_needs_rebuild(
+            reference,
+            current,
+            batch_idx,
+            skin / 2.0,
+            num_systems=3,
+            cell=cells,
+            cell_inv=cells_inv,
+            pbc=pbc,
+        )
+        assert not bool(jnp.any(result)), (
+            "Batch PBC should prevent spurious rebuilds at boundaries"
+        )

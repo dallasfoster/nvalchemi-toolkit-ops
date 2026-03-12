@@ -29,8 +29,10 @@ from warp.jax_experimental import jax_kernel
 from nvalchemiops.neighbors.rebuild_detection import (
     _check_atoms_changed_cells_overload,
     _check_atoms_moved_beyond_skin_overload,
+    _check_atoms_moved_beyond_skin_pbc_overload,
     _check_batch_atoms_changed_cells_overload,
     _check_batch_atoms_moved_beyond_skin_overload,
+    _check_batch_atoms_moved_beyond_skin_pbc_overload,
 )
 
 __all__ = [
@@ -85,6 +87,34 @@ _jax_batch_check_skin_f32 = jax_kernel(
 )
 _jax_batch_check_skin_f64 = jax_kernel(
     _check_batch_atoms_moved_beyond_skin_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
+    enable_backward=False,
+)
+
+# MIC neighbor list rebuild detection kernel wrappers
+_jax_check_skin_pbc_f32 = jax_kernel(
+    _check_atoms_moved_beyond_skin_pbc_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flag"],
+    enable_backward=False,
+)
+_jax_check_skin_pbc_f64 = jax_kernel(
+    _check_atoms_moved_beyond_skin_pbc_overload[wp.float64],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flag"],
+    enable_backward=False,
+)
+
+# MIC batch neighbor list rebuild detection kernel wrappers
+_jax_batch_check_skin_pbc_f32 = jax_kernel(
+    _check_batch_atoms_moved_beyond_skin_pbc_overload[wp.float32],
+    num_outputs=1,
+    in_out_argnames=["rebuild_flags"],
+    enable_backward=False,
+)
+_jax_batch_check_skin_pbc_f64 = jax_kernel(
+    _check_batch_atoms_moved_beyond_skin_pbc_overload[wp.float64],
     num_outputs=1,
     in_out_argnames=["rebuild_flags"],
     enable_backward=False,
@@ -195,8 +225,15 @@ def neighbor_list_needs_rebuild(
     current_positions: jax.Array,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: jax.Array | None = None,
+    cell_inv: jax.Array | None = None,
+    pbc: jax.Array | None = None,
 ) -> jax.Array:
     """Detect if neighbor list requires rebuilding due to excessive atomic motion.
+
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses minimum-image
+    convention (MIC) so atoms crossing periodic boundaries are not spuriously
+    flagged.
 
     Parameters
     ----------
@@ -208,6 +245,12 @@ def neighbor_list_needs_rebuild(
         Maximum allowed displacement before neighbor list becomes invalid.
     overwrite_reference_positions : bool, optional
         Whether to overwrite the reference positions with the current positions.
+    cell : jax.Array or None, optional
+        Unit cell matrix, shape (1, 3, 3).
+    cell_inv : jax.Array or None, optional
+        Inverse cell matrix, same shape as ``cell``.
+    pbc : jax.Array or None, optional
+        PBC flags, shape (3,), dtype=bool.
 
     Returns
     -------
@@ -216,18 +259,14 @@ def neighbor_list_needs_rebuild(
 
     Notes
     -----
-    The skin distance approach allows neighbor lists to remain valid even when atoms
-    move slightly, reducing the frequency of expensive neighbor list reconstructions.
-
-    This function is not differentiable and should not be used in JAX transformations
-    that require gradients.
+    This function is not differentiable and should not be used in JAX
+    transformations that require gradients.
 
     See Also
     --------
     nvalchemiops.neighbors.rebuild_detection.check_neighbor_list_rebuild : Core warp launcher
     check_neighbor_list_rebuild_needed : Convenience wrapper that returns Python bool
     """
-    # Check for shape compatibility
     if reference_positions.shape != current_positions.shape:
         return jnp.array([True], dtype=jnp.bool_)
 
@@ -236,26 +275,51 @@ def neighbor_list_needs_rebuild(
     if total_atoms == 0:
         return jnp.array([False], dtype=jnp.bool_)
 
-    # Allocate output
     rebuild_flag = jnp.array([False], dtype=jnp.bool_)
 
-    # Select kernel based on dtype
-    if reference_positions.dtype == jnp.float64:
-        _jax_check = _jax_check_skin_f64
-    else:
-        _jax_check = _jax_check_skin_f32
-        reference_positions = reference_positions.astype(jnp.float32)
-        current_positions = current_positions.astype(jnp.float32)
+    use_pbc = cell is not None and cell_inv is not None and pbc is not None
 
-    # Call kernel
-    (rebuild_flag,) = _jax_check(
-        reference_positions,
-        current_positions,
-        float(skin_distance_threshold),
-        rebuild_flag,
-        overwrite_reference_positions,
-        launch_dims=(total_atoms,),
-    )
+    if use_pbc:
+        if cell.dtype != reference_positions.dtype:
+            cell = cell.astype(reference_positions.dtype)
+        if cell_inv.dtype != reference_positions.dtype:
+            cell_inv = cell_inv.astype(reference_positions.dtype)
+        pbc = pbc.astype(jnp.bool_)
+
+        if reference_positions.dtype == jnp.float64:
+            _jax_check = _jax_check_skin_pbc_f64
+        else:
+            _jax_check = _jax_check_skin_pbc_f32
+            reference_positions = reference_positions.astype(jnp.float32)
+            current_positions = current_positions.astype(jnp.float32)
+
+        (rebuild_flag,) = _jax_check(
+            reference_positions,
+            current_positions,
+            cell,
+            cell_inv,
+            pbc,
+            float(skin_distance_threshold),
+            rebuild_flag,
+            overwrite_reference_positions,
+            launch_dims=(total_atoms,),
+        )
+    else:
+        if reference_positions.dtype == jnp.float64:
+            _jax_check = _jax_check_skin_f64
+        else:
+            _jax_check = _jax_check_skin_f32
+            reference_positions = reference_positions.astype(jnp.float32)
+            current_positions = current_positions.astype(jnp.float32)
+
+        (rebuild_flag,) = _jax_check(
+            reference_positions,
+            current_positions,
+            float(skin_distance_threshold),
+            rebuild_flag,
+            overwrite_reference_positions,
+            launch_dims=(total_atoms,),
+        )
 
     return rebuild_flag
 
@@ -321,16 +385,14 @@ def check_neighbor_list_rebuild_needed(
     current_positions: jax.Array,
     skin_distance_threshold: float,
     overwrite_reference_positions: bool = False,
+    cell: jax.Array | None = None,
+    cell_inv: jax.Array | None = None,
+    pbc: jax.Array | None = None,
 ) -> bool:
     """Determine if neighbor list requires rebuilding based on atomic motion.
 
-    This high-level function provides a convenient interface to check if a neighbor
-    list needs reconstruction due to excessive atomic movement. Uses the skin distance
-    approach to minimize unnecessary neighbor list rebuilds during MD simulations.
-
-    The skin distance technique allows atoms to move slightly without invalidating
-    the neighbor list, reducing computational overhead. When any atom moves beyond
-    the skin distance, the neighbor list must be rebuilt to maintain accuracy.
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
+    displacement so periodic boundary crossings are handled correctly.
 
     Parameters
     ----------
@@ -340,18 +402,19 @@ def check_neighbor_list_rebuild_needed(
         Current atomic coordinates to compare against reference positions.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-        Typically set to (cutoff_radius - cutoff) / 2 for safety.
     overwrite_reference_positions : bool, optional
         Whether to overwrite the reference positions with the current positions.
+    cell : jax.Array or None, optional
+        Unit cell matrix, shape (1, 3, 3).
+    cell_inv : jax.Array or None, optional
+        Inverse cell matrix, same shape as ``cell``.
+    pbc : jax.Array or None, optional
+        PBC flags, shape (3,), dtype=bool.
+
     Returns
     -------
     needs_rebuild : bool
-        True if any atom has moved beyond skin distance requiring neighbor list rebuild.
-
-    Notes
-    -----
-    This function is not differentiable and should not be used in JAX transformations
-    that require gradients.
+        True if any atom has moved beyond skin distance requiring rebuild.
 
     See Also
     --------
@@ -362,6 +425,9 @@ def check_neighbor_list_rebuild_needed(
         current_positions,
         skin_distance_threshold,
         overwrite_reference_positions,
+        cell,
+        cell_inv,
+        pbc,
     )
 
     return bool(rebuild_tensor[0])
@@ -379,8 +445,14 @@ def batch_neighbor_list_needs_rebuild(
     skin_distance_threshold: float,
     num_systems: int,
     overwrite_reference_positions: bool = False,
+    cell: jax.Array | None = None,
+    cell_inv: jax.Array | None = None,
+    pbc: jax.Array | None = None,
 ) -> jax.Array:
-    """Detect per-system if neighbor lists require rebuilding due to excessive atomic motion.
+    """Detect per-system if neighbor lists require rebuilding due to atomic motion.
+
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
+    displacement so periodic boundary crossings are handled correctly.
 
     Parameters
     ----------
@@ -395,22 +467,29 @@ def batch_neighbor_list_needs_rebuild(
     num_systems : int
         Number of systems in the batch.
     overwrite_reference_positions : bool, optional
-        Whether to overwrite reference positions with current positions for rebuilt systems.
+        Whether to overwrite reference positions with current positions.
+    cell : jax.Array or None, optional
+        Per-system cell matrices, shape (num_systems, 3, 3).
+    cell_inv : jax.Array or None, optional
+        Inverse cell matrices, same shape as ``cell``.
+    pbc : jax.Array or None, optional
+        PBC flags, shape (num_systems, 3), dtype=bool.
 
     Returns
     -------
     rebuild_flags : jax.Array, shape (num_systems,), dtype=bool
-        Per-system flags; True if any atom in that system moved beyond skin distance.
+        Per-system flags; True if any atom in that system moved beyond skin
+        distance.
 
     Notes
     -----
-    This function is not differentiable and should not be used in JAX transformations
-    that require gradients.
+    This function is not differentiable and should not be used in JAX
+    transformations that require gradients.
 
     See Also
     --------
     neighbor_list_needs_rebuild : Single-system version
-    check_batch_neighbor_list_rebuild_needed : Convenience wrapper returning list[bool]
+    check_batch_neighbor_list_rebuild_needed : Convenience wrapper
     """
     total_atoms = reference_positions.shape[0]
 
@@ -418,23 +497,51 @@ def batch_neighbor_list_needs_rebuild(
         return jnp.zeros(num_systems, dtype=jnp.bool_)
 
     rebuild_flags = jnp.zeros(num_systems, dtype=jnp.bool_)
+    use_pbc = cell is not None and cell_inv is not None and pbc is not None
 
-    if reference_positions.dtype == jnp.float64:
-        _jax_check = _jax_batch_check_skin_f64
+    if use_pbc:
+        if cell.dtype != reference_positions.dtype:
+            cell = cell.astype(reference_positions.dtype)
+        if cell_inv.dtype != reference_positions.dtype:
+            cell_inv = cell_inv.astype(reference_positions.dtype)
+        pbc = pbc.astype(jnp.bool_)
+
+        if reference_positions.dtype == jnp.float64:
+            _jax_check = _jax_batch_check_skin_pbc_f64
+        else:
+            _jax_check = _jax_batch_check_skin_pbc_f32
+            reference_positions = reference_positions.astype(jnp.float32)
+            current_positions = current_positions.astype(jnp.float32)
+
+        (rebuild_flags,) = _jax_check(
+            reference_positions,
+            current_positions,
+            batch_idx,
+            cell,
+            cell_inv,
+            pbc,
+            float(skin_distance_threshold),
+            rebuild_flags,
+            overwrite_reference_positions,
+            launch_dims=(total_atoms,),
+        )
     else:
-        _jax_check = _jax_batch_check_skin_f32
-        reference_positions = reference_positions.astype(jnp.float32)
-        current_positions = current_positions.astype(jnp.float32)
+        if reference_positions.dtype == jnp.float64:
+            _jax_check = _jax_batch_check_skin_f64
+        else:
+            _jax_check = _jax_batch_check_skin_f32
+            reference_positions = reference_positions.astype(jnp.float32)
+            current_positions = current_positions.astype(jnp.float32)
 
-    (rebuild_flags,) = _jax_check(
-        reference_positions,
-        current_positions,
-        batch_idx,
-        float(skin_distance_threshold),
-        rebuild_flags,
-        overwrite_reference_positions,
-        launch_dims=(total_atoms,),
-    )
+        (rebuild_flags,) = _jax_check(
+            reference_positions,
+            current_positions,
+            batch_idx,
+            float(skin_distance_threshold),
+            rebuild_flags,
+            overwrite_reference_positions,
+            launch_dims=(total_atoms,),
+        )
 
     return rebuild_flags
 
@@ -524,8 +631,14 @@ def check_batch_neighbor_list_rebuild_needed(
     skin_distance_threshold: float,
     num_systems: int,
     overwrite_reference_positions: bool = False,
+    cell: jax.Array | None = None,
+    cell_inv: jax.Array | None = None,
+    pbc: jax.Array | None = None,
 ) -> list[bool]:
-    """Determine per-system if neighbor lists require rebuilding based on atomic motion.
+    """Determine per-system if neighbor lists require rebuilding.
+
+    When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
+    displacement so periodic boundary crossings are handled correctly.
 
     Parameters
     ----------
@@ -540,17 +653,18 @@ def check_batch_neighbor_list_rebuild_needed(
     num_systems : int
         Number of systems in the batch.
     overwrite_reference_positions : bool, optional
-        Whether to overwrite reference positions with current positions for rebuilt systems.
+        Whether to overwrite reference positions with current positions.
+    cell : jax.Array or None, optional
+        Per-system cell matrices, shape (num_systems, 3, 3).
+    cell_inv : jax.Array or None, optional
+        Inverse cell matrices, same shape as ``cell``.
+    pbc : jax.Array or None, optional
+        PBC flags, shape (num_systems, 3), dtype=bool.
 
     Returns
     -------
     needs_rebuild : list[bool]
         Per-system flags; True if neighbor list for that system needs rebuilding.
-
-    Notes
-    -----
-    This function is not differentiable and should not be used in JAX transformations
-    that require gradients.
 
     See Also
     --------
@@ -563,6 +677,9 @@ def check_batch_neighbor_list_rebuild_needed(
         skin_distance_threshold,
         num_systems,
         overwrite_reference_positions,
+        cell,
+        cell_inv,
+        pbc,
     )
 
     return [bool(flag) for flag in rebuild_flags]

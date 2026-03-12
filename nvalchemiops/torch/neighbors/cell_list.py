@@ -48,7 +48,7 @@ def estimate_cell_list_sizes(
     cell: torch.Tensor,
     pbc: torch.Tensor,
     cutoff: float,
-    max_nbins: int = 1000,
+    max_nbins: int = 8192,
 ) -> tuple[int, torch.Tensor]:
     """Estimate allocation sizes for torch.compile-friendly cell list construction.
 
@@ -67,7 +67,7 @@ def estimate_cell_list_sizes(
         Flags indicating periodic boundary conditions in x, y, z directions.
     cutoff : float
         Maximum distance for neighbor search, determines minimum cell size.
-    max_nbins : int, default=1000
+    max_nbins : int, default=8192
         Maximum number of cells to allocate.
 
     Returns

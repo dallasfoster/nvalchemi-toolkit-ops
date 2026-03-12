@@ -465,7 +465,12 @@ class NeighborListManager:
         """
         self.wp_ref_positions.zero_()
 
-    def update(self, positions_wp: wp.array, cell_wp: wp.array) -> None:
+    def update(
+        self,
+        positions_wp: wp.array,
+        cell_wp: wp.array,
+        cell_inv_wp: wp.array | None = None,
+    ) -> None:
         """Check and selectively rebuild the neighbor list (no CPU-GPU sync).
 
         Parameters
@@ -474,6 +479,9 @@ class NeighborListManager:
             Current atomic positions.
         cell_wp : wp.array, shape (1,), dtype=wp.mat33*
             Current cell matrix.
+        cell_inv_wp : wp.array or None, optional
+            Precomputed inverse of the cell matrix.  When provided the
+            rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero rebuild flag — kernel only sets True, never clears
         zero_array(self.wp_rebuild_flag, self.device)
@@ -486,6 +494,9 @@ class NeighborListManager:
             rebuild_flag=self.wp_rebuild_flag,
             wp_dtype=self.wp_dtype,
             device=self.device,
+            cell=cell_wp if cell_inv_wp is not None else None,
+            cell_inv=cell_inv_wp,
+            pbc=self.wp_pbc if cell_inv_wp is not None else None,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -661,7 +672,12 @@ class BatchedNeighborListManager:
         """
         self.wp_ref_positions.zero_()
 
-    def update(self, positions_wp: wp.array, cells_wp: wp.array) -> None:
+    def update(
+        self,
+        positions_wp: wp.array,
+        cells_wp: wp.array,
+        cells_inv_wp: wp.array | None = None,
+    ) -> None:
         """Check and selectively rebuild neighbor lists (no CPU-GPU sync).
 
         Systems whose atoms have not moved beyond skin/2 skip the expensive
@@ -673,6 +689,9 @@ class BatchedNeighborListManager:
             Current atomic positions for all systems.
         cells_wp : wp.array, shape (num_systems,), dtype=wp.mat33*
             Current cell matrices.
+        cells_inv_wp : wp.array or None, optional
+            Precomputed per-system inverse cell matrices.  When provided
+            the rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero per-system flags — kernel only sets True, never clears
         zero_array(self.wp_rebuild_flags, self.device)
@@ -687,6 +706,9 @@ class BatchedNeighborListManager:
             overwrite_reference_positions=True,
             wp_dtype=self.wp_dtype,
             device=self.device,
+            cell=cells_wp if cells_inv_wp is not None else None,
+            cell_inv=cells_inv_wp,
+            pbc=self.wp_pbc if cells_inv_wp is not None else None,
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
@@ -1079,7 +1101,7 @@ class MDSystem:
 
     def _update_neighbors(self) -> None:
         """Check and selectively rebuild neighbor list (no CPU-GPU sync)."""
-        self.neighbor_manager.update(self.wp_positions, self.wp_cell)
+        self.neighbor_manager.update(self.wp_positions, self.wp_cell, self.wp_cell_inv)
 
     def compute_forces(self) -> wp.array:
         """Compute LJ forces and return per-atom potential energies (device array).
@@ -1328,7 +1350,9 @@ class BatchedMDSystem:
             device=device,
         )
         # Initial neighbor list build (ref_positions=zeros guarantees full rebuild)
-        self.neighbor_manager.update(self.wp_positions, self.wp_cells)
+        self.neighbor_manager.update(
+            self.wp_positions, self.wp_cells, self.wp_cells_inv
+        )
 
     def initialize_temperature(self, temperatures_K: np.ndarray, seed: int = 0) -> None:
         from nvalchemiops.dynamics.utils.thermostat_utils import (
@@ -1378,7 +1402,9 @@ class BatchedMDSystem:
         print(f"Initialized velocities: target={temperatures_K} K, actual={actual_T} K")
 
     def compute_forces(self) -> wp.array:
-        self.neighbor_manager.update(self.wp_positions, self.wp_cells)
+        self.neighbor_manager.update(
+            self.wp_positions, self.wp_cells, self.wp_cells_inv
+        )
         wp_energies, wp_forces = lj_energy_forces(
             positions=self.wp_positions,
             cell=self.wp_cells,
@@ -1416,9 +1442,10 @@ class BatchedMDSystem:
 
         Note
         ----
-        :func:`nvalchemiops.dynamics.utils.compute_temperature` currently takes a
-        single `num_atoms` value (per system). For heterogeneous batches this is
-        ambiguous, so we require uniform system sizes here.
+        :func:`nvalchemiops.dynamics.utils.compute_temperature` takes a
+        ``num_atoms_per_system`` warp array (shape ``(B,)``).  For heterogeneous
+        batches this works element-wise, but we still validate uniform sizes
+        here for safety.
         """
         n = np.asarray(self.num_atoms_per_system, dtype=np.int64)
         if not np.all(n == n[0]):
@@ -1435,7 +1462,6 @@ class BatchedMDSystem:
             num_atoms_per_system=wp.array(
                 self.num_atoms_per_system, dtype=wp.int32, device=self.device
             ),
-            batch_idx=self.wp_batch_idx,
         )
         return temp
 
@@ -1905,9 +1931,9 @@ def run_nph_mtk(
 
     def _compute_forces_cb(positions, cells, forces, virial_out):
         nonlocal wp_energies
-        # Ensure the system points at the integrator-updated arrays
         system.wp_positions = positions
         system.wp_cell = cells
+        compute_cell_inverse(system.wp_cell, system.wp_cell_inv, device=system.device)
         wp_energies = system.compute_forces_virial(virial_out)
         wp.copy(forces, system.wp_forces)
 
@@ -2089,6 +2115,7 @@ def run_npt_mtk(
         nonlocal wp_energies
         system.wp_positions = positions
         system.wp_cell = cells
+        compute_cell_inverse(system.wp_cell, system.wp_cell_inv, device=system.device)
         wp_energies = system.compute_forces_virial(virial_out)
         wp.copy(forces, system.wp_forces)
 

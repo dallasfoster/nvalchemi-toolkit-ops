@@ -950,3 +950,118 @@ class TestSelectiveRebuild:
         assert torch.equal(
             nn_selective[sys1_start:sys1_end], nn_full[sys1_start:sys1_end]
         ), "System 1 num_neighbors should match full rebuild"
+
+
+@pytest.mark.parametrize("device", devices)
+@pytest.mark.parametrize("dtype", dtypes)
+class TestTorchPBCRebuildDetection:
+    """Test PBC-aware rebuild detection via PyTorch bindings."""
+
+    def test_pbc_no_spurious_rebuild(self, device, dtype):
+        """Boundary-crossing atom must not trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, cell_size=cell_size, dtype=dtype, device=device
+        )
+
+        reference = positions.clone()
+        current = positions.clone()
+        current[0, 0] = cell_size - 0.01
+
+        cell_inv = (
+            torch.linalg.inv(cell.squeeze(0))
+            .unsqueeze(0)
+            .to(dtype=dtype, device=device)
+            .contiguous()
+        )
+
+        result = neighbor_list_needs_rebuild(
+            reference,
+            current,
+            skin / 2.0,
+            cell=cell,
+            cell_inv=cell_inv,
+            pbc=pbc,
+        )
+        assert not result.item(), (
+            "PBC should prevent spurious rebuild at periodic boundary"
+        )
+
+    def test_pbc_genuine_rebuild(self, device, dtype):
+        """Large genuine displacement should still trigger rebuild with PBC."""
+        cell_size = 10.0
+        skin = 1.0
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, cell_size=cell_size, dtype=dtype, device=device
+        )
+
+        reference = positions.clone()
+        current = positions.clone()
+        current[0, 0] += 2.0
+
+        cell_inv = (
+            torch.linalg.inv(cell.squeeze(0))
+            .unsqueeze(0)
+            .to(dtype=dtype, device=device)
+            .contiguous()
+        )
+
+        result = neighbor_list_needs_rebuild(
+            reference,
+            current,
+            skin / 2.0,
+            cell=cell,
+            cell_inv=cell_inv,
+            pbc=pbc,
+        )
+        assert result.item(), (
+            "PBC should still trigger rebuild for genuinely large displacement"
+        )
+
+    def test_batch_pbc_no_spurious_rebuild(self, device, dtype):
+        """Batch PBC: boundary-crossing atoms must not trigger rebuild."""
+        cell_size = 10.0
+        skin = 1.0
+        atoms_per = [4, 5, 3]
+        n_side = 2
+        spacing = cell_size / n_side
+        grid_coords = [
+            [i * spacing, j * spacing, k * spacing]
+            for i in range(n_side)
+            for j in range(n_side)
+            for k in range(n_side)
+        ]
+        all_pos = []
+        cells_list = []
+        for n in atoms_per:
+            pos = torch.tensor(grid_coords[:n], dtype=dtype, device=device)
+            all_pos.append(pos)
+            cells_list.append(torch.eye(3, dtype=dtype, device=device) * cell_size)
+
+        positions = torch.cat(all_pos, dim=0)
+        cells = torch.stack(cells_list, dim=0)
+        pbc = torch.ones(3, 3, dtype=torch.bool, device=device)
+        batch_idx = torch.repeat_interleave(
+            torch.arange(3, dtype=torch.int32, device=device),
+            torch.tensor(atoms_per, dtype=torch.int32, device=device),
+        )
+
+        reference = positions.clone()
+        current = positions.clone()
+        current[5, 0] = cell_size - 0.01
+
+        cells_inv = torch.linalg.inv(cells).to(dtype=dtype, device=device).contiguous()
+
+        result = batch_neighbor_list_needs_rebuild(
+            reference,
+            current,
+            batch_idx,
+            skin / 2.0,
+            cell=cells,
+            cell_inv=cells_inv,
+            pbc=pbc,
+        )
+        assert not result.any(), (
+            "Batch PBC should prevent spurious rebuilds at boundaries"
+        )
