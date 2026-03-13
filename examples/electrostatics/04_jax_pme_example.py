@@ -48,7 +48,9 @@ try:
     import jax
     import jax.numpy as jnp
 except ImportError:
-    print("This example requires JAX. Install with: pip install 'nvalchemi-toolkit-ops[jax]'")
+    print(
+        "This example requires JAX. Install with: pip install 'nvalchemi-toolkit-ops[jax]'"
+    )
     sys.exit(0)
 
 import numpy as np
@@ -64,7 +66,9 @@ try:
     from nvalchemiops.jax.neighbors.naive import naive_neighbor_list
     from nvalchemiops.jax.neighbors.neighbor_utils import compute_naive_num_shifts
 except Exception as exc:
-    print(f"JAX/Warp backend unavailable ({exc}). This example requires a CUDA-backed runtime.")
+    print(
+        f"JAX/Warp backend unavailable ({exc}). This example requires a CUDA-backed runtime."
+    )
     sys.exit(0)
 
 # %%

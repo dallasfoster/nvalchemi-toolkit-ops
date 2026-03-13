@@ -36,7 +36,6 @@ from nvalchemiops.neighbors.batch_naive_dual_cutoff import (
     _fill_batch_naive_neighbor_matrix_pbc_dual_cutoff_selective_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import (
-    _compute_inv_cells_overload,
     _wrap_positions_batch_overload,
     estimate_max_neighbors,
 )
@@ -206,20 +205,6 @@ _jax_fill_batch_dual_pbc_prewrapped_selective_f64 = jax_kernel(
         "num_neighbors1",
         "num_neighbors2",
     ],
-    enable_backward=False,
-)
-
-# Compute inverse cells kernel wrappers
-_jax_compute_inv_cells_f32 = jax_kernel(
-    _compute_inv_cells_overload[wp.float32],
-    num_outputs=1,
-    in_out_argnames=["inv_cell"],
-    enable_backward=False,
-)
-_jax_compute_inv_cells_f64 = jax_kernel(
-    _compute_inv_cells_overload[wp.float64],
-    num_outputs=1,
-    in_out_argnames=["inv_cell"],
     enable_backward=False,
 )
 
@@ -505,7 +490,6 @@ def batch_naive_neighbor_list_dual_cutoff(
         _jax_fill_pbc_prewrapped_selective = (
             _jax_fill_batch_dual_pbc_prewrapped_selective_f64
         )
-        _jax_inv_cells = _jax_compute_inv_cells_f64
         _jax_wrap_batch = _jax_wrap_positions_batch_f64
     else:
         _jax_fill = _jax_fill_batch_dual_f32
@@ -516,7 +500,6 @@ def batch_naive_neighbor_list_dual_cutoff(
         _jax_fill_pbc_prewrapped_selective = (
             _jax_fill_batch_dual_pbc_prewrapped_selective_f32
         )
-        _jax_inv_cells = _jax_compute_inv_cells_f32
         _jax_wrap_batch = _jax_wrap_positions_batch_f32
         positions = positions.astype(jnp.float32)
 
@@ -585,12 +568,7 @@ def batch_naive_neighbor_list_dual_cutoff(
                 ) from None
 
         if wrap_positions:
-            inv_cell = jnp.zeros_like(cell)
-            (inv_cell,) = _jax_inv_cells(
-                cell,
-                inv_cell,
-                launch_dims=(cell.shape[0],),
-            )
+            inv_cell = jnp.linalg.inv(cell)
             positions_wrapped = jnp.zeros_like(positions)
             per_atom_cell_offsets = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
             positions_wrapped, per_atom_cell_offsets = _jax_wrap_batch(
