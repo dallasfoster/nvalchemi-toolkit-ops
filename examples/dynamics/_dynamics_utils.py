@@ -1066,6 +1066,11 @@ class MDSystem:
             self.num_atoms, dtype=self.wp_vec_dtype, device=device
         )
         self.wp_masses = wp.array(masses, dtype=self.wp_dtype, device=device)
+        self.wp_num_atoms_per_system = wp.array(
+            [self.num_atoms], dtype=wp.int32, device=device
+        )
+        self._ke_buf = wp.zeros(1, dtype=self.wp_dtype, device=device)
+        self._temp_buf = wp.zeros(1, dtype=self.wp_dtype, device=device)
 
         # Cell matrix (shape (1,) for single system)
         cell_reshaped = cell.reshape(1, 3, 3).astype(dtype)
@@ -1210,27 +1215,25 @@ class MDSystem:
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""
-        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        self._ke_buf.zero_()
         compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
-            kinetic_energy=ke,
+            kinetic_energy=self._ke_buf,
             device=self.device,
         )
-        return ke
+        return self._ke_buf
 
     def temperature_kT(self) -> wp.array:
         """Compute instantaneous temperature on device (kB*T in eV, shape (1,))."""
         ke = self.kinetic_energy()
-        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        self._temp_buf.zero_()
         compute_temperature(
             kinetic_energy=ke,
-            temperature=temp,
-            num_atoms_per_system=wp.array(
-                [self.num_atoms], dtype=wp.int32, device=self.device
-            ),
+            temperature=self._temp_buf,
+            num_atoms_per_system=self.wp_num_atoms_per_system,
         )
-        return temp
+        return self._temp_buf
 
     def initialize_temperature(self, temperature: float, seed: int = 42) -> None:
         """Initialize velocities to target temperature (single system).
@@ -1332,7 +1335,14 @@ class BatchedMDSystem:
         self.wp_cells_inv = wp.empty_like(self.wp_cells)
         compute_cell_inverse(self.wp_cells, self.wp_cells_inv, device=device)
 
-        self.wp_batch_idx = wp.array(batch_idx_np, dtype=wp.int32, device=device)
+        self.wp_batch_idx = wp.array(
+            batch_idx.astype(np.int32), dtype=wp.int32, device=device
+        )
+        self.wp_num_atoms_per_system = wp.array(
+            self.num_atoms_per_system.astype(np.int32), dtype=wp.int32, device=device
+        )
+        self._ke_buf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=device)
+        self._temp_buf = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=device)
 
         pbc_np = np.tile([True, True, True], (self.num_systems, 1))
         self.neighbor_manager = BatchedNeighborListManager(
@@ -1425,45 +1435,27 @@ class BatchedMDSystem:
 
     def kinetic_energy_per_system(self) -> wp.array:
         """Compute kinetic energy per system (shape (B,), in eV)."""
-        B = self.num_systems
-        ke = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        self._ke_buf.zero_()
         compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
-            kinetic_energy=ke,
+            kinetic_energy=self._ke_buf,
             batch_idx=self.wp_batch_idx,
-            num_systems=B,
+            num_systems=self.num_systems,
             device=self.device,
         )
-        return ke
+        return self._ke_buf
 
     def temperature_kT_per_system(self) -> wp.array:
-        """Compute temperature per system (kB*T, shape (B,)).
-
-        Note
-        ----
-        :func:`nvalchemiops.dynamics.utils.compute_temperature` takes a
-        ``num_atoms_per_system`` warp array (shape ``(B,)``).  For heterogeneous
-        batches this works element-wise, but we still validate uniform sizes
-        here for safety.
-        """
-        n = np.asarray(self.num_atoms_per_system, dtype=np.int64)
-        if not np.all(n == n[0]):
-            raise ValueError(
-                "temperature_kT_per_system requires uniform num_atoms per system; "
-                f"got {n}."
-            )
-        B = self.num_systems
+        """Compute temperature per system (kB*T, shape (B,))."""
         ke = self.kinetic_energy_per_system()
-        temp = wp.zeros(B, dtype=self.wp_dtype, device=self.device)
+        self._temp_buf.zero_()
         compute_temperature(
             kinetic_energy=ke,
-            temperature=temp,
-            num_atoms_per_system=wp.array(
-                self.num_atoms_per_system, dtype=wp.int32, device=self.device
-            ),
+            temperature=self._temp_buf,
+            num_atoms_per_system=self.wp_num_atoms_per_system,
         )
-        return temp
+        return self._temp_buf
 
 
 def run_langevin_baoab(

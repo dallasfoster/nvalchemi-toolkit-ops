@@ -80,38 +80,29 @@ def _make_bench(num_atoms, perturbation=0.1, batch_size=1, seed=_DEFAULT_SEED):
             skin=_SKIN,
             neighbor_rebuild_interval=_NEIGHBOR_REBUILD,
             **_POTENTIAL,
-        ), positions.shape[0]
+        ), actual_atoms
     else:
-        # Batched system
         pos_list, cell_list = [], []
         for _ in range(batch_size):
             pos_list.append(positions + torch.randn_like(positions) * perturbation)
             cell_list.append(cell)
         batch_positions = torch.cat(pos_list, dim=0)
-        batch_cells = torch.cat(cell_list, dim=0)
+        batch_cells = torch.stack(cell_list, dim=0)
         batch_idx = torch.repeat_interleave(
             torch.arange(batch_size, device="cuda"),
             actual_atoms,
         ).to(torch.int32)
-        atom_ptr = torch.arange(
-            0,
-            (batch_size + 1) * actual_atoms,
-            actual_atoms,
-            device="cuda",
-            dtype=torch.int64,
-        )
         pbc = torch.tensor([True, True, True], device="cuda")
 
         return NvalchemiOpsBenchmark(
             positions=batch_positions,
             cell=batch_cells,
             pbc=pbc,
-            **_POTENTIAL,
             skin=_SKIN,
             neighbor_rebuild_interval=_NEIGHBOR_REBUILD,
             batch_idx=batch_idx,
-            atom_ptr=atom_ptr,
-        ), positions.shape[0] // batch_cells.shape[0]
+            **_POTENTIAL,
+        ), actual_atoms
 
 
 # ---------------------------------------------------------------------------

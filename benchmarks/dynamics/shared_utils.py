@@ -1476,6 +1476,7 @@ class MDSystem:
         self.num_atoms = len(positions)
         self.total_atoms = self.num_atoms
         self.num_systems = 1
+        self.wp_batch_idx = None
         self.epsilon = epsilon
         self.sigma = sigma
         self.cutoff = cutoff
@@ -1655,24 +1656,24 @@ class MDSystem:
 
     def kinetic_energy(self) -> wp.array:
         """Compute kinetic energy on device (shape (1,), in eV)."""
-        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        ke = wp.zeros(1, dtype=self.wp_dtype, device=self.wp_device)
         compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
             kinetic_energy=ke,
-            device=self.device,
+            device=self.wp_device,
         )
         return ke
 
     def temperature_kT(self) -> wp.array:
         """Compute instantaneous temperature on device (kB*T in eV, shape (1,))."""
         ke = self.kinetic_energy()
-        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
+        temp = wp.zeros(1, dtype=self.wp_dtype, device=self.wp_device)
         compute_temperature(
             kinetic_energy=ke,
             temperature=temp,
             num_atoms_per_system=wp.array(
-                [self.num_atoms], dtype=wp.int32, device=self.device
+                [self.num_atoms], dtype=wp.int32, device=self.wp_device
             ),
         )
         return temp
@@ -1688,12 +1689,12 @@ class MDSystem:
             Random seed for reproducibility.
         """
         kT = float(temperature) * KB_EV
-        wp_temperature = wp.array([kT], dtype=self.wp_dtype, device=self.device)
+        wp_temperature = wp.array([kT], dtype=self.wp_dtype, device=self.wp_device)
 
         # Scratch arrays for COM removal
-        wp_total_momentum = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
-        wp_total_mass = wp.zeros(1, dtype=self.wp_dtype, device=self.device)
-        wp_com_velocities = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.device)
+        wp_total_momentum = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.wp_device)
+        wp_total_mass = wp.zeros(1, dtype=self.wp_dtype, device=self.wp_device)
+        wp_com_velocities = wp.zeros(1, dtype=self.wp_vec_dtype, device=self.wp_device)
 
         initialize_velocities(
             velocities=self.wp_velocities,
@@ -1704,7 +1705,7 @@ class MDSystem:
             com_velocities=wp_com_velocities,
             random_seed=seed,
             remove_com=True,
-            device=self.device,
+            device=self.wp_device,
         )
 
         # One-time feedback: host read for user confidence
@@ -1966,7 +1967,7 @@ class BatchedMDSystem:
 
     def kinetic_energy_per_system(self) -> wp.array:
         """Compute kinetic energy per system (shape (B,), in eV)."""
-        ke = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.device)
+        ke = wp.zeros(self.num_systems, dtype=self.wp_dtype, device=self.wp_device)
         compute_kinetic_energy(
             velocities=self.wp_velocities,
             masses=self.wp_masses,
@@ -2003,7 +2004,7 @@ class BatchedMDSystem:
         tensor_dtype = vec9f if self.wp_dtype == wp.float32 else vec9d
 
         # Pre-allocate scratch arrays
-        volumes = wp.empty(1, dtype=self.wp_dtype, device=self.device)
+        volumes = wp.empty(1, dtype=self.wp_dtype, device=self.wp_device)
         compute_cell_volume(self.wp_cell, volumes=volumes, device=self.wp_device)
 
         kinetic_tensors = wp.zeros((1, 9), dtype=self.wp_dtype, device=self.wp_device)
@@ -2035,8 +2036,7 @@ class NvalchemiOpsBenchmark:
     """Unified benchmark class for both single-system and batched simulations.
 
     This class consolidates MD and optimization benchmarks, automatically detecting
-    whether to use single-system or batched mode based on the presence of batch_idx
-    and atom_ptr parameters.
+    whether to use single-system or batched mode based on the presence of batch_idx.
 
     Parameters
     ----------
@@ -2044,35 +2044,35 @@ class NvalchemiOpsBenchmark:
         Atomic positions. Shape (N, 3) for single-system or (total_atoms, 3) for batched.
     cell : torch.Tensor
         Unit cell matrix. Shape (1, 3, 3) for single-system or (num_systems, 3, 3) for batched.
-    masses : torch.Tensor
-        Atomic masses. Shape (N,) for single-system or (total_atoms,) for batched.
     pbc : torch.Tensor
         Periodic boundary conditions, shape (3,).
-    model : NvalchemiopsModelInterface, optional
-        Model for force/energy computation. If None, uses LJ with epsilon/sigma/cutoff.
+    masses : torch.Tensor, optional
+        Atomic masses. Shape (N,) or (total_atoms,). Default: argon mass for all atoms.
     epsilon : float, optional
-        LJ epsilon parameter (eV). Used only if model is None.
+        LJ epsilon parameter (eV).
     sigma : float, optional
-        LJ sigma parameter (Å). Used only if model is None.
+        LJ sigma parameter (Å).
     cutoff : float, optional
-        LJ cutoff distance (Å). Used only if model is None.
+        LJ cutoff distance (Å).
     skin : float, optional
         Neighbor list skin distance (Å). Default 1.0.
+    switch_width : float, optional
+        Switching function width (Å). Default 0.0.
+    half_neighbor_list : bool, optional
+        Whether to use half neighbor lists. Default True.
     neighbor_rebuild_interval : int, optional
         Interval for rebuilding neighbor lists (0 = displacement-based). Default 10.
     velocities : torch.Tensor, optional
         Initial velocities. Required for MD, optional for optimization.
     batch_idx : torch.Tensor, optional
         Batch index for each atom (batched mode only). Shape (total_atoms,).
-    atom_ptr : torch.Tensor, optional
-        Pointer to start of each batch (batched mode only). Shape (num_systems+1,).
 
     Notes
     -----
-    - Batching is auto-detected: if batch_idx and atom_ptr are provided, batched mode is used.
+    - Batching is auto-detected: if batch_idx is provided, batched mode is used.
     - For batched mode, positions/velocities/masses should be concatenated across all systems.
     - Supports integrators: VelocityVerlet, Langevin, NoseHoover, NPT, NPH.
-    - Supports optimizer: FIRE.
+    - Supports optimizers: FIRE, FIRE2.
     """
 
     def __init__(
@@ -2092,7 +2092,6 @@ class NvalchemiOpsBenchmark:
         batch_idx: torch.Tensor | None = None,
     ):
         self.is_batched = batch_idx is not None
-        self.num_atoms = positions.shape[0] // cell.shape[0]
         if self.is_batched:
             self.system = BatchedMDSystem(
                 positions=positions,
@@ -2116,14 +2115,56 @@ class NvalchemiOpsBenchmark:
                 cell=cell,
                 masses=masses,
                 pbc=pbc,
+                epsilon=epsilon,
+                sigma=sigma,
+                cutoff=cutoff,
+                skin=skin,
+                switch_width=switch_width,
+                half_neighbor_list=half_neighbor_list,
                 device=positions.device,
                 dtype=positions.dtype,
             )
+
+        self.neighbor_rebuild_interval = neighbor_rebuild_interval
+        self._steps_since_rebuild = 0
 
         # Device and dtype setup (needed for model creation)
         self.device = positions.device
         self.dtype = positions.dtype
         self.wp_device = str(self.device)
+
+    def __getattr__(self, name: str):
+        """Delegate attribute lookups to the underlying system object."""
+        system = self.__dict__.get("system")
+        if system is not None:
+            try:
+                return getattr(system, name)
+            except AttributeError:
+                pass
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute {name!r}"
+        )
+
+    def _compute_forces(self, wp_positions, compute_virial=False):
+        """Update system positions and compute forces (and optionally virial).
+
+        Parameters
+        ----------
+        wp_positions : wp.array
+            Atomic positions.
+        compute_virial : bool
+            If True, compute and return virial tensor.
+
+        Returns
+        -------
+        tuple
+            (energies, forces, virial) if compute_virial, else (energies, forces).
+        """
+        self.system.wp_positions = wp_positions
+        if compute_virial:
+            return self.system.compute_forces_virial()
+        energies = self.system.compute_forces()
+        return energies, self.system.wp_forces
 
     def _run_warmup(
         self, run_step_fn, warmup_steps: int, log_message: str = "Warmup"
