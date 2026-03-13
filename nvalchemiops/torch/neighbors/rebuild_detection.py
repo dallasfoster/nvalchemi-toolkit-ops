@@ -446,7 +446,7 @@ def check_neighbor_list_rebuild_needed(
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
-) -> bool:
+) -> torch.Tensor:
     """Determine if neighbor list requires rebuilding based on atomic motion.
 
     When ``cell``, ``cell_inv`` and ``pbc`` are all provided, uses MIC
