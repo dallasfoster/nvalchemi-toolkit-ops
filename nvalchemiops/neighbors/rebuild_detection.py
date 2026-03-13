@@ -204,7 +204,8 @@ def _check_atoms_moved_beyond_skin(
     if displacement_magnitude > skin_distance_threshold:
         # Neighbor list is no longer valid - flag for rebuild
         rebuild_flag[0] = True
-        reference_positions[atom_idx] = current_positions[atom_idx]
+        if overwrite_reference_positions:
+            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 # Generate overload dictionary for neighbor list rebuild kernel

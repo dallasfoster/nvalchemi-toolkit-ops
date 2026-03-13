@@ -433,6 +433,54 @@ def _batch_cell_list_query_body(
     num_neighbors: wp.array(dtype=wp.int32),
     half_fill: wp.bool,
 ):
+    """Query neighbor candidates for a single atom using the cell list.
+
+    Iterates over all candidate cells within the neighbor search radius of
+    ``atom_idx``, applies the half-list filter (only pairs where ``j > i``
+    in the same cell, or any ``j`` in a forward cell), computes the
+    Cartesian distance with periodic-boundary shift correction, and writes
+    qualifying neighbors into the pre-allocated neighbor matrix.
+
+    Parameters
+    ----------
+    atom_idx : int
+        Index of the central atom whose neighbors are being queried.
+    system_idx : int
+        Index of the system that ``atom_idx`` belongs to.
+    positions : wp.array, shape (N_atoms,), dtype=vec3*
+        Atomic positions for all systems.
+    cell : wp.array, shape (num_systems,), dtype=mat33*
+        Cell matrix for each system.
+    pbc : wp.array2d, shape (num_systems, 3), dtype=bool
+        Periodic boundary condition flags per dimension per system.
+    cutoff : scalar (float32 or float64)
+        Cutoff distance; pairs beyond this are excluded.
+    cells_per_dimension : wp.array, shape (num_systems,), dtype=vec3i
+        Number of cells along each dimension for each system.
+    neighbor_search_radius : wp.array, shape (num_systems,), dtype=vec3i
+        Half-width of the cell search window in each dimension.
+    atom_periodic_shifts : wp.array, shape (N_atoms,), dtype=vec3i
+        Per-atom integer cell offsets used for PBC shift correction.
+    atom_to_cell_mapping : wp.array, shape (N_atoms,), dtype=vec3i
+        Cell coordinates ``(cx, cy, cz)`` for each atom.
+    atoms_per_cell_count : wp.array, shape (total_cells,), dtype=int32
+        Number of atoms assigned to each global cell.
+    cell_atom_start_indices : wp.array, shape (total_cells,), dtype=int32
+        Offset into ``cell_atom_list`` for the first atom of each cell.
+    cell_atom_list : wp.array, shape (N_atoms,), dtype=int32
+        Atom indices stored in cell order.
+    cell_offsets : wp.array, shape (num_systems,), dtype=int32
+        Global cell index offset for the first cell of each system.
+    neighbor_matrix : wp.array2d, shape (N_atoms, max_neighbors), dtype=int32
+        OUTPUT: Neighbor index matrix; written entries use ``_update_neighbor_matrix_pbc``.
+    neighbor_matrix_shifts : wp.array2d, shape (N_atoms, max_neighbors), dtype=vec3i
+        OUTPUT: Integer PBC shift vectors corresponding to each neighbor entry.
+    num_neighbors : wp.array, shape (N_atoms,), dtype=int32
+        OUTPUT: Number of neighbors found for each atom (updated atomically).
+    half_fill : bool
+        If ``True``, use a half neighbor list (Newton's 3rd law; each pair
+        stored once). If ``False``, store both ``(i, j)`` and ``(j, i)``.
+    """
     central_atom_position = positions[atom_idx]
     central_atom_cell_coords = atom_to_cell_mapping[atom_idx]
 
