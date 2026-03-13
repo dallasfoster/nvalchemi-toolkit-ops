@@ -24,6 +24,11 @@ from typing import Any
 
 import warp as wp
 
+from nvalchemiops.neighbors.neighbor_utils import (
+    update_ref_positions,
+    update_ref_positions_batch,
+)
+
 __all__ = [
     "check_cell_list_rebuild",
     "check_neighbor_list_rebuild",
@@ -154,7 +159,6 @@ def _check_atoms_moved_beyond_skin(
     current_positions: wp.array(dtype=Any),
     skin_distance_threshold: Any,
     rebuild_flag: wp.array(dtype=wp.bool),
-    overwrite_reference_positions: bool = False,
 ) -> None:
     """Detect if atoms have moved beyond skin distance requiring neighbor list rebuild.
 
@@ -173,9 +177,6 @@ def _check_atoms_moved_beyond_skin(
         Typically set to (cutoff_radius - cutoff) / 2.
     rebuild_flag : wp.array, shape (1,), dtype=bool
         OUTPUT: Flag set to True if any atom moved beyond skin distance (modified atomically).
-    overwrite_reference_positions : bool, optional
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
 
     Notes
     -----
@@ -192,8 +193,6 @@ def _check_atoms_moved_beyond_skin(
 
     # Skip computation if rebuild already flagged by another thread
     if rebuild_flag[0]:
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     # Calculate displacement vector from reference to current position
@@ -204,8 +203,6 @@ def _check_atoms_moved_beyond_skin(
     if displacement_magnitude > skin_distance_threshold:
         # Neighbor list is no longer valid - flag for rebuild
         rebuild_flag[0] = True
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 # Generate overload dictionary for neighbor list rebuild kernel
@@ -218,7 +215,6 @@ for t, v in zip(_T, _V):
             wp.array(dtype=v),
             t,
             wp.array(dtype=wp.bool),
-            wp.bool,
         ],
     )
 
@@ -237,7 +233,6 @@ def _check_atoms_moved_beyond_skin_pbc(
     pbc: wp.array(dtype=wp.bool),
     skin_distance_threshold: Any,
     rebuild_flag: wp.array(dtype=wp.bool),
-    overwrite_reference_positions: bool = False,
 ) -> None:
     """Detect if atoms moved beyond skin distance using minimum-image convention.
 
@@ -261,14 +256,11 @@ def _check_atoms_moved_beyond_skin_pbc(
         Maximum allowed displacement before neighbor list becomes invalid.
     rebuild_flag : wp.array, shape (1,), dtype=bool
         OUTPUT: Flag set to True if any atom moved beyond skin distance.
-    overwrite_reference_positions : bool, optional
-        If True, overwrite reference positions with current positions
-        when rebuild_flag is True.
 
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
-    - Modifies: rebuild_flag (atomic write), optionally reference_positions
+    - Modifies: rebuild_flag (atomic write)
     - Correct for triclinic cells; avoids per-thread matrix inversion
     """
     atom_idx = wp.tid()
@@ -277,8 +269,6 @@ def _check_atoms_moved_beyond_skin_pbc(
         return
 
     if rebuild_flag[0]:
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     delta = current_positions[atom_idx] - reference_positions[atom_idx]
@@ -297,8 +287,6 @@ def _check_atoms_moved_beyond_skin_pbc(
 
     if displacement_magnitude > skin_distance_threshold:
         rebuild_flag[0] = True
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 _check_atoms_moved_beyond_skin_pbc_overload = {}
@@ -313,7 +301,6 @@ for t, v, m in zip(_T, _V, _M):
             wp.array(dtype=wp.bool),
             t,
             wp.array(dtype=wp.bool),
-            wp.bool,
         ],
     )
 
@@ -383,7 +370,7 @@ def check_neighbor_list_rebuild(
     rebuild_flag: wp.array,
     wp_dtype: type,
     device: str,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: wp.array | None = None,
     cell_inv: wp.array | None = None,
     pbc: wp.array | None = None,
@@ -409,10 +396,11 @@ def check_neighbor_list_rebuild(
         Warp dtype (wp.float32, wp.float64, or wp.float16).
     device : str
         Warp device string (e.g., 'cuda:0', 'cpu').
-    overwrite_reference_positions : bool, optional
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference
-        positions with the current positions.
+    update_reference_positions : bool, optional
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        for all atoms when a rebuild is detected. The update runs in a second
+        kernel launch after the detection kernel, so every atom is guaranteed
+        to be updated with no race conditions. Default False.
     cell : wp.array or None, optional
         Unit cell matrix, shape (1,), dtype=wp.mat33*.  Required together with
         ``cell_inv`` and ``pbc`` to enable MIC displacement.
@@ -426,13 +414,28 @@ def check_neighbor_list_rebuild(
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - rebuild_flag must be pre-allocated and initialized to False by caller.
 
+    Raises
+    ------
+    ValueError
+        If only a subset of ``cell``, ``cell_inv``, and ``pbc`` are provided.
+        All three must be supplied together to enable MIC displacement.
+
     See Also
     --------
     _check_atoms_moved_beyond_skin : Euclidean kernel
     _check_atoms_moved_beyond_skin_pbc : PBC kernel for periodic systems
+    update_ref_positions : Standalone reference-position update launcher
     """
+    pbc_params = (cell, cell_inv, pbc)
+    if any(p is not None for p in pbc_params) and not all(
+        p is not None for p in pbc_params
+    ):
+        raise ValueError(
+            "cell, cell_inv, and pbc must all be provided together to enable MIC "
+            "displacement checking. Received a partial set."
+        )
     total_atoms = reference_positions.shape[0]
-    use_pbc = cell is not None and cell_inv is not None and pbc is not None
+    use_pbc = cell is not None
     if use_pbc:
         wp.launch(
             kernel=_check_atoms_moved_beyond_skin_pbc_overload[wp_dtype],
@@ -445,7 +448,6 @@ def check_neighbor_list_rebuild(
                 pbc,
                 wp_dtype(skin_distance_threshold),
                 rebuild_flag,
-                overwrite_reference_positions,
             ],
             device=device,
         )
@@ -458,9 +460,12 @@ def check_neighbor_list_rebuild(
                 current_positions,
                 wp_dtype(skin_distance_threshold),
                 rebuild_flag,
-                overwrite_reference_positions,
             ],
             device=device,
+        )
+    if update_reference_positions:
+        update_ref_positions(
+            current_positions, rebuild_flag, reference_positions, wp_dtype, device
         )
 
 
@@ -476,7 +481,6 @@ def _check_batch_atoms_moved_beyond_skin(
     batch_idx: wp.array(dtype=wp.int32),
     skin_distance_threshold: Any,
     rebuild_flags: wp.array(dtype=wp.bool),
-    overwrite_reference_positions: bool,
 ) -> None:
     """Detect per-system if atoms moved beyond skin distance requiring neighbor list rebuild.
 
@@ -498,9 +502,7 @@ def _check_batch_atoms_moved_beyond_skin(
     rebuild_flags : wp.array, shape (num_systems,), dtype=bool
         OUTPUT: Per-system flags set to True if any atom in that system moved beyond
         skin distance (modified per system).
-    overwrite_reference_positions : bool, optional
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference positions with the current positions.
+
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
@@ -518,8 +520,6 @@ def _check_batch_atoms_moved_beyond_skin(
 
     # Skip computation if rebuild already flagged for this system
     if rebuild_flags[isys]:
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     displacement_vector = current_positions[atom_idx] - reference_positions[atom_idx]
@@ -527,8 +527,6 @@ def _check_batch_atoms_moved_beyond_skin(
 
     if displacement_magnitude > skin_distance_threshold:
         rebuild_flags[isys] = True
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 # Generate overload dictionary for batch neighbor list rebuild kernel
@@ -542,7 +540,6 @@ for t, v in zip(_T, _V):
             wp.array(dtype=wp.int32),
             t,
             wp.array(dtype=wp.bool),
-            bool,
         ],
     )
 
@@ -562,7 +559,6 @@ def _check_batch_atoms_moved_beyond_skin_pbc(
     pbc: wp.array2d(dtype=wp.bool),
     skin_distance_threshold: Any,
     rebuild_flags: wp.array(dtype=wp.bool),
-    overwrite_reference_positions: bool,
 ) -> None:
     """Per-system PBC-aware skin-distance rebuild detection.
 
@@ -589,14 +585,11 @@ def _check_batch_atoms_moved_beyond_skin_pbc(
     rebuild_flags : wp.array, shape (num_systems,), dtype=bool
         OUTPUT: Per-system flags set to True if any atom moved beyond skin
         distance.
-    overwrite_reference_positions : bool
-        If True, overwrite reference positions with current positions
-        when the system's rebuild_flag is True.
 
     Notes
     -----
     - Thread launch: One thread per atom (dim=total_atoms)
-    - Modifies: rebuild_flags, optionally reference_positions
+    - Modifies: rebuild_flags
     - Correct for triclinic cells; avoids per-thread matrix inversion
     """
     atom_idx = wp.tid()
@@ -607,8 +600,6 @@ def _check_batch_atoms_moved_beyond_skin_pbc(
     isys = batch_idx[atom_idx]
 
     if rebuild_flags[isys]:
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
         return
 
     delta = current_positions[atom_idx] - reference_positions[atom_idx]
@@ -627,8 +618,6 @@ def _check_batch_atoms_moved_beyond_skin_pbc(
 
     if displacement_magnitude > skin_distance_threshold:
         rebuild_flags[isys] = True
-        if overwrite_reference_positions:
-            reference_positions[atom_idx] = current_positions[atom_idx]
 
 
 _check_batch_atoms_moved_beyond_skin_pbc_overload = {}
@@ -644,7 +633,6 @@ for t, v, m in zip(_T, _V, _M):
             wp.array2d(dtype=wp.bool),
             t,
             wp.array(dtype=wp.bool),
-            bool,
         ],
     )
 
@@ -773,7 +761,7 @@ def check_batch_neighbor_list_rebuild(
     rebuild_flags: wp.array,
     wp_dtype: type,
     device: str,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: wp.array | None = None,
     cell_inv: wp.array | None = None,
     pbc: wp.array | None = None,
@@ -805,10 +793,12 @@ def check_batch_neighbor_list_rebuild(
         Warp dtype (wp.float32, wp.float64, or wp.float16).
     device : str
         Warp device string (e.g., 'cuda:0', 'cpu').
-    overwrite_reference_positions : bool, optional
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference
-        positions with the current positions.
+    update_reference_positions : bool, optional
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        for all atoms in rebuilt systems when a rebuild is detected. The update
+        runs in a second kernel launch after the detection kernel, so every atom
+        in each rebuilt system is guaranteed to be updated with no race
+        conditions. Default False.
     cell : wp.array or None, optional
         Per-system cell matrices, shape (num_systems,), dtype=wp.mat33*.
         Required together with ``cell_inv`` and ``pbc`` to enable MIC.
@@ -824,13 +814,28 @@ def check_batch_neighbor_list_rebuild(
     - rebuild_flags must be pre-allocated and initialized to False by caller.
     - No CPU-GPU synchronization required; flags are written entirely on GPU.
 
+    Raises
+    ------
+    ValueError
+        If only a subset of ``cell``, ``cell_inv``, and ``pbc`` are provided.
+        All three must be supplied together to enable MIC displacement.
+
     See Also
     --------
     _check_batch_atoms_moved_beyond_skin : Euclidean kernel
     _check_batch_atoms_moved_beyond_skin_pbc : PBC kernel for periodic systems
+    update_ref_positions_batch : Standalone reference-position update launcher
     """
+    pbc_params = (cell, cell_inv, pbc)
+    if any(p is not None for p in pbc_params) and not all(
+        p is not None for p in pbc_params
+    ):
+        raise ValueError(
+            "cell, cell_inv, and pbc must all be provided together to enable MIC "
+            "displacement checking. Received a partial set."
+        )
     total_atoms = reference_positions.shape[0]
-    use_pbc = cell is not None and cell_inv is not None and pbc is not None
+    use_pbc = cell is not None
     if use_pbc:
         wp.launch(
             kernel=_check_batch_atoms_moved_beyond_skin_pbc_overload[wp_dtype],
@@ -844,7 +849,6 @@ def check_batch_neighbor_list_rebuild(
                 pbc,
                 wp_dtype(skin_distance_threshold),
                 rebuild_flags,
-                overwrite_reference_positions,
             ],
             device=device,
         )
@@ -858,9 +862,17 @@ def check_batch_neighbor_list_rebuild(
                 batch_idx,
                 wp_dtype(skin_distance_threshold),
                 rebuild_flags,
-                overwrite_reference_positions,
             ],
             device=device,
+        )
+    if update_reference_positions:
+        update_ref_positions_batch(
+            current_positions,
+            rebuild_flags,
+            batch_idx,
+            reference_positions,
+            wp_dtype,
+            device,
         )
 
 

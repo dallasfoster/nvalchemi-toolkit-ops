@@ -224,7 +224,6 @@ def neighbor_list_needs_rebuild(
     reference_positions: jax.Array,
     current_positions: jax.Array,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
     cell: jax.Array | None = None,
     cell_inv: jax.Array | None = None,
     pbc: jax.Array | None = None,
@@ -243,8 +242,6 @@ def neighbor_list_needs_rebuild(
         Current atomic positions to compare against reference.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, optional
-        Whether to overwrite the reference positions with the current positions.
     cell : jax.Array or None, optional
         Unit cell matrix, shape (1, 3, 3).
     cell_inv : jax.Array or None, optional
@@ -301,7 +298,6 @@ def neighbor_list_needs_rebuild(
             pbc,
             float(skin_distance_threshold),
             rebuild_flag,
-            overwrite_reference_positions,
             launch_dims=(total_atoms,),
         )
     else:
@@ -317,7 +313,6 @@ def neighbor_list_needs_rebuild(
             current_positions,
             float(skin_distance_threshold),
             rebuild_flag,
-            overwrite_reference_positions,
             launch_dims=(total_atoms,),
         )
 
@@ -384,7 +379,6 @@ def check_neighbor_list_rebuild_needed(
     reference_positions: jax.Array,
     current_positions: jax.Array,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
     cell: jax.Array | None = None,
     cell_inv: jax.Array | None = None,
     pbc: jax.Array | None = None,
@@ -402,8 +396,6 @@ def check_neighbor_list_rebuild_needed(
         Current atomic coordinates to compare against reference positions.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, optional
-        Whether to overwrite the reference positions with the current positions.
     cell : jax.Array or None, optional
         Unit cell matrix, shape (1, 3, 3).
     cell_inv : jax.Array or None, optional
@@ -424,7 +416,6 @@ def check_neighbor_list_rebuild_needed(
         reference_positions,
         current_positions,
         skin_distance_threshold,
-        overwrite_reference_positions,
         cell,
         cell_inv,
         pbc,
@@ -444,7 +435,6 @@ def batch_neighbor_list_needs_rebuild(
     batch_idx: jax.Array,
     skin_distance_threshold: float,
     num_systems: int,
-    overwrite_reference_positions: bool = False,
     cell: jax.Array | None = None,
     cell_inv: jax.Array | None = None,
     pbc: jax.Array | None = None,
@@ -466,8 +456,6 @@ def batch_neighbor_list_needs_rebuild(
         Maximum allowed displacement before neighbor list becomes invalid.
     num_systems : int
         Number of systems in the batch.
-    overwrite_reference_positions : bool, optional
-        Whether to overwrite reference positions with current positions.
     cell : jax.Array or None, optional
         Per-system cell matrices, shape (num_systems, 3, 3).
     cell_inv : jax.Array or None, optional
@@ -522,7 +510,6 @@ def batch_neighbor_list_needs_rebuild(
             pbc,
             float(skin_distance_threshold),
             rebuild_flags,
-            overwrite_reference_positions,
             launch_dims=(total_atoms,),
         )
     else:
@@ -539,7 +526,6 @@ def batch_neighbor_list_needs_rebuild(
             batch_idx,
             float(skin_distance_threshold),
             rebuild_flags,
-            overwrite_reference_positions,
             launch_dims=(total_atoms,),
         )
 
@@ -630,7 +616,6 @@ def check_batch_neighbor_list_rebuild_needed(
     batch_idx: jax.Array,
     skin_distance_threshold: float,
     num_systems: int,
-    overwrite_reference_positions: bool = False,
     cell: jax.Array | None = None,
     cell_inv: jax.Array | None = None,
     pbc: jax.Array | None = None,
@@ -652,8 +637,6 @@ def check_batch_neighbor_list_rebuild_needed(
         Maximum allowed displacement before neighbor list becomes invalid.
     num_systems : int
         Number of systems in the batch.
-    overwrite_reference_positions : bool, optional
-        Whether to overwrite reference positions with current positions.
     cell : jax.Array or None, optional
         Per-system cell matrices, shape (num_systems, 3, 3).
     cell_inv : jax.Array or None, optional
@@ -676,7 +659,6 @@ def check_batch_neighbor_list_rebuild_needed(
         batch_idx,
         skin_distance_threshold,
         num_systems,
-        overwrite_reference_positions,
         cell,
         cell_inv,
         pbc,

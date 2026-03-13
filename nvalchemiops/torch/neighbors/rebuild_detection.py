@@ -199,12 +199,14 @@ def cell_list_needs_rebuild(
 ###########################################################################################
 
 
-@torch.library.custom_op("nvalchemiops::_neighbor_list_needs_rebuild", mutates_args=())
+@torch.library.custom_op(
+    "nvalchemiops::_neighbor_list_needs_rebuild", mutates_args=("reference_positions",)
+)
 def _neighbor_list_needs_rebuild(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -219,10 +221,9 @@ def _neighbor_list_needs_rebuild(
         Current atomic positions to compare against reference.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, default=False
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference
-        positions with the current positions.
+    update_reference_positions : bool, default=False
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        after a rebuild is detected. Uses a separate deterministic kernel launch.
     cell : torch.Tensor or None, optional
         Unit cell matrix, shape (1, 3, 3).  Required together with
         ``cell_inv`` and ``pbc`` to enable MIC displacement.
@@ -276,7 +277,7 @@ def _neighbor_list_needs_rebuild(
         rebuild_flag=wp_rebuild_flag,
         wp_dtype=wp_dtype,
         device=str(device),
-        overwrite_reference_positions=overwrite_reference_positions,
+        update_reference_positions=update_reference_positions,
         cell=wp_cell,
         cell_inv=wp_cell_inv,
         pbc=wp_pbc,
@@ -290,7 +291,7 @@ def _neighbor_list_needs_rebuild_fake(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -303,7 +304,7 @@ def neighbor_list_needs_rebuild(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -327,10 +328,10 @@ def neighbor_list_needs_rebuild(
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
         Typically set to (cutoff_radius - cutoff) / 2 for safety.
-    overwrite_reference_positions : bool, default=False
-        If True, overwrite reference positions with current positions.
-        When rebuild_flag is True, this is used to overwrite the reference
-        positions with the current positions.
+    update_reference_positions : bool, default=False
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        after a rebuild is detected. Uses a separate deterministic kernel launch
+        so all atoms are guaranteed to be updated.
     cell : torch.Tensor or None, optional
         Unit cell matrix, shape (1, 3, 3).  Required together with
         ``cell_inv`` and ``pbc`` to enable MIC displacement.
@@ -362,7 +363,7 @@ def neighbor_list_needs_rebuild(
         reference_positions,
         current_positions,
         skin_distance_threshold,
-        overwrite_reference_positions,
+        update_reference_positions,
         cell,
         cell_inv,
         pbc,
@@ -441,7 +442,7 @@ def check_neighbor_list_rebuild_needed(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -461,8 +462,8 @@ def check_neighbor_list_rebuild_needed(
         Current atomic coordinates to compare against reference positions.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, default=False
-        If True, overwrite reference positions with current positions.
+    update_reference_positions : bool, default=False
+        If True, overwrite ``reference_positions`` after a rebuild is detected.
     cell : torch.Tensor or None, optional
         Unit cell matrix, shape (1, 3, 3).
     cell_inv : torch.Tensor or None, optional
@@ -483,7 +484,7 @@ def check_neighbor_list_rebuild_needed(
         reference_positions,
         current_positions,
         skin_distance_threshold,
-        overwrite_reference_positions,
+        update_reference_positions,
         cell,
         cell_inv,
         pbc,
@@ -498,14 +499,15 @@ def check_neighbor_list_rebuild_needed(
 
 
 @torch.library.custom_op(
-    "nvalchemiops::_batch_neighbor_list_needs_rebuild", mutates_args=()
+    "nvalchemiops::_batch_neighbor_list_needs_rebuild",
+    mutates_args=("reference_positions",),
 )
 def _batch_neighbor_list_needs_rebuild(
     reference_positions: torch.Tensor,
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -522,8 +524,9 @@ def _batch_neighbor_list_needs_rebuild(
         System index for each atom.
     skin_distance_threshold : float
         Maximum allowed displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, default=False
-        If True, overwrite reference positions with current positions.
+    update_reference_positions : bool, default=False
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        after a rebuild is detected. Uses a separate deterministic kernel launch.
     cell : torch.Tensor or None, optional
         Per-system cell matrices, shape (num_systems, 3, 3).
     cell_inv : torch.Tensor or None, optional
@@ -582,7 +585,7 @@ def _batch_neighbor_list_needs_rebuild(
         rebuild_flags=wp_rebuild_flags,
         wp_dtype=wp_dtype,
         device=str(device),
-        overwrite_reference_positions=overwrite_reference_positions,
+        update_reference_positions=update_reference_positions,
         cell=wp_cell,
         cell_inv=wp_cell_inv,
         pbc=wp_pbc,
@@ -597,7 +600,7 @@ def _batch_neighbor_list_needs_rebuild_fake(
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -612,7 +615,7 @@ def batch_neighbor_list_needs_rebuild(
     current_positions: torch.Tensor,
     batch_idx: torch.Tensor,
     skin_distance_threshold: float,
-    overwrite_reference_positions: bool = False,
+    update_reference_positions: bool = False,
     cell: torch.Tensor | None = None,
     cell_inv: torch.Tensor | None = None,
     pbc: torch.Tensor | None = None,
@@ -636,8 +639,10 @@ def batch_neighbor_list_needs_rebuild(
         System index for each atom.
     skin_distance_threshold : float
         Maximum allowed atomic displacement before neighbor list becomes invalid.
-    overwrite_reference_positions : bool, default=False
-        If True, overwrite reference positions with current positions.
+    update_reference_positions : bool, default=False
+        If True, overwrite ``reference_positions`` with ``current_positions``
+        after a rebuild is detected. Uses a separate deterministic kernel launch
+        so all atoms in rebuilt systems are guaranteed to be updated.
     cell : torch.Tensor or None, optional
         Per-system cell matrices, shape (num_systems, 3, 3).
     cell_inv : torch.Tensor or None, optional
@@ -666,7 +671,7 @@ def batch_neighbor_list_needs_rebuild(
         current_positions,
         batch_idx,
         skin_distance_threshold,
-        overwrite_reference_positions,
+        update_reference_positions,
         cell,
         cell_inv,
         pbc,

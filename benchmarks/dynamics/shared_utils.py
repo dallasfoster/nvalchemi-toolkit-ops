@@ -69,8 +69,6 @@ from nvalchemiops.neighbors.cell_list import build_cell_list, query_cell_list
 from nvalchemiops.neighbors.neighbor_utils import (
     selective_zero_num_neighbors,
     selective_zero_num_neighbors_single,
-    update_ref_positions,
-    update_ref_positions_batch,
     zero_array,
 )
 from nvalchemiops.neighbors.rebuild_detection import (
@@ -917,6 +915,7 @@ class NeighborListManager:
             rebuild_flag=self.wp_rebuild_flag,
             wp_dtype=self.wp_dtype,
             device=self.device,
+            update_reference_positions=True,
             cell=cell_wp if cell_inv_wp is not None else None,
             cell_inv=cell_inv_wp,
             pbc=self.wp_pbc if cell_inv_wp is not None else None,
@@ -962,15 +961,6 @@ class NeighborListManager:
             self.device,
             half_fill=self.half_fill,
             rebuild_flags=self.wp_rebuild_flag,
-        )
-
-        # 5. Update reference positions for rebuilt atoms — GPU-side, no sync
-        update_ref_positions(
-            positions_wp,
-            self.wp_rebuild_flag,
-            self.wp_ref_positions,
-            self.wp_dtype,
-            self.device,
         )
 
     def total_neighbors(self) -> int:
@@ -1136,7 +1126,7 @@ class BatchedNeighborListManager:
             rebuild_flags=self.wp_rebuild_flags,
             wp_dtype=self.wp_dtype,
             device=self.device,
-            overwrite_reference_positions=True,
+            update_reference_positions=True,
             cell=cells_wp if cells_inv_wp is not None else None,
             cell_inv=cells_inv_wp,
             pbc=self.wp_pbc if cells_inv_wp is not None else None,
@@ -1190,16 +1180,6 @@ class BatchedNeighborListManager:
             self.device,
             half_fill=self.half_fill,
             rebuild_flags=self.wp_rebuild_flags,
-        )
-
-        # 5. Update reference positions for rebuilt atoms — GPU-side, no sync
-        update_ref_positions_batch(
-            positions_wp,
-            self.wp_rebuild_flags,
-            self.wp_batch_idx,
-            self.wp_ref_positions,
-            self.wp_dtype,
-            self.device,
         )
 
     def total_neighbors(self) -> int:
