@@ -810,6 +810,9 @@ def batch_naive_neighbor_matrix_pbc(
     half_fill: bool = False,
     rebuild_flags: wp.array | None = None,
     wrap_positions: bool = True,
+    inv_cell: wp.array | None = None,
+    positions_wrapped: wp.array | None = None,
+    per_atom_cell_offsets: wp.array | None = None,
 ) -> None:
     """Core warp launcher for batched naive neighbor matrix construction with PBC.
 
@@ -852,6 +855,19 @@ def batch_naive_neighbor_matrix_pbc(
         Per-system rebuild flags.
     wrap_positions : bool, default=True
         If True, wrap input positions into the primary cell.
+    inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*, optional
+        Caller-provided scratch for the per-system inverse cell. Required
+        alongside ``positions_wrapped`` and ``per_atom_cell_offsets`` when
+        the call must be CUDA-graph-capturable; if any of the three are
+        ``None`` the function allocates them internally via ``wp.empty``,
+        which is illegal during stream capture. Only consulted when
+        ``wrap_positions`` is True.
+    positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*, optional
+        Caller-provided scratch holding the wrapped positions. See
+        ``inv_cell``.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i, optional
+        Caller-provided scratch holding the integer cell offsets used for
+        each atom's wrap. See ``inv_cell``.
 
     Notes
     -----
@@ -859,6 +875,11 @@ def batch_naive_neighbor_matrix_pbc(
     - Output arrays must be pre-allocated by caller.
     - When ``wrap_positions`` is True, positions are wrapped into the primary cell in a
       preprocessing step before the neighbor search kernel.
+    - To capture this call into a CUDA graph with ``wrap_positions=True``,
+      pre-allocate ``inv_cell``, ``positions_wrapped``, and
+      ``per_atom_cell_offsets`` once outside the captured region — the
+      default in-function ``wp.empty`` allocations route through Warp's
+      allocator and aren't capture-safe.
 
     See Also
     --------
@@ -866,6 +887,8 @@ def batch_naive_neighbor_matrix_pbc(
     _fill_batch_naive_neighbor_matrix_pbc : Kernel that performs the computation
     _fill_batch_naive_neighbor_matrix_pbc_selective : Selective-skip kernel variant
     wrap_positions_batch : Preprocessing step that wraps positions
+    allocate_naive_pbc_wrap_scratch : Builds the three scratch arrays at
+        the right shapes/dtypes for a given (positions, cell) pair.
     """
     total_atoms = positions.shape[0]
     num_systems = cell.shape[0]
@@ -889,10 +912,19 @@ def batch_naive_neighbor_matrix_pbc(
             if wp_dtype == wp.float16
             else None
         )
-        inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+        # Allocate scratch internally only when the caller didn't supply it.
+        # Internal allocation routes through Warp's allocator (illegal
+        # during CUDA graph stream capture); graph-capturing callers pass
+        # all three pre-allocated.
+        if inv_cell is None:
+            inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+        if positions_wrapped is None:
+            positions_wrapped = wp.empty(
+                (total_atoms,), dtype=wp_vec_dtype, device=device
+            )
+        if per_atom_cell_offsets is None:
+            per_atom_cell_offsets = wp.empty(total_atoms, dtype=wp.vec3i, device=device)
         compute_inv_cells(cell, inv_cell, wp_dtype, device)
-        positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
-        per_atom_cell_offsets = wp.empty(total_atoms, dtype=wp.vec3i, device=device)
         wrap_positions_batch(
             positions,
             cell,

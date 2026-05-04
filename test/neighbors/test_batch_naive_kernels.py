@@ -30,7 +30,10 @@ from nvalchemiops.neighbors.neighbor_utils import (
     compute_inv_cells,
     wrap_positions_batch,
 )
-from nvalchemiops.torch.neighbors.neighbor_utils import compute_naive_num_shifts
+from nvalchemiops.torch.neighbors.neighbor_utils import (
+    allocate_naive_pbc_wrap_scratch,
+    compute_naive_num_shifts,
+)
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 from .test_utils import create_batch_systems
@@ -333,6 +336,120 @@ class TestBatchNaiveWpLaunchers:
             assert torch.all(torch.abs(valid_shifts) <= 5), (
                 "Unit shifts should be small integers"
             )
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("half_fill", [True, False])
+    def test_batch_naive_neighbor_matrix_pbc_with_preallocated_wrap_scratch(
+        self, device, dtype, half_fill
+    ):
+        """``batch_naive_neighbor_matrix_pbc`` accepts caller-supplied
+        ``inv_cell`` / ``positions_wrapped`` / ``per_atom_cell_offsets``
+        scratch in place of the in-body ``wp.empty`` allocations and
+        produces the same output. This is the path graph-capturing
+        callers use; the warp-allocator path inside the function isn't
+        capture-safe.
+        """
+        atoms_per_system = [4, 5]
+        num_systems = 2
+        positions_batch, cell_batch, pbc_batch, _ = create_batch_systems(
+            num_systems=num_systems,
+            atoms_per_system=atoms_per_system,
+            dtype=dtype,
+            device=device,
+        )
+        batch_idx, batch_ptr = create_batch_idx_and_ptr(atoms_per_system, device)
+        cutoff = 1.2
+        max_neighbors = 25
+        max_atoms_per_system = max(atoms_per_system)
+        total_atoms = positions_batch.shape[0]
+
+        shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+            cell_batch, cutoff, pbc_batch
+        )
+
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+
+        # Reference: run with the in-body allocator (default behaviour).
+        ref_neighbor_matrix = torch.full(
+            (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        ref_neighbor_matrix_shifts = torch.zeros(
+            (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
+        )
+        ref_num_neighbors = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+
+        batch_naive_neighbor_matrix_pbc(
+            positions=wp.from_torch(positions_batch, dtype=wp_vec_dtype),
+            cell=wp.from_torch(cell_batch, dtype=wp_mat_dtype),
+            cutoff=cutoff,
+            batch_ptr=wp.from_torch(batch_ptr, dtype=wp.int32),
+            batch_idx=wp.from_torch(batch_idx, dtype=wp.int32),
+            shift_range=wp.from_torch(shift_range, dtype=wp.vec3i),
+            num_shifts_arr=wp.from_torch(num_shifts, dtype=wp.int32),
+            max_shifts_per_system=max_shifts,
+            neighbor_matrix=wp.from_torch(ref_neighbor_matrix, dtype=wp.int32),
+            neighbor_matrix_shifts=wp.from_torch(
+                ref_neighbor_matrix_shifts, dtype=wp.vec3i
+            ),
+            num_neighbors=wp.from_torch(ref_num_neighbors, dtype=wp.int32),
+            wp_dtype=wp_dtype,
+            device=str(device),
+            max_atoms_per_system=max_atoms_per_system,
+            half_fill=half_fill,
+        )
+
+        # Now repeat with caller-supplied scratch (the graph-capturable path).
+        out_neighbor_matrix = torch.full(
+            (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        out_neighbor_matrix_shifts = torch.zeros(
+            (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
+        )
+        out_num_neighbors = torch.zeros(total_atoms, dtype=torch.int32, device=device)
+
+        inv_cell, positions_wrapped, per_atom_cell_offsets = (
+            allocate_naive_pbc_wrap_scratch(
+                total_atoms=total_atoms,
+                num_systems=num_systems,
+                dtype=dtype,
+                device=torch.device(device),
+            )
+        )
+
+        batch_naive_neighbor_matrix_pbc(
+            positions=wp.from_torch(positions_batch, dtype=wp_vec_dtype),
+            cell=wp.from_torch(cell_batch, dtype=wp_mat_dtype),
+            cutoff=cutoff,
+            batch_ptr=wp.from_torch(batch_ptr, dtype=wp.int32),
+            batch_idx=wp.from_torch(batch_idx, dtype=wp.int32),
+            shift_range=wp.from_torch(shift_range, dtype=wp.vec3i),
+            num_shifts_arr=wp.from_torch(num_shifts, dtype=wp.int32),
+            max_shifts_per_system=max_shifts,
+            neighbor_matrix=wp.from_torch(out_neighbor_matrix, dtype=wp.int32),
+            neighbor_matrix_shifts=wp.from_torch(
+                out_neighbor_matrix_shifts, dtype=wp.vec3i
+            ),
+            num_neighbors=wp.from_torch(out_num_neighbors, dtype=wp.int32),
+            wp_dtype=wp_dtype,
+            device=str(device),
+            max_atoms_per_system=max_atoms_per_system,
+            half_fill=half_fill,
+            inv_cell=wp.from_torch(inv_cell, dtype=wp_mat_dtype),
+            positions_wrapped=wp.from_torch(positions_wrapped, dtype=wp_vec_dtype),
+            per_atom_cell_offsets=wp.from_torch(per_atom_cell_offsets, dtype=wp.vec3i),
+        )
+
+        # Counts must be identical; slot ordering within each row is
+        # non-deterministic (atomic-add races for slot indices), so we
+        # compare row-sorted neighbor lists for set-equality.
+        assert torch.equal(out_num_neighbors, ref_num_neighbors)
+        assert torch.equal(
+            out_neighbor_matrix.sort(dim=1).values,
+            ref_neighbor_matrix.sort(dim=1).values,
+        )
 
     @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

@@ -37,6 +37,7 @@ __all__ = [
     "get_neighbor_list_from_neighbor_matrix",
     "prepare_batch_idx_ptr",
     "allocate_cell_list",
+    "allocate_naive_pbc_wrap_scratch",
     "estimate_max_neighbors",
     "NeighborOverflowError",
 ]
@@ -381,3 +382,61 @@ def allocate_cell_list(
         cell_atom_start_indices,
         cell_atom_list,
     )
+
+
+def allocate_naive_pbc_wrap_scratch(
+    total_atoms: int,
+    num_systems: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate the three scratch tensors the naive-PBC wrap-positions
+    branch needs.
+
+    ``batch_naive_neighbor_matrix_pbc`` with ``wrap_positions=True``
+    needs (1) a per-system inverse-cell, (2) a wrapped-positions buffer,
+    and (3) a per-atom integer cell-offset array. Internally the
+    function will ``wp.empty(...)`` these on demand, but Warp's
+    allocator isn't safe to call from inside a CUDA graph stream
+    capture. Pre-allocating with this helper and passing the three
+    arrays into ``batch_naive_neighbor_matrix_pbc`` keeps the call
+    capture-friendly.
+
+    Parameters
+    ----------
+    total_atoms : int
+        Total number of atoms across all systems (positions length).
+    num_systems : int
+        Number of systems in the batch (cell.shape[0]).
+    dtype : torch.dtype
+        Floating-point dtype of the positions / cell tensors. The
+        scratch matches this so Warp's mat33/vec3 view-as is zero-copy.
+    device : torch.device
+        Allocation target.
+
+    Returns
+    -------
+    inv_cell : torch.Tensor, shape (num_systems, 3, 3), dtype matches positions
+        Per-system inverse cell scratch.
+    positions_wrapped : torch.Tensor, shape (total_atoms, 3), dtype matches positions
+        Wrapped-position scratch.
+    per_atom_cell_offsets : torch.Tensor, shape (total_atoms, 3), dtype=int32
+        Per-atom integer cell-offset scratch.
+
+    Notes
+    -----
+    - All three tensors must be passed together (or all omitted); mixing
+      pre-allocated and on-demand scratch is not supported.
+    - Caller threads them through ``wp.from_torch`` to the warp-level
+      ``batch_naive_neighbor_matrix_pbc`` launcher.
+
+    See Also
+    --------
+    nvalchemiops.neighbors.batch_naive.batch_naive_neighbor_matrix_pbc
+    """
+    inv_cell = torch.zeros((num_systems, 3, 3), dtype=dtype, device=device)
+    positions_wrapped = torch.zeros((total_atoms, 3), dtype=dtype, device=device)
+    per_atom_cell_offsets = torch.zeros(
+        (total_atoms, 3), dtype=torch.int32, device=device
+    )
+    return inv_cell, positions_wrapped, per_atom_cell_offsets
