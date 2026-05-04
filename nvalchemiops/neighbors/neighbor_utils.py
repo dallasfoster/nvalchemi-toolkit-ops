@@ -54,6 +54,7 @@ __all__ = [
     "compute_naive_num_shifts",
     "compute_inv_cells",
     "zero_array",
+    "exclusive_scan_int32",
     "selective_zero_num_neighbors",
     "selective_zero_num_neighbors_single",
     "estimate_max_neighbors",
@@ -413,6 +414,104 @@ def zero_array(
         kernel=_zero_array_kernel,
         dim=n,
         inputs=[array],
+        device=device,
+    )
+
+
+# Threads-per-tile for the tile-based exclusive scan kernel below.
+# 64 matches the reference value Warp's own tile reduction tests use
+# (warp/tests/tile/test_tile_reduce.py:TILE_DIM); it gives one warp per
+# tile on CUDA and a sensible serial fan-out on CPU.
+_TILE_EXCLUSIVE_SCAN_INT32_THREADS = 64
+
+# Specialised single-tile scan kernels are cached on first launch per
+# unique tile length. ``wp.tile_scan_exclusive`` requires the tile shape
+# to be a compile-time constant, so each distinct length compiles its
+# own kernel; subsequent launches at the same length reuse the cubin.
+_tile_exclusive_scan_int32_kernel_cache: dict[int, Any] = {}
+
+
+def _make_tile_exclusive_scan_int32(tile_dim: int) -> Any:
+    """Build (or return cached) a specialised int32 exclusive-scan kernel.
+
+    The closed-over ``tile_dim`` becomes a compile-time constant for
+    Warp's tile codegen, which lets ``wp.tile_scan_exclusive`` pick its
+    intra-tile algorithm at compile time and keeps the per-launch
+    Python overhead near zero on cache hit.
+
+    Parameters
+    ----------
+    tile_dim : int
+        Length of the input/output array. The kernel scans exactly this
+        many elements as a single tile.
+
+    Returns
+    -------
+    callable
+        A Warp kernel suitable for passing to ``wp.launch_tiled``.
+    """
+    cached = _tile_exclusive_scan_int32_kernel_cache.get(tile_dim)
+    if cached is not None:
+        return cached
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def _kernel(
+        input: wp.array(dtype=wp.int32),
+        output: wp.array(dtype=wp.int32),
+    ) -> None:
+        t = wp.tile_load(input, shape=tile_dim)
+        s = wp.tile_scan_exclusive(t)
+        wp.tile_store(output, s)
+
+    _tile_exclusive_scan_int32_kernel_cache[tile_dim] = _kernel
+    return _kernel
+
+
+def exclusive_scan_int32(
+    input: wp.array,
+    output: wp.array,
+    device: str,
+) -> None:
+    """Exclusive prefix sum over a 1D int32 array via Warp tile primitives.
+
+    A capture-safe replacement for ``wp.utils.array_scan(input, output,
+    inclusive=False)``. The default ``array_scan`` allocates CUB scratch
+    via ``wp_alloc_device_async`` on every call, which is illegal during
+    CUDA graph stream capture; this implementation uses
+    ``wp.tile_scan_exclusive`` over a single tile, doing all work in
+    Warp's per-block tile storage with no runtime allocation. That makes
+    it portable across the CUDA and CPU back-ends and safe to record into
+    a CUDA graph.
+
+    Parameters
+    ----------
+    input : wp.array, shape (n,), dtype=wp.int32
+        Source array.
+    output : wp.array, shape (n,), dtype=wp.int32
+        OUTPUT: Exclusive prefix sum of ``input``.
+    device : str
+        Warp device string (e.g. ``"cuda:0"``, ``"cpu"``).
+
+    Notes
+    -----
+    - Input and output must be the same length.
+    - The kernel specialises on the array length; first launch at a new
+      length compiles a kernel, subsequent launches reuse the cubin.
+    - Tile storage defaults to ``"register"`` which keeps the kernel
+      portable to the CPU back-end. ``"shared"`` would silently produce
+      wrong results on CPU.
+
+    See Also
+    --------
+    _make_tile_exclusive_scan_int32 : Kernel factory that performs the scan.
+    """
+    n = input.shape[0]
+    kernel = _make_tile_exclusive_scan_int32(n)
+    wp.launch_tiled(
+        kernel,
+        dim=[1],
+        inputs=[input, output],
+        block_dim=_TILE_EXCLUSIVE_SCAN_INT32_THREADS,
         device=device,
     )
 

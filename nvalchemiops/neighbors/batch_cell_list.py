@@ -26,6 +26,7 @@ import warp as wp
 from nvalchemiops.math import wpdivmod
 from nvalchemiops.neighbors.neighbor_utils import (
     _update_neighbor_matrix_pbc,
+    exclusive_scan_int32,
     selective_zero_num_neighbors,
     zero_array,
 )
@@ -970,14 +971,17 @@ def batch_build_cell_list(
     )
 
     # Compute cell_offsets from cells_per_dimension (exclusive scan of products)
-    # This must happen after construct_bin_size fills cells_per_dimension
+    # This must happen after construct_bin_size fills cells_per_dimension.
+    # Uses the tile-scan helper rather than ``wp.utils.array_scan`` so the
+    # whole pipeline can be recorded into a CUDA graph (CUB scratch
+    # allocation in array_scan is illegal during stream capture).
     wp.launch(
         _compute_cells_per_system,
         dim=num_systems,
         device=device,
         inputs=(cells_per_dimension, cells_per_system),
     )
-    wp.utils.array_scan(cells_per_system, cell_offsets, inclusive=False)
+    exclusive_scan_int32(cells_per_system, cell_offsets, device)
 
     # Count atoms per bin (expects atoms_per_cell_count to be zeroed by caller)
     wp.launch(
@@ -996,9 +1000,10 @@ def batch_build_cell_list(
         device=device,
     )
 
-    # Compute exclusive scan to get starting indices for each cell
-    # This converts atom counts [3, 5, 2, ...] -> starting indices [0, 3, 8, ...]
-    wp.utils.array_scan(atoms_per_cell_count, cell_atom_start_indices, inclusive=False)
+    # Compute exclusive scan to get starting indices for each cell.
+    # This converts atom counts [3, 5, 2, ...] -> starting indices [0, 3, 8, ...].
+    # See the earlier scan above — same capture-safety reasoning.
+    exclusive_scan_int32(atoms_per_cell_count, cell_atom_start_indices, device)
 
     # Zero counts before binning atoms (second pass needs fresh counts)
     zero_array(atoms_per_cell_count, device)

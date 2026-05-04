@@ -21,7 +21,10 @@ import torch
 import warp as wp
 
 from nvalchemiops.neighbors.neighbor_utils import (
+    _make_tile_exclusive_scan_int32,
+    _tile_exclusive_scan_int32_kernel_cache,
     compute_naive_num_shifts,
+    exclusive_scan_int32,
     zero_array,
 )
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype
@@ -101,3 +104,118 @@ class TestNeighborUtilsWpLaunchers:
         zero_array(wp_array, device)
 
         assert test_array.shape == (0,)
+
+    @pytest.mark.parametrize("n", [1, 2, 16, 64, 256, 1024, 4096])
+    def test_exclusive_scan_int32_correctness(self, device, n):
+        """``exclusive_scan_int32`` matches ``torch.cumsum`` (exclusive variant)
+        for a range of array sizes spanning < block-dim and > block-dim cases.
+        Runs on both CPU and CUDA devices to verify the tile-scan kernel is
+        portable across back-ends.
+        """
+        torch.manual_seed(0)
+        a = torch.randint(0, 100, (n,), dtype=torch.int32, device=device)
+        out = torch.zeros(n, dtype=torch.int32, device=device)
+        wa = wp.from_torch(a, dtype=wp.int32)
+        wo = wp.from_torch(out, dtype=wp.int32)
+
+        exclusive_scan_int32(wa, wo, device)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+        expected = torch.cumsum(a, dim=0) - a  # exclusive prefix sum
+        assert torch.equal(out, expected), (
+            f"exclusive_scan_int32(n={n}, device={device}) disagrees with "
+            f"torch.cumsum reference"
+        )
+
+    def test_exclusive_scan_int32_all_zeros(self, device):
+        """All-zero input must produce an all-zero exclusive scan."""
+        n = 128
+        a = torch.zeros(n, dtype=torch.int32, device=device)
+        out = torch.full((n,), -1, dtype=torch.int32, device=device)  # poison
+        exclusive_scan_int32(
+            wp.from_torch(a, dtype=wp.int32),
+            wp.from_torch(out, dtype=wp.int32),
+            device,
+        )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        assert torch.all(out == 0)
+
+    def test_exclusive_scan_int32_all_ones(self, device):
+        """All-one input produces 0, 1, 2, ..., n-1 — equivalent to arange."""
+        n = 256
+        a = torch.ones(n, dtype=torch.int32, device=device)
+        out = torch.zeros(n, dtype=torch.int32, device=device)
+        exclusive_scan_int32(
+            wp.from_torch(a, dtype=wp.int32),
+            wp.from_torch(out, dtype=wp.int32),
+            device,
+        )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        expected = torch.arange(n, dtype=torch.int32, device=device)
+        assert torch.equal(out, expected)
+
+    def test_exclusive_scan_int32_kernel_cache_reuse(self, device):
+        """Two calls at the same length must reuse the cached specialised
+        kernel rather than recompile. We snapshot the cached kernel object
+        identity across the two calls.
+        """
+        n = 333  # arbitrary, unlikely to collide with other tests
+        # Drop any pre-existing cached kernel for this size (e.g. from a
+        # prior test in the same session) so we observe a single insert.
+        _tile_exclusive_scan_int32_kernel_cache.pop(n, None)
+
+        a = torch.arange(1, n + 1, dtype=torch.int32, device=device)
+        out = torch.zeros(n, dtype=torch.int32, device=device)
+        exclusive_scan_int32(
+            wp.from_torch(a, dtype=wp.int32),
+            wp.from_torch(out, dtype=wp.int32),
+            device,
+        )
+        first = _tile_exclusive_scan_int32_kernel_cache.get(n)
+        assert first is not None, "first launch should have populated the cache"
+
+        # Second call at the same length — kernel object must be the same
+        # instance (not a fresh compile).
+        out.zero_()
+        exclusive_scan_int32(
+            wp.from_torch(a, dtype=wp.int32),
+            wp.from_torch(out, dtype=wp.int32),
+            device,
+        )
+        second = _tile_exclusive_scan_int32_kernel_cache.get(n)
+        assert second is first, "cache hit should return the same kernel"
+
+    def test_exclusive_scan_int32_large_values(self, device):
+        """Stress the int32 range by scanning values near INT32_MAX / n;
+        the scan must not overflow within bounds and the result must still
+        match the torch reference."""
+        n = 512
+        # Pick values whose total stays within int32 (< 2**31 - 1 ≈ 2.1e9).
+        a = torch.full((n,), 1_000_000, dtype=torch.int32, device=device)
+        out = torch.zeros(n, dtype=torch.int32, device=device)
+        exclusive_scan_int32(
+            wp.from_torch(a, dtype=wp.int32),
+            wp.from_torch(out, dtype=wp.int32),
+            device,
+        )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        expected = torch.cumsum(a, dim=0) - a
+        assert torch.equal(out, expected)
+
+    def test_make_tile_exclusive_scan_int32_factory_caches(self, device):
+        """The kernel factory itself must return the same object for repeated
+        calls at the same ``tile_dim`` — the public launcher relies on it for
+        reuse, but downstream callers may also use the factory directly
+        (e.g. when capturing into a CUDA graph and wanting an upfront warmup)."""
+        n = 777
+        _tile_exclusive_scan_int32_kernel_cache.pop(n, None)
+        k1 = _make_tile_exclusive_scan_int32(n)
+        k2 = _make_tile_exclusive_scan_int32(n)
+        assert k1 is k2
+        # Different size yields a different specialised kernel.
+        k3 = _make_tile_exclusive_scan_int32(n + 1)
+        assert k3 is not k1
