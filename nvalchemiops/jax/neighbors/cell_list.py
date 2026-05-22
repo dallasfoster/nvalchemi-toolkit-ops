@@ -30,8 +30,7 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 )
 from nvalchemiops.neighbors.cell_list import (
     _cell_list_bin_atoms_overload,
-    _cell_list_build_neighbor_matrix_overload,
-    _cell_list_build_neighbor_matrix_selective_overload,
+    _cell_list_build_neighbor_matrix_local_count_sorted_overload,
     _cell_list_construct_bin_size_overload,
     _cell_list_count_atoms_per_bin_overload,
 )
@@ -44,6 +43,7 @@ from nvalchemiops.neighbors.cell_list import (
 from nvalchemiops.neighbors.neighbor_utils import (
     _selective_zero_num_neighbors_single,
     estimate_max_neighbors,
+    gather_fused_overload,
 )
 
 # ==============================================================================
@@ -92,29 +92,32 @@ _jax_bin_atoms_f64 = jax_kernel(
     enable_backward=False,
 )
 
-# Query: Build neighbor matrix from cell list
-_jax_build_neighbor_matrix_f32 = jax_kernel(
-    _cell_list_build_neighbor_matrix_overload[wp.float32],
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+# Gather: pack positions + atom_periodic_shifts into per-cell-contiguous layout
+# (cell_atom_list permutation) for coalesced reads by the sorted-build kernel.
+_jax_gather_fused_f32 = jax_kernel(
+    gather_fused_overload[wp.float32],
+    num_outputs=2,
+    in_out_argnames=["dst_pos", "dst_shifts"],
     enable_backward=False,
 )
-_jax_build_neighbor_matrix_f64 = jax_kernel(
-    _cell_list_build_neighbor_matrix_overload[wp.float64],
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+_jax_gather_fused_f64 = jax_kernel(
+    gather_fused_overload[wp.float64],
+    num_outputs=2,
+    in_out_argnames=["dst_pos", "dst_shifts"],
     enable_backward=False,
 )
 
-# Selective query: Build neighbor matrix from cell list (skips non-rebuilt systems)
-_jax_build_neighbor_matrix_selective_f32 = jax_kernel(
-    _cell_list_build_neighbor_matrix_selective_overload[wp.float32],
+# Query: sorted-reads atom-centric neighbor matrix kernel.  The selective
+# kernel is the same Warp kernel; selective callers pass a non-trivial
+# ``rebuild_flags``, non-selective callers pass a 1-element always-True flag.
+_jax_build_neighbor_matrix_local_count_sorted_f32 = jax_kernel(
+    _cell_list_build_neighbor_matrix_local_count_sorted_overload[wp.float32],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
 )
-_jax_build_neighbor_matrix_selective_f64 = jax_kernel(
-    _cell_list_build_neighbor_matrix_selective_overload[wp.float64],
+_jax_build_neighbor_matrix_local_count_sorted_f64 = jax_kernel(
+    _cell_list_build_neighbor_matrix_local_count_sorted_overload[wp.float64],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
@@ -188,16 +191,25 @@ def _run_graph_query_cell_list(
     atoms_per_cell_count,
     cell_atom_start_indices,
     cell_atom_list,
+    sorted_positions,
+    sorted_atom_periodic_shifts,
+    rebuild_flags,
     neighbor_matrix,
     neighbor_matrix_shifts,
     num_neighbors,
     cutoff,
     fill_value,
     wp_dtype,
-    rebuild_flags=None,
+    selective: bool,
 ) -> None:
-    """Execute the fused cell-list query callback."""
-    if rebuild_flags is None:
+    """Execute the fused cell-list query callback.
+
+    ``rebuild_flags`` is always a 1-element ``wp.bool`` array.  Non-selective
+    callers pass an always-True flag and we reset all outputs.  Selective
+    callers pass the live flag and we only zero ``num_neighbors`` on systems
+    whose flag is True.
+    """
+    if not selective:
         _reset_query_outputs(
             neighbor_matrix,
             neighbor_matrix_shifts,
@@ -218,24 +230,26 @@ def _run_graph_query_cell_list(
     # signature ever grows a stream/context parameter, that argument must
     # also be hoisted out of the per-replay path here.
     _warp_query_cell_list(
-        positions,
-        cell,
-        pbc,
-        cutoff,
-        cells_per_dimension,
-        neighbor_search_radius,
-        atom_periodic_shifts,
-        atom_to_cell_mapping,
-        atoms_per_cell_count,
-        cell_atom_start_indices,
-        cell_atom_list,
-        neighbor_matrix,
-        neighbor_matrix_shifts,
-        num_neighbors,
-        wp_dtype,
-        str(positions.device),
-        half_fill=False,
+        positions=positions,
+        cell=cell,
+        pbc=pbc,
+        cutoff=cutoff,
+        cells_per_dimension=cells_per_dimension,
+        neighbor_search_radius=neighbor_search_radius,
+        atom_periodic_shifts=atom_periodic_shifts,
+        atom_to_cell_mapping=atom_to_cell_mapping,
+        atoms_per_cell_count=atoms_per_cell_count,
+        cell_atom_start_indices=cell_atom_start_indices,
+        cell_atom_list=cell_atom_list,
+        sorted_positions=sorted_positions,
+        sorted_atom_periodic_shifts=sorted_atom_periodic_shifts,
+        neighbor_matrix=neighbor_matrix,
+        neighbor_matrix_shifts=neighbor_matrix_shifts,
+        num_neighbors=num_neighbors,
         rebuild_flags=rebuild_flags,
+        wp_dtype=wp_dtype,
+        device=str(positions.device),
+        half_fill=False,
     )
 
 
@@ -250,6 +264,9 @@ def _run_graph_cell_list(
     atoms_per_cell_count,
     cell_atom_start_indices,
     cell_atom_list,
+    sorted_positions,
+    sorted_atom_periodic_shifts,
+    rebuild_flags,
     neighbor_matrix,
     neighbor_matrix_shifts,
     num_neighbors,
@@ -282,12 +299,16 @@ def _run_graph_cell_list(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
         cutoff,
         fill_value,
         wp_dtype,
+        selective=False,
     )
 
 
@@ -356,6 +377,9 @@ def _graph_query_cell_list_f32(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3f),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
@@ -373,12 +397,16 @@ def _graph_query_cell_list_f32(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
         cutoff,
         fill_value,
         wp.float32,
+        selective=False,
     )
 
 
@@ -393,6 +421,9 @@ def _graph_query_cell_list_f64(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3d),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
@@ -410,12 +441,16 @@ def _graph_query_cell_list_f64(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
         cutoff,
         fill_value,
         wp.float64,
+        selective=False,
     )
 
 
@@ -430,12 +465,14 @@ def _graph_query_cell_list_selective_f32(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3f),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
     cutoff: wp.float32,
     fill_value: wp.int32,
-    rebuild_flags: wp.array(dtype=wp.bool),
 ) -> None:
     _run_graph_query_cell_list(
         positions,
@@ -448,13 +485,16 @@ def _graph_query_cell_list_selective_f32(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
         cutoff,
         fill_value,
         wp.float32,
-        rebuild_flags=rebuild_flags,
+        selective=True,
     )
 
 
@@ -469,12 +509,14 @@ def _graph_query_cell_list_selective_f64(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3d),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
     cutoff: wp.float64,
     fill_value: wp.int32,
-    rebuild_flags: wp.array(dtype=wp.bool),
 ) -> None:
     _run_graph_query_cell_list(
         positions,
@@ -487,13 +529,16 @@ def _graph_query_cell_list_selective_f64(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
         cutoff,
         fill_value,
         wp.float64,
-        rebuild_flags=rebuild_flags,
+        selective=True,
     )
 
 
@@ -508,6 +553,9 @@ def _graph_cell_list_f32(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3f),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
@@ -525,6 +573,9 @@ def _graph_cell_list_f32(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
@@ -545,6 +596,9 @@ def _graph_cell_list_f64(
     atoms_per_cell_count: wp.array(dtype=wp.int32),
     cell_atom_start_indices: wp.array(dtype=wp.int32),
     cell_atom_list: wp.array(dtype=wp.int32),
+    sorted_positions: wp.array(dtype=wp.vec3d),
+    sorted_atom_periodic_shifts: wp.array(dtype=wp.vec3i),
+    rebuild_flags: wp.array(dtype=wp.bool),
     neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
     neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
     num_neighbors: wp.array(dtype=wp.int32),
@@ -562,6 +616,9 @@ def _graph_cell_list_f64(
         atoms_per_cell_count,
         cell_atom_start_indices,
         cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        rebuild_flags,
         neighbor_matrix,
         neighbor_matrix_shifts,
         num_neighbors,
@@ -597,60 +654,60 @@ _jax_graph_build_cell_list_f64 = jax_callable(
     ],
     graph_mode=GraphMode.WARP,
 )
+_GRAPH_QUERY_INOUT = [
+    "sorted_positions",
+    "sorted_atom_periodic_shifts",
+    "neighbor_matrix",
+    "neighbor_matrix_shifts",
+    "num_neighbors",
+]
 _jax_graph_query_cell_list_f32 = jax_callable(
     _graph_query_cell_list_f32,
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    num_outputs=len(_GRAPH_QUERY_INOUT),
+    in_out_argnames=_GRAPH_QUERY_INOUT,
     graph_mode=GraphMode.WARP,
 )
 _jax_graph_query_cell_list_f64 = jax_callable(
     _graph_query_cell_list_f64,
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    num_outputs=len(_GRAPH_QUERY_INOUT),
+    in_out_argnames=_GRAPH_QUERY_INOUT,
     graph_mode=GraphMode.WARP,
 )
 _jax_graph_query_cell_list_selective_f32 = jax_callable(
     _graph_query_cell_list_selective_f32,
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    num_outputs=len(_GRAPH_QUERY_INOUT),
+    in_out_argnames=_GRAPH_QUERY_INOUT,
     graph_mode=GraphMode.WARP,
 )
 _jax_graph_query_cell_list_selective_f64 = jax_callable(
     _graph_query_cell_list_selective_f64,
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+    num_outputs=len(_GRAPH_QUERY_INOUT),
+    in_out_argnames=_GRAPH_QUERY_INOUT,
     graph_mode=GraphMode.WARP,
 )
+_GRAPH_CELL_LIST_INOUT = [
+    "cells_per_dimension",
+    "atom_periodic_shifts",
+    "atom_to_cell_mapping",
+    "atoms_per_cell_count",
+    "cell_atom_start_indices",
+    "cell_atom_list",
+    "sorted_positions",
+    "sorted_atom_periodic_shifts",
+    "neighbor_matrix",
+    "neighbor_matrix_shifts",
+    "num_neighbors",
+]
 _jax_graph_cell_list_f32 = jax_callable(
     _graph_cell_list_f32,
-    num_outputs=9,
-    in_out_argnames=[
-        "cells_per_dimension",
-        "atom_periodic_shifts",
-        "atom_to_cell_mapping",
-        "atoms_per_cell_count",
-        "cell_atom_start_indices",
-        "cell_atom_list",
-        "neighbor_matrix",
-        "neighbor_matrix_shifts",
-        "num_neighbors",
-    ],
+    num_outputs=len(_GRAPH_CELL_LIST_INOUT),
+    in_out_argnames=_GRAPH_CELL_LIST_INOUT,
     graph_mode=GraphMode.WARP,
 )
 _jax_graph_cell_list_f64 = jax_callable(
     _graph_cell_list_f64,
-    num_outputs=9,
-    in_out_argnames=[
-        "cells_per_dimension",
-        "atom_periodic_shifts",
-        "atom_to_cell_mapping",
-        "atoms_per_cell_count",
-        "cell_atom_start_indices",
-        "cell_atom_list",
-        "neighbor_matrix",
-        "neighbor_matrix_shifts",
-        "num_neighbors",
-    ],
+    num_outputs=len(_GRAPH_CELL_LIST_INOUT),
+    in_out_argnames=_GRAPH_CELL_LIST_INOUT,
     graph_mode=GraphMode.WARP,
 )
 
@@ -721,12 +778,48 @@ def estimate_cell_list_sizes(
     max_total_cells = jnp.max(jnp.array([num_cells_est, 8]))  # Minimum 8 cells
 
     # Compute cells_per_dimension and neighbor_search_radius from cell geometry,
-    # mirroring the Warp _estimate_cell_list_sizes kernel used by the Torch path.
+    # mirroring the Warp _estimate_cell_list_sizes kernel used by the Torch
+    # path: natural cell count, ADAPTIVE_MIN_CELLS=4 promotion on PBC axes,
+    # halve-to-fit when total cells > max_total_cells, then compute
+    # neighbor_search_radius against the FINAL cells_per_dimension.
     inverse_cell_transpose = jnp.linalg.inv(cell[0]).T
     face_distances = 1.0 / jnp.linalg.norm(inverse_cell_transpose, axis=1)
     cells_per_dimension = jnp.maximum(jnp.int32(face_distances / cutoff), 1)
 
     pbc_squeezed = pbc.squeeze()[:3] if pbc.ndim > 1 else pbc[:3]
+
+    # ADAPTIVE_MIN_CELLS=4: promote each PBC axis (or any axis already > 1)
+    # up to at least 4 cells so the atom-centric query has enough cell-level
+    # parallelism.  Open axes with a single cell are left alone.
+    ADAPTIVE_MIN_CELLS = 4
+    promote_mask = pbc_squeezed | (cells_per_dimension > 1)
+    # Bit-trick: smallest power-of-2 multiplier that brings cells_per_dim
+    # to >= ADAPTIVE_MIN_CELLS.  At cells_per_dim=1 → multiplier=4; at 2 →
+    # 2; at >= 4 → 1.
+    needed_mult = jnp.where(
+        cells_per_dimension >= ADAPTIVE_MIN_CELLS,
+        1,
+        ADAPTIVE_MIN_CELLS // jnp.maximum(cells_per_dimension, 1),
+    )
+    cells_per_dimension = jnp.where(
+        promote_mask,
+        cells_per_dimension * needed_mult,
+        cells_per_dimension,
+    )
+
+    # Halve-to-fit: if total cells exceeds max_total_cells, halve each axis
+    # (floor with min=1) repeatedly until total ≤ max.  Mirrors the kernel's
+    # ``while total_cells > max_cells_allowed`` loop.
+    def _halve_to_fit(cpd):
+        total = cpd[0] * cpd[1] * cpd[2]
+        cpd = jnp.where(total > max_total_cells, jnp.maximum(cpd // 2, 1), cpd)
+        return cpd
+
+    # 3 iterations is enough to halve 4*4*4=64 down to 2*2*2=8.  Cap at 16
+    # iterations to handle larger grids without unbounded growth.
+    for _ in range(16):
+        cells_per_dimension = _halve_to_fit(cells_per_dimension)
+
     neighbor_search_radius = jnp.where(
         (cells_per_dimension == 1) & ~pbc_squeezed,
         jnp.zeros(3, dtype=jnp.int32),
@@ -1047,13 +1140,16 @@ def query_cell_list(
     elif rebuild_flags is None and graph_mode == "none":
         neighbor_matrix_shifts = neighbor_matrix_shifts.at[:].set(jnp.int32(0))
 
-    # Select kernel based on dtype
+    # Select kernels based on dtype.  All paths use the same sorted-reads
+    # atom-centric kernel; selective callers supply a non-trivial
+    # ``rebuild_flags`` array, non-selective callers an always-True 1-element
+    # flag.
     if positions.dtype == jnp.float64:
-        _query_kernel = _jax_build_neighbor_matrix_f64
-        _query_kernel_selective = _jax_build_neighbor_matrix_selective_f64
+        _gather_kernel = _jax_gather_fused_f64
+        _sorted_build_kernel = _jax_build_neighbor_matrix_local_count_sorted_f64
     else:
-        _query_kernel = _jax_build_neighbor_matrix_f32
-        _query_kernel_selective = _jax_build_neighbor_matrix_selective_f32
+        _gather_kernel = _jax_gather_fused_f32
+        _sorted_build_kernel = _jax_build_neighbor_matrix_local_count_sorted_f32
         positions = positions.astype(jnp.float32)
 
     # Ensure cell dtype matches positions dtype so warp overload dispatch is consistent
@@ -1066,86 +1162,43 @@ def query_cell_list(
     pbc_1d = pbc.squeeze() if pbc.ndim == 2 else pbc
     pbc_bool = pbc_1d.astype(jnp.bool_)
 
+    if rebuild_flags is not None:
+        rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)
+        # Pre-zero num_neighbors when the flag is True so the kernel's
+        # atomic emits start from zero; leave it untouched otherwise.
+        num_neighbors = jnp.where(rf[0], jnp.zeros_like(num_neighbors), num_neighbors)
+    else:
+        rf = jnp.ones((1,), dtype=jnp.bool_)
+
+    # Sorted scratch lives next to ``positions`` in dtype/device.
+    sorted_positions = jnp.zeros((total_atoms, 3), dtype=positions.dtype)
+    sorted_atom_periodic_shifts = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+
     if graph_mode == "warp":
         fill_value = int(positions.shape[0])
-        if rebuild_flags is not None:
-            rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)
-            graph_query = (
+        graph_query = (
+            (
                 _jax_graph_query_cell_list_selective_f64
                 if positions.dtype == jnp.float64
                 else _jax_graph_query_cell_list_selective_f32
             )
-            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = graph_query(
-                positions,
-                cell,
-                pbc_bool,
-                cells_per_dimension,
-                neighbor_search_radius,
-                atom_periodic_shifts,
-                atom_to_cell_mapping,
-                atoms_per_cell_count,
-                cell_atom_start_indices,
-                cell_atom_list,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                float(cutoff),
-                fill_value,
-                rf,
-            )
-        else:
-            graph_query = (
+            if rebuild_flags is not None
+            else (
                 _jax_graph_query_cell_list_f64
                 if positions.dtype == jnp.float64
                 else _jax_graph_query_cell_list_f32
             )
-            neighbor_matrix, neighbor_matrix_shifts, num_neighbors = graph_query(
-                positions,
-                cell,
-                pbc_bool,
-                cells_per_dimension,
-                neighbor_search_radius,
-                atom_periodic_shifts,
-                atom_to_cell_mapping,
-                atoms_per_cell_count,
-                cell_atom_start_indices,
-                cell_atom_list,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                float(cutoff),
-                fill_value,
-            )
-    elif rebuild_flags is not None:
-        rf = rebuild_flags.flatten()[:1].astype(jnp.bool_)
-        num_neighbors = jnp.where(rf[0], jnp.zeros_like(num_neighbors), num_neighbors)
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
-            _query_kernel_selective(
-                positions,
-                cell,
-                pbc_bool,
-                float(cutoff),
-                cells_per_dimension,
-                neighbor_search_radius,
-                atom_periodic_shifts,
-                atom_to_cell_mapping,
-                atoms_per_cell_count,
-                cell_atom_start_indices,
-                cell_atom_list,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                False,  # half_fill
-                rf,
-                launch_dims=(total_atoms,),
-            )
         )
-    else:
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _query_kernel(
+        (
+            sorted_positions,
+            sorted_atom_periodic_shifts,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+            num_neighbors,
+        ) = graph_query(
             positions,
             cell,
             pbc_bool,
-            float(cutoff),
             cells_per_dimension,
             neighbor_search_radius,
             atom_periodic_shifts,
@@ -1153,10 +1206,41 @@ def query_cell_list(
             atoms_per_cell_count,
             cell_atom_start_indices,
             cell_atom_list,
+            sorted_positions,
+            sorted_atom_periodic_shifts,
+            rf,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+            num_neighbors,
+            float(cutoff),
+            fill_value,
+        )
+    else:
+        sorted_positions, sorted_atom_periodic_shifts = _gather_kernel(
+            positions,
+            atom_periodic_shifts,
+            cell_atom_list,
+            sorted_positions,
+            sorted_atom_periodic_shifts,
+            launch_dims=(total_atoms,),
+        )
+        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _sorted_build_kernel(
+            sorted_positions,
+            sorted_atom_periodic_shifts,
+            cell,
+            pbc_bool,
+            float(cutoff),
+            cells_per_dimension,
+            neighbor_search_radius,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            atom_to_cell_mapping,
             neighbor_matrix,
             neighbor_matrix_shifts,
             num_neighbors,
             False,  # half_fill
+            rf,
             launch_dims=(total_atoms,),
         )
 
@@ -1308,6 +1392,11 @@ def cell_list(
             if positions.dtype == jnp.float64
             else _jax_graph_cell_list_f32
         )
+        sorted_positions = jnp.zeros((positions.shape[0], 3), dtype=positions.dtype)
+        sorted_atom_periodic_shifts = jnp.zeros(
+            (positions.shape[0], 3), dtype=jnp.int32
+        )
+        always_true_rebuild_flags = jnp.ones((1,), dtype=jnp.bool_)
         (
             cells_per_dimension,
             atom_periodic_shifts,
@@ -1315,6 +1404,8 @@ def cell_list(
             atoms_per_cell_count,
             cell_atom_start_indices,
             cell_atom_list,
+            sorted_positions,
+            sorted_atom_periodic_shifts,
             neighbor_matrix,
             neighbor_matrix_shifts,
             num_neighbors,
@@ -1329,6 +1420,9 @@ def cell_list(
             atoms_per_cell_count,
             cell_atom_start_indices,
             cell_atom_list,
+            sorted_positions,
+            sorted_atom_periodic_shifts,
+            always_true_rebuild_flags,
             neighbor_matrix,
             neighbor_matrix_shifts,
             num_neighbors,

@@ -13,7 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PyTorch bindings for batched cell list neighbor construction."""
+"""PyTorch bindings for batched cell list neighbor construction.
+
+The torch wrapper auto-dispatches between two batch query kernels:
+
+* **atom-centric** (:mod:`nvalchemiops.neighbors.batch_cell_list`) —
+  baseline 1 thread/atom; thread-local-counter optimisation.  Best at
+  large total atoms with small per-system cutoff (cutoff=6 MLIP regime
+  with many systems).
+* **pair-centric** (:func:`nvalchemiops.neighbors.batch_cell_list.batch_query_cell_list_pair_centric`) —
+  one block per ``(source_cell, outer_offset)``; per-emit
+  ``atomic_add(num_neighbors, atom_i, 1)`` trades thread-local-counter
+  for ``ncell × n_outer`` parallelism.  Best at moderate-to-large
+  cutoff and / or few-large-systems batches.
+
+Auto-select uses sync-free quantities (``total_atoms``, ``num_systems``,
+``cutoff``); the ``total_cells`` Python int is already paid by
+:func:`estimate_batch_cell_list_sizes` at allocation time.  Defaults
+are calibrated empirically; overrides are exposed via environment
+variables — see :func:`_should_dispatch_batch_pair_centric`.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +43,8 @@ import warp as wp
 
 from nvalchemiops.neighbors.batch_cell_list import (
     _batch_estimate_cell_list_sizes_overload,
+    _should_dispatch_batch_pair_centric,
+    compute_batch_pair_centric_n_outer,
 )
 from nvalchemiops.neighbors.batch_cell_list import (
     batch_build_cell_list as wp_batch_build_cell_list,
@@ -32,6 +53,9 @@ from nvalchemiops.neighbors.batch_cell_list import (
     batch_query_cell_list as wp_batch_query_cell_list,
 )
 from nvalchemiops.neighbors.neighbor_utils import estimate_max_neighbors
+from nvalchemiops.neighbors.neighbor_utils import (
+    fill_neighbor_matrix_tail as wp_fill_neighbor_matrix_tail,
+)
 from nvalchemiops.torch.neighbors.neighbor_utils import (
     allocate_cell_list,
     get_neighbor_list_from_neighbor_matrix,
@@ -44,6 +68,75 @@ __all__ = [
     "batch_query_cell_list",
     "batch_cell_list",
 ]
+
+
+# Module-level caches for batch pair-centric scratch buffers (torch
+# layer only — the warp-level batch_query_cell_list_pair_centric takes
+# all scratch as required arguments).
+# * sorted positions / shifts — keyed by (total_atoms, dtype, device).
+# * cell_to_system map        — keyed by (total_cells, device).
+_batch_pair_sorted_cache: dict | None = None
+_batch_pair_cell_to_system_cache: dict | None = None
+
+
+def _get_batch_pair_sorted_cache(
+    total_atoms: int, wp_vec_dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _batch_pair_sorted_cache
+    key = (total_atoms, wp_vec_dtype, str(device))
+    if (
+        _batch_pair_sorted_cache is not None
+        and _batch_pair_sorted_cache.get("key") == key
+    ):
+        return (
+            _batch_pair_sorted_cache["sorted_positions"],
+            _batch_pair_sorted_cache["sorted_shifts"],
+        )
+    pos_dtype = torch.float32 if wp_vec_dtype == wp.vec3f else torch.float64
+    sorted_positions = torch.empty((total_atoms, 3), dtype=pos_dtype, device=device)
+    sorted_shifts = torch.empty((total_atoms, 3), dtype=torch.int32, device=device)
+    _batch_pair_sorted_cache = {
+        "key": key,
+        "sorted_positions": sorted_positions,
+        "sorted_shifts": sorted_shifts,
+    }
+    return sorted_positions, sorted_shifts
+
+
+def _get_batch_pair_cell_to_system(
+    total_cells: int, device: torch.device
+) -> torch.Tensor:
+    global _batch_pair_cell_to_system_cache
+    key = (total_cells, str(device))
+    if (
+        _batch_pair_cell_to_system_cache is not None
+        and _batch_pair_cell_to_system_cache.get("key") == key
+    ):
+        return _batch_pair_cell_to_system_cache["tensor"]
+    t = torch.zeros(max(total_cells, 1), dtype=torch.int32, device=device)
+    _batch_pair_cell_to_system_cache = {"key": key, "tensor": t}
+    return t
+
+
+_batch_always_true_rebuild_flag_cache: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _get_batch_always_true_rebuild_flag(
+    num_systems: int, device: torch.device | str
+) -> torch.Tensor:
+    """Return a per-(num_systems, device) cached always-True rebuild-flag array.
+
+    Used as the ``rebuild_flags`` argument when a batch query is non-selective;
+    the sorted-reads kernel requires the array unconditionally, so allocating
+    + filling once and reusing it avoids per-call allocation.
+    """
+    key = (int(num_systems), str(device))
+    cached = _batch_always_true_rebuild_flag_cache.get(key)
+    if cached is not None:
+        return cached
+    flag = torch.ones((num_systems,), dtype=torch.bool, device=device)
+    _batch_always_true_rebuild_flag_cache[key] = flag
+    return flag
 
 
 def estimate_batch_cell_list_sizes(
@@ -168,11 +261,6 @@ def _batch_build_cell_list_op(
     """Internal custom op for building batch spatial cell lists.
 
     This function is torch compilable.
-
-    Notes
-    -----
-    The neighbor_search_radius is not an input parameter because it's not used
-    during cell list building - it's only needed for querying the cell list.
 
     See Also
     --------
@@ -336,10 +424,24 @@ def _batch_query_cell_list_op(
     neighbor_matrix_shifts: torch.Tensor,
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
+    fill_value: int | None = None,
+    algorithm: str = "auto",
 ) -> None:
     """Internal custom op for querying batch spatial cell lists to build neighbor matrices.
 
     This function is torch compilable.
+
+    When ``fill_value`` is provided, the op writes ``fill_value`` into
+    ``neighbor_matrix[i, num_neighbors[i]..max_neighbors-1]`` after the
+    query kernel (CUDA only), letting callers skip the upstream
+    ``neighbor_matrix.fill_(fill_value) + neighbor_matrix_shifts.zero_()``
+    prefills.  Mirrors the single-system skip-prefill design.
+
+    ``algorithm`` mirrors the single-system :func:`cell_list` knob:
+
+    - ``"auto"`` (default) — apply :func:`_should_dispatch_batch_pair_centric`.
+    - ``"atom_centric"`` — force atom-centric.
+    - ``"pair_centric"`` — force pair-centric (CUDA only; CPU raises).
 
     See Also
     --------
@@ -403,7 +505,66 @@ def _batch_query_cell_list_op(
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
 
-    # Call core warp launcher
+    # Atom-centric vs pair-centric (pair-centric is CUDA-only).
+    total_atoms = positions.shape[0]
+    cpu_only = device.type != "cuda"
+    if algorithm == "auto":
+        use_pair_centric = (not cpu_only) and _should_dispatch_batch_pair_centric(
+            total_atoms=int(total_atoms),
+            num_systems=int(num_systems),
+            cutoff=float(cutoff),
+        )
+    elif algorithm == "atom_centric":
+        use_pair_centric = False
+    elif algorithm == "pair_centric":
+        if cpu_only:
+            raise ValueError(
+                "algorithm='pair_centric' is not supported on CPU "
+                "(kernels use raw blockIdx/threadIdx).  Pass 'auto' or "
+                "'atom_centric' instead.",
+            )
+        use_pair_centric = True
+    else:
+        raise ValueError(
+            f"algorithm must be 'auto' | 'atom_centric' | 'pair_centric', "
+            f"got {algorithm!r}",
+        )
+
+    # Both paths need per-cell-contiguous sorted scratch (the warp
+    # launcher's _gather_positions_by_cell writes into it).
+    sorted_positions_t, sorted_shifts_t = _get_batch_pair_sorted_cache(
+        int(total_atoms), wp_vec_dtype, device
+    )
+    wp_sorted_pos = wp.from_torch(
+        sorted_positions_t, dtype=wp_vec_dtype, return_ctype=True
+    )
+    wp_sorted_shifts = wp.from_torch(sorted_shifts_t, dtype=wp.vec3i, return_ctype=True)
+
+    # Non-selective: always-True rebuild flag.
+    always_true_flag = _get_batch_always_true_rebuild_flag(num_systems, device)
+    wp_rebuild_flags_op = wp.from_torch(
+        always_true_flag, dtype=wp.bool, return_ctype=True
+    )
+
+    if use_pair_centric:
+        wp_cells_per_system = wp.from_torch(
+            cells_per_system.to(dtype=torch.int32), dtype=wp.int32, return_ctype=True
+        )
+        total_cells = int(cells_per_system.sum().item())
+        R_max_t = neighbor_search_radius.max(dim=0).values.tolist()
+        R_max = (int(R_max_t[0]), int(R_max_t[1]), int(R_max_t[2]))
+        n_outer = compute_batch_pair_centric_n_outer(R_max, bool(half_fill))
+        cell_to_system_t = _get_batch_pair_cell_to_system(total_cells, device)
+        wp_cell_to_system = wp.from_torch(
+            cell_to_system_t, dtype=wp.int32, return_ctype=True
+        )
+    else:
+        wp_cells_per_system = None
+        wp_cell_to_system = None
+        total_cells = None
+        n_outer = None
+        R_max = None
+
     wp_batch_query_cell_list(
         positions=wp_positions,
         cell=wp_cell,
@@ -418,13 +579,38 @@ def _batch_query_cell_list_op(
         atoms_per_cell_count=wp_atoms_per_cell_count,
         cell_atom_start_indices=wp_cell_atom_start_indices,
         cell_atom_list=wp_cell_atom_list,
+        sorted_positions=wp_sorted_pos,
+        sorted_atom_periodic_shifts=wp_sorted_shifts,
         neighbor_matrix=wp_neighbor_matrix,
         neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
         num_neighbors=wp_num_neighbors,
+        rebuild_flags=wp_rebuild_flags_op,
         wp_dtype=wp_dtype,
         device=wp_device,
         half_fill=half_fill,
+        algorithm="pair_centric" if use_pair_centric else "atom_centric",
+        cells_per_system=wp_cells_per_system,
+        cell_to_system=wp_cell_to_system,
+        total_cells=total_cells,
+        n_outer=n_outer,
+        R_max=R_max,
     )
+
+    # Coalesced tail fill (CUDA only — the kernel uses wp.launch_tiled
+    # which silently mis-runs on CPU; CPU callers prefill in
+    # ``batch_cell_list`` above).  Mirrors the single-system pattern
+    # in ``_query_cell_list_op``.
+    if fill_value is not None and wp_device != "cpu":
+        max_neighbors = int(neighbor_matrix.shape[1])
+        if max_neighbors > 0:
+            wp_fill_neighbor_matrix_tail(
+                wp_num_neighbors,
+                int(total_atoms),
+                max_neighbors,
+                int(fill_value),
+                wp_neighbor_matrix,
+                wp_device,
+            )
 
 
 @torch.library.custom_op(
@@ -514,6 +700,15 @@ def _batch_query_cell_list_selective_op(
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
     wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool, return_ctype=True)
 
+    total_atoms_sel = positions.shape[0]
+    sorted_positions_t, sorted_shifts_t = _get_batch_pair_sorted_cache(
+        int(total_atoms_sel), wp_vec_dtype, device
+    )
+    wp_sorted_pos = wp.from_torch(
+        sorted_positions_t, dtype=wp_vec_dtype, return_ctype=True
+    )
+    wp_sorted_shifts = wp.from_torch(sorted_shifts_t, dtype=wp.vec3i, return_ctype=True)
+
     wp_batch_query_cell_list(
         positions=wp_positions,
         cell=wp_cell,
@@ -528,6 +723,8 @@ def _batch_query_cell_list_selective_op(
         atoms_per_cell_count=wp_atoms_per_cell_count,
         cell_atom_start_indices=wp_cell_atom_start_indices,
         cell_atom_list=wp_cell_atom_list,
+        sorted_positions=wp_sorted_pos,
+        sorted_atom_periodic_shifts=wp_sorted_shifts,
         neighbor_matrix=wp_neighbor_matrix,
         neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
         num_neighbors=wp_num_neighbors,
@@ -556,6 +753,8 @@ def batch_query_cell_list(
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
     rebuild_flags: torch.Tensor | None = None,
+    fill_value: int | None = None,
+    algorithm: str = "auto",
 ) -> None:
     """Query batch spatial cell lists to build neighbor matrices for multiple systems.
 
@@ -596,6 +795,18 @@ def batch_query_cell_list(
     rebuild_flags : torch.Tensor, shape (num_systems,), dtype=torch.bool, optional
         Per-system rebuild flags. If provided, only systems with True are processed
         on the GPU; existing neighbor data for other systems is preserved.
+    fill_value : int, optional
+        If provided AND ``rebuild_flags`` is None, the operation writes
+        ``fill_value`` into the unused-column tail of ``neighbor_matrix``
+        after the kernel runs (CUDA only), letting callers skip the
+        ``neighbor_matrix.fill_(fill_value) + neighbor_matrix_shifts.zero_()``
+        prefills.  Mirrors the single-system skip-prefill design.
+    algorithm : {"auto", "atom_centric", "pair_centric"}, default "auto"
+        Forces one of the two warp-level batch cell-list kernels.
+        ``"auto"`` applies the sync-free dispatch rule
+        (:func:`_should_dispatch_batch_pair_centric`).  Ignored when
+        ``rebuild_flags`` is provided — the selective path is
+        atom-centric only.  ``"pair_centric"`` requires CUDA.
 
     See Also
     --------
@@ -621,6 +832,8 @@ def batch_query_cell_list(
             neighbor_matrix_shifts,
             num_neighbors,
             half_fill,
+            fill_value,
+            algorithm,
         )
     return _batch_query_cell_list_selective_op(
         positions,
@@ -665,6 +878,7 @@ def batch_cell_list(
     cell_atom_start_indices: torch.Tensor | None = None,
     cell_atom_list: torch.Tensor | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    algorithm: str = "auto",
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -760,18 +974,26 @@ def batch_cell_list(
     if fill_value is None:
         fill_value = total_atoms
 
+    # CPU prefills; CUDA tail-fills (``wp.launch_tiled`` mis-runs on CPU).
+    is_cpu = device.type == "cpu"
     if neighbor_matrix is None:
-        neighbor_matrix = torch.full(
-            (total_atoms, max_neighbors), fill_value, dtype=torch.int32, device=device
-        )
-    elif rebuild_flags is None:
+        if is_cpu:
+            neighbor_matrix = torch.full(
+                (total_atoms, max_neighbors),
+                fill_value,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            neighbor_matrix = torch.empty(
+                (total_atoms, max_neighbors), dtype=torch.int32, device=device
+            )
+    elif is_cpu and rebuild_flags is None:
         neighbor_matrix.fill_(fill_value)
     if neighbor_matrix_shifts is None:
-        neighbor_matrix_shifts = torch.zeros(
+        neighbor_matrix_shifts = torch.empty(
             (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
         )
-    elif rebuild_flags is None:
-        neighbor_matrix_shifts.zero_()
     if num_neighbors is None:
         num_neighbors = torch.zeros((total_atoms,), dtype=torch.int32, device=device)
     elif rebuild_flags is None:
@@ -814,12 +1036,8 @@ def batch_cell_list(
             cell_atom_list,
         )
     else:
-        cells_per_dimension.zero_()
-        atom_periodic_shifts.zero_()
-        atom_to_cell_mapping.zero_()
+        # atoms_per_cell_count is atomic_add'd; the rest are fully overwritten.
         atoms_per_cell_count.zero_()
-        cell_atom_start_indices.zero_()
-        cell_atom_list.zero_()
         cell_list_cache = (
             cells_per_dimension,
             neighbor_search_radius,
@@ -853,6 +1071,8 @@ def batch_cell_list(
         num_neighbors,
         half_fill,
         rebuild_flags,
+        fill_value,
+        algorithm,
     )
 
     if return_neighbor_list:

@@ -42,6 +42,15 @@ from nvalchemiops.jax.neighbors.batch_naive_dual_cutoff import (
     batch_naive_neighbor_list_dual_cutoff,
 )
 
+# Batched cluster-pair tile neighbor list
+from nvalchemiops.jax.neighbors.batch_tile_warp import (
+    batch_tile_neighbor_list,
+    batch_tile_to_coo,
+    batch_tile_to_matrix,
+    build_batch_tile_neighbor_list,
+    estimate_batch_tile_neighbor_list_sizes,
+)
+
 # Unbatched cell list functions
 from nvalchemiops.jax.neighbors.cell_list import (
     build_cell_list,
@@ -80,6 +89,15 @@ from nvalchemiops.jax.neighbors.rebuild_detection import (
     check_cell_list_rebuild_needed,
     check_neighbor_list_rebuild_needed,
     neighbor_list_needs_rebuild,
+)
+
+# Single-system cluster-pair tile neighbor list
+from nvalchemiops.jax.neighbors.tile_warp import (
+    build_tile_neighbor_list,
+    estimate_tile_neighbor_list_sizes,
+    tile_neighbor_list,
+    tile_to_coo,
+    tile_to_matrix,
 )
 
 
@@ -405,6 +423,11 @@ __all__ = [
     "build_cell_list",
     "query_cell_list",
     "cell_list",
+    "estimate_tile_neighbor_list_sizes",
+    "build_tile_neighbor_list",
+    "tile_to_matrix",
+    "tile_to_coo",
+    "tile_neighbor_list",
     # Batched neighbor list
     "batch_naive_neighbor_list",
     "batch_naive_neighbor_list_dual_cutoff",
@@ -412,6 +435,11 @@ __all__ = [
     "batch_build_cell_list",
     "batch_query_cell_list",
     "batch_cell_list",
+    "estimate_batch_tile_neighbor_list_sizes",
+    "build_batch_tile_neighbor_list",
+    "batch_tile_to_matrix",
+    "batch_tile_to_coo",
+    "batch_tile_neighbor_list",
     # Rebuild detection
     "cell_list_needs_rebuild",
     "neighbor_list_needs_rebuild",

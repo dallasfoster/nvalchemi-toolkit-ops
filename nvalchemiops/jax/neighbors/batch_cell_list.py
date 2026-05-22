@@ -29,11 +29,11 @@ from nvalchemiops.jax.neighbors.neighbor_utils import (
 )
 from nvalchemiops.neighbors.batch_cell_list import (
     _batch_cell_list_bin_atoms_overload,
-    _batch_cell_list_build_neighbor_matrix_overload,
-    _batch_cell_list_build_neighbor_matrix_selective_overload,
+    _batch_cell_list_build_neighbor_matrix_local_count_sorted_overload,
     _batch_cell_list_construct_bin_size_overload,
     _batch_cell_list_count_atoms_per_bin_overload,
     _compute_cells_per_system,
+    _gather_positions_by_cell_overload,
 )
 from nvalchemiops.neighbors.neighbor_utils import estimate_max_neighbors
 
@@ -91,29 +91,32 @@ _jax_batch_bin_atoms_f64 = jax_kernel(
     enable_backward=False,
 )
 
-# Query: Build neighbor matrix from batch cell list
-_jax_batch_build_neighbor_matrix_f32 = jax_kernel(
-    _batch_cell_list_build_neighbor_matrix_overload[wp.float32],
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+# Gather: pack positions + atom_periodic_shifts into per-cell-contiguous layout
+# (cell_atom_list permutation) for coalesced reads by the sorted-build kernel.
+_jax_batch_gather_positions_by_cell_f32 = jax_kernel(
+    _gather_positions_by_cell_overload[wp.float32],
+    num_outputs=2,
+    in_out_argnames=["sorted_positions", "sorted_shifts"],
     enable_backward=False,
 )
-_jax_batch_build_neighbor_matrix_f64 = jax_kernel(
-    _batch_cell_list_build_neighbor_matrix_overload[wp.float64],
-    num_outputs=3,
-    in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
+_jax_batch_gather_positions_by_cell_f64 = jax_kernel(
+    _gather_positions_by_cell_overload[wp.float64],
+    num_outputs=2,
+    in_out_argnames=["sorted_positions", "sorted_shifts"],
     enable_backward=False,
 )
 
-# Selective query: Build neighbor matrix from batch cell list (skips non-rebuilt systems)
-_jax_batch_build_neighbor_matrix_selective_f32 = jax_kernel(
-    _batch_cell_list_build_neighbor_matrix_selective_overload[wp.float32],
+# Query: sorted-reads atom-centric batch neighbor matrix kernel.  The same
+# kernel handles selective and non-selective callers via the ``rebuild_flags``
+# array (always-True for non-selective; per-system bool array otherwise).
+_jax_batch_build_neighbor_matrix_local_count_sorted_f32 = jax_kernel(
+    _batch_cell_list_build_neighbor_matrix_local_count_sorted_overload[wp.float32],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
 )
-_jax_batch_build_neighbor_matrix_selective_f64 = jax_kernel(
-    _batch_cell_list_build_neighbor_matrix_selective_overload[wp.float64],
+_jax_batch_build_neighbor_matrix_local_count_sorted_f64 = jax_kernel(
+    _batch_cell_list_build_neighbor_matrix_local_count_sorted_overload[wp.float64],
     num_outputs=3,
     in_out_argnames=["neighbor_matrix", "neighbor_matrix_shifts", "num_neighbors"],
     enable_backward=False,
@@ -506,13 +509,14 @@ def batch_query_cell_list(
     elif rebuild_flags is None:
         num_neighbors = num_neighbors.at[:].set(jnp.int32(0))
 
-    # Select kernel based on dtype
+    # Select kernels based on dtype; same sorted-reads kernel for selective
+    # and non-selective (controlled by ``rebuild_flags``).
     if positions.dtype == jnp.float64:
-        _query_kernel = _jax_batch_build_neighbor_matrix_f64
-        _query_kernel_selective = _jax_batch_build_neighbor_matrix_selective_f64
+        _gather_kernel = _jax_batch_gather_positions_by_cell_f64
+        _sorted_build_kernel = _jax_batch_build_neighbor_matrix_local_count_sorted_f64
     else:
-        _query_kernel = _jax_batch_build_neighbor_matrix_f32
-        _query_kernel_selective = _jax_batch_build_neighbor_matrix_selective_f32
+        _gather_kernel = _jax_batch_gather_positions_by_cell_f32
+        _sorted_build_kernel = _jax_batch_build_neighbor_matrix_local_count_sorted_f32
         positions = positions.astype(jnp.float32)
 
     # Ensure cell dtype matches positions
@@ -556,50 +560,41 @@ def batch_query_cell_list(
         num_neighbors = jnp.where(
             atom_rebuild, jnp.zeros_like(num_neighbors), num_neighbors
         )
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = (
-            _query_kernel_selective(
-                positions,
-                cell,
-                pbc_bool,
-                batch_idx_i32,
-                float(cutoff),
-                cells_per_dimension,
-                neighbor_search_radius,
-                atom_periodic_shifts,
-                atom_to_cell_mapping,
-                atoms_per_cell_count,
-                cell_atom_start_indices,
-                cell_atom_list,
-                cell_offsets,
-                neighbor_matrix,
-                neighbor_matrix_shifts,
-                num_neighbors,
-                False,  # half_fill
-                rf,
-                launch_dims=(total_atoms,),
-            )
-        )
     else:
-        neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _query_kernel(
-            positions,
-            cell,
-            pbc_bool,
-            batch_idx_i32,
-            float(cutoff),
-            cells_per_dimension,
-            neighbor_search_radius,
-            atom_periodic_shifts,
-            atom_to_cell_mapping,
-            atoms_per_cell_count,
-            cell_atom_start_indices,
-            cell_atom_list,
-            cell_offsets,
-            neighbor_matrix,
-            neighbor_matrix_shifts,
-            num_neighbors,
-            False,  # half_fill
-            launch_dims=(total_atoms,),
-        )
+        rf = jnp.ones((num_systems,), dtype=jnp.bool_)
+
+    sorted_positions = jnp.zeros((total_atoms, 3), dtype=positions.dtype)
+    sorted_atom_periodic_shifts = jnp.zeros((total_atoms, 3), dtype=jnp.int32)
+    sorted_positions, sorted_atom_periodic_shifts = _gather_kernel(
+        positions,
+        atom_periodic_shifts,
+        cell_atom_list,
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        launch_dims=(total_atoms,),
+    )
+
+    neighbor_matrix, neighbor_matrix_shifts, num_neighbors = _sorted_build_kernel(
+        sorted_positions,
+        sorted_atom_periodic_shifts,
+        cell,
+        pbc_bool,
+        batch_idx_i32,
+        float(cutoff),
+        cells_per_dimension,
+        neighbor_search_radius,
+        atom_to_cell_mapping,
+        atoms_per_cell_count,
+        cell_atom_start_indices,
+        cell_atom_list,
+        cell_offsets,
+        neighbor_matrix,
+        neighbor_matrix_shifts,
+        num_neighbors,
+        False,  # half_fill
+        rf,
+        launch_dims=(total_atoms,),
+    )
 
     return neighbor_matrix, num_neighbors, neighbor_matrix_shifts
 

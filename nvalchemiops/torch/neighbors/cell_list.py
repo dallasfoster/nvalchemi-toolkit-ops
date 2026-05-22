@@ -13,13 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PyTorch bindings for unbatched cell list neighbor construction."""
+"""PyTorch bindings for the CSR cell-list neighbor builder.
+
+The CSR path stores per-cell atom lists in three tensors
+(``cell_atom_start_indices``, ``cell_atom_list``, ``atoms_per_cell_count``)
+with variable per-cell occupancy.  It handles arbitrary cell geometry
+(orthorhombic + triclinic), arbitrary periodic-boundary settings, both
+half-fill modes, and selective rebuild.
+
+Two query kernels share this build:
+
+* **atom-centric** — one thread per atom; thread-local-counter
+  optimisation; no atomics on ``num_neighbors``.  Best at large N.
+* **pair-centric** — one CUDA block per ``(source_cell, outer_offset)``
+  pair plus a self-cell kernel; per-emit ``atomic_add`` on
+  ``num_neighbors``.  Best at small/medium N or large cutoff (more
+  cell-level parallelism than atom-level).
+
+Auto-select uses sync-free quantities (``natom``, ``cutoff``).  See
+:func:`_dispatch_algorithm` for the 3-clause rule.  Users can override
+per-call via ``cell_list(..., algorithm="pair_centric")`` or globally
+via env ``NVALCHEMI_NEIGHLIST_ALGO``.
+"""
 
 from __future__ import annotations
+
+import os
 
 import torch
 import warp as wp
 
+from nvalchemiops.neighbors.cell_list import (
+    _compute_pair_centric_n_outer,
+    _dispatch_algorithm,
+    query_cell_list_local_count_sorted,
+    query_cell_list_pair_centric_sorted,
+)
 from nvalchemiops.neighbors.cell_list import (
     build_cell_list as wp_build_cell_list,
 )
@@ -28,7 +57,11 @@ from nvalchemiops.neighbors.cell_list import (
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     estimate_max_neighbors,
+    gather_fused_overload,
     selective_zero_num_neighbors_single,
+)
+from nvalchemiops.neighbors.neighbor_utils import (
+    fill_neighbor_matrix_tail as wp_fill_neighbor_matrix_tail,
 )
 from nvalchemiops.torch.neighbors.neighbor_utils import (
     allocate_cell_list,
@@ -37,18 +70,116 @@ from nvalchemiops.torch.neighbors.neighbor_utils import (
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 __all__ = [
-    "estimate_cell_list_sizes",
+    "allocate_query_sort_scratch",
     "build_cell_list",
-    "query_cell_list",
     "cell_list",
+    "estimate_cell_list_sizes",
+    "query_cell_list",
 ]
+
+
+# Module-level cache for the sorted-positions scratch used by both the
+# atom-centric and pair-centric query paths.  Keyed by
+# ``(natom, dtype, device)``; switching geometries replaces the entry.
+# Used only when the caller does NOT pass scratch tensors to
+# ``query_cell_list`` (the convenience path).  Graph-capture callers must
+# pass explicit scratch via ``allocate_query_sort_scratch``.
+_pair_sorted_cache: dict | None = None
+
+
+def _get_pair_sorted_cache(
+    natom: int, wp_vec_dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _pair_sorted_cache
+    key = (natom, wp_vec_dtype, str(device))
+    if _pair_sorted_cache is not None and _pair_sorted_cache.get("key") == key:
+        return _pair_sorted_cache["sorted_positions"], _pair_sorted_cache[
+            "sorted_shifts"
+        ]
+    pos_dtype = torch.float32 if wp_vec_dtype == wp.vec3f else torch.float64
+    sorted_positions = torch.empty((natom, 3), dtype=pos_dtype, device=device)
+    sorted_shifts = torch.empty((natom, 3), dtype=torch.int32, device=device)
+    _pair_sorted_cache = {
+        "key": key,
+        "sorted_positions": sorted_positions,
+        "sorted_shifts": sorted_shifts,
+    }
+    return sorted_positions, sorted_shifts
+
+
+# Module-level always-True rebuild-flag cache, keyed by device.  The
+# warp-level launchers all require ``rebuild_flags`` to be passed
+# explicitly (no hidden allocation inside the kernel-launch path).
+# Non-selective callers reuse one allocation per device for the entire
+# process.
+_always_true_rebuild_flag_cache: dict[str, torch.Tensor] = {}
+
+
+def _get_always_true_rebuild_flag(device: torch.device | str) -> torch.Tensor:
+    """Return a 1-element ``torch.bool`` tensor containing ``True`` for ``device``.
+
+    Cached per-device so repeat callers reuse the same allocation.
+    Always contains ``True``; used as the ``rebuild_flags`` argument when
+    a query is non-selective.  Allocated lazily on first use per device.
+    """
+    key = str(device)
+    cached = _always_true_rebuild_flag_cache.get(key)
+    if cached is not None:
+        return cached
+    flag = torch.ones((1,), dtype=torch.bool, device=device)
+    _always_true_rebuild_flag_cache[key] = flag
+    return flag
+
+
+def allocate_query_sort_scratch(
+    total_atoms: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate the sort-side scratch tensors consumed by
+    ``query_cell_list``.
+
+    Required by both atom-centric and pair-centric query paths when the
+    call is wrapped in a captured CUDA graph.  Allocate once during
+    setup and pass the returned tensors to ``query_cell_list(...,
+    sorted_positions=..., sorted_shifts=...)`` so the captured region
+    does no allocation of its own.
+
+    Returns
+    -------
+    sorted_positions : torch.Tensor, shape ``(total_atoms, 3)``, dtype=``dtype``
+        Per-cell-contiguous gathered positions.  Written by
+        ``gather_fused`` each call.
+    sorted_shifts : torch.Tensor, shape ``(total_atoms, 3)``, dtype=int32
+        Per-cell-contiguous gathered periodic shifts.  Written by
+        ``gather_fused`` each call.
+
+    Parameters
+    ----------
+    total_atoms : int
+    dtype : torch.dtype
+        Must match the positions dtype passed to ``query_cell_list``.
+    device : torch.device | str
+    """
+    sorted_positions = torch.empty(
+        (int(total_atoms), 3),
+        dtype=dtype,
+        device=device,
+    )
+    sorted_shifts = torch.empty(
+        (int(total_atoms), 3),
+        dtype=torch.int32,
+        device=device,
+    )
+    return sorted_positions, sorted_shifts
 
 
 def estimate_cell_list_sizes(
     cell: torch.Tensor,
     pbc: torch.Tensor,
     cutoff: float,
-    max_nbins: int = 8192,
+    max_nbins: int = 524288,
 ) -> tuple[int, torch.Tensor]:
     """Estimate allocation sizes for torch.compile-friendly cell list construction.
 
@@ -67,8 +198,13 @@ def estimate_cell_list_sizes(
         Flags indicating periodic boundary conditions in x, y, z directions.
     cutoff : float
         Maximum distance for neighbor search, determines minimum cell size.
-    max_nbins : int, default=8192
-        Maximum number of cells to allocate.
+    max_nbins : int, default=524288
+        Cap on total cells.  When the natural cell-grid (box / cutoff)^3
+        exceeds this cap, the kernel halves cells/dim iteratively until it
+        fits — which inflates the *atoms-per-cell* count and quadratically
+        increases inner-loop work.  Default raised from 8192 → 524288 in
+        2026-04 after observing a 10× cliff at N>500k atoms; cells/dim arrays
+        cost only ~4 MB at this cap (2 × max_nbins × 4 bytes).
 
     Returns
     -------
@@ -217,10 +353,7 @@ def _build_cell_list_op(
     wp_cell_atom_start_indices = wp.from_torch(cell_atom_start_indices, dtype=wp.int32)
     wp_cell_atom_list = wp.from_torch(cell_atom_list, dtype=wp.int32, return_ctype=True)
 
-    # Zero atoms_per_cell_count before building
     atoms_per_cell_count.zero_()
-
-    # Call core warp launcher
     wp_build_cell_list(
         positions=wp_positions,
         cell=wp_cell,
@@ -235,12 +368,6 @@ def _build_cell_list_op(
         wp_dtype=wp_dtype,
         device=wp_device,
     )
-
-    # Compute cell atom start indices using cumsum
-    max_total_cells = atoms_per_cell_count.shape[0]
-    cell_atom_start_indices[0] = 0
-    if max_total_cells > 1:
-        torch.cumsum(atoms_per_cell_count[:-1], dim=0, out=cell_atom_start_indices[1:])
 
 
 def build_cell_list(
@@ -341,10 +468,23 @@ def _query_cell_list_op(
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
     rebuild_flags: torch.Tensor | None = None,
+    fill_value: int | None = None,
+    algorithm: str = "auto",
+    sorted_positions: torch.Tensor | None = None,
+    sorted_shifts: torch.Tensor | None = None,
 ) -> None:
     """Internal custom op for querying spatial cell list to build neighbor matrix.
 
     This function is torch compilable.
+
+    When ``fill_value`` is provided and ``rebuild_flags`` is None, the
+    operation also writes ``fill_value`` into ``neighbor_matrix[i,
+    num_neighbors[i]..max_neighbors-1]`` after the query kernel, letting
+    callers skip ``neighbor_matrix.fill_(fill_value) +
+    neighbor_matrix_shifts.zero_()`` (~60% of the per-step CUDA time at
+    large N + cutoff).  ``neighbor_matrix_shifts`` is intentionally NOT
+    tail-filled — downstream consumers gate on
+    ``neighbor_matrix != fill_value`` and never read tail entries.
 
     See Also
     --------
@@ -399,6 +539,10 @@ def _query_cell_list_op(
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
 
+    # The warp-level launchers require ``rebuild_flags`` to be a real
+    # 1-element wp.bool array (no hidden allocation inside the kernel
+    # path).  Non-selective callers reuse a per-device always-True
+    # tensor allocated once per process.
     if rebuild_flags is not None:
         wp_rebuild_flags = wp.from_torch(
             rebuild_flags, dtype=wp.bool, return_ctype=True
@@ -407,29 +551,200 @@ def _query_cell_list_op(
             wp_num_neighbors, wp_rebuild_flags, wp_device
         )
     else:
-        wp_rebuild_flags = None
+        always_true_flag = _get_always_true_rebuild_flag(device)
+        wp_rebuild_flags = wp.from_torch(
+            always_true_flag, dtype=wp.bool, return_ctype=True
+        )
 
-    # Call core warp launcher
-    wp_query_cell_list(
-        positions=wp_positions,
-        cell=wp_cell,
-        pbc=wp_pbc,
-        cutoff=cutoff,
-        cells_per_dimension=wp_cells_per_dimension,
-        neighbor_search_radius=wp_neighbor_search_radius,
-        atom_periodic_shifts=wp_atom_periodic_shifts,
-        atom_to_cell_mapping=wp_atom_to_cell_mapping,
-        atoms_per_cell_count=wp_atoms_per_cell_count,
-        cell_atom_start_indices=wp_cell_atom_start_indices,
-        cell_atom_list=wp_cell_atom_list,
-        neighbor_matrix=wp_neighbor_matrix,
-        neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
-        num_neighbors=wp_num_neighbors,
-        wp_dtype=wp_dtype,
-        device=wp_device,
-        half_fill=half_fill,
-        rebuild_flags=wp_rebuild_flags,
+    # Pair-centric kernels are CUDA-only; see :func:`_dispatch_algorithm`.
+    cpu_only = device.type == "cpu"
+    if algorithm == "auto":
+        chosen = (
+            "atom_centric"
+            if cpu_only
+            else _dispatch_algorithm(int(total_atoms), float(cutoff))
+        )
+    elif algorithm == "atom_centric":
+        chosen = "atom_centric"
+    elif algorithm == "pair_centric":
+        if cpu_only:
+            raise ValueError(
+                "algorithm='pair_centric' is not supported on CPU "
+                "(kernels use raw blockIdx/threadIdx).  Pass 'auto' or "
+                "'atom_centric' instead.",
+            )
+        chosen = "pair_centric"
+    else:
+        raise ValueError(
+            f"algorithm must be 'auto' | 'atom_centric' | 'pair_centric', "
+            f"got {algorithm!r}",
+        )
+    use_pair = chosen == "pair_centric"
+
+    # Caller-allocated sort scratch — both or neither.  Mixed state raises so
+    # a half-graph capture can't silently fall back to an internal
+    # allocation.
+    _sort_set = {sorted_positions is not None, sorted_shifts is not None}
+    if len(_sort_set) != 1:
+        raise ValueError(
+            "Pass both sorted_positions and sorted_shifts, or neither — "
+            "got a mixed state.",
+        )
+    sort_scratch_provided = sorted_positions is not None
+
+    if os.environ.get("NVALCHEMI_NEIGHLIST_DISPATCH_LOG"):
+        _selective = " selective" if rebuild_flags is not None else ""
+        _scratch = " (scratch=ext)" if sort_scratch_provided else " (scratch=cache)"
+        print(
+            f"[neighlist-dispatch] natom={int(total_atoms)} "
+            f"cutoff={float(cutoff):.3f} "
+            f"total_cells={int(atoms_per_cell_count.shape[0])} "
+            f"half_fill={bool(half_fill)} algorithm={algorithm} "
+            f"-> {chosen}{_selective}{_scratch}",
+            flush=True,
+        )
+
+    # Resolve sort scratch (used by both paths).
+    if sort_scratch_provided:
+        sorted_positions_t = sorted_positions
+        sorted_shifts_t = sorted_shifts
+    else:
+        sorted_positions_t, sorted_shifts_t = _get_pair_sorted_cache(
+            int(total_atoms),
+            wp_vec_dtype,
+            device,
+        )
+    wp_sorted_positions = wp.from_torch(
+        sorted_positions_t,
+        dtype=wp_vec_dtype,
+        return_ctype=True,
     )
+    wp_sorted_shifts = wp.from_torch(
+        sorted_shifts_t,
+        dtype=wp.vec3i,
+        return_ctype=True,
+    )
+
+    if use_pair:
+        # n_outer is the only host-side dependency on the per-axis radius;
+        # the kernel decodes (dx, dy, dz) on-the-fly via the shared shift-
+        # index decoders.  One ``.item()`` sync per call — same cost as the
+        # old offset-table path, with no allocation.
+        Rx = int(neighbor_search_radius[0].item())
+        Ry = int(neighbor_search_radius[1].item())
+        Rz = int(neighbor_search_radius[2].item())
+        n_outer = _compute_pair_centric_n_outer((Rx, Ry, Rz), bool(half_fill))
+        wp.launch(
+            gather_fused_overload[wp_dtype],
+            dim=int(total_atoms),
+            inputs=[
+                wp_positions,
+                wp_atom_periodic_shifts,
+                wp_cell_atom_list,
+                wp_sorted_positions,
+                wp_sorted_shifts,
+            ],
+            device=wp_device,
+        )
+        query_cell_list_pair_centric_sorted(
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=float(cutoff),
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            neighbor_matrix=wp_neighbor_matrix,
+            neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
+            num_neighbors=wp_num_neighbors,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            n_outer=n_outer,
+            block_dim=64,
+            half_fill=bool(half_fill),
+            rebuild_flags=wp_rebuild_flags,
+        )
+    elif sort_scratch_provided:
+        # Atom-centric, graph-safe path: gather into caller-allocated
+        # sorted scratch and call the sorted-reads kernel directly,
+        # bypassing the warp-layer `_get_sorted_reads_cache`.  Supports
+        # both half_fill modes and selective rebuild.
+        wp.launch(
+            gather_fused_overload[wp_dtype],
+            dim=int(total_atoms),
+            inputs=[
+                wp_positions,
+                wp_atom_periodic_shifts,
+                wp_cell_atom_list,
+                wp_sorted_positions,
+                wp_sorted_shifts,
+            ],
+            device=wp_device,
+        )
+        query_cell_list_local_count_sorted(
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=float(cutoff),
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            neighbor_matrix=wp_neighbor_matrix,
+            neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
+            num_neighbors=wp_num_neighbors,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=bool(half_fill),
+            rebuild_flags=wp_rebuild_flags,
+        )
+    else:
+        # Atom-centric, no caller scratch: use the warp-level launcher
+        # with the cached sort scratch resolved above.
+        wp_query_cell_list(
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_neighbor_matrix,
+            neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
+            num_neighbors=wp_num_neighbors,
+            rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=half_fill,
+        )
+
+    # Coalesced tail fill (CUDA only — the kernel uses wp.launch_tiled which
+    # silently mis-runs on CPU; CPU callers prefill in ``cell_list`` above).
+    # Skipped when ``rebuild_flags`` is provided — those callers own
+    # buffer prefill explicitly.
+    if fill_value is not None and rebuild_flags is None and wp_device != "cpu":
+        max_neighbors = int(neighbor_matrix.shape[1])
+        if max_neighbors > 0:
+            wp_fill_neighbor_matrix_tail(
+                wp_num_neighbors,
+                int(total_atoms),
+                max_neighbors,
+                int(fill_value),
+                wp_neighbor_matrix,
+                wp_device,
+            )
 
 
 def query_cell_list(
@@ -449,6 +764,10 @@ def query_cell_list(
     num_neighbors: torch.Tensor,
     half_fill: bool = False,
     rebuild_flags: torch.Tensor | None = None,
+    fill_value: int | None = None,
+    algorithm: str = "auto",
+    sorted_positions: torch.Tensor | None = None,
+    sorted_shifts: torch.Tensor | None = None,
 ) -> None:
     """Query spatial cell list to build neighbor matrix with distance constraints.
 
@@ -499,6 +818,34 @@ def query_cell_list(
         tensors are returned unchanged.  When the flag is True (or when this
         argument is None) the query proceeds as normal.
         Note: providing this argument disables torch.compile compatibility.
+    fill_value : int, optional
+        If provided AND ``rebuild_flags`` is None, the operation writes
+        ``fill_value`` into the unused-column tail of ``neighbor_matrix``
+        after the kernel runs, letting callers skip the
+        ``neighbor_matrix.fill_(fill_value) + neighbor_matrix_shifts.zero_()``
+        prefills.  Drops ~60 % of the per-step CUDA cost at large N/cutoff.
+    algorithm : {"auto", "atom_centric", "pair_centric"}, default "auto"
+        Selects which of the two cell-list query kernels to launch.  See
+        :func:`_dispatch_algorithm` for the "auto" rule.  Both algorithms
+        return identical pair sets for either ``half_fill`` value;
+        per-row ordering inside ``neighbor_matrix`` differs.  Override
+        via env ``NVALCHEMI_NEIGHLIST_ALGO``.
+    sorted_positions, sorted_shifts : torch.Tensor, optional
+        Pre-allocated scratch (shape ``(total_atoms, 3)``) used by both
+        atom-centric and pair-centric paths.  Allocate via
+        :func:`allocate_query_sort_scratch`.  Both or neither.
+
+        When NOT provided, the function falls back to a module-level
+        cache — fine outside graph capture but **NOT graph-safe**.  Pass
+        the allocated tensors for graphed workflows.
+
+        Graph capture: use ``wp.capture_begin/end`` with stream
+        alignment (``wp.ScopedStream(wp.stream_from_torch(side_stream))``).
+        ``torch.cuda.graph`` will NOT work because ``build_cell_list``
+        invokes ``wp.utils.array_scan`` (CUB) which allocates its
+        workspace via ``cudaMallocAsync``; that allocator is not
+        permitted by ``torch.cuda.graph`` capture but is fine under
+        Warp's stream-capture flavor.
 
     See Also
     --------
@@ -523,6 +870,10 @@ def query_cell_list(
         num_neighbors,
         half_fill,
         rebuild_flags,
+        fill_value,
+        algorithm,
+        sorted_positions,
+        sorted_shifts,
     )
 
 
@@ -546,6 +897,9 @@ def cell_list(
     cell_atom_start_indices: torch.Tensor | None = None,
     cell_atom_list: torch.Tensor | None = None,
     rebuild_flags: torch.Tensor | None = None,
+    algorithm: str = "auto",
+    sorted_positions: torch.Tensor | None = None,
+    sorted_shifts: torch.Tensor | None = None,
 ) -> (
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -622,6 +976,16 @@ def cell_list(
         and ``neighbor_matrix_shifts`` tensors are returned unchanged and all
         kernel launches are skipped.  When the flag is True (or when this argument
         is None) the neighbor list is recomputed as normal.
+    algorithm : {"auto", "atom_centric", "pair_centric"}, default "auto"
+        Cell-list query kernel selection.  Both algorithms return identical
+        pair sets; per-row ordering inside ``neighbor_matrix`` differs.
+        See :func:`nvalchemiops.neighbors.cell_list._dispatch_algorithm`
+        for the ``"auto"`` rule and the ``NVALCHEMI_NEIGHLIST_ALGO``
+        environment override.  Pair-centric is CUDA-only.
+    sorted_positions, sorted_shifts : torch.Tensor, optional
+        Pre-allocated sort-side scratch (shape ``(total_atoms, 3)``).
+        Pass both to make the call graph-capture safe.  Allocate via
+        :func:`allocate_query_sort_scratch`.  Both or neither.
 
     Returns
     -------
@@ -682,18 +1046,26 @@ def cell_list(
     ):
         max_neighbors = estimate_max_neighbors(cutoff)
 
+    # CPU prefills; CUDA tail-fills (``wp.launch_tiled`` mis-runs on CPU).
+    is_cpu = str(device) == "cpu"
     if neighbor_matrix is None:
-        neighbor_matrix = torch.full(
-            (total_atoms, max_neighbors), fill_value, dtype=torch.int32, device=device
-        )
-    elif rebuild_flags is None:
+        if is_cpu:
+            neighbor_matrix = torch.full(
+                (total_atoms, max_neighbors),
+                fill_value,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            neighbor_matrix = torch.empty(
+                (total_atoms, max_neighbors), dtype=torch.int32, device=device
+            )
+    elif is_cpu and rebuild_flags is None:
         neighbor_matrix.fill_(fill_value)
     if neighbor_matrix_shifts is None:
-        neighbor_matrix_shifts = torch.zeros(
+        neighbor_matrix_shifts = torch.empty(
             (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
         )
-    elif rebuild_flags is None:
-        neighbor_matrix_shifts.zero_()
     if num_neighbors is None:
         num_neighbors = torch.zeros((total_atoms,), dtype=torch.int32, device=device)
     elif rebuild_flags is None:
@@ -754,6 +1126,10 @@ def cell_list(
         num_neighbors,
         half_fill,
         rebuild_flags,
+        fill_value,
+        algorithm,
+        sorted_positions,
+        sorted_shifts,
     )
 
     if return_neighbor_list:
