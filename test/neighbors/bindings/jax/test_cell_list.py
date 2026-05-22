@@ -280,7 +280,13 @@ class TestEstimateCellListSizes:
             )
 
     def test_search_radius_d3_scenario(self):
-        """D3 benchmark scenario: cell 12.42 A, cutoff 21.2 A -> radius 2."""
+        """D3 benchmark scenario: cell 12.42 A, cutoff 21.2 A.
+
+        With the warp kernel's adaptive promotion (each PBC axis is bumped to
+        ``ADAPTIVE_MIN_CELLS=4`` and then halved to fit ``max_total_cells``),
+        a tiny ``max_total_cells=8`` budget lands at ``cells_per_dim=[2, 2, 2]``
+        so the search radius is ``ceil(21.2 * 2 / 12.42) = 4`` per axis.
+        """
         positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
         cell = jnp.eye(3, dtype=jnp.float32).reshape(1, 3, 3) * 12.42
         pbc = jnp.array([[True, True, True]])
@@ -291,8 +297,9 @@ class TestEstimateCellListSizes:
 
         assert neighbor_search_radius.shape == (3,)
         for i in range(3):
-            assert int(neighbor_search_radius[i]) == 2, (
-                f"dim {i}: expected search radius == 2, got {int(neighbor_search_radius[i])}"
+            assert int(neighbor_search_radius[i]) == 4, (
+                f"dim {i}: expected search radius == 4, "
+                f"got {int(neighbor_search_radius[i])}"
             )
 
 
@@ -816,3 +823,89 @@ class TestCellListGraphMode:
                 max_total_cells=8,
                 graph_mode="bad",
             )
+
+
+class TestCellListPreallocatedBufferReuse:
+    """Preallocated-buffer in-place reset branches in ``query_cell_list``.
+
+    Covers the ``elif rebuild_flags is None and graph_mode == "none":`` paths
+    in nvalchemiops/jax/neighbors/cell_list.py for ``neighbor_matrix``,
+    ``num_neighbors``, and ``neighbor_matrix_shifts``.
+    """
+
+    def test_preallocated_buffers_reset_in_place(self):
+        positions = jnp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [2.0, 2.0, 0.0],
+                [0.0, 0.0, 2.0],
+                [2.0, 0.0, 2.0],
+                [0.0, 2.0, 2.0],
+                [2.0, 2.0, 2.0],
+            ],
+            dtype=jnp.float32,
+        )
+        cell = jnp.eye(3, dtype=jnp.float32).reshape(1, 3, 3) * 4.0
+        pbc = jnp.array([[True, True, True]])
+        cutoff = 2.5
+        max_neighbors = 20
+        N = positions.shape[0]
+
+        (
+            cells_per_dimension,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            neighbor_search_radius,
+        ) = build_cell_list(positions, cutoff, cell, pbc)
+
+        # Pre-allocate buffers seeded with sentinel garbage to verify the
+        # in-place .at[:].set() reset paths actually overwrite.
+        nm_buf = jnp.full((N, max_neighbors), -9, dtype=jnp.int32)
+        nn_buf = jnp.full((N,), 99, dtype=jnp.int32)
+        nms_buf = jnp.full((N, max_neighbors, 3), 7, dtype=jnp.int32)
+
+        # rebuild_flags=None (default) + graph_mode='none' (default) +
+        # all three buffers preallocated → hits all three elif branches.
+        nm, nn, nms = query_cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            cells_per_dimension,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            neighbor_search_radius,
+            max_neighbors=max_neighbors,
+            neighbor_matrix=nm_buf,
+            num_neighbors=nn_buf,
+            neighbor_matrix_shifts=nms_buf,
+        )
+        # Reference (no preallocation) must match.
+        nm_ref, nn_ref, nms_ref = query_cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            cells_per_dimension,
+            atom_periodic_shifts,
+            atom_to_cell_mapping,
+            atoms_per_cell_count,
+            cell_atom_start_indices,
+            cell_atom_list,
+            neighbor_search_radius,
+            max_neighbors=max_neighbors,
+        )
+        assert jnp.array_equal(nn, nn_ref)
+        # active-range pair sets per row must match (tail may diverge under
+        # the always-write-shifts contract; both runs see the same prefix)
+        for i in range(N):
+            k = int(nn_ref[i])
+            assert jnp.array_equal(jnp.sort(nm[i, :k]), jnp.sort(nm_ref[i, :k]))

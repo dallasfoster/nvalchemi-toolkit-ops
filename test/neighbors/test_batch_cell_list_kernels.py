@@ -28,7 +28,6 @@ import warp as wp
 
 from nvalchemiops.neighbors.batch_cell_list import (
     _batch_cell_list_bin_atoms_overload,
-    _batch_cell_list_build_neighbor_matrix_overload,
     _batch_cell_list_construct_bin_size_overload,
     _batch_cell_list_count_atoms_per_bin_overload,
     _batch_estimate_cell_list_sizes_overload,
@@ -37,7 +36,11 @@ from nvalchemiops.neighbors.batch_cell_list import (
 )
 from nvalchemiops.neighbors.neighbor_utils import estimate_max_neighbors
 
-from .test_utils import create_batch_systems, create_random_system
+from .test_utils import (
+    create_batch_systems,
+    create_random_system,
+    neighbor_matrix_row_set,
+)
 
 # Map torch dtypes to warp dtypes for parametrization
 TORCH_TO_WP_DTYPE = {
@@ -496,144 +499,6 @@ class TestBatchCellListKernels:
                 f"Atom {atom_idx}: cell indices should be within system bounds"
             )
 
-    def test_batch_build_neighbor_matrix(self, device, dtype):
-        """Test _batch_cell_list_build_neighbor_matrix kernel."""
-        # Create batch system
-        positions_torch, cell_torch, pbc_torch, ptr_torch = create_batch_systems(
-            num_systems=2,
-            atoms_per_system=[3, 4],
-            cell_sizes=[2.0, 2.5],
-            dtype=dtype,
-            device=device,
-        )
-        idx_torch = torch.tensor(
-            [0, 0, 0, 1, 1, 1, 1], dtype=torch.int32, device=device
-        )
-
-        num_systems = ptr_torch.shape[0] - 1
-        total_atoms = positions_torch.shape[0]
-        cutoff = 1.0
-
-        # Get warp dtypes
-        wp_dtype = TORCH_TO_WP_DTYPE[dtype]
-        wp_vec_dtype = TORCH_TO_WP_VEC_DTYPE[dtype]
-        wp_mat_dtype = TORCH_TO_WP_MAT_DTYPE[dtype]
-        wp_device = str(device)
-
-        # Convert input tensors to warp arrays
-        wp_positions = wp.from_torch(
-            positions_torch, dtype=wp_vec_dtype, return_ctype=True
-        )
-        wp_cell = wp.from_torch(cell_torch, dtype=wp_mat_dtype, return_ctype=True)
-        wp_pbc = wp.from_torch(pbc_torch, dtype=wp.bool, return_ctype=True)
-        wp_idx = wp.from_torch(idx_torch, dtype=wp.int32, return_ctype=True)
-
-        # Estimate cell list sizes using warp
-        max_total_cells, wp_neighbor_search_radius = estimate_batch_cell_list_sizes_wp(
-            wp_cell, wp_pbc, cutoff, wp_dtype, wp_device
-        )
-
-        # Allocate cell list arrays
-        (
-            wp_cells_per_dimension,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-        ) = allocate_cell_list_wp(total_atoms, max_total_cells, num_systems, wp_device)
-
-        # Allocate cell offsets and cells_per_system scratch buffer
-        wp_cell_offsets = wp.zeros(num_systems, dtype=wp.int32, device=wp_device)
-        wp_cells_per_system = wp.zeros(num_systems, dtype=wp.int32, device=wp_device)
-
-        # Build cell list using warp launcher
-        batch_build_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_idx,
-            wp_cells_per_dimension,
-            wp_cell_offsets,
-            wp_cells_per_system,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_dtype,
-            wp_device,
-        )
-
-        # Output arrays - neighbor matrix format
-        max_neighbors = 100
-        neighbor_matrix_torch = torch.full(
-            (total_atoms, max_neighbors), -1, dtype=torch.int32, device=device
-        )
-        neighbor_matrix_shifts_torch = torch.zeros(
-            (total_atoms, max_neighbors, 3), dtype=torch.int32, device=device
-        )
-        num_neighbors_torch = torch.zeros(total_atoms, dtype=torch.int32, device=device)
-
-        wp_neighbor_matrix = wp.from_torch(
-            neighbor_matrix_torch, dtype=wp.int32, return_ctype=True
-        )
-        wp_neighbor_matrix_shifts = wp.from_torch(
-            neighbor_matrix_shifts_torch, dtype=wp.vec3i, return_ctype=True
-        )
-        wp_num_neighbors = wp.from_torch(
-            num_neighbors_torch, dtype=wp.int32, return_ctype=True
-        )
-
-        # Build neighbor matrix
-        wp.launch(
-            _batch_cell_list_build_neighbor_matrix_overload[wp_dtype],
-            dim=total_atoms,
-            inputs=(
-                wp_positions,
-                wp_cell,
-                wp_pbc,
-                wp_idx,
-                wp_dtype(cutoff),
-                wp_cells_per_dimension,
-                wp_neighbor_search_radius,
-                wp_atom_periodic_shifts,
-                wp_atom_to_cell_mapping,
-                wp_atoms_per_cell_count,
-                wp_cell_atom_start_indices,
-                wp_cell_atom_list,
-                wp_cell_offsets,
-                wp_neighbor_matrix,
-                wp_neighbor_matrix_shifts,
-                wp_num_neighbors,
-                False,
-            ),
-            device=wp_device,
-        )
-
-        # Check that neighbor counts are reasonable
-        num_neighbors_np = num_neighbors_torch.cpu().numpy()
-        assert np.all(num_neighbors_np >= 0), (
-            "All neighbor counts should be non-negative"
-        )
-
-        # Check that pairs are from the same system
-        neighbor_matrix_np = neighbor_matrix_torch.cpu().numpy()
-        idx_np = idx_torch.cpu().numpy()
-        for atom_idx in range(total_atoms):
-            n_neigh = num_neighbors_np[atom_idx]
-            sys_i = idx_np[atom_idx]
-            for neigh_idx in range(min(n_neigh, max_neighbors)):
-                atom_j = neighbor_matrix_np[atom_idx, neigh_idx]
-                if atom_j == -1:
-                    break
-
-                sys_j = idx_np[atom_j]
-                assert sys_i == sys_j, (
-                    f"Atoms {atom_idx} and {atom_j} should be from same system"
-                )
-
 
 @pytest.mark.parametrize("dtype", dtypes)
 class TestBatchCellListWpLaunchers:
@@ -806,7 +671,14 @@ class TestBatchCellListWpLaunchers:
             num_neighbors_torch, dtype=wp.int32, return_ctype=True
         )
 
-        # Call batch_query_cell_list launcher
+        # Sorted scratch + always-True rebuild flags (sorted-reads kernel
+        # requires both).
+        wp_sorted_pos = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=wp_device)
+        wp_sorted_shifts = wp.zeros(total_atoms, dtype=wp.vec3i, device=wp_device)
+        wp_rebuild_flags = wp.full(
+            (num_systems,), True, dtype=wp.bool, device=wp_device
+        )
+
         batch_query_cell_list(
             wp_positions,
             wp_cell,
@@ -821,9 +693,12 @@ class TestBatchCellListWpLaunchers:
             wp_atoms_per_cell_count,
             wp_cell_atom_start_indices,
             wp_cell_atom_list,
+            wp_sorted_pos,
+            wp_sorted_shifts,
             wp_neighbor_matrix,
             wp_neighbor_matrix_shifts,
             wp_num_neighbors,
+            wp_rebuild_flags,
             wp_dtype,
             wp_device,
             False,
@@ -914,12 +789,6 @@ class TestBatchCellListScalingPureWarp:
             wp_cell, wp_pbc, cutoff, wp_dtype, wp_device
         )
 
-        print(
-            f"\nTest params: num_atoms={num_atoms}, cutoff={cutoff}, pbc_flags={pbc_flags}"
-        )
-        print(f"  max_total_cells estimated: {max_total_cells}")
-        print(f"  per_system_limit: {max_total_cells // num_systems}")
-
         # Allocate cell list arrays using warp
         (
             wp_cells_per_dimension,
@@ -959,11 +828,7 @@ class TestBatchCellListScalingPureWarp:
         for sys_idx in range(num_systems):
             sys_cells = int(np.prod(cells_per_dimension_np[sys_idx]))
             actual_total_cells += sys_cells
-            print(
-                f"  System {sys_idx}: {cells_per_dimension_np[sys_idx]} = {sys_cells} cells"
-            )
 
-        print(f"  actual_total_cells: {actual_total_cells}")
         assert actual_total_cells <= max_total_cells, (
             f"Actual cells {actual_total_cells} exceeds allocated {max_total_cells}"
         )
@@ -992,7 +857,13 @@ class TestBatchCellListScalingPureWarp:
             num_neighbors_torch, dtype=wp.int32, return_ctype=True
         )
 
-        # Query cell list
+        # Sorted scratch + always-True rebuild flags.
+        wp_sorted_pos = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=wp_device)
+        wp_sorted_shifts = wp.zeros(total_atoms, dtype=wp.vec3i, device=wp_device)
+        wp_rebuild_flags = wp.full(
+            (num_systems,), True, dtype=wp.bool, device=wp_device
+        )
+
         batch_query_cell_list(
             wp_positions,
             wp_cell,
@@ -1007,9 +878,12 @@ class TestBatchCellListScalingPureWarp:
             wp_atoms_per_cell_count,
             wp_cell_atom_start_indices,
             wp_cell_atom_list,
+            wp_sorted_pos,
+            wp_sorted_shifts,
             wp_neighbor_matrix,
             wp_neighbor_matrix_shifts,
             wp_num_neighbors,
+            wp_rebuild_flags,
             wp_dtype,
             wp_device,
             False,
@@ -1020,7 +894,7 @@ class TestBatchCellListScalingPureWarp:
         assert np.all(num_neighbors_np >= 0), "Neighbor counts should be non-negative"
 
         total_neighbors = np.sum(num_neighbors_np)
-        print(f"  Found {total_neighbors} total neighbors")
+        assert total_neighbors > 0, "expected non-empty neighbor list"
 
         # Verify neighbors are within same system
         neighbor_matrix_np = neighbor_matrix_torch.cpu().numpy()
@@ -1133,26 +1007,35 @@ class TestBatchCellListSelectiveRebuildFlags:
         wp_nm_shifts = wp.from_torch(nm_shifts_torch, dtype=wp.vec3i)
         wp_nn = wp.from_torch(nn_torch, dtype=wp.int32, return_ctype=True)
 
+        wp_sorted_pos = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=wp_device)
+        wp_sorted_shifts = wp.zeros(total_atoms, dtype=wp.vec3i, device=wp_device)
+        wp_rebuild_flags_full = wp.full(
+            (num_systems,), True, dtype=wp.bool, device=wp_device
+        )
+
         batch_query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_idx,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_cell_offsets,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm,
-            wp_nm_shifts,
-            wp_nn,
-            wp_dtype,
-            wp_device,
-            False,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            batch_idx=wp_idx,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            cell_offsets=wp_cell_offsets,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_pos,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm,
+            neighbor_matrix_shifts=wp_nm_shifts,
+            num_neighbors=wp_nn,
+            rebuild_flags=wp_rebuild_flags_full,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=False,
         )
 
         saved_nm = nm_torch.clone()
@@ -1163,26 +1046,28 @@ class TestBatchCellListSelectiveRebuildFlags:
         wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
 
         batch_query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_idx,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_cell_offsets,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm,
-            wp_nm_shifts,
-            wp_nn,
-            wp_dtype,
-            wp_device,
-            False,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            batch_idx=wp_idx,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            cell_offsets=wp_cell_offsets,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_pos,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm,
+            neighbor_matrix_shifts=wp_nm_shifts,
+            num_neighbors=wp_nn,
             rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=False,
         )
 
         assert torch.equal(nn_torch, saved_nn), (
@@ -1268,26 +1153,35 @@ class TestBatchCellListSelectiveRebuildFlags:
         wp_nm_ref_shifts = wp.from_torch(nm_ref_shifts, dtype=wp.vec3i)
         wp_nn_ref = wp.from_torch(nn_ref, dtype=wp.int32, return_ctype=True)
 
+        wp_sorted_pos = wp.zeros(total_atoms, dtype=wp_vec_dtype, device=wp_device)
+        wp_sorted_shifts = wp.zeros(total_atoms, dtype=wp.vec3i, device=wp_device)
+        wp_rebuild_flags_full = wp.full(
+            (num_systems,), True, dtype=wp.bool, device=wp_device
+        )
+
         batch_query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_idx,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_cell_offsets,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm_ref,
-            wp_nm_ref_shifts,
-            wp_nn_ref,
-            wp_dtype,
-            wp_device,
-            False,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            batch_idx=wp_idx,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            cell_offsets=wp_cell_offsets,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_pos,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm_ref,
+            neighbor_matrix_shifts=wp_nm_ref_shifts,
+            num_neighbors=wp_nn_ref,
+            rebuild_flags=wp_rebuild_flags_full,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=False,
         )
 
         # Selective rebuild with all flags=True
@@ -1306,28 +1200,162 @@ class TestBatchCellListSelectiveRebuildFlags:
         wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
 
         batch_query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_idx,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_cell_offsets,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm_sel,
-            wp_nm_sel_shifts,
-            wp_nn_sel,
-            wp_dtype,
-            wp_device,
-            False,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            batch_idx=wp_idx,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            cell_offsets=wp_cell_offsets,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_pos,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm_sel,
+            neighbor_matrix_shifts=wp_nm_sel_shifts,
+            num_neighbors=wp_nn_sel,
             rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=wp_device,
+            half_fill=False,
         )
 
         assert torch.equal(nn_sel, nn_ref), (
             "num_neighbors should match full rebuild when all flags=True"
         )
+
+
+@pytest.mark.parametrize("dtype", dtypes)
+class TestBatchCellListPairCentric:
+    """Parity tests for the batch pair-centric query kernel.
+
+    Forces the pair-centric path via the
+    ``NVALCHEMI_NEIGHLIST_BATCH_PAIR_*`` env vars and compares its
+    output against the atom-centric reference.
+    """
+
+    def test_dispatch_threshold_env(self, device, dtype, monkeypatch):
+        """Env-var overrides change the dispatch decision."""
+        del device, dtype  # not used; fixture present for parametrization
+        from nvalchemiops.torch.neighbors.batch_cell_list import (
+            _should_dispatch_batch_pair_centric,
+        )
+
+        # Default rule: cutoff=12 always picks pair-centric.
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=1_000_000, num_systems=64, cutoff=12.0
+            )
+            is True
+        )
+
+        # cutoff=6, large total, many systems → atom-centric.
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=1_000_000, num_systems=64, cutoff=6.0
+            )
+            is False
+        )
+
+        # cutoff=6, few large systems (total > 65k cap) → pair (clause 3).
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=1_000_000, num_systems=8, cutoff=6.0
+            )
+            is True
+        )
+
+        # cutoff=6, few small systems (total ≤ 65k cap, avg_aps < 4096
+        # floor) → atom: clause 3 is gated by total_atoms > total_cap to
+        # avoid setup overhead.
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=4_096, num_systems=4, cutoff=6.0
+            )
+            is False
+        )
+
+        # cutoff=6, total below cap AND avg_aps reasonable → pair (clause 2).
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=32_768, num_systems=8, cutoff=6.0
+            )
+            is True
+        )
+
+        # cutoff=6, total below cap but avg_aps too small → atom (clause 2 fails).
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=32_768, num_systems=128, cutoff=6.0
+            )
+            is False
+        )
+
+        # Lifting all clauses disables pair-centric entirely.
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_CUTOFF_FLOOR", "20.0")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_TOTAL_CAP", "0")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_NSYS_CAP", "0")
+        assert (
+            _should_dispatch_batch_pair_centric(
+                total_atoms=1_000_000, num_systems=64, cutoff=12.0
+            )
+            is False
+        )
+
+    def test_pair_set_matches_atom_centric(self, device, dtype, monkeypatch):
+        """Same pair set as atom-centric for a small batch with PBC."""
+        from nvalchemiops.torch.neighbors.batch_cell_list import batch_cell_list
+
+        if str(device) == "cpu":
+            pytest.skip("pair-centric kernel uses CUDA blockIdx/threadIdx")
+
+        positions, cell, pbc, _ptr = create_batch_systems(
+            num_systems=4,
+            atoms_per_system=[64, 64, 64, 64],
+            cell_sizes=[2.0, 2.0, 2.0, 2.0],
+            dtype=dtype,
+            device=device,
+            pbc_flag=True,
+        )
+        cutoff = 0.6
+        batch_idx = torch.repeat_interleave(
+            torch.arange(4, dtype=torch.int32, device=device),
+            torch.tensor([64] * 4, dtype=torch.int32, device=device),
+        )
+
+        # Force atom-centric.
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_CUTOFF_FLOOR", "999")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_TOTAL_CAP", "0")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_NSYS_CAP", "0")
+        nm_a, nn_a, _ = batch_cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            batch_idx,
+            half_fill=True,
+        )
+
+        # Force pair-centric.
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_CUTOFF_FLOOR", "0")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_TOTAL_CAP", "999999999")
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_BATCH_PAIR_NSYS_CAP", "999999999")
+        nm_p, nn_p, _ = batch_cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            batch_idx,
+            half_fill=True,
+        )
+
+        assert torch.equal(nn_a, nn_p), (
+            "Per-atom neighbor counts must match between batch kernels"
+        )
+        assert neighbor_matrix_row_set(nm_a, nn_a) == neighbor_matrix_row_set(
+            nm_p, nn_p
+        ), "Pair sets must match between batch kernels (row order may differ)"

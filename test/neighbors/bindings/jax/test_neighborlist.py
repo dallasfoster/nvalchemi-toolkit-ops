@@ -269,6 +269,71 @@ class TestNeighborListAutoSelection:
         assert shifts1.shape[1] == 3
         assert shifts2.shape[1] == 3
 
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_auto_select_batch_ptr_only_no_cell(self, dtype, device):
+        """method=None + batch_ptr-only (no batch_idx, no cell) hits the
+        ``elif batch_ptr is not None`` branch in jax __init__.py dispatch."""
+        key = jax.random.PRNGKey(42)
+        positions = jax.random.normal(key, (80, 3), dtype=dtype) * 5.0
+        batch_ptr = jnp.array([0, 50, 80], dtype=jnp.int32)
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            batch_ptr=batch_ptr,
+            return_neighbor_list=True,
+        )
+        # avg_atoms = 40 < 2000 → batch_naive (no PBC → 2-tuple)
+        assert len(result) == 2
+        nlist, neighbor_ptr = result
+        assert nlist.shape[0] == 2
+        assert neighbor_ptr.shape[0] == 81
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_auto_select_batch_idx_only_no_cell(self, dtype, device):
+        """method=None + batch_idx-only (no batch_ptr, no cell) hits the
+        ``elif batch_idx is not None`` branch in jax __init__.py dispatch."""
+        key = jax.random.PRNGKey(43)
+        positions = jax.random.normal(key, (80, 3), dtype=dtype) * 5.0
+        batch_idx = jnp.concatenate(
+            [
+                jnp.zeros(50, dtype=jnp.int32),
+                jnp.ones(30, dtype=jnp.int32),
+            ]
+        )
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            batch_idx=batch_idx,
+            return_neighbor_list=True,
+        )
+        assert len(result) == 2
+        nlist, neighbor_ptr = result
+        assert nlist.shape[0] == 2
+        assert neighbor_ptr.shape[0] == 81
+
+    @pytest.mark.parametrize("dtype", [jnp.float32])
+    def test_auto_select_batch_cell_list_large(self, dtype, device):
+        """method=None + large avg_atoms + batched input hits the
+        ``method = 'batch_cell_list'`` dispatch branch."""
+        key = jax.random.PRNGKey(44)
+        positions = jax.random.normal(key, (5000, 3), dtype=dtype) * 50.0
+        batch_ptr = jnp.array([0, 2500, 5000], dtype=jnp.int32)
+        cell = jnp.eye(3, dtype=dtype).reshape(1, 3, 3).repeat(2, axis=0) * 60.0
+        pbc = jnp.array([[True, True, True], [True, True, True]])
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            cell=cell,
+            pbc=pbc,
+            batch_ptr=batch_ptr,
+            return_neighbor_list=True,
+        )
+        # batch_cell_list with PBC → 3-tuple
+        assert len(result) == 3
+        nlist, neighbor_ptr, _ = result
+        assert nlist.shape[0] == 2
+        assert neighbor_ptr.shape[0] == 5001
+
 
 # ==============================================================================
 # Tests: Explicit Method

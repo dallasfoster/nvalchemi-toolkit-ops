@@ -120,6 +120,66 @@ class TestBatchedDualCutoffListFormat:
         assert unit_shifts1.shape[0] == neighbor_list1.shape[1]
         assert unit_shifts2.shape[0] == neighbor_list2.shape[1]
 
+    @pytest.mark.parametrize("return_neighbor_list", [True, False])
+    @pytest.mark.parametrize("with_pbc", [True, False])
+    def test_zero_cutoffs_fast_path(self, return_neighbor_list, with_pbc):
+        """``cutoff1 <= 0 and cutoff2 <= 0`` returns 0-pair tuples — 4 shape
+        variants × {return_list, !return_list} × {pbc, !pbc}."""
+        positions1, cell1, pbc1 = create_simple_cubic_system_jax(
+            num_atoms=4, cell_size=2.0, dtype=jnp.float32
+        )
+        positions2, cell2, pbc2 = create_simple_cubic_system_jax(
+            num_atoms=4, cell_size=2.5, dtype=jnp.float32
+        )
+        positions = jnp.concatenate([positions1, positions2], axis=0)
+        batch_idx, batch_ptr = create_batch_idx_and_ptr_jax([4, 4])
+        N = positions.shape[0]
+
+        kwargs = dict(
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            max_neighbors1=10,
+            max_neighbors2=15,
+            return_neighbor_list=return_neighbor_list,
+        )
+        if with_pbc:
+            kwargs["cell"] = jnp.concatenate([cell1, cell2], axis=0)
+            kwargs["pbc"] = jnp.concatenate([pbc1, pbc2], axis=0)
+
+        result = batch_naive_neighbor_list_dual_cutoff(
+            positions,
+            0.0,
+            0.0,
+            **kwargs,
+        )
+
+        if return_neighbor_list:
+            if with_pbc:
+                assert len(result) == 6
+                nl1, np1, sh1, nl2, np2, sh2 = result
+                assert nl1.shape == (2, 0)
+                assert np1.shape == (N + 1,)
+                assert sh1.shape == (0, 3)
+                assert nl2.shape == (2, 0)
+                assert np2.shape == (N + 1,)
+                assert sh2.shape == (0, 3)
+            else:
+                assert len(result) == 4
+                nl1, np1, nl2, np2 = result
+                assert nl1.shape == (2, 0)
+                assert np1.shape == (N + 1,)
+                assert nl2.shape == (2, 0)
+                assert np2.shape == (N + 1,)
+        else:
+            if with_pbc:
+                assert len(result) == 6
+                nm1, nn1, sh1, nm2, nn2, sh2 = result
+                assert int(nn1.sum()) == 0 and int(nn2.sum()) == 0
+            else:
+                assert len(result) == 4
+                nm1, nn1, nm2, nn2 = result
+                assert int(nn1.sum()) == 0 and int(nn2.sum()) == 0
+
 
 class TestBatchNaiveDualCutoffJIT:
     """Smoke tests for batch_naive_neighbor_list_dual_cutoff with jax.jit."""

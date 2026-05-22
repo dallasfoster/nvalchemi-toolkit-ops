@@ -42,6 +42,7 @@ from nvalchemiops.torch.neighbors.neighbor_utils import (
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
 from .test_utils import (
+    create_random_system,
     create_simple_cubic_system,
 )
 
@@ -852,4 +853,326 @@ class TestNaiveSelectiveRebuildFlags:
 
         assert torch.equal(nn_sel, nn_ref), (
             "num_neighbors should match full rebuild when flag=True"
+        )
+
+
+###########################################################################################
+########################### Tiled Naive Kernel Tests #######################################
+###########################################################################################
+
+dtypes = [torch.float32, torch.float64]
+
+
+def _skip_if_cpu(device):
+    """Skip tiled kernel tests on CPU — wp.launch_tiled requires GPU."""
+    if "cpu" in str(device):
+        pytest.skip("Tiled kernels use wp.launch_tiled (requires GPU)")
+
+
+@pytest.mark.parametrize("dtype", dtypes)
+class TestNaiveTiledMatchesScalar:
+    """Verify that tiled naive kernels produce identical results to scalar kernels."""
+
+    def test_tiled_no_pbc_counts_match(self, device, dtype):
+        """Tiled non-PBC neighbor counts should match scalar kernel."""
+        _skip_if_cpu(device)
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=27, cell_size=3.0, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 30
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_device = str(device)
+
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+
+        # Scalar reference
+        nm_ref = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_ref, dtype=wp.int32),
+            wp.from_torch(nn_ref, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        # Tiled
+        nm_tiled = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_tiled = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp.from_torch(nm_tiled, dtype=wp.int32),
+            wp.from_torch(nn_tiled, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        assert torch.equal(nn_tiled, nn_ref), (
+            f"Tiled counts differ: {nn_tiled.tolist()} vs {nn_ref.tolist()}"
+        )
+
+    def test_tiled_no_pbc_random(self, device, dtype):
+        """Tiled should match scalar for random non-PBC system."""
+        _skip_if_cpu(device)
+        positions, _, _ = create_random_system(
+            num_atoms=64, cell_size=5.0, dtype=dtype, device=device, pbc_flag=False
+        )
+        cutoff = 2.0
+        max_neighbors = 50
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_device = str(device)
+
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+
+        nm_ref = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_ref, dtype=wp.int32),
+            wp.from_torch(nn_ref, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        nm_tiled = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_tiled = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp_positions,
+            cutoff,
+            wp.from_torch(nm_tiled, dtype=wp.int32),
+            wp.from_torch(nn_tiled, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        assert torch.equal(nn_tiled, nn_ref), (
+            "Random system: tiled counts differ from scalar"
+        )
+
+    def test_tiled_pbc_counts_match(self, device, dtype):
+        """Tiled PBC neighbor counts should match scalar kernel."""
+        _skip_if_cpu(device)
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=27, cell_size=3.0, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 30
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_mat_dtype = get_wp_mat_dtype(dtype)
+        wp_device = str(device)
+
+        shift_range, num_shifts, _ = compute_naive_num_shifts(cell, cutoff, pbc)
+
+        # Note: PBC tiled launcher accesses .ptr for caching, so we must NOT
+        # use return_ctype=True for positions/cell passed to the tiled launcher.
+        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype)
+        wp_cell_obj = wp.from_torch(cell, dtype=wp_mat_dtype)
+        wp_shift_range_obj = wp.from_torch(shift_range, dtype=wp.vec3i)
+
+        # Scalar reference
+        nm_ref = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        ns_ref = torch.zeros(
+            (num_atoms, max_neighbors, 3), dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix_pbc(
+            wp_positions,
+            cutoff,
+            wp_cell_obj,
+            wp_shift_range_obj,
+            num_shifts,
+            wp.from_torch(nm_ref, dtype=wp.int32),
+            wp.from_torch(ns_ref, dtype=wp.vec3i),
+            wp.from_torch(nn_ref, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        # Tiled
+        nm_tiled = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        ns_tiled = torch.zeros(
+            (num_atoms, max_neighbors, 3), dtype=torch.int32, device=device
+        )
+        nn_tiled = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix_pbc(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp_cell_obj,
+            wp_shift_range_obj,
+            num_shifts,
+            wp.from_torch(nm_tiled, dtype=wp.int32),
+            wp.from_torch(ns_tiled, dtype=wp.vec3i),
+            wp.from_torch(nn_tiled, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        assert torch.equal(nn_tiled, nn_ref), (
+            f"PBC tiled counts differ: {nn_tiled.tolist()} vs {nn_ref.tolist()}"
+        )
+
+    def test_tiled_half_fill_no_pbc(self, device, dtype):
+        """Tiled half_fill=True should match scalar half_fill counts."""
+        _skip_if_cpu(device)
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, cell_size=2.0, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_device = str(device)
+
+        # Scalar reference
+        nm_ref = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_ref, dtype=wp.int32),
+            wp.from_torch(nn_ref, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+            half_fill=True,
+        )
+
+        # Tiled
+        nm_tiled = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_tiled = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_tiled, dtype=wp.int32),
+            wp.from_torch(nn_tiled, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+            half_fill=True,
+        )
+
+        assert torch.equal(nn_tiled, nn_ref), (
+            "Half-fill tiled counts differ from scalar"
+        )
+
+
+@pytest.mark.parametrize("dtype", dtypes)
+class TestNaiveTiledSelectiveRebuild:
+    """Test selective rebuild for tiled naive kernels."""
+
+    def test_no_rebuild_preserves_data(self, device, dtype):
+        """Flag=False should leave existing data untouched."""
+        _skip_if_cpu(device)
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, cell_size=2.0, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_device = str(device)
+
+        # First build to populate data
+        nm = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        wp_nm = wp.from_torch(nm, dtype=wp.int32)
+        wp_nn = wp.from_torch(nn, dtype=wp.int32)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp_nm,
+            wp_nn,
+            wp_dtype,
+            wp_device,
+        )
+        saved_nn = nn.clone()
+
+        # Rebuild with flag=False — data should be unchanged
+        rebuild_flags = torch.zeros(1, dtype=torch.bool, device=device)
+        wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp_nm,
+            wp_nn,
+            wp_dtype,
+            wp_device,
+            rebuild_flags=wp_rebuild_flags,
+        )
+
+        assert torch.equal(nn, saved_nn), "num_neighbors unchanged when flag=False"
+
+    def test_rebuild_matches_full(self, device, dtype):
+        """Flag=True should produce same results as full build."""
+        _skip_if_cpu(device)
+        positions, _, _ = create_simple_cubic_system(
+            num_atoms=8, cell_size=2.0, dtype=dtype, device=device
+        )
+        cutoff = 1.1
+        max_neighbors = 20
+        num_atoms = positions.shape[0]
+        wp_dtype = get_wp_dtype(dtype)
+        wp_vec_dtype = get_wp_vec_dtype(dtype)
+        wp_device = str(device)
+
+        # Full build reference
+        nm_ref = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_ref = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_ref, dtype=wp.int32),
+            wp.from_torch(nn_ref, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+        )
+
+        # Selective build with flag=True
+        nm_sel = torch.full(
+            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
+        )
+        nn_sel = torch.zeros(num_atoms, dtype=torch.int32, device=device)
+        rebuild_flags = torch.ones(1, dtype=torch.bool, device=device)
+        naive_neighbor_matrix(
+            wp.from_torch(positions, dtype=wp_vec_dtype),
+            cutoff,
+            wp.from_torch(nm_sel, dtype=wp.int32),
+            wp.from_torch(nn_sel, dtype=wp.int32),
+            wp_dtype,
+            wp_device,
+            rebuild_flags=wp.from_torch(rebuild_flags, dtype=wp.bool),
+        )
+
+        assert torch.equal(nn_sel, nn_ref), (
+            "Selective rebuild should match full build when flag=True"
         )

@@ -277,11 +277,24 @@ class TestBatchCellListAPI:
             batch_idx,
             return_neighbor_list=return_neighbor_list,
         )
-        u = results[-1]
 
-        # With no PBC, all shifts should be zero
-        if len(u) > 0:
-            assert torch.all(u == 0), "All shifts should be zero with no PBC"
+        # With no PBC, every shift at every active slot must be zero.
+        # Under the skip-prefill design, tail slots of neighbor_matrix_shifts
+        # (column index >= num_neighbors[i]) are uninitialized — downstream
+        # consumers gate on ``neighbor_matrix != fill_value`` and never read
+        # tail entries.  Assertion checks only active slots.
+        if return_neighbor_list:
+            _, _, u = results
+            if len(u) > 0:
+                assert torch.all(u == 0), "All shifts should be zero with no PBC"
+        else:
+            nm, _, u = results
+            fill_value = positions.shape[0]
+            mask = nm != fill_value
+            if mask.any():
+                assert torch.all(u[mask] == 0), (
+                    "All shifts at active slots should be zero with no PBC"
+                )
 
     @pytest.mark.parametrize("return_neighbor_list", [True, False])
     @pytest.mark.parametrize("preallocate", [True, False])
@@ -372,15 +385,24 @@ class TestBatchCellListAPI:
                 return_neighbor_list=return_neighbor_list,
             )
 
+        # With mixed PBC, the z-shift of every active slot must be zero
+        # in system 0 (PBC=[True,False,True] → z-PBC is True, but recall
+        # the test uses cutoff > cell so x/z wrap → z-shift can be non-zero?
+        # actually no: pbc[0,2]=True so z-shift can be non-zero in sys 0).
+        # The assertion ``u[:, :, 2].sum() == 0`` reflects the OBSERVED
+        # state — under skip-prefill we must mask tail slots that may now
+        # contain uninitialized memory.
         if return_neighbor_list:
             neighbor_list, _, u = results
             assert len(neighbor_list) == 2
             assert u[:, 2].sum().item() == 0
             assert (u[:, 0] ** 2).sum().item() > 0
         else:
-            _, _, u = results
-            assert u[:, :, 2].sum().item() == 0
-            assert (u[:, :, 0] ** 2).sum().item() > 0
+            nm, _, u = results
+            fv = positions.shape[0] if fill_value is None else fill_value
+            mask = nm != fv
+            assert u[..., 2][mask].sum().item() == 0
+            assert (u[..., 0][mask] ** 2).sum().item() > 0
 
     @pytest.mark.parametrize("return_neighbor_list", [True, False])
     def test_batch_zero_cutoff(self, device, dtype, return_neighbor_list):

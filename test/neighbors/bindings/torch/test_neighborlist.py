@@ -309,6 +309,97 @@ class TestNeighborListAutoSelection:
         assert shifts1.shape[1] == 3
         assert shifts2.shape[1] == 3
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_auto_select_batch_ptr_only_no_cell(self, dtype, device):
+        """method=None + batch_ptr-only (no batch_idx, no cell) hits the
+        ``elif batch_ptr is not None`` branch in __init__.py dispatch."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        positions = torch.randn(80, 3, dtype=dtype, device=device) * 5.0
+        batch_ptr = torch.tensor([0, 50, 80], dtype=torch.int32, device=device)
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            batch_ptr=batch_ptr,
+            return_neighbor_list=True,
+        )
+        # avg_atoms = 40 < 2000 → batch_naive (no PBC → 2-tuple)
+        assert len(result) == 2
+        nlist, neighbor_ptr = result
+        assert nlist.shape[0] == 2
+        assert neighbor_ptr.shape[0] == 81
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_auto_select_batch_idx_only_no_cell(self, dtype, device):
+        """method=None + batch_idx-only (no batch_ptr, no cell) hits the
+        ``elif batch_idx is not None`` branch in __init__.py dispatch."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        positions = torch.randn(80, 3, dtype=dtype, device=device) * 5.0
+        batch_idx = torch.cat(
+            [
+                torch.zeros(50, dtype=torch.int32, device=device),
+                torch.ones(30, dtype=torch.int32, device=device),
+            ]
+        )
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            batch_idx=batch_idx,
+            return_neighbor_list=True,
+        )
+        assert len(result) == 2
+        nlist, neighbor_ptr = result
+        assert nlist.shape[0] == 2
+        assert neighbor_ptr.shape[0] == 81
+
+    def test_cell_without_pbc_raises(self):
+        """`cell` provided without `pbc` must raise (line 271-276)."""
+        positions = torch.randn(10, 3, dtype=torch.float32)
+        cell = torch.eye(3, dtype=torch.float32) * 10.0
+        with pytest.raises(ValueError, match="`pbc` is required"):
+            neighbor_list(positions, cutoff=2.0, cell=cell)
+
+    @pytest.mark.parametrize("dtype", [torch.float32])
+    def test_explicit_tile_warp_no_cell_synthesizes(self, dtype):
+        """method='tile_warp' + cell=None triggers synthesize_cell_for_ss."""
+        if not torch.cuda.is_available():
+            pytest.skip("tile_warp requires CUDA")
+        positions = torch.randn(256, 3, dtype=dtype, device="cuda") * 5.0
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            method="tile_warp",
+            return_neighbor_list=True,
+        )
+        # format='coo' → 2-tuple (no pbc info from synthesized cell)
+        assert isinstance(result, tuple)
+        nlist = result[0]
+        assert nlist.shape[0] == 2
+
+    @pytest.mark.parametrize("dtype", [torch.float32])
+    def test_explicit_batch_tile_warp_no_cell_batch_ptr_only(self, dtype):
+        """method='batch_tile_warp' + cell=None + batch_ptr-only triggers
+        prepare_batch_idx_ptr (fills batch_idx) + synthesize_cell_for_batch."""
+        if not torch.cuda.is_available():
+            pytest.skip("batch_tile_warp requires CUDA")
+        positions = torch.randn(256, 3, dtype=dtype, device="cuda") * 5.0
+        batch_ptr = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
+        result = neighbor_list(
+            positions,
+            cutoff=2.0,
+            method="batch_tile_warp",
+            batch_ptr=batch_ptr,
+            return_neighbor_list=True,
+        )
+        assert isinstance(result, tuple)
+        nlist = result[0]
+        assert nlist.shape[0] == 2
+
 
 class TestNeighborListExplicitMethod:
     """Test explicit method selection."""

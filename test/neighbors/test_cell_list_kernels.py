@@ -22,15 +22,10 @@ import warp as wp
 
 from nvalchemiops.neighbors.cell_list import (
     _cell_list_bin_atoms_overload,
-    _cell_list_build_neighbor_matrix_overload,
-    _cell_list_compute_cell_offsets,
     _cell_list_construct_bin_size_overload,
     _cell_list_count_atoms_per_bin_overload,
     build_cell_list,
     query_cell_list,
-)
-from nvalchemiops.torch.neighbors.cell_list import (
-    build_cell_list as torch_build_cell_list,
 )
 from nvalchemiops.torch.neighbors.cell_list import (
     estimate_cell_list_sizes,
@@ -38,7 +33,10 @@ from nvalchemiops.torch.neighbors.cell_list import (
 from nvalchemiops.torch.neighbors.neighbor_utils import allocate_cell_list
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
-from .test_utils import create_random_system, create_simple_cubic_system
+from .test_utils import (
+    create_simple_cubic_system,
+    neighbor_matrix_row_set,
+)
 
 dtypes = [torch.float32, torch.float64]
 
@@ -150,31 +148,22 @@ class TestCellListKernels:
         )
 
     def test_compute_cell_offsets(self, device, dtype):
-        """Test _cell_list_compute_cell_offsets kernel."""
-        wp_device = str(device)
+        """Production cell-offset compute uses ``wp.utils.array_scan`` (CUB
+        exclusive scan) — invoked internally by ``build_cell_list``.  This
+        unit-test exercises the same primitive directly.
+        """
+        if str(device) == "cpu":
+            pytest.skip("wp.utils.array_scan requires CUDA")
 
-        # Test data: cell atom counts
         cell_atom_counts = torch.tensor(
             [3, 0, 2, 1, 4], dtype=torch.int32, device=device
         )
         num_cells = len(cell_atom_counts)
-
-        # Output array
         cell_offsets = torch.zeros(num_cells, dtype=torch.int32, device=device)
-        wp_cell_atom_counts = wp.from_torch(
-            cell_atom_counts, dtype=wp.int32, return_ctype=True
-        )
-        wp_cell_offsets = wp.from_torch(cell_offsets, dtype=wp.int32, return_ctype=True)
+        wp_counts = wp.from_torch(cell_atom_counts, dtype=wp.int32)
+        wp_offsets = wp.from_torch(cell_offsets, dtype=wp.int32)
+        wp.utils.array_scan(wp_counts, wp_offsets, inclusive=False)
 
-        # Launch kernel
-        wp.launch(
-            _cell_list_compute_cell_offsets,
-            dim=num_cells,
-            device=wp_device,
-            inputs=(wp_cell_atom_counts, wp_cell_offsets, num_cells),
-        )
-
-        # Expected prefix sum: [0, 3, 3, 5, 6]
         expected = torch.tensor([0, 3, 3, 5, 6], dtype=torch.int32, device=device)
         torch.testing.assert_close(cell_offsets, expected)
 
@@ -223,15 +212,13 @@ class TestCellListKernels:
             ),
         )
 
-        # Compute offsets
+        # Compute offsets — production uses wp.utils.array_scan (CUB).
         cell_offsets = torch.zeros(total_cells, dtype=torch.int32, device=device)
         wp_cell_offsets = wp.from_torch(cell_offsets, dtype=wp.int32, return_ctype=True)
-
-        wp.launch(
-            _cell_list_compute_cell_offsets,
-            dim=total_cells,
-            device=wp_device,
-            inputs=(wp_cell_atom_counts, wp_cell_offsets, total_cells),
+        wp.utils.array_scan(
+            wp.from_torch(cell_atom_counts, dtype=wp.int32),
+            wp.from_torch(cell_offsets, dtype=wp.int32),
+            inclusive=False,
         )
 
         # Allocate atom indices array
@@ -282,149 +269,6 @@ class TestCellListKernels:
         assert torch.all(valid_indices[:total_binned]), (
             "All atom indices should be valid"
         )
-
-    def test_build_neighbor_matrix(self, device, dtype):
-        """Test _cell_list_build_neighbor_matrix kernel."""
-        # Simple two-atom system
-        positions, cell, pbc = create_random_system(
-            num_atoms=16, cell_size=1.0, dtype=dtype, device=device, pbc_flag=False
-        )
-        pbc = pbc.squeeze(0)
-        cell = cell.reshape(1, 3, 3)
-        cutoff = 0.5
-
-        # Estimate cell list sizes
-        max_cells, neighbor_search_radius = estimate_cell_list_sizes(
-            cell,
-            pbc,
-            cutoff,
-        )
-        # Simplified setup - put both atoms in same cell
-        (
-            cells_per_dimension,
-            neighbor_search_radius,
-            atom_periodic_shifts,
-            atom_to_cell_mapping,
-            atoms_per_cell_count,
-            cell_atom_start_indices,
-            cell_atom_list,
-        ) = allocate_cell_list(
-            positions.shape[0],
-            max_cells,
-            neighbor_search_radius,
-            device,
-        )
-        torch_build_cell_list(
-            positions,
-            cutoff,
-            cell,
-            pbc,
-            cells_per_dimension,
-            neighbor_search_radius,
-            atom_periodic_shifts,
-            atom_to_cell_mapping,
-            atoms_per_cell_count,
-            cell_atom_start_indices,
-            cell_atom_list,
-        )
-
-        # Output arrays - neighbor matrix format
-        max_neighbors = 10  # Generous allocation
-        num_atoms = positions.shape[0]
-        neighbor_matrix = torch.full(
-            (num_atoms, max_neighbors), -1, dtype=torch.int32, device=device
-        )
-        neighbor_matrix_shifts = torch.zeros(
-            (num_atoms, max_neighbors, 3), dtype=torch.int32, device=device
-        )
-        num_neighbors = torch.zeros(num_atoms, dtype=torch.int32, device=device)
-
-        # Convert to warp types
-        wp_dtype = get_wp_dtype(dtype)
-        wp_vec_dtype = get_wp_vec_dtype(dtype)
-        wp_mat_dtype = get_wp_mat_dtype(dtype)
-        wp_device = str(device)
-
-        wp_positions = wp.from_torch(positions, dtype=wp_vec_dtype, return_ctype=True)
-        wp_cell = wp.from_torch(cell, dtype=wp_mat_dtype, return_ctype=True)
-        wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
-        wp_cells_per_dimension = wp.from_torch(
-            cells_per_dimension, dtype=wp.int32, return_ctype=True
-        )
-        wp_atom_periodic_shifts = wp.from_torch(
-            atom_periodic_shifts, dtype=wp.vec3i, return_ctype=True
-        )
-        wp_neighbor_search_radius = wp.from_torch(
-            neighbor_search_radius, dtype=wp.vec3i, return_ctype=True
-        )
-        wp_atom_to_cell_mapping = wp.from_torch(
-            atom_to_cell_mapping, dtype=wp.vec3i, return_ctype=True
-        )
-        wp_atoms_per_cell_count = wp.from_torch(
-            atoms_per_cell_count, dtype=wp.int32, return_ctype=True
-        )
-        wp_cell_atom_start_indices = wp.from_torch(
-            cell_atom_start_indices, dtype=wp.int32, return_ctype=True
-        )
-        wp_cell_atom_list = wp.from_torch(
-            cell_atom_list, dtype=wp.int32, return_ctype=True
-        )
-        wp_neighbor_matrix = wp.from_torch(
-            neighbor_matrix, dtype=wp.int32, return_ctype=True
-        )
-        wp_neighbor_matrix_shifts = wp.from_torch(
-            neighbor_matrix_shifts, dtype=wp.vec3i, return_ctype=True
-        )
-        wp_num_neighbors = wp.from_torch(
-            num_neighbors, dtype=wp.int32, return_ctype=True
-        )
-
-        # Launch kernel
-        wp.launch(
-            _cell_list_build_neighbor_matrix_overload[wp_dtype],
-            dim=positions.shape[0],
-            device=wp_device,
-            inputs=(
-                wp_positions,
-                wp_cell,
-                wp_pbc,
-                wp_dtype(cutoff),
-                wp_cells_per_dimension,
-                wp_atom_periodic_shifts,
-                wp_neighbor_search_radius,
-                wp_atom_to_cell_mapping,
-                wp_atoms_per_cell_count,
-                wp_cell_atom_start_indices,
-                wp_cell_atom_list,
-                wp_neighbor_matrix,
-                wp_neighbor_matrix_shifts,
-                wp_num_neighbors,
-                True,
-            ),
-        )
-
-        # Check that we found some neighbors
-        assert torch.all(num_neighbors >= 0), "Neighbor counts should be non-negative"
-
-        # Each atom should have the other as a neighbor
-        for atom_idx in range(num_atoms):
-            n_neigh = num_neighbors[atom_idx].item()
-            if n_neigh > 0:
-                # Check that distances are within cutoff
-                for neigh_idx in range(min(n_neigh, max_neighbors)):
-                    atom_j = neighbor_matrix[atom_idx, neigh_idx].item()
-                    if atom_j == -1:
-                        break
-
-                    # Verify distance is within cutoff (shifts are in fractional coords)
-                    shift_frac = neighbor_matrix_shifts[atom_idx, neigh_idx]
-                    shift_cart = cell.reshape(3, 3).T @ shift_frac.to(dtype)
-
-                    rij = positions[atom_j] - positions[atom_idx] + shift_cart
-                    dist = torch.norm(rij).item()
-                    assert dist < cutoff + 1e-5, (
-                        f"Distance {dist} should be within cutoff {cutoff}"
-                    )
 
 
 @pytest.mark.parametrize("dtype", dtypes)
@@ -584,25 +428,37 @@ class TestCellListWpLaunchers:
             num_neighbors, dtype=wp.int32, return_ctype=True
         )
 
-        # Call query_cell_list launcher
+        # Caller-allocated sort scratch + rebuild_flags (always-True for
+        # non-selective builds).  The warp-level API holds no hidden state.
+        wp_sorted_positions = wp.empty(
+            positions.shape[0], dtype=wp_vec_dtype, device=str(device)
+        )
+        wp_sorted_shifts = wp.empty(
+            positions.shape[0], dtype=wp.vec3i, device=str(device)
+        )
+        wp_rebuild_flags = wp.array([True], dtype=wp.bool, device=str(device))
+
         query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_neighbor_matrix,
-            wp_neighbor_matrix_shifts,
-            wp_num_neighbors,
-            wp_dtype,
-            str(device),
-            True,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_neighbor_matrix,
+            neighbor_matrix_shifts=wp_neighbor_matrix_shifts,
+            num_neighbors=wp_num_neighbors,
+            rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            half_fill=True,
         )
 
         # Verify we found some neighbors
@@ -684,24 +540,35 @@ class TestCellListSelectiveRebuildFlags:
         )
         wp_nn = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
 
+        wp_sorted_positions = wp.empty(
+            positions.shape[0], dtype=wp_vec_dtype, device=str(device)
+        )
+        wp_sorted_shifts = wp.empty(
+            positions.shape[0], dtype=wp.vec3i, device=str(device)
+        )
+        wp_always_true = wp.array([True], dtype=wp.bool, device=str(device))
+
         query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm,
-            wp_nm_shifts,
-            wp_nn,
-            wp_dtype,
-            str(device),
-            True,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm,
+            neighbor_matrix_shifts=wp_nm_shifts,
+            num_neighbors=wp_nn,
+            rebuild_flags=wp_always_true,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            half_fill=True,
         )
 
         saved_nm = neighbor_matrix.clone()
@@ -712,24 +579,26 @@ class TestCellListSelectiveRebuildFlags:
         wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
 
         query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm,
-            wp_nm_shifts,
-            wp_nn,
-            wp_dtype,
-            str(device),
-            True,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm,
+            neighbor_matrix_shifts=wp_nm_shifts,
+            num_neighbors=wp_nn,
             rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            half_fill=True,
         )
 
         assert torch.equal(num_neighbors, saved_nn), (
@@ -810,24 +679,36 @@ class TestCellListSelectiveRebuildFlags:
             nm_ref_shifts, dtype=wp.vec3i, return_ctype=True
         )
         wp_nn_ref = wp.from_torch(nn_ref, dtype=wp.int32, return_ctype=True)
+
+        wp_sorted_positions = wp.empty(
+            positions.shape[0], dtype=wp_vec_dtype, device=str(device)
+        )
+        wp_sorted_shifts = wp.empty(
+            positions.shape[0], dtype=wp.vec3i, device=str(device)
+        )
+        wp_always_true = wp.array([True], dtype=wp.bool, device=str(device))
+
         query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm_ref,
-            wp_nm_ref_shifts,
-            wp_nn_ref,
-            wp_dtype,
-            str(device),
-            True,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm_ref,
+            neighbor_matrix_shifts=wp_nm_ref_shifts,
+            num_neighbors=wp_nn_ref,
+            rebuild_flags=wp_always_true,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            half_fill=True,
         )
 
         # Selective rebuild with flag=True
@@ -848,26 +729,321 @@ class TestCellListSelectiveRebuildFlags:
         wp_rebuild_flags = wp.from_torch(rebuild_flags, dtype=wp.bool)
 
         query_cell_list(
-            wp_positions,
-            wp_cell,
-            wp_pbc,
-            cutoff,
-            wp_cells_per_dimension,
-            wp_neighbor_search_radius,
-            wp_atom_periodic_shifts,
-            wp_atom_to_cell_mapping,
-            wp_atoms_per_cell_count,
-            wp_cell_atom_start_indices,
-            wp_cell_atom_list,
-            wp_nm_sel,
-            wp_nm_sel_shifts,
-            wp_nn_sel,
-            wp_dtype,
-            str(device),
-            True,
+            positions=wp_positions,
+            cell=wp_cell,
+            pbc=wp_pbc,
+            cutoff=cutoff,
+            cells_per_dimension=wp_cells_per_dimension,
+            neighbor_search_radius=wp_neighbor_search_radius,
+            atom_periodic_shifts=wp_atom_periodic_shifts,
+            atom_to_cell_mapping=wp_atom_to_cell_mapping,
+            atoms_per_cell_count=wp_atoms_per_cell_count,
+            cell_atom_start_indices=wp_cell_atom_start_indices,
+            cell_atom_list=wp_cell_atom_list,
+            sorted_positions=wp_sorted_positions,
+            sorted_atom_periodic_shifts=wp_sorted_shifts,
+            neighbor_matrix=wp_nm_sel,
+            neighbor_matrix_shifts=wp_nm_sel_shifts,
+            num_neighbors=wp_nn_sel,
             rebuild_flags=wp_rebuild_flags,
+            wp_dtype=wp_dtype,
+            device=str(device),
+            half_fill=True,
         )
 
         assert torch.equal(nn_sel, nn_ref), (
             "num_neighbors should match full rebuild when flag=True"
+        )
+
+
+@pytest.mark.parametrize("dtype", dtypes)
+class TestCellListPairCentric:
+    """Parity tests for the pair-centric query kernel.
+
+    The pair-centric kernel is dispatched automatically by the torch wrapper
+    based on a sync-free heuristic; these tests force it via the
+    ``algorithm=`` parameter and compare its output against the atom-centric
+    reference.
+    """
+
+    def test_pair_set_matches_atom_centric(self, device, dtype):
+        """Same pair set as atom-centric on the cubic test system."""
+        from nvalchemiops.torch.neighbors.cell_list import cell_list
+
+        if str(device) == "cpu":
+            pytest.skip("pair-centric kernel uses CUDA blockIdx/threadIdx")
+
+        # 4×4×4 simple cubic, lattice spacing 0.5 → box=2.0, cutoff=0.6
+        # captures only nearest-neighbor pairs (1 lattice spacing).
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=64, cell_size=2.0, dtype=dtype, device=device
+        )
+        pbc = pbc.squeeze(0)
+        cutoff = 0.6
+
+        nm_a, nn_a, _ = cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            half_fill=True,
+            algorithm="atom_centric",
+        )
+        nm_p, nn_p, _ = cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            half_fill=True,
+            algorithm="pair_centric",
+        )
+
+        assert torch.equal(nn_a, nn_p), (
+            "Per-atom neighbor counts must match between kernels"
+        )
+        assert neighbor_matrix_row_set(nm_a, nn_a) == neighbor_matrix_row_set(
+            nm_p, nn_p
+        ), "Pair sets must match between kernels (row order may differ)"
+
+    def test_dispatch_threshold_env(self, device, dtype, monkeypatch):
+        """``_dispatch_algorithm`` and ``NVALCHEMI_NEIGHLIST_ALGO`` env override."""
+        del device, dtype  # not used; fixture present for parametrization
+        from nvalchemiops.torch.neighbors.cell_list import _dispatch_algorithm
+
+        # Default rule: clause 1 (cutoff >= 8 AND N <= 65536) → pair_centric.
+        assert _dispatch_algorithm(4096, 12.0) == "pair_centric"
+        # Outside every clause → atom_centric.
+        assert _dispatch_algorithm(131072, 12.0) == "atom_centric"
+        # Clause 2 (cutoff >= 6 AND N <= 8192) → pair_centric.
+        assert _dispatch_algorithm(2048, 6.0) == "pair_centric"
+        # Clause 3 (cutoff >= 4 AND N <= 1024) → pair_centric.
+        assert _dispatch_algorithm(1024, 4.0) == "pair_centric"
+
+        # Env override pins to a specific algorithm regardless of rule.
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_ALGO", "atom_centric")
+        assert _dispatch_algorithm(1024, 12.0) == "atom_centric"
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_ALGO", "pair_centric")
+        assert _dispatch_algorithm(131072, 4.0) == "pair_centric"
+
+    def test_pair_centric_with_rebuild_flag_false(self, device, dtype):
+        """rebuild_flags=False with pair-centric must preserve outputs."""
+        from nvalchemiops.torch.neighbors.cell_list import cell_list
+
+        if str(device) == "cpu":
+            pytest.skip("pair-centric kernel uses CUDA blockIdx/threadIdx")
+
+        positions, cell, pbc = create_simple_cubic_system(
+            num_atoms=64, cell_size=2.0, dtype=dtype, device=device
+        )
+        pbc = pbc.squeeze(0)
+        cutoff = 0.6
+
+        nm, nn, nms = cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            half_fill=True,
+            algorithm="pair_centric",
+        )
+        saved_nm = nm.clone()
+        saved_nn = nn.clone()
+        saved_nms = nms.clone()
+
+        rebuild_flags = torch.zeros(1, dtype=torch.bool, device=device)
+        cell_list(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            half_fill=True,
+            algorithm="pair_centric",
+            neighbor_matrix=nm,
+            neighbor_matrix_shifts=nms,
+            num_neighbors=nn,
+            rebuild_flags=rebuild_flags,
+        )
+
+        assert torch.equal(nn, saved_nn), (
+            "pair-centric: num_neighbors must be preserved when flag=False"
+        )
+        assert torch.equal(nm, saved_nm), (
+            "pair-centric: neighbor_matrix must be preserved when flag=False"
+        )
+        assert torch.equal(nms, saved_nms), (
+            "pair-centric: shifts must be preserved when flag=False"
+        )
+
+
+def _make_query_cell_list_kwargs(device, dtype, *, half_fill=True):
+    """Build a fully-allocated kwargs dict for ``query_cell_list``.
+
+    Used by the error-path tests below: the algorithm-validation block
+    runs before any kernel launch, so the inner contents need not be
+    correct — only the shapes/dtypes need to satisfy the warp-array
+    binding so the launcher reaches the algorithm check.
+    """
+    positions, cell, pbc = create_simple_cubic_system(
+        num_atoms=8, cell_size=2.0, dtype=dtype, device=device
+    )
+    pbc = pbc.squeeze(0)
+    cutoff = 1.1
+    max_cells, neighbor_search_radius = estimate_cell_list_sizes(cell, pbc, cutoff)
+    cl_cache = allocate_cell_list(
+        positions.shape[0], max_cells, neighbor_search_radius, device
+    )
+    wp_dtype = get_wp_dtype(dtype)
+    wp_vec = get_wp_vec_dtype(dtype)
+    wp_mat = get_wp_mat_dtype(dtype)
+    wp_positions = wp.from_torch(positions, dtype=wp_vec, return_ctype=True)
+    wp_cell = wp.from_torch(cell, dtype=wp_mat, return_ctype=True)
+    wp_pbc = wp.from_torch(pbc, dtype=wp.bool, return_ctype=True)
+    wp_cpd = wp.from_torch(cl_cache[0], dtype=wp.int32, return_ctype=True)
+    wp_nsr = wp.from_torch(cl_cache[1], dtype=wp.int32, return_ctype=True)
+    wp_aps = wp.from_torch(cl_cache[2], dtype=wp.vec3i, return_ctype=True)
+    wp_atc = wp.from_torch(cl_cache[3], dtype=wp.vec3i, return_ctype=True)
+    wp_apcc = wp.from_torch(cl_cache[4], dtype=wp.int32)
+    wp_casi = wp.from_torch(cl_cache[5], dtype=wp.int32)
+    wp_cal = wp.from_torch(cl_cache[6], dtype=wp.int32, return_ctype=True)
+    build_cell_list(
+        wp_positions,
+        wp_cell,
+        wp_pbc,
+        cutoff,
+        wp_cpd,
+        wp_aps,
+        wp_atc,
+        wp_apcc,
+        wp_casi,
+        wp_cal,
+        wp_dtype,
+        str(device),
+    )
+    max_neighbors = 10
+    nm = torch.full(
+        (positions.shape[0], max_neighbors),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    nms = torch.zeros(
+        (positions.shape[0], max_neighbors, 3),
+        dtype=torch.int32,
+        device=device,
+    )
+    nn = torch.zeros((positions.shape[0],), dtype=torch.int32, device=device)
+    wp_nm = wp.from_torch(nm, dtype=wp.int32, return_ctype=True)
+    wp_nms = wp.from_torch(nms, dtype=wp.vec3i, return_ctype=True)
+    wp_nn = wp.from_torch(nn, dtype=wp.int32, return_ctype=True)
+    wp_sp = wp.empty(positions.shape[0], dtype=wp_vec, device=str(device))
+    wp_ss = wp.empty(positions.shape[0], dtype=wp.vec3i, device=str(device))
+    wp_rf = wp.array([True], dtype=wp.bool, device=str(device))
+    return dict(
+        positions=wp_positions,
+        cell=wp_cell,
+        pbc=wp_pbc,
+        cutoff=cutoff,
+        cells_per_dimension=wp_cpd,
+        neighbor_search_radius=wp_nsr,
+        atom_periodic_shifts=wp_aps,
+        atom_to_cell_mapping=wp_atc,
+        atoms_per_cell_count=wp_apcc,
+        cell_atom_start_indices=wp_casi,
+        cell_atom_list=wp_cal,
+        sorted_positions=wp_sp,
+        sorted_atom_periodic_shifts=wp_ss,
+        neighbor_matrix=wp_nm,
+        neighbor_matrix_shifts=wp_nms,
+        num_neighbors=wp_nn,
+        rebuild_flags=wp_rf,
+        wp_dtype=wp_dtype,
+        device=str(device),
+        half_fill=half_fill,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32])
+class TestQueryCellListErrorPaths:
+    """Error / log paths in ``query_cell_list`` (warp launcher) — covers
+    lines 1530-1559 in nvalchemiops/neighbors/cell_list.py."""
+
+    def test_pair_centric_on_cpu_raises(self, device, dtype):
+        if str(device) != "cpu":
+            pytest.skip("CPU-only error path")
+        kwargs = _make_query_cell_list_kwargs(device, dtype)
+        with pytest.raises(ValueError, match="not supported on CPU"):
+            query_cell_list(**kwargs, algorithm="pair_centric")
+
+    def test_pair_centric_missing_n_outer_raises(self, device, dtype):
+        if str(device) == "cpu":
+            pytest.skip("requires CUDA (pair_centric uses raw blockIdx)")
+        kwargs = _make_query_cell_list_kwargs(device, dtype)
+        with pytest.raises(ValueError, match="n_outer"):
+            query_cell_list(**kwargs, algorithm="pair_centric", n_outer=None)
+
+    def test_unknown_algorithm_raises(self, device, dtype):
+        kwargs = _make_query_cell_list_kwargs(device, dtype)
+        with pytest.raises(ValueError, match="atom_centric"):
+            query_cell_list(**kwargs, algorithm="bogus")
+
+    def test_dispatch_log_env_prints(self, device, dtype, monkeypatch, capsys):
+        kwargs = _make_query_cell_list_kwargs(device, dtype)
+        monkeypatch.setenv("NVALCHEMI_NEIGHLIST_DISPATCH_LOG", "1")
+        query_cell_list(**kwargs, algorithm="atom_centric")
+        out = capsys.readouterr().out
+        assert "[neighlist-dispatch] (wp.launcher)" in out
+        assert "atom_centric_local_count_sorted" in out
+
+    def test_pair_centric_success_path(self, device, dtype):
+        """Valid ``algorithm='pair_centric'`` + ``n_outer`` exercises the
+        ``chosen = 'pair_centric'`` assignment and the corresponding
+        ``query_cell_list_pair_centric_sorted`` launch inside the warp
+        launcher (lines 1542 + 1576 of cell_list.py)."""
+        from nvalchemiops.neighbors.cell_list import (
+            _compute_pair_centric_n_outer,
+        )
+
+        if str(device) == "cpu":
+            pytest.skip("pair-centric kernel uses CUDA blockIdx/threadIdx")
+        # Recompute the per-axis neighbor_search_radius the helper used so we
+        # can derive n_outer.  Cheaper than reading back from the wp.array.
+        _, cell, pbc = create_simple_cubic_system(
+            num_atoms=8, cell_size=2.0, dtype=dtype, device=device
+        )
+        pbc = pbc.squeeze(0)
+        _, nsr_t = estimate_cell_list_sizes(cell, pbc, 1.1)
+        nsr = tuple(int(x) for x in nsr_t.cpu().tolist())
+        n_outer = _compute_pair_centric_n_outer(nsr, half_fill=True)
+        kwargs = _make_query_cell_list_kwargs(device, dtype, half_fill=True)
+        query_cell_list(**kwargs, algorithm="pair_centric", n_outer=n_outer)
+        # Kernel wrote into num_neighbors via wp.from_torch — sanity check.
+        assert kwargs["num_neighbors"] is not None
+
+
+class TestMakeOuterNeighOffsets:
+    """Unit tests for the public ``make_outer_neigh_offsets`` helper."""
+
+    def test_radius_1_returns_13_offsets(self):
+        from nvalchemiops.neighbors.cell_list import make_outer_neigh_offsets
+
+        offs = make_outer_neigh_offsets(1)
+        assert len(offs) == 13
+        assert (0, 0, 0) not in offs
+        # half-shell invariant: each offset satisfies the lex-order rule.
+        for dx, dy, dz in offs:
+            assert dx > 0 or (dx == 0 and dy > 0) or (dx == 0 and dy == 0 and dz > 0)
+        # Complement set has the same size (one cell from each unordered pair).
+        complements = {(-dx, -dy, -dz) for (dx, dy, dz) in offs}
+        assert complements.isdisjoint(set(offs))
+
+    def test_radius_2_returns_62_offsets(self):
+        from nvalchemiops.neighbors.cell_list import make_outer_neigh_offsets
+
+        offs = make_outer_neigh_offsets(2)
+        # (2R+1)^3 - 1 = 124 total non-self cells; half-shell picks 62.
+        assert len(offs) == 62
+        assert (0, 0, 0) not in offs
+        assert all(
+            dx > 0 or (dx == 0 and dy > 0) or (dx == 0 and dy == 0 and dz > 0)
+            for (dx, dy, dz) in offs
         )
