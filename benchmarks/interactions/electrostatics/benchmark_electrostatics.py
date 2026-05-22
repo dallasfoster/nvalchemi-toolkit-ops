@@ -142,6 +142,7 @@ except ImportError:
     CoulombPotential = None
 
 
+
 # ==============================================================================
 # Utilities
 # ==============================================================================
@@ -378,6 +379,8 @@ def convert_to_backend(
 def compute_electrostatics_params(
     backend_data: dict,
     backend: str,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
 ) -> dict:
     """Compute Ewald/PME parameters using the appropriate backend.
 
@@ -388,6 +391,16 @@ def compute_electrostatics_params(
         optionally batch_idx.
     backend : str
         "torch" or "jax".
+    real_space_cutoff : float, optional
+        If provided, forwarded to ``estimate_pme_parameters``; ``alpha``
+        and mesh dimensions are then derived from this cutoff instead
+        of the cost-optimal one. The Ewald-parameter side uses the
+        cost-optimal cutoff regardless (Ewald has no auto-cutoff
+        equivalent to PME's).
+    accuracy : float, default=1e-4
+        Target relative force accuracy passed to ``estimate_ewald_parameters``
+        and ``estimate_pme_parameters``. Drives the cost-model choice of
+        alpha, real-space cutoff, and mesh dimensions.
 
     Returns
     -------
@@ -403,28 +416,36 @@ def compute_electrostatics_params(
 
     if batch_idx is None:
         ewald_params = electrostatics_mod.estimate_ewald_parameters(
-            positions, cell, accuracy=1e-6
+            positions, cell, accuracy=accuracy
         )
         k_cutoff = ewald_params.reciprocal_space_cutoff.item()
         cutoff = ewald_params.real_space_cutoff.item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, accuracy=1e-6
+            positions, cell, accuracy=accuracy,
+            real_space_cutoff=real_space_cutoff,
         )
     else:
         ewald_params = electrostatics_mod.estimate_ewald_parameters(
-            positions, cell, batch_idx, accuracy=1e-6
+            positions, cell, batch_idx, accuracy=accuracy
         )
         k_cutoff = ewald_params.reciprocal_space_cutoff[0].item()
         cutoff = ewald_params.real_space_cutoff[0].item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, batch_idx, accuracy=1e-6
+            positions, cell, batch_idx, accuracy=accuracy,
+            real_space_cutoff=real_space_cutoff,
         )
 
     alpha = pme_params.alpha
     mesh_dimensions = pme_params.mesh_dimensions
     mesh_spacing = pme_params.mesh_spacing
+
+    # When the caller pinned ``real_space_cutoff``, use it for the neighbor
+    # cutoff too — otherwise the neighbor matrix and PME alpha would
+    # disagree on what "rc" means.
+    if real_space_cutoff is not None:
+        cutoff = float(real_space_cutoff)
 
     k_vectors_pme, k_squared_pme = electrostatics_mod.generate_k_vectors_pme(
         cell, mesh_dimensions
@@ -493,11 +514,11 @@ def prepare_single_system(
     supercell_size: int,
     device: str,
     dtype: torch.dtype,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
+    build_neighbors: bool = True,
 ) -> dict:
     """Prepare a single system for benchmarking.
-
-    Backward-compatible wrapper that uses the new decoupled helpers internally.
-    The return value structure is identical to the original implementation.
 
     Parameters
     ----------
@@ -508,12 +529,21 @@ def prepare_single_system(
         Device string for torch tensors.
     dtype : torch.dtype
         Data type for torch tensors.
+    real_space_cutoff : float, optional
+        If provided, forwarded to ``estimate_pme_parameters`` (pins PME's
+        rc / alpha) and also used as the cutoff for the neighbor matrix.
+    accuracy : float, default=1e-4
+        Target relative force accuracy for the Ewald/PME parameter estimator.
+    build_neighbors : bool, default=True
+        Build the neighbor matrix. Set to ``False`` to skip when the
+        benchmark only exercises the reciprocal half of PME.
 
     Returns
     -------
     dict
         System data ready for electrostatics benchmarks, containing positions,
-        charges, cell, pbc, neighbor list data, and computed parameters.
+        charges, cell, pbc, neighbor list data (or ``None`` when
+        ``build_neighbors=False``), and computed parameters.
     """
     dtype_str = str(dtype).split(".")[-1]
 
@@ -523,11 +553,19 @@ def prepare_single_system(
         np_data, "torch", device=device, dtype_str=dtype_str
     )
 
-    params = compute_electrostatics_params(backend_data, "torch")
-
-    neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
-        backend_data, "torch", params["cutoff"]
+    params = compute_electrostatics_params(
+        backend_data, "torch",
+        real_space_cutoff=real_space_cutoff, accuracy=accuracy,
     )
+
+    if build_neighbors:
+        neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
+            backend_data, "torch", params["cutoff"]
+        )
+    else:
+        neighbor_matrix = None
+        num_neighbors = None
+        neighbor_matrix_shifts = None
 
     pbc = backend_data["pbc"]
     if pbc.dim() == 2 and pbc.shape[0] == 1:
@@ -537,10 +575,28 @@ def prepare_single_system(
     if hasattr(mesh_spacing, "tolist"):
         mesh_spacing = mesh_spacing.tolist()
 
+    cell_t = backend_data["cell"]
+    cell_inv_t = torch.linalg.inv(cell_t).transpose(-1, -2).contiguous()
+    volume = torch.abs(torch.linalg.det(cell_t)).reshape(-1).to(cell_t.dtype)
+
+    mx_dim, my_dim, mz_dim = params["mesh_dimensions"]
+    device_t = cell_t.device
+    miller_xs = torch.fft.fftfreq(mx_dim, d=1.0 / mx_dim, device=device_t, dtype=cell_t.dtype)
+    miller_ys = torch.fft.fftfreq(my_dim, d=1.0 / my_dim, device=device_t, dtype=cell_t.dtype)
+    miller_zs = torch.fft.rfftfreq(mz_dim, d=1.0 / mz_dim, device=device_t, dtype=cell_t.dtype)
+    moduli_x = _torch_electrostatics.compute_bspline_moduli_1d(miller_xs, mx_dim, 4)
+    moduli_y = _torch_electrostatics.compute_bspline_moduli_1d(miller_ys, my_dim, 4)
+    moduli_z = _torch_electrostatics.compute_bspline_moduli_1d(miller_zs, mz_dim, 4)
+
     return {
         "positions": backend_data["positions"],
         "charges": backend_data["charges"],
-        "cell": backend_data["cell"],
+        "cell": cell_t,
+        "cell_inv_t": cell_inv_t,
+        "volume": volume,
+        "moduli_x": moduli_x,
+        "moduli_y": moduli_y,
+        "moduli_z": moduli_z,
         "pbc": pbc,
         "neighbor_matrix": neighbor_matrix,
         "num_neighbors": num_neighbors,
@@ -563,6 +619,9 @@ def prepare_batch_system(
     batch_size: int,
     device: str,
     dtype: torch.dtype,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
+    build_neighbors: bool = True,
 ) -> dict:
     """Prepare a batched system for benchmarking.
 
@@ -595,16 +654,42 @@ def prepare_batch_system(
         np_data, "torch", device=device, dtype_str=dtype_str
     )
 
-    params = compute_electrostatics_params(backend_data, "torch")
-
-    neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
-        backend_data, "torch", params["cutoff"]
+    params = compute_electrostatics_params(
+        backend_data, "torch",
+        real_space_cutoff=real_space_cutoff, accuracy=accuracy,
     )
+
+    if build_neighbors:
+        neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
+            backend_data, "torch", params["cutoff"]
+        )
+    else:
+        neighbor_matrix = None
+        num_neighbors = None
+        neighbor_matrix_shifts = None
+
+    cell_t_b = backend_data["cell"]
+    cell_inv_t_b = torch.linalg.inv(cell_t_b).transpose(-1, -2).contiguous()
+    volume_b = torch.abs(torch.linalg.det(cell_t_b)).reshape(-1).to(cell_t_b.dtype)
+
+    mx_dim_b, my_dim_b, mz_dim_b = params["mesh_dimensions"]
+    device_b = cell_t_b.device
+    miller_xs_b = torch.fft.fftfreq(mx_dim_b, d=1.0 / mx_dim_b, device=device_b, dtype=cell_t_b.dtype)
+    miller_ys_b = torch.fft.fftfreq(my_dim_b, d=1.0 / my_dim_b, device=device_b, dtype=cell_t_b.dtype)
+    miller_zs_b = torch.fft.rfftfreq(mz_dim_b, d=1.0 / mz_dim_b, device=device_b, dtype=cell_t_b.dtype)
+    moduli_x_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_xs_b, mx_dim_b, 4)
+    moduli_y_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_ys_b, my_dim_b, 4)
+    moduli_z_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_zs_b, mz_dim_b, 4)
 
     return {
         "positions": backend_data["positions"],
         "charges": backend_data["charges"],
-        "cell": backend_data["cell"],
+        "cell": cell_t_b,
+        "cell_inv_t": cell_inv_t_b,
+        "volume": volume_b,
+        "moduli_x": moduli_x_b,
+        "moduli_y": moduli_y_b,
+        "moduli_z": moduli_z_b,
         "pbc": backend_data["pbc"],
         "neighbor_matrix": neighbor_matrix,
         "num_neighbors": num_neighbors,
@@ -976,6 +1061,11 @@ def run_nvalchemiops_pme(
     positions = system_data["positions"]
     charges = system_data["charges"]
     cell = system_data["cell"]
+    cell_inv_t = system_data.get("cell_inv_t")
+    volume = system_data.get("volume")
+    moduli_x = system_data.get("moduli_x")
+    moduli_y = system_data.get("moduli_y")
+    moduli_z = system_data.get("moduli_z")
     batch_idx = system_data.get("batch_idx")
     alpha = system_data.get("alpha")
     mesh_dimensions = system_data.get("mesh_dimensions")
@@ -1010,6 +1100,11 @@ def run_nvalchemiops_pme(
                 compute_virial=compute_virial,
                 k_vectors=k_vectors_pme,
                 k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
             )
         else:  # full
             return _torch_electrostatics.particle_mesh_ewald(
@@ -1025,6 +1120,11 @@ def run_nvalchemiops_pme(
                 compute_virial=compute_virial,
                 k_vectors=k_vectors_pme,
                 k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
             )
     else:
         if component == "real":
@@ -1052,6 +1152,11 @@ def run_nvalchemiops_pme(
                 compute_virial=compute_virial,
                 k_vectors=k_vectors_pme,
                 k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
             )
         else:  # full
             return _torch_electrostatics.particle_mesh_ewald(
@@ -1068,6 +1173,11 @@ def run_nvalchemiops_pme(
                 compute_virial=compute_virial,
                 k_vectors=k_vectors_pme,
                 k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
             )
 
 
@@ -1256,6 +1366,13 @@ def prepare_jax_pme(
     alpha = system_data.get("alpha")
     mesh_dimensions = system_data.get("mesh_dimensions")
     spline_order = system_data.get("spline_order")
+    cell_inv_t = system_data.get("cell_inv_t")
+    volume = system_data.get("volume")
+    moduli_x = system_data.get("moduli_x")
+    moduli_y = system_data.get("moduli_y")
+    moduli_z = system_data.get("moduli_z")
+    k_vectors_pme = system_data.get("k_vectors_pme")
+    k_squared_pme = system_data.get("k_squared_pme")
 
     neighbor_matrix_data = system_data.get("neighbor_matrix")
     neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
@@ -1309,6 +1426,13 @@ def prepare_jax_pme(
             cell,
             alpha,
             batch_idx,
+            cell_inv_t,
+            volume,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            k_vectors,
+            k_squared,
         ):
             return _jax_electrostatics.pme_reciprocal_space(
                 positions=positions,
@@ -1318,8 +1442,13 @@ def prepare_jax_pme(
                 mesh_dimensions=_mesh_dimensions,
                 spline_order=_spline_order,
                 batch_idx=batch_idx,
-                k_vectors=None,
-                k_squared=None,
+                k_vectors=k_vectors,
+                k_squared=k_squared,
+                volume=volume,
+                cell_inv_t=cell_inv_t,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
                 compute_forces=_compute_forces,
                 compute_virial=_compute_virial,
             )
@@ -1331,6 +1460,13 @@ def prepare_jax_pme(
                 cell,
                 alpha,
                 batch_idx,
+                cell_inv_t,
+                volume,
+                moduli_x,
+                moduli_y,
+                moduli_z,
+                k_vectors_pme,
+                k_squared_pme,
             )
 
     else:  # full
@@ -1344,6 +1480,13 @@ def prepare_jax_pme(
             neighbor_matrix,
             neighbor_matrix_shifts,
             batch_idx,
+            cell_inv_t,
+            volume,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            k_vectors,
+            k_squared,
         ):
             return _jax_electrostatics.particle_mesh_ewald(
                 positions=positions,
@@ -1353,10 +1496,15 @@ def prepare_jax_pme(
                 mesh_dimensions=_mesh_dimensions,
                 spline_order=_spline_order,
                 batch_idx=batch_idx,
-                k_vectors=None,
-                k_squared=None,
+                k_vectors=k_vectors,
+                k_squared=k_squared,
                 neighbor_matrix=neighbor_matrix,
                 neighbor_matrix_shifts=neighbor_matrix_shifts,
+                volume=volume,
+                cell_inv_t=cell_inv_t,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
                 compute_forces=_compute_forces,
                 compute_virial=_compute_virial,
             )
@@ -1370,6 +1518,13 @@ def prepare_jax_pme(
                 neighbor_matrix_data,
                 neighbor_matrix_shifts,
                 batch_idx,
+                cell_inv_t,
+                volume,
+                moduli_x,
+                moduli_y,
+                moduli_z,
+                k_vectors_pme,
+                k_squared_pme,
             )
 
     return call
@@ -1790,8 +1945,18 @@ def run_benchmark(
     compute_virial: bool,
     timer: BenchmarkTimer,
     neighbor_format: str = "list",
+    torch_compile: bool = False,
 ) -> dict:
-    """Run a single benchmark configuration."""
+    """Run a single benchmark configuration.
+
+    When ``torch_compile`` is True and the backend is ``torch`` /
+    ``torchpme`` / ``torch_dsf``, the bench callable is wrapped in
+    ``torch.compile(fullgraph=True)``. Framework-compile cost
+    (``torch.compile`` Dynamo + Inductor trace; or for the jax backend
+    the first XLA trace) is measured separately as
+    ``framework_compile_ms`` in the returned dict, isolated from the
+    warp NVRTC cost which is paid by a pre-warm raw call beforehand.
+    """
     total_atoms = system_data["total_atoms"]
     batch_size = system_data.get("batch_size", 1)
 
@@ -1915,7 +2080,60 @@ def run_benchmark(
                 "error_type": "NotApplicable",
             }
 
-        # Run benchmark
+        # Framework-compile cost (torch.compile or JAX jit) measured by a
+        # one-shot wrap + first-call timing AFTER the raw bench_fn has been
+        # called once to warm warp / cuFFT. This isolates Dynamo+Inductor
+        # (or XLA) trace cost from NVRTC kernel compile cost.
+        framework_compile_ms: float | None = None
+        framework: str = "none"
+        warp_compile_ms: float | None = None
+        if backend in ("torch", "torchpme", "torch_dsf") and torch_compile:
+            try:
+                # 1) Raw pre-warm — pays warp NVRTC + any cuFFT plan creation.
+                import time as _time
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                _t0 = _time.perf_counter()
+                bench_fn()
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                warp_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                # 2) Wrap with torch.compile and time the FIRST call.
+                # Use the default mode: ``reduce-overhead`` captures CUDA
+                # graphs internally, which clashes with warp's stream
+                # binding (``cudaErrorStreamCaptureInvalidated``). The
+                # default mode runs Dynamo + Inductor codegen but lets
+                # the warp ops execute against the caller's stream.
+                compiled_fn = torch.compile(bench_fn, fullgraph=True)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                _t0 = _time.perf_counter()
+                compiled_fn()
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                framework_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                framework = "torch.compile"
+                bench_fn = compiled_fn
+            except Exception as _e:
+                framework = f"torch.compile-FAILED:{type(_e).__name__}"
+                framework_compile_ms = None
+        elif backend == "jax":
+            # JAX path is already JIT-ed inside ``prepare_jax_pme``. Pre-call
+            # the underlying warp kernel once via the timer's first warmup
+            # iteration; but we can isolate XLA trace cost the same way by
+            # forcing one untraced launch first. The JIT call doesn't expose
+            # an untraced path, so the cleanest proxy is to time the first
+            # call separately here.
+            try:
+                import time as _time
+                # First call: XLA trace + warp NVRTC + GPU kernel
+                _t0 = _time.perf_counter()
+                _res = bench_fn()
+                if _res is not None:
+                    jax.block_until_ready(_res)
+                framework_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                framework = "jax.jit"
+            except Exception as _e:
+                framework = f"jax.jit-FAILED:{type(_e).__name__}"
+                framework_compile_ms = None
+
+        # Run steady-state benchmark
         timing_results = timer.time_function(bench_fn)
         if TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1949,6 +2167,9 @@ def run_benchmark(
             "median_time_ms": float(timing_results["median"]),
             "peak_memory_mb": timing_results.get("peak_memory_mb"),
             "compile_ms": timing_results.get("compile_ms"),
+            "warp_compile_ms": warp_compile_ms,
+            "framework_compile_ms": framework_compile_ms,
+            "framework": framework,
             "success": True,
         }
 
@@ -2005,11 +2226,11 @@ def main():
         "--method",
         type=str,
         choices=["ewald", "pme", "dsf", "both", "all"],
-        default="both",
+        default=None,
         help=(
-            "Method to benchmark (default: both). "
-            "'both' = ewald + pme (backward compat). "
-            "'all' = ewald + pme + dsf."
+            "Method to benchmark. When omitted, the YAML ``methods:`` list "
+            "controls; if that is also empty, defaults to ewald + pme. "
+            "'both' = ewald + pme. 'all' = ewald + pme + dsf."
         ),
     )
     parser.add_argument(
@@ -2034,6 +2255,41 @@ def main():
         choices=["float32", "float64"],
         default=None,
         help="Override dtype from config (default: use config value)",
+    )
+    parser.add_argument(
+        "--real-space-cutoff",
+        type=float,
+        default=None,
+        help=(
+            "Override the PME real-space cutoff (Angstrom). When set, alpha "
+            "and the mesh dimensions are derived from this rc instead of the "
+            "cost-optimized value. Overrides the same field in config "
+            "parameters."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy",
+        type=float,
+        default=None,
+        help=(
+            "Target relative force accuracy passed to the Ewald/PME parameter "
+            "estimator. Drives alpha, real-space cutoff (when not pinned), and "
+            "mesh dimensions. Overrides the ``accuracy`` field in config "
+            "parameters (default 1e-4)."
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help=(
+            "Wrap each torch-backend bench callable in "
+            "``torch.compile(fullgraph=True, mode='reduce-overhead')`` and "
+            "record the framework-compile cost in a separate CSV column. "
+            "The pre-warm pass calls the raw bench_fn once first so warp "
+            "NVRTC compile and torch.compile (Dynamo + Inductor) costs "
+            "appear in distinct columns. JAX backend always JITs; the "
+            "first-call XLA trace cost is recorded under the same column."
+        ),
     )
 
     args = parser.parse_args()
@@ -2085,13 +2341,18 @@ def main():
     if backend_type == "torch" and wp is not None:
         wp.init()
 
-    # Determine what to benchmark
-    if args.method == "both":
-        methods = ["ewald", "pme"]
-    elif args.method == "all":
-        methods = ["ewald", "pme", "dsf"]
+    # Determine what to benchmark. The CLI ``--method`` wins when explicitly
+    # passed; otherwise the YAML's ``methods:`` list controls. If neither is
+    # set, default to the historical ewald + pme pair.
+    if args.method is not None:
+        if args.method == "both":
+            methods = ["ewald", "pme"]
+        elif args.method == "all":
+            methods = ["ewald", "pme", "dsf"]
+        else:
+            methods = [args.method]
     else:
-        methods = [args.method]
+        methods = config.get("methods", ["ewald", "pme"])
 
     # Build per-method backend list
     def get_backends_for_method(method: str) -> list[str]:
@@ -2123,6 +2384,23 @@ def main():
     compute_forces = config.get("compute_forces", True)
     compute_virial = config.get("compute_virial", False)
 
+    # Optional PME real-space cutoff (CLI overrides config)
+    if args.real_space_cutoff is not None:
+        real_space_cutoff = float(args.real_space_cutoff)
+    else:
+        rc_cfg = params.get("real_space_cutoff", None)
+        real_space_cutoff = float(rc_cfg) if rc_cfg is not None else None
+
+    # Target relative force accuracy passed to the Ewald/PME parameter
+    # estimator (CLI overrides config; default 1e-4 if neither is set).
+    if args.accuracy is not None:
+        accuracy = float(args.accuracy)
+    else:
+        accuracy = float(params.get("accuracy", 1e-4))
+
+    # Skip neighbor-list construction when only reciprocal space is requested.
+    build_neighbors = set(components) != {"reciprocal"}
+
     # DSF-specific parameters (hardcoded defaults)
     dsf_cutoff = 12.0
     dsf_alpha = 0.2
@@ -2139,6 +2417,9 @@ def main():
     print(f"Components: {components}")
     print(f"Compute forces: {compute_forces}")
     print(f"Compute virial: {compute_virial}")
+    print(f"Accuracy: {accuracy:g}")
+    if real_space_cutoff is not None:
+        print(f"Real-space cutoff (pinned): {real_space_cutoff} A")
     print(f"Warmup iterations: {warmup}")
     print(f"Timing iterations: {timing}")
     print(f"Output directory: {output_dir}")
@@ -2205,22 +2486,50 @@ def main():
                         if "ewald_pme" not in system_data_cache:
                             try:
                                 if args.backend == "jax":
+                                    import jax.numpy as jnp
                                     np_data = prepare_system_numpy(size, batch_size=1)
                                     backend_data = convert_to_backend(
                                         np_data, "jax", dtype_str=dtype_str
                                     )
                                     params_data = compute_electrostatics_params(
-                                        backend_data, "jax"
+                                        backend_data, "jax",
+                                        real_space_cutoff=real_space_cutoff,
+                                        accuracy=accuracy,
                                     )
-                                    nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
-                                        compute_neighbor_list(
-                                            backend_data, "jax", params_data["cutoff"]
+                                    if build_neighbors:
+                                        nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
+                                            compute_neighbor_list(
+                                                backend_data, "jax",
+                                                params_data["cutoff"],
+                                            )
                                         )
-                                    )
+                                    else:
+                                        nl_matrix = None
+                                        nl_num_neighbors = None
+                                        nl_matrix_shifts = None
+                                    cell_j = backend_data["cell"]
+                                    cell_inv_j = jnp.linalg.inv(cell_j)
+                                    if cell_j.ndim == 2:
+                                        cell_inv_t_j = cell_inv_j.T
+                                    else:
+                                        cell_inv_t_j = jnp.transpose(cell_inv_j, (0, 2, 1))
+                                    volume_j = jnp.abs(jnp.linalg.det(cell_j)).reshape(-1).astype(cell_j.dtype)
+                                    mx_jax, my_jax, mz_jax = params_data["mesh_dimensions"]
+                                    miller_x_j = jnp.fft.fftfreq(mx_jax, d=1.0/mx_jax).astype(cell_j.dtype)
+                                    miller_y_j = jnp.fft.fftfreq(my_jax, d=1.0/my_jax).astype(cell_j.dtype)
+                                    miller_z_j = jnp.fft.rfftfreq(mz_jax, d=1.0/mz_jax).astype(cell_j.dtype)
+                                    moduli_x_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_x_j, mx_jax, 4)
+                                    moduli_y_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_y_j, my_jax, 4)
+                                    moduli_z_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_z_j, mz_jax, 4)
                                     system_data_cache["ewald_pme"] = {
                                         "positions": backend_data["positions"],
                                         "charges": backend_data["charges"],
-                                        "cell": backend_data["cell"],
+                                        "cell": cell_j,
+                                        "cell_inv_t": cell_inv_t_j,
+                                        "volume": volume_j,
+                                        "moduli_x": moduli_x_j,
+                                        "moduli_y": moduli_y_j,
+                                        "moduli_z": moduli_z_j,
                                         "pbc": backend_data["pbc"],
                                         "neighbor_matrix": nl_matrix,
                                         "num_neighbors": nl_num_neighbors,
@@ -2243,7 +2552,12 @@ def main():
                                     }
                                 else:
                                     system_data_cache["ewald_pme"] = (
-                                        prepare_single_system(size, device, dtype)
+                                        prepare_single_system(
+                                            size, device, dtype,
+                                            real_space_cutoff=real_space_cutoff,
+                                            accuracy=accuracy,
+                                            build_neighbors=build_neighbors,
+                                        )
                                     )
                             except Exception as e:
                                 print(f"    Failed to prepare system: {e}")
@@ -2282,6 +2596,7 @@ def main():
                                         compute_virial,
                                         timer,
                                         neighbor_format=nf,
+                                        torch_compile=args.torch_compile,
                                     )
                                     result["supercell_size"] = size
                                     result["mode"] = mode
@@ -2364,13 +2679,21 @@ def main():
                                         np_data, "jax", dtype_str=dtype_str
                                     )
                                     params_data = compute_electrostatics_params(
-                                        backend_data, "jax"
+                                        backend_data, "jax",
+                                        real_space_cutoff=real_space_cutoff,
+                                        accuracy=accuracy,
                                     )
-                                    nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
-                                        compute_neighbor_list(
-                                            backend_data, "jax", params_data["cutoff"]
+                                    if build_neighbors:
+                                        nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
+                                            compute_neighbor_list(
+                                                backend_data, "jax",
+                                                params_data["cutoff"],
+                                            )
                                         )
-                                    )
+                                    else:
+                                        nl_matrix = None
+                                        nl_num_neighbors = None
+                                        nl_matrix_shifts = None
                                     system_data_cache["ewald_pme"] = {
                                         "positions": backend_data["positions"],
                                         "charges": backend_data["charges"],
@@ -2399,7 +2722,10 @@ def main():
                                 else:
                                     system_data_cache["ewald_pme"] = (
                                         prepare_batch_system(
-                                            base_size, batch_size, device, dtype
+                                            base_size, batch_size, device, dtype,
+                                            real_space_cutoff=real_space_cutoff,
+                                            accuracy=accuracy,
+                                            build_neighbors=build_neighbors,
                                         )
                                     )
                             except Exception as e:
@@ -2439,6 +2765,7 @@ def main():
                                         compute_virial,
                                         timer,
                                         neighbor_format=nf,
+                                        torch_compile=args.torch_compile,
                                     )
                                     result["supercell_size"] = base_size
                                     result["mode"] = mode
