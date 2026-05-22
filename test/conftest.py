@@ -56,14 +56,17 @@ def _release_gpu_memory():
     """
     yield
     import gc
+
     gc.collect()
     try:
         import jax
+
         jax.clear_caches()
     except ImportError:
         pass
     try:
         import torch
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except ImportError:

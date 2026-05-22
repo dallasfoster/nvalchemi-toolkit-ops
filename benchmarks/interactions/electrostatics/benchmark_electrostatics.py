@@ -142,7 +142,6 @@ except ImportError:
     CoulombPotential = None
 
 
-
 # ==============================================================================
 # Utilities
 # ==============================================================================
@@ -422,7 +421,9 @@ def compute_electrostatics_params(
         cutoff = ewald_params.real_space_cutoff.item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, accuracy=accuracy,
+            positions,
+            cell,
+            accuracy=accuracy,
             real_space_cutoff=real_space_cutoff,
         )
     else:
@@ -433,7 +434,10 @@ def compute_electrostatics_params(
         cutoff = ewald_params.real_space_cutoff[0].item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, batch_idx, accuracy=accuracy,
+            positions,
+            cell,
+            batch_idx,
+            accuracy=accuracy,
             real_space_cutoff=real_space_cutoff,
         )
 
@@ -554,8 +558,10 @@ def prepare_single_system(
     )
 
     params = compute_electrostatics_params(
-        backend_data, "torch",
-        real_space_cutoff=real_space_cutoff, accuracy=accuracy,
+        backend_data,
+        "torch",
+        real_space_cutoff=real_space_cutoff,
+        accuracy=accuracy,
     )
 
     if build_neighbors:
@@ -581,9 +587,15 @@ def prepare_single_system(
 
     mx_dim, my_dim, mz_dim = params["mesh_dimensions"]
     device_t = cell_t.device
-    miller_xs = torch.fft.fftfreq(mx_dim, d=1.0 / mx_dim, device=device_t, dtype=cell_t.dtype)
-    miller_ys = torch.fft.fftfreq(my_dim, d=1.0 / my_dim, device=device_t, dtype=cell_t.dtype)
-    miller_zs = torch.fft.rfftfreq(mz_dim, d=1.0 / mz_dim, device=device_t, dtype=cell_t.dtype)
+    miller_xs = torch.fft.fftfreq(
+        mx_dim, d=1.0 / mx_dim, device=device_t, dtype=cell_t.dtype
+    )
+    miller_ys = torch.fft.fftfreq(
+        my_dim, d=1.0 / my_dim, device=device_t, dtype=cell_t.dtype
+    )
+    miller_zs = torch.fft.rfftfreq(
+        mz_dim, d=1.0 / mz_dim, device=device_t, dtype=cell_t.dtype
+    )
     moduli_x = _torch_electrostatics.compute_bspline_moduli_1d(miller_xs, mx_dim, 4)
     moduli_y = _torch_electrostatics.compute_bspline_moduli_1d(miller_ys, my_dim, 4)
     moduli_z = _torch_electrostatics.compute_bspline_moduli_1d(miller_zs, mz_dim, 4)
@@ -655,8 +667,10 @@ def prepare_batch_system(
     )
 
     params = compute_electrostatics_params(
-        backend_data, "torch",
-        real_space_cutoff=real_space_cutoff, accuracy=accuracy,
+        backend_data,
+        "torch",
+        real_space_cutoff=real_space_cutoff,
+        accuracy=accuracy,
     )
 
     if build_neighbors:
@@ -674,12 +688,24 @@ def prepare_batch_system(
 
     mx_dim_b, my_dim_b, mz_dim_b = params["mesh_dimensions"]
     device_b = cell_t_b.device
-    miller_xs_b = torch.fft.fftfreq(mx_dim_b, d=1.0 / mx_dim_b, device=device_b, dtype=cell_t_b.dtype)
-    miller_ys_b = torch.fft.fftfreq(my_dim_b, d=1.0 / my_dim_b, device=device_b, dtype=cell_t_b.dtype)
-    miller_zs_b = torch.fft.rfftfreq(mz_dim_b, d=1.0 / mz_dim_b, device=device_b, dtype=cell_t_b.dtype)
-    moduli_x_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_xs_b, mx_dim_b, 4)
-    moduli_y_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_ys_b, my_dim_b, 4)
-    moduli_z_b = _torch_electrostatics.compute_bspline_moduli_1d(miller_zs_b, mz_dim_b, 4)
+    miller_xs_b = torch.fft.fftfreq(
+        mx_dim_b, d=1.0 / mx_dim_b, device=device_b, dtype=cell_t_b.dtype
+    )
+    miller_ys_b = torch.fft.fftfreq(
+        my_dim_b, d=1.0 / my_dim_b, device=device_b, dtype=cell_t_b.dtype
+    )
+    miller_zs_b = torch.fft.rfftfreq(
+        mz_dim_b, d=1.0 / mz_dim_b, device=device_b, dtype=cell_t_b.dtype
+    )
+    moduli_x_b = _torch_electrostatics.compute_bspline_moduli_1d(
+        miller_xs_b, mx_dim_b, 4
+    )
+    moduli_y_b = _torch_electrostatics.compute_bspline_moduli_1d(
+        miller_ys_b, my_dim_b, 4
+    )
+    moduli_z_b = _torch_electrostatics.compute_bspline_moduli_1d(
+        miller_zs_b, mz_dim_b, 4
+    )
 
     return {
         "positions": backend_data["positions"],
@@ -2091,6 +2117,7 @@ def run_benchmark(
             try:
                 # 1) Raw pre-warm — pays warp NVRTC + any cuFFT plan creation.
                 import time as _time
+
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 _t0 = _time.perf_counter()
                 bench_fn()
@@ -2115,6 +2142,7 @@ def run_benchmark(
             # first call separately as a proxy for XLA trace cost.
             try:
                 import time as _time
+
                 # First call: XLA trace + warp NVRTC + GPU kernel
                 _t0 = _time.perf_counter()
                 _res = bench_fn()
@@ -2480,21 +2508,26 @@ def main():
                             try:
                                 if args.backend == "jax":
                                     import jax.numpy as jnp
+
                                     np_data = prepare_system_numpy(size, batch_size=1)
                                     backend_data = convert_to_backend(
                                         np_data, "jax", dtype_str=dtype_str
                                     )
                                     params_data = compute_electrostatics_params(
-                                        backend_data, "jax",
+                                        backend_data,
+                                        "jax",
                                         real_space_cutoff=real_space_cutoff,
                                         accuracy=accuracy,
                                     )
                                     if build_neighbors:
-                                        nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
-                                            compute_neighbor_list(
-                                                backend_data, "jax",
-                                                params_data["cutoff"],
-                                            )
+                                        (
+                                            nl_matrix,
+                                            nl_num_neighbors,
+                                            nl_matrix_shifts,
+                                        ) = compute_neighbor_list(
+                                            backend_data,
+                                            "jax",
+                                            params_data["cutoff"],
                                         )
                                     else:
                                         nl_matrix = None
@@ -2505,15 +2538,41 @@ def main():
                                     if cell_j.ndim == 2:
                                         cell_inv_t_j = cell_inv_j.T
                                     else:
-                                        cell_inv_t_j = jnp.transpose(cell_inv_j, (0, 2, 1))
-                                    volume_j = jnp.abs(jnp.linalg.det(cell_j)).reshape(-1).astype(cell_j.dtype)
-                                    mx_jax, my_jax, mz_jax = params_data["mesh_dimensions"]
-                                    miller_x_j = jnp.fft.fftfreq(mx_jax, d=1.0/mx_jax).astype(cell_j.dtype)
-                                    miller_y_j = jnp.fft.fftfreq(my_jax, d=1.0/my_jax).astype(cell_j.dtype)
-                                    miller_z_j = jnp.fft.rfftfreq(mz_jax, d=1.0/mz_jax).astype(cell_j.dtype)
-                                    moduli_x_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_x_j, mx_jax, 4)
-                                    moduli_y_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_y_j, my_jax, 4)
-                                    moduli_z_j = _jax_electrostatics.compute_bspline_moduli_1d(miller_z_j, mz_jax, 4)
+                                        cell_inv_t_j = jnp.transpose(
+                                            cell_inv_j, (0, 2, 1)
+                                        )
+                                    volume_j = (
+                                        jnp.abs(jnp.linalg.det(cell_j))
+                                        .reshape(-1)
+                                        .astype(cell_j.dtype)
+                                    )
+                                    mx_jax, my_jax, mz_jax = params_data[
+                                        "mesh_dimensions"
+                                    ]
+                                    miller_x_j = jnp.fft.fftfreq(
+                                        mx_jax, d=1.0 / mx_jax
+                                    ).astype(cell_j.dtype)
+                                    miller_y_j = jnp.fft.fftfreq(
+                                        my_jax, d=1.0 / my_jax
+                                    ).astype(cell_j.dtype)
+                                    miller_z_j = jnp.fft.rfftfreq(
+                                        mz_jax, d=1.0 / mz_jax
+                                    ).astype(cell_j.dtype)
+                                    moduli_x_j = (
+                                        _jax_electrostatics.compute_bspline_moduli_1d(
+                                            miller_x_j, mx_jax, 4
+                                        )
+                                    )
+                                    moduli_y_j = (
+                                        _jax_electrostatics.compute_bspline_moduli_1d(
+                                            miller_y_j, my_jax, 4
+                                        )
+                                    )
+                                    moduli_z_j = (
+                                        _jax_electrostatics.compute_bspline_moduli_1d(
+                                            miller_z_j, mz_jax, 4
+                                        )
+                                    )
                                     system_data_cache["ewald_pme"] = {
                                         "positions": backend_data["positions"],
                                         "charges": backend_data["charges"],
@@ -2546,7 +2605,9 @@ def main():
                                 else:
                                     system_data_cache["ewald_pme"] = (
                                         prepare_single_system(
-                                            size, device, dtype,
+                                            size,
+                                            device,
+                                            dtype,
                                             real_space_cutoff=real_space_cutoff,
                                             accuracy=accuracy,
                                             build_neighbors=build_neighbors,
@@ -2672,16 +2733,20 @@ def main():
                                         np_data, "jax", dtype_str=dtype_str
                                     )
                                     params_data = compute_electrostatics_params(
-                                        backend_data, "jax",
+                                        backend_data,
+                                        "jax",
                                         real_space_cutoff=real_space_cutoff,
                                         accuracy=accuracy,
                                     )
                                     if build_neighbors:
-                                        nl_matrix, nl_num_neighbors, nl_matrix_shifts = (
-                                            compute_neighbor_list(
-                                                backend_data, "jax",
-                                                params_data["cutoff"],
-                                            )
+                                        (
+                                            nl_matrix,
+                                            nl_num_neighbors,
+                                            nl_matrix_shifts,
+                                        ) = compute_neighbor_list(
+                                            backend_data,
+                                            "jax",
+                                            params_data["cutoff"],
                                         )
                                     else:
                                         nl_matrix = None
@@ -2715,7 +2780,10 @@ def main():
                                 else:
                                     system_data_cache["ewald_pme"] = (
                                         prepare_batch_system(
-                                            base_size, batch_size, device, dtype,
+                                            base_size,
+                                            batch_size,
+                                            device,
+                                            dtype,
                                             real_space_cutoff=real_space_cutoff,
                                             accuracy=accuracy,
                                             build_neighbors=build_neighbors,

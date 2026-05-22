@@ -28,7 +28,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-import warp as wp
 
 from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     BATCH_BLOCK_SIZE,
