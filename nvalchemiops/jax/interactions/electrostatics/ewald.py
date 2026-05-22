@@ -29,7 +29,6 @@ import math
 import jax
 import jax.numpy as jnp
 import warp as wp
-from warp.jax_experimental import jax_kernel
 
 from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     BATCH_BLOCK_SIZE,
@@ -58,6 +57,9 @@ from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     _ewald_reciprocal_space_virial_kernel_overload,
     _ewald_subtract_self_energy_kernel_overload,
 )
+from nvalchemiops.jax.interactions.electrostatics._lazy_jax_kernels import (
+    make_jax_kernels as _make_jax_kernels,
+)
 from nvalchemiops.jax.interactions.electrostatics.k_vectors import (
     generate_k_vectors_ewald_summation,
 )
@@ -77,12 +79,6 @@ PI = math.pi
 # Helper for Creating JAX Kernel Dictionaries
 # ==============================================================================
 
-# Dtype normalization for kernel lookup
-_DTYPE_MAP = {
-    jnp.float32: jnp.float32,
-    jnp.float64: jnp.float64,
-}
-
 
 def _normalize_dtype(dtype):
     """Normalize dtype for kernel dictionary lookup.
@@ -97,7 +93,6 @@ def _normalize_dtype(dtype):
     jnp.float32 or jnp.float64
         Normalized JAX dtype for kernel lookup.
     """
-    # Convert to JAX dtype if needed
     if dtype == jnp.float32 or str(dtype) == "float32":
         return jnp.float32
     elif dtype == jnp.float64 or str(dtype) == "float64":
@@ -106,37 +101,11 @@ def _normalize_dtype(dtype):
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def _make_jax_kernels(
-    wp_overload_dict: dict,
-    num_outputs: int,
-    in_out_argnames: list[str],
-) -> dict:
-    """Maps a ``jax`` data type to ``warp``.
-
-    Parameters
-    ----------
-    wp_overload_dict : dict
-        Warp kernel overload dictionary keyed by wp.float32/wp.float64.
-    num_outputs : int
-        Number of output arrays returned by the kernel.
-    in_out_argnames : list of str
-        Names of in-place output arguments.
-
-    Returns
-    -------
-    dict
-        Dictionary mapping jnp.float32/jnp.float64 to jax_kernel instances.
-    """
-    _JAX_TO_WP = {jnp.float32: wp.float32, jnp.float64: wp.float64}
-    return {
-        jax_dtype: jax_kernel(
-            wp_overload_dict[wp_dtype],
-            num_outputs=num_outputs,
-            in_out_argnames=in_out_argnames,
-            enable_backward=False,
-        )
-        for jax_dtype, wp_dtype in _JAX_TO_WP.items()
-    }
+# ``_make_jax_kernels`` is imported from ``_lazy_jax_kernels``: it returns a
+# lazy dict whose dtype entries materialize their ``jax_kernel`` wrappers on
+# first ``__getitem__``. Module import is therefore free of FFI work; warp
+# NVRTC compile defers to first launch (same lazy-per-module shape used by
+# ``nvalchemiops.math.spline``).
 
 
 # ==============================================================================

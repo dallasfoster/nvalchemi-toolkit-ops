@@ -13,8 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import tempfile
 
 import pytest
+
+# Set Warp's kernel cache directory to a writable location BEFORE any test
+# (or any module that pulls in Warp) is imported. In sandboxed CI / dev
+# environments the default ``~/.cache/warp`` may be read-only, which would
+# disable kernel caching and surface as ``OSError: Read-only file system``.
+# Using ``os.environ`` here (rather than ``wp.config.kernel_cache_dir``)
+# avoids importing Warp at conftest-collection time.
+_warp_cache_default = os.path.join(
+    os.environ.get("TMPDIR", tempfile.gettempdir()), "warp_test_cache"
+)
+os.environ.setdefault("WARP_CACHE_PATH", _warp_cache_default)
+os.makedirs(os.environ["WARP_CACHE_PATH"], exist_ok=True)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -24,7 +37,7 @@ def set_env_vars():
         old_preallocate = os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]
     else:
         old_preallocate = ""
-    if "XLA_PYTHON_CLIENT_PREALLOCATE" in os.environ:
+    if "XLA_PYTHON_CLIENT_ALLOCATOR" in os.environ:
         old_allocator = os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]
     else:
         old_allocator = ""
@@ -33,3 +46,29 @@ def set_env_vars():
     yield
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = old_allocator
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = old_preallocate
+
+
+@pytest.fixture(autouse=True)
+def _release_gpu_memory():
+    """Drop JAX program cache and CUDA caching allocator pools after each test.
+
+    On unified-memory hardware (e.g. GB10) the platform allocator's per-test
+    allocations otherwise accumulate across a long pytest session until the
+    OOM killer fires. Forcing GC + cache release between tests trades a few
+    ms of per-test overhead (and occasional JIT recompilation if the same
+    shape recurs later in the suite) for stable memory across the run.
+    """
+    yield
+    import gc
+    gc.collect()
+    try:
+        import jax
+        jax.clear_caches()
+    except ImportError:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
