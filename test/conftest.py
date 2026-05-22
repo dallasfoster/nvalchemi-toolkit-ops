@@ -17,12 +17,8 @@ import tempfile
 
 import pytest
 
-# Set Warp's kernel cache directory to a writable location BEFORE any test
-# (or any module that pulls in Warp) is imported. In sandboxed CI / dev
-# environments the default ``~/.cache/warp`` may be read-only, which would
-# disable kernel caching and surface as ``OSError: Read-only file system``.
-# Using ``os.environ`` here (rather than ``wp.config.kernel_cache_dir``)
-# avoids importing Warp at conftest-collection time.
+# Point Warp's kernel cache at $TMPDIR via env-var BEFORE any module
+# imports Warp; the default ~/.cache/warp is read-only in some sandboxes.
 _warp_cache_default = os.path.join(
     os.environ.get("TMPDIR", tempfile.gettempdir()), "warp_test_cache"
 )
