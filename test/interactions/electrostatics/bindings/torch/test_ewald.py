@@ -6877,7 +6877,10 @@ class TestRetainGraph:
         energy.backward()
         grad_second = charges_1.grad.clone()
 
-        torch.testing.assert_close(grad_first, grad_second, rtol=0.0, atol=0.0)
+        # Two backward passes on the same graph should produce the SAME
+        # gradients, but GPU atomic-add ordering is not bit-deterministic
+        # across launches; allow ULP-level fp64 roundoff (~1e-15).
+        torch.testing.assert_close(grad_first, grad_second, rtol=1e-14, atol=1e-14)
 
 
 ###########################################################################################
