@@ -813,8 +813,11 @@ def _tile_to_matrix_kernel(
     side is preloaded into shared memory (atom IDs + 3 position axes)
     once per tile and broadcast across the inner loop over the 32 column
     atoms.  Per-pair distance is computed under triclinic minimum-image
-    PBC; pairs within ``cutoff_sq`` are appended to ``neighbor_matrix``
-    rows of both atoms via atomic increments on ``num_neighbors``.
+    PBC; pairs within ``cutoff_sq`` are appended only to the row-side
+    atom's row of ``neighbor_matrix`` (upper-triangular emission via
+    ``i_sorted < j_sorted``) with an atomic increment on
+    ``num_neighbors[i_orig]``.  Callers that need symmetric per-atom
+    rows must symmetrize after the kernel returns.
 
     Shifts at active slots are written unconditionally; tail slots
     (``column >= num_neighbors[atom]``) are left untouched.  Pair with

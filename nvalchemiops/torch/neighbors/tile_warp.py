@@ -557,7 +557,12 @@ def tile_to_matrix(
     cell_mat, inv_cell_mat = _cell_invcell_from_cell(cell)
     cell_mat = cell_mat.to(sorted_pos_x.dtype)
     inv_cell_mat = inv_cell_mat.to(sorted_pos_x.dtype)
-    n_tiles = int(num_tiles.item())
+    # Clamp ``num_tiles`` to the allocated buffer size: the build kernel
+    # increments the counter unconditionally and only guards the write,
+    # so on under-sized buffers ``num_tiles[0]`` can exceed
+    # ``tile_row_group.shape[0]``.  Reading past that with the consumer
+    # launcher would be an out-of-bounds GPU read.
+    n_tiles = min(int(num_tiles.item()), int(tile_row_group.shape[0]))
     _tile_to_matrix_op(
         cutoff,
         natom,
@@ -658,7 +663,9 @@ def tile_to_coo(
     cell_mat, inv_cell_mat = _cell_invcell_from_cell(cell)
     cell_mat = cell_mat.to(sorted_pos_x.dtype)
     inv_cell_mat = inv_cell_mat.to(sorted_pos_x.dtype)
-    n_tiles = int(num_tiles.item())
+    # See ``tile_to_matrix`` for the rationale on clamping num_tiles to
+    # the allocated tile_row_group size.
+    n_tiles = min(int(num_tiles.item()), int(tile_row_group.shape[0]))
     pair_counter.zero_()
     _tile_to_coo_op(
         cutoff,
