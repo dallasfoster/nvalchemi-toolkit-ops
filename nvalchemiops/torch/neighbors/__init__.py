@@ -38,6 +38,11 @@ from nvalchemiops.torch.neighbors.batch_naive_dual_cutoff import (
     batch_naive_neighbor_list_dual_cutoff,
 )
 
+# Batched cluster-pair tile (tile_warp) functions
+from nvalchemiops.torch.neighbors.batch_tile_warp import (
+    batch_tile_neighbor_list,
+)
+
 # Unbatched cell list functions
 from nvalchemiops.torch.neighbors.cell_list import (
     cell_list,
@@ -55,7 +60,16 @@ from nvalchemiops.torch.neighbors.naive_dual_cutoff import (
 )
 
 # Utility functions
-from nvalchemiops.torch.neighbors.neighbor_utils import prepare_batch_idx_ptr
+from nvalchemiops.torch.neighbors.neighbor_utils import (
+    prepare_batch_idx_ptr,
+    synthesize_cell_for_batch,
+    synthesize_cell_for_ss,
+)
+
+# Unbatched cluster-pair tile (tile_warp) functions
+from nvalchemiops.torch.neighbors.tile_warp import (
+    tile_neighbor_list,
+)
 
 
 def neighbor_list(
@@ -112,7 +126,11 @@ def neighbor_list(
         and only convert to a neighbor list format if absolutely necessary.
     method : str | None, optional
         Method to use for neighbor list computation.
-        Choices: "naive", "cell_list", "batch_naive", "batch_cell_list", "naive_dual_cutoff", "batch_naive_dual_cutoff".
+        Choices: "naive", "cell_list", "tile_warp", "batch_naive",
+        "batch_cell_list", "batch_tile_warp", "naive_dual_cutoff",
+        "batch_naive_dual_cutoff".  The ``tile_warp`` / ``batch_tile_warp``
+        cluster-pair tile path is currently opt-in (not picked by the
+        ``method=None`` auto-rule); set it explicitly when you want it.
         If None, a default method will be chosen based on average atoms per
         system (cell_list when >= 2000, naive otherwise). When only
         ``batch_idx`` is provided (no ``batch_ptr`` or 3-D ``cell``),
@@ -302,14 +320,7 @@ def neighbor_list(
             )
         case "cell_list":
             if cell is None:
-                pos_min = positions.min(dim=0).values
-                positions = positions - pos_min
-                pos_max = positions.max(dim=0).values
-                cell_lengths = pos_max + 0.1 * cutoff
-                cell = torch.diag(cell_lengths).reshape(1, 3, 3)
-                pbc = torch.tensor(
-                    [False, False, False], dtype=torch.bool, device=positions.device
-                )
+                positions, cell, pbc = synthesize_cell_for_ss(positions, cutoff)
             return cell_list(
                 positions,
                 cutoff,
@@ -340,30 +351,8 @@ def neighbor_list(
                     batch_idx, batch_ptr, positions.shape[0], positions.device
                 )
             if cell is None:
-                num_systems = batch_ptr.shape[0] - 1
-                expanded_idx = batch_idx.unsqueeze(1).expand_as(positions)
-                pos_min = torch.full(
-                    (num_systems, 3),
-                    float("inf"),
-                    dtype=positions.dtype,
-                    device=positions.device,
-                )
-                pos_min.scatter_reduce_(0, expanded_idx, positions, reduce="amin")
-                pos_max = torch.full(
-                    (num_systems, 3),
-                    float("-inf"),
-                    dtype=positions.dtype,
-                    device=positions.device,
-                )
-                pos_max.scatter_reduce_(0, expanded_idx, positions, reduce="amax")
-                # TODO: switch to segment_ops once #17 is merged
-                positions = positions - torch.index_select(pos_min, 0, batch_idx)
-                cell_lengths = pos_max - pos_min + 0.1 * cutoff
-                cell = torch.diag_embed(cell_lengths)
-                pbc = torch.zeros(
-                    (num_systems, 3),
-                    dtype=torch.bool,
-                    device=positions.device,
+                positions, cell, pbc = synthesize_cell_for_batch(
+                    positions, batch_idx, batch_ptr, cutoff
                 )
             return batch_cell_list(
                 positions,
@@ -374,6 +363,36 @@ def neighbor_list(
                 half_fill=half_fill,
                 fill_value=fill_value,
                 return_neighbor_list=return_neighbor_list,
+                **kwargs,
+            )
+        case "tile_warp":
+            # format="tile" is reachable only via tile_neighbor_list directly.
+            if cell is None:
+                positions, cell, _pbc = synthesize_cell_for_ss(positions, cutoff)
+            return tile_neighbor_list(
+                positions,
+                cutoff,
+                cell,
+                fill_value=fill_value,
+                format="coo" if return_neighbor_list else "matrix",
+                **kwargs,
+            )
+        case "batch_tile_warp":
+            if batch_idx is None or batch_ptr is None:
+                batch_idx, batch_ptr = prepare_batch_idx_ptr(
+                    batch_idx, batch_ptr, positions.shape[0], positions.device
+                )
+            if cell is None:
+                positions, cell, _pbc = synthesize_cell_for_batch(
+                    positions, batch_idx, batch_ptr, cutoff
+                )
+            return batch_tile_neighbor_list(
+                positions,
+                cutoff,
+                cell,
+                batch_ptr,
+                fill_value=fill_value,
+                format="coo" if return_neighbor_list else "matrix",
                 **kwargs,
             )
         case "naive_dual_cutoff":
@@ -415,10 +434,12 @@ __all__ = [
     "cell_list",
     "naive_neighbor_list",
     "naive_neighbor_list_dual_cutoff",
+    "tile_neighbor_list",
     "estimate_cell_list_sizes",
     # Batched algorithms
     "batch_cell_list",
     "batch_naive_neighbor_list",
     "batch_naive_neighbor_list_dual_cutoff",
+    "batch_tile_neighbor_list",
     "estimate_batch_cell_list_sizes",
 ]

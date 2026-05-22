@@ -24,10 +24,10 @@ from __future__ import annotations
 import importlib
 import warnings
 
-# Warp launchers from batch_cell_list
 from nvalchemiops.neighbors.batch_cell_list import (
     batch_build_cell_list,
     batch_query_cell_list,
+    batch_query_cell_list_pair_centric,
 )
 
 # Warp launchers from batch_naive
@@ -45,7 +45,10 @@ from nvalchemiops.neighbors.batch_naive_dual_cutoff import (
 # Warp launchers from cell_list
 from nvalchemiops.neighbors.cell_list import (
     build_cell_list,
+    make_outer_neigh_offsets,
     query_cell_list,
+    query_cell_list_local_count_sorted,
+    query_cell_list_pair_centric_sorted,
 )
 
 # Warp launchers from naive
@@ -123,11 +126,15 @@ __all__ = [
     "naive_neighbor_matrix",
     "naive_neighbor_matrix_pbc",
     "build_cell_list",
+    "make_outer_neigh_offsets",
     "query_cell_list",
+    "query_cell_list_local_count_sorted",
+    "query_cell_list_pair_centric_sorted",
     "batch_naive_neighbor_matrix",
     "batch_naive_neighbor_matrix_pbc",
     "batch_build_cell_list",
     "batch_query_cell_list",
+    "batch_query_cell_list_pair_centric",
     "naive_neighbor_matrix_dual_cutoff",
     "naive_neighbor_matrix_pbc_dual_cutoff",
     "batch_naive_neighbor_matrix_dual_cutoff",

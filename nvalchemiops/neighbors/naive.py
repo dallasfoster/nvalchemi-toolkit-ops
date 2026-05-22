@@ -542,8 +542,11 @@ def naive_neighbor_matrix(
     """Core warp launcher for naive neighbor matrix construction (no PBC).
 
     Computes pairwise distances and fills the neighbor matrix with atom indices
-    within the cutoff distance using pure warp operations. No periodic boundary
-    conditions are applied.
+    within the cutoff distance.  Internally dispatches between two kernels
+    based on ``device``: a scalar SIMT kernel on CPU and a tile-cooperative
+    kernel on CUDA (``wp.launch_tiled`` with ``block_dim = BLOCK_DIM``
+    cooperatively sweeping the j-loop).  Both produce identical pair sets;
+    per-row ordering within ``neighbor_matrix`` may differ.
 
     Parameters
     ----------
@@ -565,46 +568,86 @@ def naive_neighbor_matrix(
     half_fill : bool, default=False
         If True, only store relationships where i < j to avoid double counting.
         If False, store all neighbor relationships symmetrically.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool, optional
+        When provided, the kernel checks this flag on the GPU and skips work
+        when False (no CPU-GPU sync).
 
     Notes
     -----
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - Output arrays must be pre-allocated by caller.
+    - The CUDA path uses ``wp.launch_tiled(block_dim=BLOCK_DIM)``; Warp forces
+      ``block_dim = 1`` on CPU which would silently break the lane-cooperative
+      partitioning, so CPU callers take the scalar path.
 
     See Also
     --------
     naive_neighbor_matrix_pbc : Version with periodic boundary conditions
-    _fill_naive_neighbor_matrix : Kernel that performs the computation
-    _fill_naive_neighbor_matrix_selective : Selective-skip kernel variant
-    wrap_positions_single : Preprocessing step that wraps positions
+    _fill_naive_neighbor_matrix : Scalar (CPU) kernel
+    _fill_naive_neighbor_matrix_tiled : Tile-cooperative (CUDA) kernel
     """
     total_atoms = positions.shape[0]
+    is_cpu = "cpu" in str(device).lower()
 
+    if is_cpu:
+        if rebuild_flags is None:
+            wp.launch(
+                kernel=_fill_naive_neighbor_matrix_overload[wp_dtype],
+                dim=total_atoms,
+                inputs=[
+                    positions,
+                    wp_dtype(cutoff * cutoff),
+                    neighbor_matrix,
+                    num_neighbors,
+                    half_fill,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                kernel=_fill_naive_neighbor_matrix_selective_overload[wp_dtype],
+                dim=total_atoms,
+                inputs=[
+                    positions,
+                    wp_dtype(cutoff * cutoff),
+                    neighbor_matrix,
+                    num_neighbors,
+                    half_fill,
+                    rebuild_flags,
+                ],
+                device=device,
+            )
+        return
+
+    # CUDA: tile-cooperative kernel.
+    cutoff_sq = wp_dtype(cutoff * cutoff)
     if rebuild_flags is None:
-        wp.launch(
-            kernel=_fill_naive_neighbor_matrix_overload[wp_dtype],
-            dim=total_atoms,
+        wp.launch_tiled(
+            kernel=_fill_naive_neighbor_matrix_tiled_overload[wp_dtype],
+            dim=[total_atoms],
             inputs=[
                 positions,
-                wp_dtype(cutoff * cutoff),
+                cutoff_sq,
                 neighbor_matrix,
                 num_neighbors,
                 half_fill,
             ],
+            block_dim=BLOCK_DIM,
             device=device,
         )
     else:
-        wp.launch(
-            kernel=_fill_naive_neighbor_matrix_selective_overload[wp_dtype],
-            dim=total_atoms,
+        wp.launch_tiled(
+            kernel=_fill_naive_neighbor_matrix_tiled_selective_overload[wp_dtype],
+            dim=[total_atoms],
             inputs=[
                 positions,
-                wp_dtype(cutoff * cutoff),
+                cutoff_sq,
                 neighbor_matrix,
                 num_neighbors,
                 half_fill,
                 rebuild_flags,
             ],
+            block_dim=BLOCK_DIM,
             device=device,
         )
 
@@ -626,8 +669,12 @@ def naive_neighbor_matrix_pbc(
 ) -> None:
     """Core warp launcher for naive neighbor matrix construction with PBC.
 
-    Computes neighbor relationships between atoms across periodic boundaries using
-    pure warp operations.
+    Computes neighbor relationships between atoms across periodic boundaries.
+    Internally dispatches between two kernel families based on ``device``:
+    a scalar SIMT kernel on CPU and a tile-cooperative kernel on CUDA
+    (``wp.launch_tiled`` with ``block_dim = BLOCK_DIM``).  Both produce
+    identical pair sets and shift vectors; per-row ordering inside
+    ``neighbor_matrix`` may differ.
 
     Parameters
     ----------
@@ -664,59 +711,185 @@ def naive_neighbor_matrix_pbc(
     -----
     - This is a low-level warp interface. For framework bindings, use torch/jax wrappers.
     - Output arrays must be pre-allocated by caller.
-    - When ``wrap_positions`` is True, positions are wrapped into the primary cell in a
-      preprocessing step before the neighbor search kernel.
+    - When ``wrap_positions`` is True, positions are wrapped into the primary cell
+      in a preprocessing step before the neighbor search kernel.
+    - The CUDA path additionally caches PBC scratch buffers and skips
+      wrap-recomputation when ``positions``/``cell`` pointers are unchanged.
+    - The CUDA path uses ``wp.launch_tiled(block_dim=BLOCK_DIM)``; CPU is
+      forced to ``block_dim = 1`` by Warp, so CPU callers take the scalar path.
 
     See Also
     --------
     naive_neighbor_matrix : Version without periodic boundary conditions
-    _fill_naive_neighbor_matrix_pbc : Kernel that performs the computation
-    _fill_naive_neighbor_matrix_pbc_selective : Selective-skip kernel variant
+    _fill_naive_neighbor_matrix_pbc : Scalar (CPU) kernel
+    _fill_naive_neighbor_matrix_pbc_tiled : Tile-cooperative (CUDA) kernel
     wrap_positions_single : Preprocessing step that wraps positions
     """
     total_atoms = positions.shape[0]
+    is_cpu = "cpu" in str(device).lower()
 
+    if is_cpu:
+        if wrap_positions:
+            wp_mat_dtype = (
+                wp.mat33f
+                if wp_dtype == wp.float32
+                else wp.mat33d
+                if wp_dtype == wp.float64
+                else wp.mat33h
+                if wp_dtype == wp.float16
+                else None
+            )
+            wp_vec_dtype = (
+                wp.vec3f
+                if wp_dtype == wp.float32
+                else wp.vec3d
+                if wp_dtype == wp.float64
+                else wp.vec3h
+                if wp_dtype == wp.float16
+                else None
+            )
+            inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+            compute_inv_cells(cell, inv_cell, wp_dtype, device)
+            positions_wrapped = wp.empty(
+                (total_atoms,), dtype=wp_vec_dtype, device=device
+            )
+            per_atom_cell_offsets = wp.empty(
+                (total_atoms,), dtype=wp.vec3i, device=device
+            )
+            wrap_positions_single(
+                positions,
+                cell,
+                inv_cell,
+                positions_wrapped,
+                per_atom_cell_offsets,
+                wp_dtype,
+                device,
+            )
+
+            if rebuild_flags is None:
+                wp.launch(
+                    kernel=_fill_naive_neighbor_matrix_pbc_overload[wp_dtype],
+                    dim=(num_shifts, total_atoms),
+                    inputs=[
+                        positions_wrapped,
+                        per_atom_cell_offsets,
+                        wp_dtype(cutoff * cutoff),
+                        cell,
+                        shift_range,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                    ],
+                    device=device,
+                )
+            else:
+                wp.launch(
+                    kernel=_fill_naive_neighbor_matrix_pbc_selective_overload[wp_dtype],
+                    dim=(num_shifts, total_atoms),
+                    inputs=[
+                        positions_wrapped,
+                        per_atom_cell_offsets,
+                        wp_dtype(cutoff * cutoff),
+                        cell,
+                        shift_range,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rebuild_flags,
+                    ],
+                    device=device,
+                )
+        else:
+            if rebuild_flags is None:
+                wp.launch(
+                    kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_overload[
+                        wp_dtype
+                    ],
+                    dim=(num_shifts, total_atoms),
+                    inputs=[
+                        positions,
+                        wp_dtype(cutoff * cutoff),
+                        cell,
+                        shift_range,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                    ],
+                    device=device,
+                )
+            else:
+                wp.launch(
+                    kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_selective_overload[
+                        wp_dtype
+                    ],
+                    dim=(num_shifts, total_atoms),
+                    inputs=[
+                        positions,
+                        wp_dtype(cutoff * cutoff),
+                        cell,
+                        shift_range,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rebuild_flags,
+                    ],
+                    device=device,
+                )
+        return
+
+    # CUDA: tile-cooperative kernel + cached PBC scratch.
+    cutoff_sq = wp_dtype(cutoff * cutoff)
     if wrap_positions:
-        wp_mat_dtype = (
-            wp.mat33f
-            if wp_dtype == wp.float32
-            else wp.mat33d
-            if wp_dtype == wp.float64
-            else wp.mat33h
-            if wp_dtype == wp.float16
-            else None
-        )
-        wp_vec_dtype = (
-            wp.vec3f
-            if wp_dtype == wp.float32
-            else wp.vec3d
-            if wp_dtype == wp.float64
-            else wp.vec3h
-            if wp_dtype == wp.float16
-            else None
-        )
-        inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
-        compute_inv_cells(cell, inv_cell, wp_dtype, device)
-        positions_wrapped = wp.empty((total_atoms,), dtype=wp_vec_dtype, device=device)
-        per_atom_cell_offsets = wp.empty((total_atoms,), dtype=wp.vec3i, device=device)
-        wrap_positions_single(
-            positions,
-            cell,
-            inv_cell,
-            positions_wrapped,
-            per_atom_cell_offsets,
-            wp_dtype,
-            device,
-        )
+        wp_mat_dtype = _MAT_DTYPE[wp_dtype]
+        wp_vec_dtype = _VEC_DTYPE[wp_dtype]
+        cache_key = (total_atoms, wp_dtype, device)
+        cached = _pbc_buffer_cache.get(cache_key)
+        if cached is not None:
+            inv_cell, positions_wrapped, per_atom_cell_offsets = cached
+        else:
+            inv_cell = wp.empty((cell.shape[0],), dtype=wp_mat_dtype, device=device)
+            positions_wrapped = wp.empty(
+                (total_atoms,), dtype=wp_vec_dtype, device=device
+            )
+            per_atom_cell_offsets = wp.empty(
+                (total_atoms,), dtype=wp.vec3i, device=device
+            )
+            _pbc_buffer_cache[cache_key] = (
+                inv_cell,
+                positions_wrapped,
+                per_atom_cell_offsets,
+            )
+
+        # Skip wrap recomputation when positions + cell pointers are unchanged.
+        _pos_id = getattr(positions, "ptr", id(positions))
+        _cell_id = getattr(cell, "ptr", id(cell))
+        wrap_key = (_pos_id, _cell_id, cache_key)
+        if wrap_key not in _pbc_wrap_cache:
+            compute_inv_cells(cell, inv_cell, wp_dtype, device)
+            wrap_positions_single(
+                positions,
+                cell,
+                inv_cell,
+                positions_wrapped,
+                per_atom_cell_offsets,
+                wp_dtype,
+                device,
+            )
+            _pbc_wrap_cache.clear()
+            _pbc_wrap_cache[wrap_key] = True
 
         if rebuild_flags is None:
-            wp.launch(
-                kernel=_fill_naive_neighbor_matrix_pbc_overload[wp_dtype],
-                dim=(num_shifts, total_atoms),
+            wp.launch_tiled(
+                kernel=_fill_naive_neighbor_matrix_pbc_tiled_overload[wp_dtype],
+                dim=[num_shifts, total_atoms],
                 inputs=[
                     positions_wrapped,
                     per_atom_cell_offsets,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     cell,
                     shift_range,
                     neighbor_matrix,
@@ -724,16 +897,19 @@ def naive_neighbor_matrix_pbc(
                     num_neighbors,
                     half_fill,
                 ],
+                block_dim=BLOCK_DIM,
                 device=device,
             )
         else:
-            wp.launch(
-                kernel=_fill_naive_neighbor_matrix_pbc_selective_overload[wp_dtype],
-                dim=(num_shifts, total_atoms),
+            wp.launch_tiled(
+                kernel=_fill_naive_neighbor_matrix_pbc_tiled_selective_overload[
+                    wp_dtype
+                ],
+                dim=[num_shifts, total_atoms],
                 inputs=[
                     positions_wrapped,
                     per_atom_cell_offsets,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     cell,
                     shift_range,
                     neighbor_matrix,
@@ -742,16 +918,19 @@ def naive_neighbor_matrix_pbc(
                     half_fill,
                     rebuild_flags,
                 ],
+                block_dim=BLOCK_DIM,
                 device=device,
             )
     else:
         if rebuild_flags is None:
-            wp.launch(
-                kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_overload[wp_dtype],
-                dim=(num_shifts, total_atoms),
+            wp.launch_tiled(
+                kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_tiled_overload[
+                    wp_dtype
+                ],
+                dim=[num_shifts, total_atoms],
                 inputs=[
                     positions,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     cell,
                     shift_range,
                     neighbor_matrix,
@@ -759,17 +938,18 @@ def naive_neighbor_matrix_pbc(
                     num_neighbors,
                     half_fill,
                 ],
+                block_dim=BLOCK_DIM,
                 device=device,
             )
         else:
-            wp.launch(
-                kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_selective_overload[
+            wp.launch_tiled(
+                kernel=_fill_naive_neighbor_matrix_pbc_prewrapped_tiled_selective_overload[
                     wp_dtype
                 ],
-                dim=(num_shifts, total_atoms),
+                dim=[num_shifts, total_atoms],
                 inputs=[
                     positions,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     cell,
                     shift_range,
                     neighbor_matrix,
@@ -778,5 +958,602 @@ def naive_neighbor_matrix_pbc(
                     half_fill,
                     rebuild_flags,
                 ],
+                block_dim=BLOCK_DIM,
                 device=device,
             )
+
+
+# =============================================================================
+# Tile-cooperative variants
+# =============================================================================
+# The tiled kernels below are CUDA-only — they rely on ``wp.launch_tiled``
+# with ``block_dim = BLOCK_DIM`` threads cooperatively sweeping the j-loop.
+# On CPU, Warp forces ``block_dim = 1``, which would silently break the
+# lane-cooperative work partitioning (only 1/BLOCK_DIM of pairs would be
+# emitted).  The public launchers above branch on ``device`` and pick the
+# scalar kernel on CPU and the tiled kernel on CUDA.
+
+BLOCK_DIM = 64  # threads per block; must be a power of 2.
+
+_VEC_DTYPE = {wp.float32: wp.vec3f, wp.float64: wp.vec3d, wp.float16: wp.vec3h}
+_MAT_DTYPE = {wp.float32: wp.mat33f, wp.float64: wp.mat33d, wp.float16: wp.mat33h}
+
+_pbc_buffer_cache: dict = {}
+_pbc_wrap_cache: dict = {}
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_tiled(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+) -> None:
+    """Tiled naive neighbor matrix kernel (no PBC).
+
+    One block per atom *i*.  Each block cooperatively loads chunks of
+    ``BLOCK_DIM`` candidate j-positions via ``wp.tile_load``, computes
+    distances in SIMT, and uses ``wp.tile_scan_exclusive`` to derive
+    compact write offsets so that only **one** ``wp.atomic_add`` per
+    chunk is needed to claim slots in ``num_neighbors``.
+
+    The kernel has two phases per chunk:
+
+    1. **Tile phase**: cooperative load (``tile_load``), prefix scan
+       (``tile_scan_exclusive``), and count reduction (``tile_sum``).
+    2. **SIMT phase**: per-thread distance check (``wp.dot``), conditional
+       atomic, broadcast via ``wp.tile_extract``, and scatter writes.
+
+    .. note::
+
+       ``wp.tile_map`` with ``@wp.func(dtype=Any)`` does **not** compile
+       in warp ≤ 1.12 because CUDA template deduction cannot resolve the
+       polymorphic function pointer.  The distance check therefore stays
+       in SIMT, bridged by ``wp.untile`` / ``wp.tile``.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j. If False, store both
+        directions (i-side via scan, j-side via per-pair atomic).
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[total_atoms], block_dim=BLOCK_DIM)``
+    - ``wp.tid()`` returns the block index which equals atom *i*.
+    """
+    i = wp.tid()
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+    pos_i = positions[i]
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(i + 1, N, BLOCK_DIM):
+        j_idx = chunk_start + lane
+        safe_idx = wp.min(j_idx, N - 1)
+        pos_j = positions[safe_idx]
+        diff = pos_i - pos_j
+        dist_sq = wp.dot(diff, diff)
+
+        if j_idx < N and dist_sq < cutoff_sq:
+            write_pos = wp.atomic_add(num_neighbors, i, 1)
+            if write_pos < max_nb:
+                neighbor_matrix[i, write_pos] = j_idx
+
+            if not half_fill:
+                rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                if rev_pos < max_nb:
+                    neighbor_matrix[j_idx, rev_pos] = i
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_tiled_selective(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective tiled naive neighbor matrix kernel (no PBC) -- skips when not rebuilding.
+
+    Identical to ``_fill_naive_neighbor_matrix_tiled`` but checks
+    ``rebuild_flags[0]`` on the GPU and returns immediately when False.
+    All threads in the block evaluate the same condition so the early exit
+    is safe with respect to tile-operation convergence requirements.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Atomic coordinates in Cartesian space.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        When False the kernel returns immediately -- no recomputation.
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[total_atoms], block_dim=BLOCK_DIM)``
+    - GPU-side conditional: no CPU-GPU synchronization occurs.
+    """
+    i = wp.tid()
+    if not rebuild_flags[0]:
+        return
+
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+    pos_i = positions[i]
+
+    for chunk_start in range(i + 1, N, BLOCK_DIM):
+        lane = wp.untile(wp.tile_arange(BLOCK_DIM, dtype=wp.int32))
+        j_idx = chunk_start + lane
+        safe_idx = wp.min(j_idx, N - 1)
+        pos_j = positions[safe_idx]
+        diff = pos_i - pos_j
+        dist_sq = wp.dot(diff, diff)
+
+        if j_idx < N and dist_sq < cutoff_sq:
+            write_pos = wp.atomic_add(num_neighbors, i, 1)
+            if write_pos < max_nb:
+                neighbor_matrix[i, write_pos] = j_idx
+
+            if not half_fill:
+                rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                if rev_pos < max_nb:
+                    neighbor_matrix[j_idx, rev_pos] = i
+
+
+# PBC kernels
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_pbc_tiled(
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cutoff_sq: Any,
+    cell: wp.array(dtype=Any),
+    shift_range: wp.array(dtype=wp.vec3i),
+    neighbor_matrix: wp.array2d(dtype=wp.int32),
+    neighbor_matrix_shifts: wp.array2d(dtype=wp.vec3i),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+) -> None:
+    """Tiled naive neighbor matrix kernel with periodic boundary conditions.
+
+    2D launch over ``(num_shifts, total_atoms)``.  Each block handles one
+    ``(shift, iatom)`` pair and cooperatively sweeps j-atoms in chunks of
+    ``BLOCK_DIM``.
+
+    Positions must be pre-wrapped and per-atom cell offsets pre-computed
+    via ``wrap_positions_single`` before calling this kernel.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Assumed to be wrapped into the primary cell.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom (floor of fractional coordinates).
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors.
+    shift_range : wp.array, shape (1,), dtype=wp.vec3i
+        Shift range per dimension for the single system.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Matrix storing shift vectors for each neighbor relationship.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j (within the zero-shift image).
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[num_shifts, total_atoms], block_dim=BLOCK_DIM)``
+    - Shift vectors are decoded on-the-fly via ``_decode_shift_index``.
+    """
+    ishift, iatom = wp.tid()
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    shift = _decode_shift_index(ishift, shift_range[0])
+    _cell = cell[0]
+    pos_i = positions[iatom]
+    int_i = per_atom_cell_offsets[iatom]
+    pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+
+    _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+    j_end = iatom if _zero_shift else N
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(0, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+
+        if j_idx < j_end:
+            pos_j = positions[j_idx]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+            if dist_sq < cutoff_sq:
+                int_j = per_atom_cell_offsets[j_idx]
+                corrected_shift = wp.vec3i(
+                    shift[0] - int_i[0] + int_j[0],
+                    shift[1] - int_i[1] + int_j[1],
+                    shift[2] - int_i[2] + int_j[2],
+                )
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = -corrected_shift
+
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = corrected_shift
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_pbc_tiled_selective(
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cutoff_sq: Any,
+    cell: wp.array(dtype=Any),
+    shift_range: wp.array(dtype=wp.vec3i),
+    neighbor_matrix: wp.array2d(dtype=wp.int32),
+    neighbor_matrix_shifts: wp.array2d(dtype=wp.vec3i),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective tiled PBC naive neighbor matrix kernel -- skips when not rebuilding.
+
+    Identical to ``_fill_naive_neighbor_matrix_pbc_tiled`` but checks
+    ``rebuild_flags[0]`` on the GPU and returns immediately when False.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Assumed to be wrapped into the primary cell.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets for each atom.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors.
+    shift_range : wp.array, shape (1,), dtype=wp.vec3i
+        Shift range per dimension for the single system.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Shift vectors for each neighbor relationship.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        When False the kernel returns immediately.
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[num_shifts, total_atoms], block_dim=BLOCK_DIM)``
+    - GPU-side conditional: no CPU-GPU synchronization occurs.
+    """
+    ishift, iatom = wp.tid()
+    if not rebuild_flags[0]:
+        return
+
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    shift = _decode_shift_index(ishift, shift_range[0])
+    _cell = cell[0]
+    pos_i = positions[iatom]
+    int_i = per_atom_cell_offsets[iatom]
+    pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+
+    _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+    j_end = iatom if _zero_shift else N
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(0, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+
+        if j_idx < j_end:
+            pos_j = positions[j_idx]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+            if dist_sq < cutoff_sq:
+                int_j = per_atom_cell_offsets[j_idx]
+                corrected_shift = wp.vec3i(
+                    shift[0] - int_i[0] + int_j[0],
+                    shift[1] - int_i[1] + int_j[1],
+                    shift[2] - int_i[2] + int_j[2],
+                )
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = -corrected_shift
+
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = corrected_shift
+
+
+# Pre-wrapped PBC kernels
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_pbc_prewrapped_tiled(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    cell: wp.array(dtype=Any),
+    shift_range: wp.array(dtype=wp.vec3i),
+    neighbor_matrix: wp.array2d(dtype=wp.int32),
+    neighbor_matrix_shifts: wp.array2d(dtype=wp.vec3i),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+) -> None:
+    """Tiled PBC neighbor matrix for pre-wrapped positions (no cell-offset correction).
+
+    Same as ``_fill_naive_neighbor_matrix_pbc_tiled`` but assumes positions
+    are already wrapped and shifts are used directly without correcting for
+    per-atom cell offsets.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Pre-wrapped atomic coordinates in Cartesian space.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors.
+    shift_range : wp.array, shape (1,), dtype=wp.vec3i
+        Shift range per dimension for the single system.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Matrix storing shift vectors for each neighbor relationship.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j (within the zero-shift image).
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[num_shifts, total_atoms], block_dim=BLOCK_DIM)``
+    """
+    ishift, iatom = wp.tid()
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    shift = _decode_shift_index(ishift, shift_range[0])
+    _cell = cell[0]
+    pos_i = positions[iatom]
+    pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+
+    _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+    j_end = iatom if _zero_shift else N
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(0, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+
+        if j_idx < j_end:
+            pos_j = positions[j_idx]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+            if dist_sq < cutoff_sq:
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = shift
+
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = -shift
+
+
+@wp.kernel(enable_backward=False, module="naive_tiled")
+def _fill_naive_neighbor_matrix_pbc_prewrapped_tiled_selective(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    cell: wp.array(dtype=Any),
+    shift_range: wp.array(dtype=wp.vec3i),
+    neighbor_matrix: wp.array2d(dtype=wp.int32),
+    neighbor_matrix_shifts: wp.array2d(dtype=wp.vec3i),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective tiled PBC kernel for pre-wrapped positions -- skips when not rebuilding.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Pre-wrapped atomic coordinates in Cartesian space.
+    cutoff_sq : float
+        Squared cutoff distance for neighbor detection.
+    cell : wp.array, shape (1,), dtype=wp.mat33*
+        Cell matrix defining lattice vectors.
+    shift_range : wp.array, shape (1,), dtype=wp.vec3i
+        Shift range per dimension for the single system.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix to be filled with neighbor atom indices.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Shift vectors for each neighbor relationship.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Number of neighbors found for each atom.
+    half_fill : wp.bool
+        If True, only store pairs where i < j.
+    rebuild_flags : wp.array, shape (1,), dtype=wp.bool
+        When False the kernel returns immediately.
+
+    Notes
+    -----
+    - Launch: ``wp.launch_tiled(dim=[num_shifts, total_atoms], block_dim=BLOCK_DIM)``
+    - GPU-side conditional: no CPU-GPU synchronization occurs.
+    """
+    ishift, iatom = wp.tid()
+    if not rebuild_flags[0]:
+        return
+
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    shift = _decode_shift_index(ishift, shift_range[0])
+    _cell = cell[0]
+    pos_i = positions[iatom]
+    pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+
+    _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+    j_end = iatom if _zero_shift else N
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(0, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+
+        if j_idx < j_end:
+            pos_j = positions[j_idx]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+            if dist_sq < cutoff_sq:
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = shift
+
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = -shift
+
+
+# Overload dicts
+
+T = [wp.float32, wp.float64, wp.float16]
+V = [wp.vec3f, wp.vec3d, wp.vec3h]
+M = [wp.mat33f, wp.mat33d, wp.mat33h]
+
+# Non-PBC overloads
+_fill_naive_neighbor_matrix_tiled_overload = {}
+_fill_naive_neighbor_matrix_tiled_selective_overload = {}
+
+# PBC overloads (with cell-offset correction)
+_fill_naive_neighbor_matrix_pbc_tiled_overload = {}
+_fill_naive_neighbor_matrix_pbc_tiled_selective_overload = {}
+
+# PBC pre-wrapped overloads (no cell-offset correction)
+_fill_naive_neighbor_matrix_pbc_prewrapped_tiled_overload = {}
+_fill_naive_neighbor_matrix_pbc_prewrapped_tiled_selective_overload = {}
+
+for t, v, m in zip(T, V, M):
+    _fill_naive_neighbor_matrix_tiled_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_tiled,
+        [
+            wp.array(dtype=v),
+            t,
+            wp.array2d(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+        ],
+    )
+    _fill_naive_neighbor_matrix_tiled_selective_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_tiled_selective,
+        [
+            wp.array(dtype=v),
+            t,
+            wp.array2d(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+    _fill_naive_neighbor_matrix_pbc_tiled_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_pbc_tiled,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
+            t,
+            wp.array(dtype=m),
+            wp.array(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+        ],
+    )
+    _fill_naive_neighbor_matrix_pbc_tiled_selective_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_pbc_tiled_selective,
+        [
+            wp.array(dtype=v),
+            wp.array(dtype=wp.vec3i),
+            t,
+            wp.array(dtype=m),
+            wp.array(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+    _fill_naive_neighbor_matrix_pbc_prewrapped_tiled_overload[t] = wp.overload(
+        _fill_naive_neighbor_matrix_pbc_prewrapped_tiled,
+        [
+            wp.array(dtype=v),
+            t,
+            wp.array(dtype=m),
+            wp.array(dtype=wp.vec3i),
+            wp.array2d(dtype=wp.int32),
+            wp.array2d(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+        ],
+    )
+    _fill_naive_neighbor_matrix_pbc_prewrapped_tiled_selective_overload[t] = (
+        wp.overload(
+            _fill_naive_neighbor_matrix_pbc_prewrapped_tiled_selective,
+            [
+                wp.array(dtype=v),
+                t,
+                wp.array(dtype=m),
+                wp.array(dtype=wp.vec3i),
+                wp.array2d(dtype=wp.int32),
+                wp.array2d(dtype=wp.vec3i),
+                wp.array(dtype=wp.int32),
+                wp.bool,
+                wp.array(dtype=wp.bool),
+            ],
+        )
+    )

@@ -753,26 +753,81 @@ def batch_naive_neighbor_matrix(
     See Also
     --------
     batch_naive_neighbor_matrix_pbc : Version with periodic boundary conditions
-    _fill_batch_naive_neighbor_matrix : Kernel that performs the computation
-    _fill_batch_naive_neighbor_matrix_selective : Selective-skip kernel variant
+    _fill_batch_naive_neighbor_matrix : Scalar (CPU) kernel
+    _fill_batch_naive_neighbor_matrix_tiled : Tile-cooperative (CUDA) kernel
+
+    Notes
+    -----
+    Dispatches internally:
+
+    - On CPU, always uses the scalar kernel (Warp forces ``block_dim=1`` on CPU).
+    - On CUDA, uses the tile-cooperative kernel when the adaptive ``use_tiled``
+      heuristic favors it (``total_atoms >= 256 * num_systems`` with a tighter
+      threshold above 12 288 atoms), otherwise falls back to the scalar kernel.
     """
     total_atoms = positions.shape[0]
+    cutoff_sq = wp_dtype(cutoff * cutoff)
+    is_cpu = "cpu" in str(device).lower()
+
+    if is_cpu or total_atoms < 2048:
+        use_tiled = False
+    else:
+        num_systems = batch_ptr.shape[0] - 1
+        use_tiled = total_atoms >= 256 * num_systems
+        if use_tiled and total_atoms > 12288:
+            use_tiled = total_atoms >= 512 * num_systems
 
     if rebuild_flags is not None:
         selective_zero_num_neighbors(num_neighbors, batch_idx, rebuild_flags, device)
-        wp.launch(
-            kernel=_fill_batch_naive_neighbor_matrix_selective_overload[wp_dtype],
-            dim=total_atoms,
+        if use_tiled:
+            wp.launch_tiled(
+                kernel=_fill_batch_naive_neighbor_matrix_tiled_selective_overload[
+                    wp_dtype
+                ],
+                dim=[total_atoms],
+                inputs=[
+                    positions,
+                    cutoff_sq,
+                    batch_idx,
+                    batch_ptr,
+                    neighbor_matrix,
+                    num_neighbors,
+                    half_fill,
+                    rebuild_flags,
+                ],
+                block_dim=BLOCK_DIM,
+                device=device,
+            )
+        else:
+            wp.launch(
+                kernel=_fill_batch_naive_neighbor_matrix_selective_overload[wp_dtype],
+                dim=total_atoms,
+                inputs=[
+                    positions,
+                    cutoff_sq,
+                    batch_idx,
+                    batch_ptr,
+                    neighbor_matrix,
+                    num_neighbors,
+                    half_fill,
+                    rebuild_flags,
+                ],
+                device=device,
+            )
+    elif use_tiled:
+        wp.launch_tiled(
+            kernel=_fill_batch_naive_neighbor_matrix_tiled_overload[wp_dtype],
+            dim=[total_atoms],
             inputs=[
                 positions,
-                wp_dtype(cutoff * cutoff),
+                cutoff_sq,
                 batch_idx,
                 batch_ptr,
                 neighbor_matrix,
                 num_neighbors,
                 half_fill,
-                rebuild_flags,
             ],
+            block_dim=BLOCK_DIM,
             device=device,
         )
     else:
@@ -781,7 +836,7 @@ def batch_naive_neighbor_matrix(
             dim=total_atoms,
             inputs=[
                 positions,
-                wp_dtype(cutoff * cutoff),
+                cutoff_sq,
                 batch_idx,
                 batch_ptr,
                 neighbor_matrix,
@@ -863,12 +918,28 @@ def batch_naive_neighbor_matrix_pbc(
     See Also
     --------
     batch_naive_neighbor_matrix : Version without periodic boundary conditions
-    _fill_batch_naive_neighbor_matrix_pbc : Kernel that performs the computation
-    _fill_batch_naive_neighbor_matrix_pbc_selective : Selective-skip kernel variant
+    _fill_batch_naive_neighbor_matrix_pbc : Scalar (CPU) PBC kernel
+    _fill_batch_naive_neighbor_matrix_pbc_tiled : Tile-cooperative (CUDA) PBC kernel
     wrap_positions_batch : Preprocessing step that wraps positions
+
+    Notes
+    -----
+    Dispatches internally:
+
+    - On CPU, always uses the scalar 3D-launch kernels (Warp forces
+      ``block_dim=1`` on CPU).
+    - On CUDA with ``wrap_positions=True``, uses the tile-cooperative kernel
+      when the adaptive ``use_tiled`` heuristic favors it
+      (``256 <= avg_atoms_per_system < 6144`` and either
+      ``avg_atoms_per_system >= 2048`` or ``total_atoms <= 8192``), otherwise
+      falls back to the scalar 3D-launch kernel.
+    - When ``wrap_positions=False`` the prewrapped scalar kernels are used on
+      both devices (no tiled prewrapped variant).
     """
     total_atoms = positions.shape[0]
     num_systems = cell.shape[0]
+    cutoff_sq = wp_dtype(cutoff * cutoff)
+    is_cpu = "cpu" in str(device).lower()
 
     if wrap_positions:
         wp_mat_dtype = (
@@ -904,20 +975,74 @@ def batch_naive_neighbor_matrix_pbc(
             device,
         )
 
+        if is_cpu:
+            use_tiled = False
+        else:
+            avg_atoms_per_system = total_atoms // max(num_systems, 1)
+            use_tiled = 256 <= avg_atoms_per_system < 6144 and (
+                avg_atoms_per_system >= 2048 or total_atoms <= 8192
+            )
+
         if rebuild_flags is not None:
             selective_zero_num_neighbors(
                 num_neighbors, batch_idx, rebuild_flags, device
             )
-            wp.launch(
-                kernel=_fill_batch_naive_neighbor_matrix_pbc_selective_overload[
-                    wp_dtype
-                ],
-                dim=(num_systems, max_shifts_per_system, max_atoms_per_system),
+            if use_tiled:
+                wp.launch_tiled(
+                    kernel=_fill_batch_naive_neighbor_matrix_pbc_tiled_selective_overload[
+                        wp_dtype
+                    ],
+                    dim=[total_atoms],
+                    inputs=[
+                        positions_wrapped,
+                        per_atom_cell_offsets,
+                        cell,
+                        cutoff_sq,
+                        batch_idx,
+                        batch_ptr,
+                        shift_range,
+                        num_shifts_arr,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rebuild_flags,
+                    ],
+                    block_dim=BLOCK_DIM,
+                    device=device,
+                )
+            else:
+                wp.launch(
+                    kernel=_fill_batch_naive_neighbor_matrix_pbc_selective_overload[
+                        wp_dtype
+                    ],
+                    dim=(num_systems, max_shifts_per_system, max_atoms_per_system),
+                    inputs=[
+                        positions_wrapped,
+                        per_atom_cell_offsets,
+                        cell,
+                        cutoff_sq,
+                        batch_ptr,
+                        shift_range,
+                        num_shifts_arr,
+                        neighbor_matrix,
+                        neighbor_matrix_shifts,
+                        num_neighbors,
+                        half_fill,
+                        rebuild_flags,
+                    ],
+                    device=device,
+                )
+        elif use_tiled:
+            wp.launch_tiled(
+                kernel=_fill_batch_naive_neighbor_matrix_pbc_tiled_overload[wp_dtype],
+                dim=[total_atoms],
                 inputs=[
                     positions_wrapped,
                     per_atom_cell_offsets,
                     cell,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
+                    batch_idx,
                     batch_ptr,
                     shift_range,
                     num_shifts_arr,
@@ -925,8 +1050,8 @@ def batch_naive_neighbor_matrix_pbc(
                     neighbor_matrix_shifts,
                     num_neighbors,
                     half_fill,
-                    rebuild_flags,
                 ],
+                block_dim=BLOCK_DIM,
                 device=device,
             )
         else:
@@ -937,7 +1062,7 @@ def batch_naive_neighbor_matrix_pbc(
                     positions_wrapped,
                     per_atom_cell_offsets,
                     cell,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     batch_ptr,
                     shift_range,
                     num_shifts_arr,
@@ -961,7 +1086,7 @@ def batch_naive_neighbor_matrix_pbc(
                 inputs=[
                     positions,
                     cell,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     batch_ptr,
                     shift_range,
                     num_shifts_arr,
@@ -982,7 +1107,7 @@ def batch_naive_neighbor_matrix_pbc(
                 inputs=[
                     positions,
                     cell,
-                    wp_dtype(cutoff * cutoff),
+                    cutoff_sq,
                     batch_ptr,
                     shift_range,
                     num_shifts_arr,
@@ -993,3 +1118,385 @@ def batch_naive_neighbor_matrix_pbc(
                 ],
                 device=device,
             )
+
+
+# =============================================================================
+# Tile-cooperative variants
+# =============================================================================
+# The tiled kernels below are CUDA-only -- they rely on ``wp.launch_tiled``
+# with ``block_dim = BLOCK_DIM`` threads cooperatively sweeping the j-loop.
+# On CPU, Warp forces ``block_dim = 1``, which would silently break the
+# lane-cooperative work partitioning.  The public launchers above branch on
+# ``device`` and pick the scalar kernel on CPU and the tiled kernel on CUDA.
+
+BLOCK_DIM = 64  # threads per block; must be a power of 2.
+
+
+@wp.kernel(enable_backward=False, module="batch_naive_tiled")
+def _fill_batch_naive_neighbor_matrix_tiled(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+) -> None:
+    """Tiled batched naive neighbor matrix kernel (no PBC).
+
+    One block per atom *i*; ``BLOCK_DIM`` threads cooperatively sweep the
+    j-loop in chunks.  Each lane checks its own j-atom and emits via
+    per-pair atomics; the j-side mirror atomic is skipped when ``half_fill``.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Concatenated Cartesian coordinates for all systems.
+    cutoff_sq : float
+        Squared cutoff distance.
+    batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+        System index for each atom.
+    batch_ptr : wp.array, shape (num_systems + 1,), dtype=wp.int32
+        Cumulative atom counts.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Per-atom neighbor counts.
+    half_fill : wp.bool
+        If True, only store pairs where i < j.
+    """
+    i = wp.tid()
+    isys = batch_idx[i]
+    j_end = batch_ptr[isys + 1]
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+    pos_i = positions[i]
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(i + 1, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+        safe_idx = wp.min(j_idx, N - 1)
+        pos_j = positions[safe_idx]
+        diff = pos_i - pos_j
+        dist_sq = wp.dot(diff, diff)
+
+        if j_idx < j_end and dist_sq < cutoff_sq:
+            write_pos = wp.atomic_add(num_neighbors, i, 1)
+            if write_pos < max_nb:
+                neighbor_matrix[i, write_pos] = j_idx
+
+            if not half_fill:
+                rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                if rev_pos < max_nb:
+                    neighbor_matrix[j_idx, rev_pos] = i
+
+
+@wp.kernel(enable_backward=False, module="batch_naive_tiled")
+def _fill_batch_naive_neighbor_matrix_tiled_selective(
+    positions: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective tiled batched naive neighbor matrix kernel (no PBC).
+
+    Identical to ``_fill_batch_naive_neighbor_matrix_tiled`` but skips
+    atoms whose system has ``rebuild_flags[isys] == False``.
+
+    Parameters
+    ----------
+    positions, cutoff_sq, batch_idx, batch_ptr, neighbor_matrix,
+    num_neighbors, half_fill :
+        Same as ``_fill_batch_naive_neighbor_matrix_tiled``.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags.
+    """
+    i = wp.tid()
+    isys = batch_idx[i]
+    if not rebuild_flags[isys]:
+        return
+
+    j_end = batch_ptr[isys + 1]
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+    pos_i = positions[i]
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for chunk_start in range(i + 1, j_end, BLOCK_DIM):
+        j_idx = chunk_start + lane
+        safe_idx = wp.min(j_idx, N - 1)
+        pos_j = positions[safe_idx]
+        diff = pos_i - pos_j
+        dist_sq = wp.dot(diff, diff)
+
+        if j_idx < j_end and dist_sq < cutoff_sq:
+            write_pos = wp.atomic_add(num_neighbors, i, 1)
+            if write_pos < max_nb:
+                neighbor_matrix[i, write_pos] = j_idx
+
+            if not half_fill:
+                rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                if rev_pos < max_nb:
+                    neighbor_matrix[j_idx, rev_pos] = i
+
+
+@wp.kernel(enable_backward=False, module="batch_naive_tiled")
+def _fill_batch_naive_neighbor_matrix_pbc_tiled(
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cell: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    shift_range: wp.array(dtype=wp.vec3i),
+    num_shifts_arr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+) -> None:
+    """Tiled batched naive neighbor matrix kernel with PBC.
+
+    One block per atom *i*; ``BLOCK_DIM`` threads cooperatively sweep the
+    j-loop for each periodic shift.  Zero-shift restricts j < i to avoid
+    self-pairing; nonzero shifts sweep the full system range.
+
+    Parameters
+    ----------
+    positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+        Wrapped Cartesian coordinates.
+    per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+        Integer cell offsets from wrapping.
+    cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+        Per-system cell matrices.
+    cutoff_sq : float
+        Squared cutoff distance.
+    batch_idx, batch_ptr :
+        System index and atom-range arrays.
+    shift_range : wp.array, shape (num_systems,), dtype=wp.vec3i
+        Per-system shift ranges.
+    num_shifts_arr : wp.array, shape (num_systems,), dtype=wp.int32
+        Per-system shift counts.
+    neighbor_matrix : wp.array, shape (total_atoms, max_neighbors), dtype=wp.int32
+        OUTPUT: Neighbor matrix.
+    neighbor_matrix_shifts : wp.array, shape (total_atoms, max_neighbors), dtype=wp.vec3i
+        OUTPUT: Shift vector for each neighbor.
+    num_neighbors : wp.array, shape (total_atoms,), dtype=wp.int32
+        OUTPUT: Per-atom neighbor counts.
+    half_fill : wp.bool
+        If True, only emit i→j (skip mirror j→i).
+    """
+    iatom = wp.tid()
+    isys = batch_idx[iatom]
+    j_start = batch_ptr[isys]
+    j_end = batch_ptr[isys + 1]
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    _cell = cell[isys]
+    pos_i = positions[iatom]
+    int_i = per_atom_cell_offsets[iatom]
+    n_shifts = num_shifts_arr[isys]
+    _shift_range = shift_range[isys]
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for ishift in range(n_shifts):
+        shift = _decode_shift_index(ishift, _shift_range)
+
+        pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+        _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+        _j_end = iatom if _zero_shift else j_end
+
+        for chunk_start in range(j_start, _j_end, BLOCK_DIM):
+            j_idx = chunk_start + lane
+            safe_j = wp.min(j_idx, N - 1)
+            pos_j = positions[safe_j]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+
+            if j_idx < _j_end and dist_sq < cutoff_sq:
+                int_j = per_atom_cell_offsets[j_idx]
+                corrected_shift = wp.vec3i(
+                    shift[0] - int_i[0] + int_j[0],
+                    shift[1] - int_i[1] + int_j[1],
+                    shift[2] - int_i[2] + int_j[2],
+                )
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = corrected_shift
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = -corrected_shift
+
+
+@wp.kernel(enable_backward=False, module="batch_naive_tiled")
+def _fill_batch_naive_neighbor_matrix_pbc_tiled_selective(
+    positions: wp.array(dtype=Any),
+    per_atom_cell_offsets: wp.array(dtype=wp.vec3i),
+    cell: wp.array(dtype=Any),
+    cutoff_sq: Any,
+    batch_idx: wp.array(dtype=wp.int32),
+    batch_ptr: wp.array(dtype=wp.int32),
+    shift_range: wp.array(dtype=wp.vec3i),
+    num_shifts_arr: wp.array(dtype=wp.int32),
+    neighbor_matrix: wp.array(dtype=wp.int32, ndim=2),
+    neighbor_matrix_shifts: wp.array(dtype=wp.vec3i, ndim=2),
+    num_neighbors: wp.array(dtype=wp.int32),
+    half_fill: wp.bool,
+    rebuild_flags: wp.array(dtype=wp.bool),
+) -> None:
+    """Selective tiled batched naive neighbor matrix kernel with PBC.
+
+    Identical to ``_fill_batch_naive_neighbor_matrix_pbc_tiled`` but skips
+    atoms whose system has ``rebuild_flags[isys] == False``.
+
+    Parameters
+    ----------
+    See ``_fill_batch_naive_neighbor_matrix_pbc_tiled``.
+    rebuild_flags : wp.array, shape (num_systems,), dtype=wp.bool
+        Per-system rebuild flags.
+    """
+    iatom = wp.tid()
+    isys = batch_idx[iatom]
+    if not rebuild_flags[isys]:
+        return
+
+    j_start = batch_ptr[isys]
+    j_end = batch_ptr[isys + 1]
+    N = positions.shape[0]
+    max_nb = neighbor_matrix.shape[1]
+
+    _cell = cell[isys]
+    pos_i = positions[iatom]
+    int_i = per_atom_cell_offsets[iatom]
+    n_shifts = num_shifts_arr[isys]
+    _shift_range = shift_range[isys]
+
+    lane_tile = wp.tile_arange(BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+
+    for ishift in range(n_shifts):
+        shift = _decode_shift_index(ishift, _shift_range)
+
+        pos_i_shifted = type(_cell[0])(shift) * _cell + pos_i
+        _zero_shift = shift[0] == 0 and shift[1] == 0 and shift[2] == 0
+        _j_end = iatom if _zero_shift else j_end
+
+        base_shift = wp.vec3i(
+            shift[0] - int_i[0],
+            shift[1] - int_i[1],
+            shift[2] - int_i[2],
+        )
+
+        for chunk_start in range(j_start, _j_end, BLOCK_DIM):
+            j_idx = chunk_start + lane
+            safe_j = wp.min(j_idx, N - 1)
+            pos_j = positions[safe_j]
+            diff = pos_i_shifted - pos_j
+            dist_sq = wp.dot(diff, diff)
+
+            if j_idx < _j_end and dist_sq < cutoff_sq:
+                int_j = per_atom_cell_offsets[j_idx]
+                corrected_shift = wp.vec3i(
+                    base_shift[0] + int_j[0],
+                    base_shift[1] + int_j[1],
+                    base_shift[2] + int_j[2],
+                )
+                write_pos = wp.atomic_add(num_neighbors, iatom, 1)
+                if write_pos < max_nb:
+                    neighbor_matrix[iatom, write_pos] = j_idx
+                    neighbor_matrix_shifts[iatom, write_pos] = corrected_shift
+                if not half_fill:
+                    rev_pos = wp.atomic_add(num_neighbors, j_idx, 1)
+                    if rev_pos < max_nb:
+                        neighbor_matrix[j_idx, rev_pos] = iatom
+                        neighbor_matrix_shifts[j_idx, rev_pos] = -corrected_shift
+
+
+# Tiled kernel overload tables
+_T = [wp.float32, wp.float64, wp.float16]
+_V = [wp.vec3f, wp.vec3d, wp.vec3h]
+_M = [wp.mat33f, wp.mat33d, wp.mat33h]
+
+_fill_batch_naive_neighbor_matrix_tiled_overload = {}
+_fill_batch_naive_neighbor_matrix_tiled_selective_overload = {}
+
+for _t, _v in zip(_T, _V):
+    _fill_batch_naive_neighbor_matrix_tiled_overload[_t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_tiled,
+        [
+            wp.array(dtype=_v),
+            _t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+        ],
+    )
+    _fill_batch_naive_neighbor_matrix_tiled_selective_overload[_t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_tiled_selective,
+        [
+            wp.array(dtype=_v),
+            _t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )
+
+_fill_batch_naive_neighbor_matrix_pbc_tiled_overload = {}
+_fill_batch_naive_neighbor_matrix_pbc_tiled_selective_overload = {}
+
+for _t, _v, _m in zip(_T, _V, _M):
+    _fill_batch_naive_neighbor_matrix_pbc_tiled_overload[_t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_pbc_tiled,
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=_m),
+            _t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.vec3i, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+        ],
+    )
+    _fill_batch_naive_neighbor_matrix_pbc_tiled_selective_overload[_t] = wp.overload(
+        _fill_batch_naive_neighbor_matrix_pbc_tiled_selective,
+        [
+            wp.array(dtype=_v),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=_m),
+            _t,
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.vec3i),
+            wp.array(dtype=wp.int32),
+            wp.array(dtype=wp.int32, ndim=2),
+            wp.array(dtype=wp.vec3i, ndim=2),
+            wp.array(dtype=wp.int32),
+            wp.bool,
+            wp.array(dtype=wp.bool),
+        ],
+    )

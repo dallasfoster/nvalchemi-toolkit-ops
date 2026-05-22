@@ -202,6 +202,44 @@ def _decode_shift_index(local_idx: int, shift_range: wp.vec3i) -> wp.vec3i:
 
 
 @wp.func
+def _decode_full_shift_index(local_idx: int, shift_range: wp.vec3i) -> wp.vec3i:
+    """Decode a flat full-shell index into ``(kx, ky, kz)``, excluding ``(0, 0, 0)``.
+
+    Companion to :func:`_decode_shift_index`.  Enumerates the FULL sphere
+    of shift vectors at radius ``shift_range`` (not the half-shell), in
+    the natural Cartesian order (``k0`` outer, ``k2`` inner), skipping the
+    self entry at the centre.
+
+    Parameters
+    ----------
+    local_idx : int
+        Zero-based index in ``[0, (2*Rx+1)*(2*Ry+1)*(2*Rz+1) - 1)``.
+    shift_range : wp.vec3i
+        Per-axis radius ``(Rx, Ry, Rz)``.
+
+    Returns
+    -------
+    wp.vec3i
+        The integer lattice shift vector ``(kx, ky, kz)`` with
+        ``-Rx <= kx <= Rx`` etc., and never ``(0, 0, 0)``.
+    """
+    k1_size = 2 * shift_range[1] + 1
+    k2_size = 2 * shift_range[2] + 1
+    plane = k1_size * k2_size
+    self_pos = shift_range[0] * plane + shift_range[1] * k2_size + shift_range[2]
+
+    raw_idx = local_idx
+    if local_idx >= self_pos:
+        raw_idx = local_idx + 1
+
+    k0 = raw_idx / plane - shift_range[0]
+    rem = raw_idx % plane
+    k1 = rem / k2_size - shift_range[1]
+    k2 = rem % k2_size - shift_range[2]
+    return wp.vec3i(k0, k1, k2)
+
+
+@wp.func
 def _update_neighbor_matrix(
     i: int,
     j: int,
@@ -1141,5 +1179,213 @@ def update_ref_positions_batch(
         kernel=_update_ref_positions_batch_overload[wp_dtype],
         dim=total_atoms,
         inputs=[positions, rebuild_flags, batch_idx, ref_positions],
+        device=device,
+    )
+
+
+# =============================================================================
+# Fused gather kernels for cell-list pair-centric layout
+# =============================================================================
+@wp.kernel(enable_backward=False)
+def _gather_positions_and_shifts_f32(
+    src_pos: wp.array(dtype=wp.vec3f),
+    src_shifts: wp.array(dtype=wp.vec3i),
+    perm: wp.array(dtype=wp.int32),
+    dst_pos: wp.array(dtype=wp.vec3f),
+    dst_shifts: wp.array(dtype=wp.vec3i),
+):
+    """Fused gather of positions and shifts under a permutation (f32 variant).
+
+    Writes ``dst_pos[i] = src_pos[perm[i]]`` and
+    ``dst_shifts[i] = src_shifts[perm[i]]`` for the float32 position
+    type.  Used by the cell-list pair-centric path to reorder per-atom
+    arrays into cell-contiguous layout for coalesced inner-loop reads.
+
+    Parameters
+    ----------
+    src_pos : wp.array, shape (N,), dtype=wp.vec3f
+        Source positions in original order.
+    src_shifts : wp.array, shape (N,), dtype=wp.vec3i
+        Source per-atom integer PBC shift vectors in original order.
+    perm : wp.array, shape (N,), dtype=wp.int32
+        Permutation ``perm[i]`` = source index for output slot ``i``.
+    dst_pos : wp.array, shape (N,), dtype=wp.vec3f
+        OUTPUT: gathered positions.
+    dst_shifts : wp.array, shape (N,), dtype=wp.vec3i
+        OUTPUT: gathered shifts.
+
+    Returns
+    -------
+    None
+        This function modifies the input arrays in-place:
+
+        - dst_pos : Filled with permuted positions
+        - dst_shifts : Filled with permuted shifts
+
+    Notes
+    -----
+    - Thread launch: one thread per output slot (dim=N).
+
+    See Also
+    --------
+    _gather_positions_and_shifts_f64 : Float64 variant
+    gather_fused_overload : Dtype dispatch table
+    """
+    i = wp.tid()
+    idx = perm[i]
+    dst_pos[i] = src_pos[idx]
+    dst_shifts[i] = src_shifts[idx]
+
+
+@wp.kernel(enable_backward=False)
+def _gather_positions_and_shifts_f64(
+    src_pos: wp.array(dtype=wp.vec3d),
+    src_shifts: wp.array(dtype=wp.vec3i),
+    perm: wp.array(dtype=wp.int32),
+    dst_pos: wp.array(dtype=wp.vec3d),
+    dst_shifts: wp.array(dtype=wp.vec3i),
+):
+    """Fused gather of positions and shifts under a permutation (f64 variant).
+
+    Float64 counterpart of :func:`_gather_positions_and_shifts_f32`; see
+    that function for parameter / return semantics.
+    """
+    i = wp.tid()
+    idx = perm[i]
+    dst_pos[i] = src_pos[idx]
+    dst_shifts[i] = src_shifts[idx]
+
+
+gather_fused_overload = {
+    wp.float32: _gather_positions_and_shifts_f32,
+    wp.float64: _gather_positions_and_shifts_f64,
+}
+
+
+# =============================================================================
+# Neighbor matrix tail-fill kernel + launcher (used by tile_warp + cell_list)
+# =============================================================================
+FILL_TAIL_BLOCK_DIM = wp.constant(128)
+
+
+@wp.kernel(enable_backward=False, module="tail_fill_block")
+def _fill_neighbor_matrix_tail_kernel(
+    num_neighbors: wp.array(dtype=wp.int32),
+    natom: wp.int32,
+    max_neighbors: wp.int32,
+    sentinel: wp.int32,
+    neighbor_matrix: wp.array2d(dtype=wp.int32),
+):
+    """Fill ``neighbor_matrix[i, num_neighbors[i]..max_neighbors-1]`` with sentinel.
+
+    One block per atom row; lanes stride-loop over the row's unused tail
+    and write the sentinel value.  Pairs with any always-write
+    neighbor-matrix kernel (tile_to_matrix, pair-centric cell-list
+    query, etc.) so the caller can skip the
+    ``neighbor_matrix.fill_(sentinel)`` prefill.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (natom,), dtype=wp.int32
+        Per-atom neighbor counts (active-slot count).  Tail columns
+        ``[num_neighbors[i], max_neighbors)`` are filled with ``sentinel``.
+    natom : wp.int32
+        Number of rows; threads with ``tid >= natom`` exit early.
+    max_neighbors : wp.int32
+        Column count of ``neighbor_matrix``.
+    sentinel : wp.int32
+        Value written into unused columns.
+    neighbor_matrix : wp.array2d, shape (natom, max_neighbors), dtype=wp.int32
+        OUTPUT: tail columns filled with ``sentinel``.
+
+    Returns
+    -------
+    None
+        This function modifies ``neighbor_matrix`` in-place.
+
+    Notes
+    -----
+    - Thread launch: tiled, ``block_dim = FILL_TAIL_BLOCK_DIM = 128``;
+      ``dim = natom``.
+    - Only the unused-column range is touched; active columns
+      (``[0, num_neighbors[i])``) are left untouched.
+
+    See Also
+    --------
+    fill_neighbor_matrix_tail : Python launcher for this kernel.
+    """
+    row = wp.tid()
+    if row >= natom:
+        return
+    nn = num_neighbors[row]
+    if nn >= max_neighbors:
+        return
+    lane_tile = wp.tile_arange(FILL_TAIL_BLOCK_DIM, dtype=wp.int32)
+    lane = wp.untile(lane_tile)
+    k = nn + lane
+    while k < max_neighbors:
+        neighbor_matrix[row, k] = sentinel
+        k += FILL_TAIL_BLOCK_DIM
+
+
+def fill_neighbor_matrix_tail(
+    num_neighbors: wp.array,
+    natom: int,
+    max_neighbors: int,
+    sentinel: int,
+    neighbor_matrix: wp.array,
+    device: str,
+) -> None:
+    """Core warp launcher for coalesced tail-fill of the neighbor matrix.
+
+    Writes ``sentinel`` into every column of ``neighbor_matrix`` that lies
+    past the active-slot range ``[0, num_neighbors[i])``.  Pairs with
+    always-write neighbor-matrix builders (e.g.
+    :func:`nvalchemiops.neighbors.tile_warp.tile_to_matrix`, pair-centric
+    cell-list queries) so callers can skip the per-step
+    ``neighbor_matrix.fill_(sentinel)`` prefill.
+
+    Parameters
+    ----------
+    num_neighbors : wp.array, shape (natom,), dtype=wp.int32
+        Per-atom active-slot counts.
+    natom : int
+        Number of atoms.
+    max_neighbors : int
+        Column count of ``neighbor_matrix``.
+    sentinel : int
+        Value written into unused columns.
+    neighbor_matrix : wp.array, shape (natom, max_neighbors), dtype=wp.int32
+        OUTPUT: tail columns filled with ``sentinel``.
+    device : str
+        Warp device string (e.g. ``"cuda:0"``).
+
+    Returns
+    -------
+    None
+        Modifies ``neighbor_matrix`` in-place; see
+        :func:`_fill_neighbor_matrix_tail_kernel`.
+
+    Notes
+    -----
+    - This is a low-level warp interface.  Framework bindings should call
+      it through :mod:`nvalchemiops.torch.neighbors` /
+      :mod:`nvalchemiops.jax.neighbors`.
+
+    See Also
+    --------
+    _fill_neighbor_matrix_tail_kernel : Kernel that performs the fill.
+    """
+    wp.launch_tiled(
+        kernel=_fill_neighbor_matrix_tail_kernel,
+        dim=[int(natom)],
+        inputs=[
+            num_neighbors,
+            int(natom),
+            int(max_neighbors),
+            int(sentinel),
+            neighbor_matrix,
+        ],
+        block_dim=int(FILL_TAIL_BLOCK_DIM),
         device=device,
     )

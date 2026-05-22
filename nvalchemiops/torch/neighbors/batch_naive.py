@@ -26,7 +26,6 @@ from nvalchemiops.neighbors.batch_naive import (
 )
 from nvalchemiops.neighbors.neighbor_utils import (
     estimate_max_neighbors,
-    selective_zero_num_neighbors,
 )
 from nvalchemiops.torch.neighbors.neighbor_utils import (
     compute_naive_num_shifts,
@@ -106,15 +105,11 @@ def _batch_naive_neighbor_matrix_no_pbc(
         neighbor_matrix, dtype=wp.int32, return_ctype=True
     )
     wp_num_neighbors = wp.from_torch(num_neighbors, dtype=wp.int32, return_ctype=True)
+    wp_rebuild_flags = None
     if rebuild_flags is not None:
         wp_rebuild_flags = wp.from_torch(
             rebuild_flags, dtype=wp.bool, return_ctype=True
         )
-        selective_zero_num_neighbors(
-            wp_num_neighbors, wp_batch_idx, wp_rebuild_flags, str(device)
-        )
-    else:
-        wp_rebuild_flags = None
     batch_naive_neighbor_matrix(
         positions=wp_positions,
         cutoff=cutoff,
@@ -193,7 +188,6 @@ def _batch_naive_neighbor_matrix_pbc(
     batch_naive_neighbor_list : Higher-level wrapper function
     """
     device = positions.device
-    wp_device = wp.device_from_torch(device)
     wp_vec_dtype = get_wp_vec_dtype(positions.dtype)
     wp_mat_dtype = get_wp_mat_dtype(positions.dtype)
     wp_dtype = get_wp_dtype(positions.dtype)
@@ -219,16 +213,11 @@ def _batch_naive_neighbor_matrix_pbc(
     if max_atoms_per_system is None:
         max_atoms_per_system = (batch_ptr[1:] - batch_ptr[:-1]).max().item()
 
+    wp_rebuild_flags = None
     if rebuild_flags is not None:
         wp_rebuild_flags = wp.from_torch(
             rebuild_flags, dtype=wp.bool, return_ctype=True
         )
-        selective_zero_num_neighbors(
-            wp_num_neighbors, wp_batch_idx, wp_rebuild_flags, str(wp_device)
-        )
-    else:
-        wp_rebuild_flags = None
-
     batch_naive_neighbor_matrix_pbc(
         positions=wp_positions,
         cell=wp_cell,
