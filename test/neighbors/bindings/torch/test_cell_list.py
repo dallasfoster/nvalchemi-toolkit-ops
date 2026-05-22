@@ -661,11 +661,16 @@ class TestCellListOutputFormats:
                 return_neighbor_list=False,
             )
 
-        _, _, u = results
+        nm, _, u = results
+        # Under the always-write-shifts contract only the active range of
+        # ``u`` is written; the tail is uninitialised.  Mask by the
+        # fill_value-padded neighbor_matrix (matches the batch sibling).
+        fv = positions.shape[0] if fill_value is None else fill_value
+        mask = nm != fv
         # z-direction should have no shifts (no PBC)
-        assert u[:, :, 2].sum().item() == 0
+        assert int(u[..., 2][mask].sum().item()) == 0
         # x-direction should have some shifts (PBC enabled)
-        assert (u[:, :, 0] ** 2).sum().item() > 0
+        assert int((u[..., 0][mask] ** 2).sum().item()) > 0
 
     def test_dtype_consistency(self, dtype, return_neighbor_list):
         """Output dtypes should be consistent (int32 for indices)."""
