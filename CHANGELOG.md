@@ -21,6 +21,14 @@ release.
 - JAX bindings in `nvalchemiops.jax.*` that wrap the Warp kernels, providing
   support for neighbor lists, DFT-D3 dispersion, electrostatics (Coulomb, Ewald,
   PME), and splines with `jax.jit` compatibility.
+- Higher-order (multipole) electrostatics for charges, dipoles, and quadrupoles
+  (l = 0, 1, 2): direct-k Ewald (`multipole_ewald_summation`), particle-mesh
+  Ewald (`multipole_particle_mesh_ewald`), reciprocal- and real-space entry
+  points, electrostatic feature extraction (`multipole_electrostatic_features`),
+  and an SCF cache/step API for repeated evaluations on a fixed cell. Provided as
+  Warp kernels and `nvalchemiops.torch` bindings, single-system and batched, with
+  energies, forces, moment gradients, stress, and force-loss (`create_graph`)
+  training; the forward and first-order backward are `torch.compile`-compatible.
 - GPU-accelerated molecular dynamics integrators with single-system and batched modes:
 Velocity Verlet (NVE), Langevin (NVT), Nosé-Hoover Chain (NVT), NPT, NPH, and
 Velocity Rescaling
