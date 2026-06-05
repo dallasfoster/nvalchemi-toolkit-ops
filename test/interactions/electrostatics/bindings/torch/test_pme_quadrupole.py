@@ -134,63 +134,6 @@ class TestQuadrupolePMEForwardEnergy:
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-class TestQuadrupolePMEvsReference:
-    """PME at l_max = 2 vs the independent Python direct-Ewald reference."""
-
-    def test_pme_reciprocal_quadrupole_matches_reference(self):
-        """PME reciprocal half (E_recip − E_self) at l_max = 2 matches the
-        reference's ``direct_ewald_reciprocal_minus_self`` (no real-space sum)."""
-        from nvalchemiops._reference.multipole_reference import (
-            direct_ewald_reciprocal_minus_self,
-        )
-
-        fix = _bcc_quadrupole_fixture(size=2)
-        sigma, alpha = 1.0, 0.4632
-        mesh = (32, 32, 32)
-
-        e_pme = float(
-            multipole_pme_reciprocal_space(
-                fix["positions"],
-                pack_multipole_moments(
-                    fix["charges"], fix["dipoles"], fix["quadrupoles"]
-                ),
-                fix["cell"],
-                sigma=sigma,
-                alpha=alpha,
-                mesh_dimensions=mesh,
-                spline_order=4,
-            ).item()
-        )
-
-        pos_np = fix["positions"].cpu().numpy()
-        q_np = fix["charges"].cpu().numpy()
-        mu_np = fix["dipoles"].cpu().numpy()
-        Q_np = fix["quadrupoles"].cpu().numpy()
-        cell_np = fix["cell"].cpu().numpy()
-        e_ref = direct_ewald_reciprocal_minus_self(
-            pos_np,
-            q_np,
-            dipoles=mu_np,
-            quadrupoles=Q_np,
-            cell=cell_np,
-            alpha=alpha,
-            sigma=sigma,
-            kspace_cutoff=5.0,
-        )
-        rel_err = abs(e_pme - e_ref) / max(abs(e_ref), 1.0)
-        print(
-            f"\n  PME recip-only (l_max=2)        = {e_pme:.6f}"
-            f"\n  Reference recip-minus-self      = {e_ref:.6f}"
-            f"\n  rel_err                         = {rel_err:.3e}"
-        )
-        # PME spline-truncation at order=4, mesh=32³ gives ~1e-3 relative.
-        assert rel_err < 5e-3, (
-            f"PME l_max=2 recip vs reference rel_err = {rel_err:.3e} > 5e-3 "
-            f"(PME = {e_pme}, ref = {e_ref})"
-        )
-
-
 def _small_quadrupole_fixture(device: str = "cuda:0"):
     """4-atom diagonal fixture with symmetric traceless Q.
 

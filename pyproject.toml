@@ -84,7 +84,6 @@ dev = [
     "coverage>=7.2.0",
     "pytest-cov>=7.0.0",
     "pytest-testmon>=2.2.0",
-    "scipy",
     {include-group="docs"},
 ]
 
