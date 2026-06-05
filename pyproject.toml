@@ -12,7 +12,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 dependencies = [
-    "warp-lang >= 1.10.0",
+    "warp-lang >= 1.13.0",
     "numpy",
 ]
 keywords = [
@@ -68,8 +68,10 @@ dev = [
     "coverage>=7.2.0",
     "pytest-cov>=7.0.0",
     "pytest-testmon>=2.2.0",
+    "scipy",
     {include-group="docs"},
 ]
+
 docs = [
     "sphinx>=6.0.0",
     "sphinx-design",

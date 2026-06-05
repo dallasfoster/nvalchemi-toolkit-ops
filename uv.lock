@@ -38,6 +38,20 @@ wheels = [
 ]
 
 [[package]]
+name = "ase"
+version = "3.28.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1b/76/7696a44e56b04a8e31e8e6c85cbf5b13250b9b4c75242910d92c5ce3ed0e/ase-3.28.0.tar.gz", hash = "sha256:74fe77ca38bf78070e24cd283f5d25be129bad6503fd26619008548518144732", size = 2396385, upload-time = "2026-03-17T20:47:55.885Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6c/25/4f103d1bedb3593718713b3f743df7b3ff3fc68d36d6666c30265ef59c8a/ase-3.28.0-py3-none-any.whl", hash = "sha256:0e24056302d7307b7247f90de281de15e3031c14cf400bedb1116c3b0d0e50b8", size = 2929909, upload-time = "2026-03-17T20:47:51.773Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "25.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -405,6 +419,21 @@ wheels = [
 ]
 
 [[package]]
+name = "e3nn"
+version = "0.4.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opt-einsum-fx" },
+    { name = "scipy" },
+    { name = "sympy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/aa/98/8e7102dea93106603383fda23bf96649c397a37b910e7c76086e584cd92d/e3nn-0.4.4.tar.gz", hash = "sha256:51c91a84c1fb72e7e3600000958fa8caad48f8270937090fb8d0f8bfffbb3525", size = 361661, upload-time = "2021-12-16T08:49:23.382Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9a/b6/c8327065d1dd8bca28521fe65ff72b649ed17ca8a1f0c1f498006d7567b7/e3nn-0.4.4-py3-none-any.whl", hash = "sha256:87d99876abb362a6e07d555d10752ff2e20c2b7731d8928ebe5d9121fb019f84", size = 387707, upload-time = "2021-12-16T08:49:21.596Z" },
+]
+
+[[package]]
 name = "fastjsonschema"
 version = "2.21.2"
 source = { registry = "https://pypi.org/simple" }
@@ -478,6 +507,17 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d5/7d/5df2650c57d47c57232af5ef4b4fdbff182070421e405e0d62c6cdbfaa87/fsspec-2026.1.0.tar.gz", hash = "sha256:e987cb0496a0d81bba3a9d1cee62922fb395e7d4c3b575e57f547953334fe07b", size = 310496, upload-time = "2026-01-09T15:21:35.562Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/01/c9/97cc5aae1648dcb851958a3ddf73ccd7dbe5650d95203ecb4d7720b4cdbf/fsspec-2026.1.0-py3-none-any.whl", hash = "sha256:cb76aa913c2285a3b49bdd5fc55b1d7c708d7208126b60f2eb8194fe1b4cbdcc", size = 201838, upload-time = "2026-01-09T15:21:34.041Z" },
+]
+
+[[package]]
+name = "graph-longrange"
+version = "0.4.0"
+source = { git = "https://github.com/WillBaldwin0/graph_electrostatics?rev=0e21d5546c482d08388a08eb4d948e833227ce47#0e21d5546c482d08388a08eb4d948e833227ce47" }
+dependencies = [
+    { name = "ase" },
+    { name = "e3nn" },
+    { name = "numpy" },
+    { name = "torch" },
 ]
 
 [[package]]
@@ -1148,6 +1188,7 @@ torch = [
 dev = [
     { name = "coverage" },
     { name = "dotenv" },
+    { name = "graph-longrange" },
     { name = "jupytext" },
     { name = "matplotlib" },
     { name = "myst-parser" },
@@ -1162,6 +1203,7 @@ dev = [
     { name = "pytest-testmon" },
     { name = "pytest-timeout" },
     { name = "python-dotenv" },
+    { name = "scipy" },
     { name = "sphinx", version = "9.0.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "sphinx", version = "9.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sphinx-autodoc-typehints", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1188,6 +1230,9 @@ docs = [
     { name = "sphinx-gallery" },
     { name = "sphinx-togglebutton" },
 ]
+parity = [
+    { name = "graph-longrange" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1202,6 +1247,7 @@ provides-extras = ["jax", "torch"]
 dev = [
     { name = "coverage", specifier = ">=7.2.0" },
     { name = "dotenv", specifier = ">=0.9.9" },
+    { name = "graph-longrange", git = "https://github.com/WillBaldwin0/graph_electrostatics?rev=0e21d5546c482d08388a08eb4d948e833227ce47" },
     { name = "jupytext", specifier = ">=1.15.0" },
     { name = "matplotlib" },
     { name = "myst-parser", specifier = ">=0.18.0" },
@@ -1216,6 +1262,7 @@ dev = [
     { name = "pytest-testmon", specifier = ">=2.2.0" },
     { name = "pytest-timeout", specifier = ">=2.0.1" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
+    { name = "scipy" },
     { name = "sphinx", specifier = ">=6.0.0" },
     { name = "sphinx-autodoc-typehints", specifier = ">=1.24.0" },
     { name = "sphinx-design" },
@@ -1238,6 +1285,7 @@ docs = [
     { name = "sphinx-gallery", specifier = ">=0.19.0" },
     { name = "sphinx-togglebutton", specifier = "==0.3.2" },
 ]
+parity = [{ name = "graph-longrange", git = "https://github.com/WillBaldwin0/graph_electrostatics?rev=0e21d5546c482d08388a08eb4d948e833227ce47" }]
 
 [[package]]
 name = "nvidia-cublas-cu12"
@@ -1400,6 +1448,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8c/b9/2ac072041e899a52f20cf9510850ff58295003aa75525e58343591b0cbfb/opt_einsum-3.4.0.tar.gz", hash = "sha256:96ca72f1b886d148241348783498194c577fa30a8faac108586b14f1ba4473ac", size = 63004, upload-time = "2024-09-26T14:33:24.483Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl", hash = "sha256:69bb92469f86a1565195ece4ac0323943e83477171b91d24c35afe028a90d7cd", size = 71932, upload-time = "2024-09-26T14:33:23.039Z" },
+]
+
+[[package]]
+name = "opt-einsum-fx"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opt-einsum" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/93/de/856dab99be0360c7275fee075eb0450a2ec82a54c4c33689606f62e9615b/opt_einsum_fx-0.1.4.tar.gz", hash = "sha256:7eeb7f91ecb70be65e6179c106ea7f64fc1db6319e3d1289a4518b384f81e74f", size = 12969, upload-time = "2021-11-07T20:49:33.811Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/4c/e0370709aaf9d7ceb68f975cac559751e75954429a77e83202e680606560/opt_einsum_fx-0.1.4-py3-none-any.whl", hash = "sha256:85f489f4c7c31fd88d5faf9669c09e61ec37a30098809fdcfe2a08a9e42f23c9", size = 13213, upload-time = "2021-11-07T20:49:32.395Z" },
 ]
 
 [[package]]

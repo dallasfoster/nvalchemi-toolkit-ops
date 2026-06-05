@@ -30,6 +30,8 @@ SUPPORTED ORDERS
 - Order 2: Linear
 - Order 3: Quadratic
 - Order 4: Cubic (recommended for PME)
+- Order 5: Quartic
+- Order 6: Quintic
 
 OPERATIONS
 ==========
@@ -78,7 +80,8 @@ def bspline_weight(u: Any, order: wp.int32) -> Any:
     u : float (Any)
         Parameter in [0, order). Type-generic (float32 or float64).
     order : wp.int32
-        Spline order (1=constant, 2=linear, 3=quadratic, 4=cubic).
+        Spline order (1=constant, 2=linear, 3=quadratic, 4=cubic,
+        5=quartic, 6=quintic).
 
     Returns
     -------
@@ -91,9 +94,101 @@ def bspline_weight(u: Any, order: wp.int32) -> Any:
     two = type(u)(2.0)
     three = type(u)(3.0)
     four = type(u)(4.0)
+    five = type(u)(5.0)
     six = type(u)(6.0)
 
-    if order == 4:
+    if order == 6:
+        # M_6 has 6 quintic pieces on [0, 6); peak M_6(3) = 11/20.
+        # Derived as the 6-fold convolution of the unit boxcar:
+        # M_6(u) = (1/120) Σ_{j=0}^{6} (-1)^j C(6,j) (u-j)_+^5.
+        u2 = u * u
+        u3 = u2 * u
+        u4 = u3 * u
+        u5 = u4 * u
+        c120 = type(u)(120.0)
+        if u >= zero and u < one:
+            return u5 / c120
+        elif u >= one and u < two:
+            return (
+                type(u)(-5.0) * u5
+                + type(u)(30.0) * u4
+                + type(u)(-60.0) * u3
+                + type(u)(60.0) * u2
+                + type(u)(-30.0) * u
+                + six
+            ) / c120
+        elif u >= two and u < three:
+            return (
+                type(u)(10.0) * u5
+                + type(u)(-120.0) * u4
+                + type(u)(540.0) * u3
+                + type(u)(-1140.0) * u2
+                + type(u)(1170.0) * u
+                + type(u)(-474.0)
+            ) / c120
+        elif u >= three and u < four:
+            return (
+                type(u)(-10.0) * u5
+                + type(u)(180.0) * u4
+                + type(u)(-1260.0) * u3
+                + type(u)(4260.0) * u2
+                + type(u)(-6930.0) * u
+                + type(u)(4386.0)
+            ) / c120
+        elif u >= four and u < five:
+            return (
+                five * u5
+                + type(u)(-120.0) * u4
+                + type(u)(1140.0) * u3
+                + type(u)(-5340.0) * u2
+                + type(u)(12270.0) * u
+                + type(u)(-10974.0)
+            ) / c120
+        elif u >= five and u < six:
+            v = six - u
+            return v * v * v * v * v / c120
+        else:
+            return zero
+    elif order == 5:
+        # M_5 has 5 quartic pieces on [0, 5); peak M_5(5/2) = 115/192.
+        # Derived as the 5-fold convolution of the unit boxcar:
+        # M_5(u) = (1/24) Σ_{j=0}^{5} (-1)^j C(5,j) (u-j)_+^4.
+        u2 = u * u
+        u3 = u2 * u
+        u4 = u3 * u
+        c24 = type(u)(24.0)
+        if u >= zero and u < one:
+            return u4 / c24
+        elif u >= one and u < two:
+            return (
+                type(u)(-4.0) * u4
+                + type(u)(20.0) * u3
+                + type(u)(-30.0) * u2
+                + type(u)(20.0) * u
+                + type(u)(-5.0)
+            ) / c24
+        elif u >= two and u < three:
+            return (
+                type(u)(6.0) * u4
+                + type(u)(-60.0) * u3
+                + type(u)(210.0) * u2
+                + type(u)(-300.0) * u
+                + type(u)(155.0)
+            ) / c24
+        elif u >= three and u < four:
+            return (
+                type(u)(-4.0) * u4
+                + type(u)(60.0) * u3
+                + type(u)(-330.0) * u2
+                + type(u)(780.0) * u
+                + type(u)(-655.0)
+            ) / c24
+        elif u >= four and u < five:
+            v = five - u
+            return v * v * v * v / c24
+        else:
+            return zero
+    elif order == 4:
         if u >= zero and u < one:
             return u * u * u / six
         elif u >= one and u < two:
@@ -161,9 +256,88 @@ def bspline_derivative(u: Any, order: wp.int32) -> Any:
     two = type(u)(2.0)
     three = type(u)(3.0)
     four = type(u)(4.0)
+    five = type(u)(5.0)
     six = type(u)(6.0)
 
-    if order == 4:
+    if order == 6:
+        # M_6'(u) — quartic on each of 6 unit pieces.
+        u2 = u * u
+        u3 = u2 * u
+        u4 = u3 * u
+        c120 = type(u)(120.0)
+        if u >= zero and u < one:
+            return five * u4 / c120
+        elif u >= one and u < two:
+            return (
+                type(u)(-25.0) * u4
+                + type(u)(120.0) * u3
+                + type(u)(-180.0) * u2
+                + type(u)(120.0) * u
+                + type(u)(-30.0)
+            ) / c120
+        elif u >= two and u < three:
+            return (
+                type(u)(50.0) * u4
+                + type(u)(-480.0) * u3
+                + type(u)(1620.0) * u2
+                + type(u)(-2280.0) * u
+                + type(u)(1170.0)
+            ) / c120
+        elif u >= three and u < four:
+            return (
+                type(u)(-50.0) * u4
+                + type(u)(720.0) * u3
+                + type(u)(-3780.0) * u2
+                + type(u)(8520.0) * u
+                + type(u)(-6930.0)
+            ) / c120
+        elif u >= four and u < five:
+            return (
+                type(u)(25.0) * u4
+                + type(u)(-480.0) * u3
+                + type(u)(3420.0) * u2
+                + type(u)(-10680.0) * u
+                + type(u)(12270.0)
+            ) / c120
+        elif u >= five and u < six:
+            v = six - u
+            return -five * v * v * v * v / c120
+        else:
+            return zero
+    elif order == 5:
+        # M_5'(u) — cubic on each of 5 unit pieces.
+        u2 = u * u
+        u3 = u2 * u
+        c24 = type(u)(24.0)
+        if u >= zero and u < one:
+            return four * u3 / c24
+        elif u >= one and u < two:
+            return (
+                type(u)(-16.0) * u3
+                + type(u)(60.0) * u2
+                + type(u)(-60.0) * u
+                + type(u)(20.0)
+            ) / c24
+        elif u >= two and u < three:
+            return (
+                type(u)(24.0) * u3
+                + type(u)(-180.0) * u2
+                + type(u)(420.0) * u
+                + type(u)(-300.0)
+            ) / c24
+        elif u >= three and u < four:
+            return (
+                type(u)(-16.0) * u3
+                + type(u)(180.0) * u2
+                + type(u)(-660.0) * u
+                + type(u)(780.0)
+            ) / c24
+        elif u >= four and u < five:
+            v = five - u
+            return -four * v * v * v / c24
+        else:
+            return zero
+    elif order == 4:
         if u >= zero and u < one:
             return u * u / two
         elif u >= one and u < two:
@@ -426,6 +600,419 @@ def bspline_weight_gradient_3d(
     dw_z = bspline_derivative(u_z, order) * type(t0)(mesh_dims[2])
 
     return type(theta)(dw_x * w_y * w_z, w_x * dw_y * w_z, w_x * w_y * dw_z)
+
+
+@wp.func
+def bspline_second_derivative(u: Any, order: wp.int32) -> Any:
+    """Compute B-spline second derivative d²M_n(u)/du².
+
+    Same piecewise structure as :func:`bspline_weight` /
+    :func:`bspline_derivative`. Used by :func:`bspline_weight_hessian_3d`
+    for the dipole-force gather kernel in Multipole PME (Phase 3).
+
+    Parameters
+    ----------
+    u : float (Any)
+        Parameter in [0, order). Type-generic (float32 or float64).
+    order : wp.int32
+        Spline order. Defined for orders 3, 4, 5, and 6 (orders 1, 2
+        return 0 because M₁ and M₂ are piecewise constant / linear and
+        have zero second derivative everywhere except on a measure-zero
+        set; the Hessian gather samples at smooth interior points).
+
+    Returns
+    -------
+    float (Any)
+        Second-derivative value. Same type as input.
+    """
+    zero = type(u)(0.0)
+    one = type(u)(1.0)
+    two = type(u)(2.0)
+    three = type(u)(3.0)
+    four = type(u)(4.0)
+    five = type(u)(5.0)
+    six = type(u)(6.0)
+
+    if order == 6:
+        # M_6''(u) — cubic on each of 6 unit pieces.
+        u2 = u * u
+        u3 = u2 * u
+        c120 = type(u)(120.0)
+        if u >= zero and u < one:
+            return type(u)(20.0) * u3 / c120
+        elif u >= one and u < two:
+            return (
+                type(u)(-100.0) * u3
+                + type(u)(360.0) * u2
+                + type(u)(-360.0) * u
+                + type(u)(120.0)
+            ) / c120
+        elif u >= two and u < three:
+            return (
+                type(u)(200.0) * u3
+                + type(u)(-1440.0) * u2
+                + type(u)(3240.0) * u
+                + type(u)(-2280.0)
+            ) / c120
+        elif u >= three and u < four:
+            return (
+                type(u)(-200.0) * u3
+                + type(u)(2160.0) * u2
+                + type(u)(-7560.0) * u
+                + type(u)(8520.0)
+            ) / c120
+        elif u >= four and u < five:
+            return (
+                type(u)(100.0) * u3
+                + type(u)(-1440.0) * u2
+                + type(u)(6840.0) * u
+                + type(u)(-10680.0)
+            ) / c120
+        elif u >= five and u < six:
+            v = six - u
+            return type(u)(20.0) * v * v * v / c120
+        else:
+            return zero
+    elif order == 5:
+        # M_5''(u) — quadratic on each of 5 unit pieces.
+        u2 = u * u
+        c24 = type(u)(24.0)
+        if u >= zero and u < one:
+            # B(u) = u^4/24 → B''(u) = u^2/2 = 12 u^2 / 24.
+            return type(u)(12.0) * u2 / c24
+        elif u >= one and u < two:
+            return (type(u)(-48.0) * u2 + type(u)(120.0) * u + type(u)(-60.0)) / c24
+        elif u >= two and u < three:
+            return (type(u)(72.0) * u2 + type(u)(-360.0) * u + type(u)(420.0)) / c24
+        elif u >= three and u < four:
+            return (type(u)(-48.0) * u2 + type(u)(360.0) * u + type(u)(-660.0)) / c24
+        elif u >= four and u < five:
+            v = five - u
+            return type(u)(12.0) * v * v / c24
+        else:
+            return zero
+    elif order == 4:
+        if u >= zero and u < one:
+            # B(u) = u³/6  →  B''(u) = u.
+            return u
+        elif u >= one and u < two:
+            # B(u) = (-3u³ + 12u² − 12u + 4)/6  →  B''(u) = -3u + 4.
+            return four - three * u
+        elif u >= two and u < three:
+            # B(u) = (3u³ − 24u² + 60u − 44)/6  →  B''(u) = 3u - 8.
+            return three * u - type(u)(8.0)
+        elif u >= three and u < four:
+            # B(u) = (4 - u)³/6  →  B''(u) = 4 - u.
+            return four - u
+        else:
+            return zero
+    elif order == 3:
+        if u >= zero and u < one:
+            # B(u) = u²/2  →  B''(u) = 1.
+            return one
+        elif u >= one and u < two:
+            # B(u) = 3/4 - (u - 3/2)²  →  B''(u) = -2.
+            return -two
+        elif u >= two and u < three:
+            # B(u) = (3 - u)²/2  →  B''(u) = 1.
+            return one
+        else:
+            return zero
+    else:
+        # Orders 1 and 2 are piecewise constant / linear; the second
+        # derivative is zero on the open interior of each piece.
+        return zero
+
+
+@wp.func
+def bspline_third_derivative(u: Any, order: wp.int32) -> Any:
+    r"""Compute B-spline third derivative ``d³M_n(u)/du³``.
+
+    Same piecewise structure as :func:`bspline_second_derivative`. Used
+    by the multipole-PME ``l_max = 2`` (quadrupole) backward kernels —
+    the position-gradient slot ``∂L/∂r_i`` of the Q channel needs
+    ``∂³B`` (since ``E_recip^(Q) ∝ Q : ∇²φ`` and ``∂/∂r_i`` adds one
+    more derivative).
+
+    Defined for orders 4, 5, 6 (cubic and above). Lower orders return
+    zero (their third derivative is a Dirac delta train, sampled at
+    interior smooth points to be zero).
+
+    Parameters
+    ----------
+    u : float (Any)
+        Parameter in ``[0, order)``. Type-generic (float32 or float64).
+    order : wp.int32
+        Spline order.
+
+    Returns
+    -------
+    float (Any)
+        Third-derivative value. Same type as ``u``.
+    """
+    zero = type(u)(0.0)
+    one = type(u)(1.0)
+    two = type(u)(2.0)
+    three = type(u)(3.0)
+    four = type(u)(4.0)
+    five = type(u)(5.0)
+    six = type(u)(6.0)
+
+    if order == 6:
+        # M_6''' is quadratic on each of 6 unit pieces.
+        u2 = u * u
+        c120 = type(u)(120.0)
+        if u >= zero and u < one:
+            # M_6''(u) = 20 u³/120  →  M_6'''(u) = 60 u²/120 = u²/2.
+            return type(u)(60.0) * u2 / c120
+        elif u >= one and u < two:
+            # M_6'' = (-100 u³ + 360 u² − 360 u + 120)/120
+            # → M_6''' = (-300 u² + 720 u − 360)/120
+            return (type(u)(-300.0) * u2 + type(u)(720.0) * u + type(u)(-360.0)) / c120
+        elif u >= two and u < three:
+            # M_6'' = (200 u³ − 1440 u² + 3240 u − 2280)/120
+            # → M_6''' = (600 u² − 2880 u + 3240)/120
+            return (type(u)(600.0) * u2 + type(u)(-2880.0) * u + type(u)(3240.0)) / c120
+        elif u >= three and u < four:
+            # M_6'' = (-200 u³ + 2160 u² − 7560 u + 8520)/120
+            # → M_6''' = (-600 u² + 4320 u − 7560)/120
+            return (
+                type(u)(-600.0) * u2 + type(u)(4320.0) * u + type(u)(-7560.0)
+            ) / c120
+        elif u >= four and u < five:
+            # M_6'' = (100 u³ − 1440 u² + 6840 u − 10680)/120
+            # → M_6''' = (300 u² − 2880 u + 6840)/120
+            return (type(u)(300.0) * u2 + type(u)(-2880.0) * u + type(u)(6840.0)) / c120
+        elif u >= five and u < six:
+            # M_6''(u) = 20 (6-u)³/120  →  ∂/∂u of that
+            # = 20 · 3 (6-u)² · (-1) / 120 = -60 (6-u)²/120
+            v = six - u
+            return -type(u)(60.0) * v * v / c120
+        else:
+            return zero
+    elif order == 5:
+        # M_5''' is linear on each of 5 unit pieces.
+        c24 = type(u)(24.0)
+        if u >= zero and u < one:
+            return type(u)(24.0) * u / c24  # ≡ u
+        elif u >= one and u < two:
+            return (type(u)(-96.0) * u + type(u)(120.0)) / c24
+        elif u >= two and u < three:
+            return (type(u)(144.0) * u + type(u)(-360.0)) / c24
+        elif u >= three and u < four:
+            return (type(u)(-96.0) * u + type(u)(360.0)) / c24
+        elif u >= four and u < five:
+            # M_5'' = 12 (5-u)²/24  →  d/du = -24(5-u)/24 = -(5-u)
+            v = five - u
+            return -v
+        else:
+            return zero
+    elif order == 4:
+        # M_4''' is piecewise constant on each of 4 unit pieces.
+        if u >= zero and u < one:
+            # M_4''(u) = u  →  M_4'''(u) = 1
+            return one
+        elif u >= one and u < two:
+            # M_4''(u) = 4 - 3u  →  M_4'''(u) = -3
+            return -three
+        elif u >= two and u < three:
+            # M_4''(u) = 3u - 8  →  M_4'''(u) = 3
+            return three
+        elif u >= three and u < four:
+            # M_4''(u) = 4 - u  →  M_4'''(u) = -1
+            return -one
+        else:
+            return zero
+    else:
+        # Orders 1, 2, 3 are piecewise constant/linear/quadratic; the
+        # third derivative is zero on the open interior of each piece.
+        return zero
+
+
+@wp.func
+def bspline_fourth_derivative(u: Any, order: wp.int32) -> Any:
+    r"""Compute B-spline fourth derivative ``d⁴M_n(u)/du⁴``.
+
+    Same piecewise structure as :func:`bspline_third_derivative`, one order
+    higher. Used by the multipole-PME ``l_max = 2`` **double-backward** (Q5r-2):
+    the position-position Hessian block ``∂(∂L/∂r_i)/∂r_j`` of the Q channel
+    needs ``∂⁴B`` (the Q-channel forward spread already carries ``∂²B``, its
+    first backward ``∂³B``, and create_graph adds one more).
+
+    Defined for orders 5, 6. ``M_6'''`` is quadratic per piece → ``M_6''''``
+    is **linear** per piece (C⁰-continuous, since ``M_6`` is C⁴). ``M_5'''`` is
+    linear per piece → ``M_5''''`` is **piecewise-constant** ``(1, −4, 6, −4,
+    1)`` (discontinuous at knots — ``M_5`` is only C³). Orders ≤ 4 return zero
+    (their fourth derivative is a Dirac train, zero on the open interior).
+
+    Parameters
+    ----------
+    u : float (Any)
+        Parameter in ``[0, order)``. Type-generic (float32 or float64).
+    order : wp.int32
+        Spline order.
+
+    Returns
+    -------
+    float (Any)
+        Fourth-derivative value. Same type as ``u``.
+    """
+    zero = type(u)(0.0)
+    one = type(u)(1.0)
+    two = type(u)(2.0)
+    three = type(u)(3.0)
+    four = type(u)(4.0)
+    five = type(u)(5.0)
+    six = type(u)(6.0)
+
+    if order == 6:
+        # M_6'''' is linear on each of 6 unit pieces (∂/∂u of M_6''', /120).
+        c120 = type(u)(120.0)
+        if u >= zero and u < one:
+            return type(u)(120.0) * u / c120
+        elif u >= one and u < two:
+            return (type(u)(-600.0) * u + type(u)(720.0)) / c120
+        elif u >= two and u < three:
+            return (type(u)(1200.0) * u + type(u)(-2880.0)) / c120
+        elif u >= three and u < four:
+            return (type(u)(-1200.0) * u + type(u)(4320.0)) / c120
+        elif u >= four and u < five:
+            return (type(u)(600.0) * u + type(u)(-2880.0)) / c120
+        elif u >= five and u < six:
+            # ∂/∂u of -60(6-u)²/120 = 120(6-u)/120 = (6-u).
+            return six - u
+        else:
+            return zero
+    elif order == 5:
+        # M_5'''' is piecewise-constant (1, -4, 6, -4, 1) on the 5 unit pieces.
+        if u >= zero and u < one:
+            return one
+        elif u >= one and u < two:
+            return -four
+        elif u >= two and u < three:
+            return six
+        elif u >= three and u < four:
+            return -four
+        elif u >= four and u < five:
+            return one
+        else:
+            return zero
+    else:
+        # Orders <= 4: fourth derivative is zero on the open interior of each
+        # piece (M_4''' is piecewise constant; lower orders even smoother here).
+        return zero
+
+
+@wp.func
+def bspline_weight_hessian_3d(
+    theta: Any,
+    offset: wp.vec3i,
+    order: wp.int32,
+    mesh_dims: wp.vec3i,
+):
+    r"""Compute the Hessian of the 3D B-spline weight at a grid offset.
+
+    The 3D weight is the product of three 1D weights:
+
+    .. math::
+
+        w_{3D}(\theta) = M_n(u_x) \, M_n(u_y) \, M_n(u_z)
+
+    where :math:`u_\alpha = \mathrm{order}/2 + \theta_\alpha - \mathrm{offset}_\alpha`.
+    The Hessian is the symmetric 3×3 matrix of second partials:
+
+    * Diagonal :math:`\partial^2 w_{3D}/\partial \theta_\alpha^2 = M_n''(u_\alpha) \cdot \prod_{\beta \neq \alpha} M_n(u_\beta)`.
+    * Off-diagonal :math:`\partial^2 w_{3D}/\partial \theta_\alpha \partial \theta_\beta = M_n'(u_\alpha) \, M_n'(u_\beta) \, M_n(u_\gamma)`
+      with :math:`\gamma` the remaining axis.
+
+    Each component is scaled by ``mesh_dims_α · mesh_dims_β`` to match
+    the fractional-mesh convention used by :func:`bspline_weight_gradient_3d`
+    (the chain rule from parametric ``u`` to ``r`` introduces the same
+    Jacobian factors per derivative).
+
+    Returns two ``vec3`` tiles:
+
+    * ``diag = (Hxx, Hyy, Hzz)`` (3-vector of diagonal entries).
+    * ``off  = (Hxy, Hxz, Hyz)`` (3-vector of unique off-diagonal entries).
+
+    The full symmetric Hessian is::
+
+        H = [[diag.x, off.x, off.y],
+             [off.x, diag.y, off.z],
+             [off.y, off.z, diag.z]]
+
+    Two-vec3 return chosen over a ``mat33`` to avoid importing matrix
+    types into the spline-primitive layer; callers (e.g., the
+    Multipole PME Hessian-gather kernel) accumulate ``μ_i · H · μ_j``
+    directly from the six unique entries without materializing a
+    matrix.
+
+    Parameters
+    ----------
+    theta : vec3 (Any)
+        Fractional position within the base grid cell [0, 1).
+        Type-generic (vec3f or vec3d).
+    offset : wp.vec3i
+        Grid offset from base grid point (includes offset_start adjustment).
+    order : wp.int32
+        Spline order.
+    mesh_dims : wp.vec3i
+        Mesh dimensions (for scaling to Cartesian coordinates).
+
+    Returns
+    -------
+    diag : vec3 (Any)
+        ``(Hxx, Hyy, Hzz)`` in fractional mesh-space.
+    off : vec3 (Any)
+        ``(Hxy, Hxz, Hyz)`` in fractional mesh-space.
+    """
+    t0 = theta[0]
+    half_order = type(t0)(order) * type(t0)(0.5)
+    zero = type(t0)(0.0)
+    order_f = type(t0)(order)
+
+    u_x = half_order + t0 - type(t0)(offset[0])
+    u_y = half_order + theta[1] - type(t0)(offset[1])
+    u_z = half_order + theta[2] - type(t0)(offset[2])
+
+    if (
+        u_x < zero
+        or u_x >= order_f
+        or u_y < zero
+        or u_y >= order_f
+        or u_z < zero
+        or u_z >= order_f
+    ):
+        zvec = type(theta)(zero, zero, zero)
+        return zvec, zvec
+
+    w_x = bspline_weight(u_x, order)
+    w_y = bspline_weight(u_y, order)
+    w_z = bspline_weight(u_z, order)
+
+    dw_x = bspline_derivative(u_x, order)
+    dw_y = bspline_derivative(u_y, order)
+    dw_z = bspline_derivative(u_z, order)
+
+    ddw_x = bspline_second_derivative(u_x, order)
+    ddw_y = bspline_second_derivative(u_y, order)
+    ddw_z = bspline_second_derivative(u_z, order)
+
+    md_x = type(t0)(mesh_dims[0])
+    md_y = type(t0)(mesh_dims[1])
+    md_z = type(t0)(mesh_dims[2])
+
+    diag = type(theta)(
+        ddw_x * w_y * w_z * md_x * md_x,
+        w_x * ddw_y * w_z * md_y * md_y,
+        w_x * w_y * ddw_z * md_z * md_z,
+    )
+    off = type(theta)(
+        dw_x * dw_y * w_z * md_x * md_y,
+        dw_x * w_y * dw_z * md_x * md_z,
+        w_x * dw_y * dw_z * md_y * md_z,
+    )
+    return diag, off
 
 
 @wp.func
@@ -1883,8 +2470,11 @@ __all__ = [
     # Warp functions (@wp.func)
     "bspline_weight",
     "bspline_derivative",
+    "bspline_second_derivative",
+    "bspline_third_derivative",
     "bspline_weight_3d",
     "bspline_weight_gradient_3d",
+    "bspline_weight_hessian_3d",
     "compute_fractional_coords",
     "bspline_grid_offset",
     "wrap_grid_index",

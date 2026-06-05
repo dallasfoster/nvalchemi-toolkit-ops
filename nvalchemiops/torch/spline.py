@@ -318,7 +318,7 @@ def _spline_gather(
         cell = cell.unsqueeze(0)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -395,7 +395,7 @@ def _spline_gather_vec3(
         cell = cell.unsqueeze(0)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -482,7 +482,7 @@ def _spline_gather_gradient(
         cell = cell.unsqueeze(0)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -590,7 +590,7 @@ def _batch_spline_spread(
     needs_grad_flag = needs_grad(positions, values, cell)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -676,7 +676,7 @@ def _batch_spline_gather(
     needs_grad_flag = needs_grad(positions, mesh, cell)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -758,7 +758,7 @@ def _batch_spline_gather_vec3(
     needs_grad_flag = needs_grad(positions, mesh, cell)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -845,7 +845,7 @@ def _batch_spline_gather_gradient(
     needs_grad_flag = needs_grad(positions, charges, mesh, cell)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -1034,7 +1034,7 @@ def _spline_gather_channels(
     if cell.dim() == 2:
         cell = cell.unsqueeze(0)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -1134,7 +1134,7 @@ def _batch_spline_spread_channels(
     num_points = spline_order**3
     needs_grad_flag = needs_grad(positions, values, cell)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -1226,7 +1226,7 @@ def _batch_spline_gather_channels(
     num_points = spline_order**3
     needs_grad_flag = needs_grad(positions, mesh, cell)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
