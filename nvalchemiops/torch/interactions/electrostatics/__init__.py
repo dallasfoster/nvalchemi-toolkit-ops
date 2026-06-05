@@ -15,6 +15,10 @@
 
 """PyTorch bindings for electrostatics interactions."""
 
+from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
+    infer_l_max,
+    pack_multipole_moments,
+)
 from nvalchemiops.torch.interactions.electrostatics.coulomb import (
     coulomb_energy,
     coulomb_energy_forces,
@@ -32,10 +36,43 @@ from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
     generate_k_vectors_ewald_summation,
     generate_k_vectors_pme,
 )
+from nvalchemiops.torch.interactions.electrostatics.multipole_electrostatics import (
+    multipole_electrostatic_energy,
+    multipole_reciprocal_space_energy,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
+    MultipoleRealSpaceBackwardFunction,
+    MultipoleRealSpaceFunction,
+    MultipoleRealSpaceMonopoleBackwardFunction,
+    MultipoleRealSpaceMonopoleFunction,
+    multipole_ewald_summation,
+    multipole_real_space_energy,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_ewald_quadrupole import (
+    MultipoleRealSpaceQuadrupoleBackwardFunction,
+    MultipoleRealSpaceQuadrupoleFunction,
+    multipole_real_space_quadrupole_energy,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_features import (
+    multipole_electrostatic_features,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+    MultipoleSCFCache,
+    prepare_multipole_scf_cache,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+    multipole_ewald_scf_step_energy,
+    multipole_scf_step_energy,
+    multipole_scf_step_features,
+)
 from nvalchemiops.torch.interactions.electrostatics.parameters import (
     EwaldParameters,
+    MultipoleEwaldParameters,
+    MultipolePMEParameters,
     PMEParameters,
     estimate_ewald_parameters,
+    estimate_multipole_ewald_parameters,
+    estimate_multipole_pme_parameters,
     estimate_pme_mesh_dimensions,
     estimate_pme_parameters,
     mesh_spacing_to_dimensions,
@@ -68,11 +105,40 @@ __all__ = [
     # K-vectors
     "generate_k_vectors_ewald_summation",
     "generate_k_vectors_pme",
+    # Multipole moments packing (e3nn <-> Cartesian)
+    "pack_multipole_moments",
+    "infer_l_max",
+    # Multipole (direct k-space)
+    "multipole_electrostatic_energy",
+    "multipole_electrostatic_features",
+    "multipole_reciprocal_space_energy",
+    "MultipoleSCFCache",
+    "prepare_multipole_scf_cache",
+    "multipole_scf_step_energy",
+    "multipole_scf_step_features",
+    # Multipole Ewald (real-space l_max=0/1)
+    "multipole_real_space_energy",
+    "MultipoleRealSpaceFunction",
+    "MultipoleRealSpaceBackwardFunction",
+    "MultipoleRealSpaceMonopoleFunction",
+    "MultipoleRealSpaceMonopoleBackwardFunction",
+    # Multipole Ewald (real-space l_max=2 per-atom)
+    "multipole_real_space_quadrupole_energy",
+    "MultipoleRealSpaceQuadrupoleFunction",
+    "MultipoleRealSpaceQuadrupoleBackwardFunction",
+    # Composite Ewald summation (real + reciprocal - self)
+    "multipole_ewald_summation",
+    # Cache-aware Ewald SCF step
+    "multipole_ewald_scf_step_energy",
     # Parameters
     "EwaldParameters",
     "PMEParameters",
+    "MultipoleEwaldParameters",
+    "MultipolePMEParameters",
     "estimate_ewald_parameters",
     "estimate_pme_parameters",
     "estimate_pme_mesh_dimensions",
+    "estimate_multipole_ewald_parameters",
+    "estimate_multipole_pme_parameters",
     "mesh_spacing_to_dimensions",
 ]

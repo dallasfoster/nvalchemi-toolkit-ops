@@ -1,0 +1,2515 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+r"""
+Autograd.Function wrappers for the multipole direct-k-space pipeline.
+
+Single-purpose home for the ``torch.autograd.Function``-based forwards +
+backwards. Decoupled from :mod:`multipole_scf_step` so the autograd
+machinery (analytical backward kernels, Jacobian-via-kernel-reuse
+pattern) stays out of the step wrappers.
+
+Design notes
+------------
+
+* **Why not @warp_custom_op?** The decorator assumes a Warp tape-of-tape
+  for backward. We use analytical backward kernels, both for speed
+  (3-10x faster than tape replay at this pipeline's kernel complexity)
+  and because tape-of-tape does not support double-backward reliably
+  across the kernel shapes used here. ``torch.autograd.Function`` gives
+  per-input backward control and composition for double-backward.
+
+* **Jacobian-via-kernel-reuse.** The backward of the :math:`\rho(k)`
+  assembly w.r.t. (charges, dipoles) is structurally identical to the
+  feature-projection kernel with inputs rewired:
+
+  .. math::
+
+      \frac{\partial L}{\partial q_i} &=
+          \frac{(2\pi)^3}{V} \sum_k
+          \mathrm{Re}\!\left[\frac{\partial L}{\partial \rho(k)}^{*}
+          \hat{\phi}_\mathrm{source}(k)\, e^{-i k\cdot r_i}\right] \\
+      \frac{\partial L}{\partial \mu_i} &=
+          \frac{(2\pi)^3}{V} \sum_k
+          \mathrm{Re}\!\left[\frac{\partial L}{\partial \rho(k)}^{*}
+          (\text{vector }\hat{\phi})\, e^{-i k\cdot r_i}\right]
+
+  This is exactly what ``project_features_dipole`` computes, with
+  :math:`V(k)` replaced by :math:`\partial L/\partial \rho(k)` and the
+  receiver basis replaced by the source basis.
+
+* **Dipole-axis permutation.** The :math:`\rho` assembly kernel embeds the
+  Cartesian → e3nn :math:`(y, z, x)` rotation: ``dipoles[i, 0]`` maps to
+  ``lm = 3`` (m=+1), ``dipoles[i, 1]`` → ``lm = 1`` (m=-1), ``dipoles[i, 2]``
+  → ``lm = 2`` (m=0). The backward inverts this permutation when assembling
+  the Cartesian dipole gradient.
+"""
+
+from __future__ import annotations
+
+import math
+import types
+
+import torch
+import warp as wp
+
+from nvalchemiops.interactions.electrostatics import (
+    assemble_rho_k_dipole,
+    build_structure_factor_table,
+    feat_position_grad_backward_grad_raw,
+    feat_position_grad_backward_grad_raw_quadrupole,
+    feat_position_grad_backward_positions,
+    feat_position_grad_backward_positions_quadrupole,
+    feat_position_grad_backward_v,
+    feat_position_grad_backward_v_quadrupole,
+    position_gradient_from_feature_grad,
+    position_gradient_from_feature_grad_quadrupole,
+    position_gradient_from_rhok,
+    project_features_dipole,
+    project_features_quadrupole,
+    project_kphase_grad_dipole,
+    project_phihat_grad_dipole,
+    rhok_position_grad_backward_grad_rho,
+    rhok_position_grad_backward_moments,
+    rhok_position_grad_backward_positions,
+    v_grad_from_feat_grad_backward_positions,
+    v_grad_from_feat_grad_backward_positions_quadrupole,
+    v_gradient_from_feature_grad,
+    v_gradient_from_feature_grad_quadrupole,
+)
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
+    assemble_rho_q,
+    position_gradient_from_rhoq,
+    rho_kphase_grad,
+    rho_phihat_grad,
+    rho_q_coeff2_grad,
+    rho_q_kvec_grad,
+    rho_q_moment_grad,
+    rhoq_posgrad_backward_grad_rho,
+    rhoq_posgrad_backward_positions,
+    rhoq_posgrad_backward_quad,
+)
+from nvalchemiops.torch.interactions.electrostatics._warp_op_helpers import (
+    register_warp_op_chain,
+)
+from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+    MultipoleSCFCache,
+)
+
+_TWO_PI_CUBED = (2.0 * math.pi) ** 3
+_TWO_PI_SIXTH = (2.0 * math.pi) ** 6
+
+
+def _structure_factor_table_launch(
+    positions: torch.Tensor,
+    k_vectors: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Cache-free :math:`(\cos(k\cdot r_i), \sin(k\cdot r_i))` table.
+
+    Both ``positions`` and ``k_vectors`` are detached for the Warp launch
+    (their gradients flow via the analytical backward kernels, not through
+    this cos/sin table). ``n_k`` / device are derived from the inputs, so
+    this is the launcher used inside the ``multipole_rho`` custom op.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(cos, sin)`` as ``(N_k, N_atoms)`` float64 tensors.
+    """
+    device = positions.device
+    wp_device = wp.device_from_torch(device)
+    n_k = k_vectors.shape[0]
+    n_atoms = positions.shape[0]
+    wp_scalar = wp.float64 if positions.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+
+    cosines_t = torch.empty((n_k, n_atoms), dtype=torch.float64, device=device)
+    sines_t = torch.empty((n_k, n_atoms), dtype=torch.float64, device=device)
+    build_structure_factor_table(
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(positions.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines_t, dtype=wp.float64),
+        wp.from_torch(sines_t, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return cosines_t, sines_t
+
+
+def _compute_structure_factor_table(
+    positions: torch.Tensor,
+    cache: MultipoleSCFCache,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Cache-bound wrapper of :func:`_structure_factor_table_launch`.
+
+    Convenience for callers holding a :class:`MultipoleSCFCache` (e.g. tests
+    cross-checking the projection); the production op path uses the cache-free
+    launcher directly.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(cos, sin)`` as ``(N_k, N_atoms)`` float64 tensors on
+        ``cache.device``.
+    """
+    return _structure_factor_table_launch(positions, cache.k_vectors)
+
+
+def _assemble_rho_launch(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    volume_f: float,
+) -> torch.Tensor:
+    r"""Cache-free :math:`\rho(k)` assembly from a ``(cos, sin)`` table.
+
+    All inputs are detached for the Warp launch. The launcher used inside the
+    ``multipole_rho`` custom op.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(N_k, 2)`` float64 tensor on ``charges.device``.
+    """
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    n_k = cosines.shape[0]
+    wp_scalar = wp.float64 if charges.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+
+    rho = torch.zeros((n_k, 2), dtype=torch.float64, device=device)
+    assemble_rho_k_dipole(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        volume=volume_f,
+        rho=wp.from_torch(rho, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return rho
+
+
+# =============================================================================
+# Opaque rho-backward sub-op chains
+# =============================================================================
+#
+# The rho(k) backward is composed of four independent kernel calls (moments,
+# positions, phi_hat phase, k-vector phase). Each is wrapped as its own opaque
+# ``torch.library.custom_op`` so that the ``multipole_rho`` backward
+# (``register_autograd``, which AOTAutograd *traces*) calls only opaque ops +
+# plain torch ops — never a struct-dtype ``wp.from_torch`` directly. The two
+# differentiable chains (moments, positions) carry their own analytical
+# backward, so ``create_graph=True`` (force-/stress-loss) composes and stays
+# compile-clean. The phi_hat / k-vector ops are forward-only (their 1st-order
+# values carry the reciprocal cell-grad; cell 2nd-order is out of scope, as in
+# the original raw-kernel path). Each is single-output, so its backward never
+# receives a partial-``None`` cotangent tuple.
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_structure_factor",
+    mutates_args=(),
+    schema="(Tensor positions, Tensor k_vectors) -> (Tensor, Tensor)",
+)
+def _multipole_structure_factor_op(
+    positions: torch.Tensor, k_vectors: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opaque ``(cos(k.r), sin(k.r))`` table (forward-only; cos/sin are constants)."""
+    return _structure_factor_table_launch(positions, k_vectors)
+
+
+@torch.library.register_fake("nvalchemiops::multipole_structure_factor")
+def _multipole_structure_factor_fake(
+    positions: torch.Tensor, k_vectors: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shape/dtype metadata: two ``(N_k, N_atoms)`` float64 tables."""
+    n_k = k_vectors.shape[0]
+    n_atoms = positions.shape[0]
+    return (
+        positions.new_empty((n_k, n_atoms), dtype=torch.float64),
+        positions.new_empty((n_k, n_atoms), dtype=torch.float64),
+    )
+
+
+# ---- moments: grad_rho -> (grad_charges, grad_dipoles) via project rewired ----
+
+
+def _rho_moment_grad_forward(
+    grad_rho: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`project_features_dipole` rewired as the :math:`\partial\rho/\partial`-moments Jacobian transpose.
+
+    Returns the per-atom moment gradient in e3nn layout ``(N_atoms, 4)``.
+    """
+    device = grad_rho.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_k = cosines.shape[0]
+    volume_f = float(volume.detach().item())
+    # Kernel's built-in 2/(2*pi)**3 times (2*pi)**6/(2 V) == (2*pi)**3 / V.
+    per_k_factor_grad = torch.full(
+        (n_k,), _TWO_PI_SIXTH / (2.0 * volume_f), dtype=torch.float64, device=device
+    )
+    source_phi_4d = source_phi_hat.detach().view(n_k, 1, 4, 2).contiguous()
+    src_lm_zero = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    oc_zero = torch.zeros((1, 2), dtype=torch.float64, device=device)
+    lut = torch.arange(4, dtype=torch.int32, device=device).view(1, 4).contiguous()
+    grad_flat = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    project_features_dipole(
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_4d, dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(per_k_factor_grad, dtype=wp.float64),
+        wp.from_torch(src_lm_zero, dtype=wp.float64),
+        wp.from_torch(oc_zero, dtype=wp.float64),
+        False,  # subtract_self
+        wp.from_torch(lut, dtype=wp.int32),
+        wp.from_torch(grad_flat, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_flat
+
+
+def _rho_moment_grad_forward_fake(
+    grad_rho: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: moment gradient ``(N_atoms, 4)`` float64."""
+    return cosines.new_empty((cosines.shape[1], 4), dtype=torch.float64)
+
+
+def _rho_moment_grad_backward(
+    gg_moments: torch.Tensor,
+    grad_rho: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    volume: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose backward of the linear moments map: ``(ggrad_rho, ggrad_volume)``."""
+    device = grad_rho.device
+    wp_device = wp.device_from_torch(device)
+    gg_q = gg_moments[:, 0].contiguous()
+    gg_mu = gg_moments[:, [3, 1, 2]].contiguous()
+    volume_f = float(volume.detach().item())
+    ggrad_rho = torch.empty_like(grad_rho)
+    assemble_rho_k_dipole(
+        wp.from_torch(gg_q, dtype=wp.float64),
+        wp.from_torch(gg_mu, dtype=wp.vec3d),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        volume_f,
+        wp.from_torch(ggrad_rho, dtype=wp.float64),
+        wp_dtype=wp.float64,
+        device=str(wp_device),
+    )
+    # grad_flat scales as 1/V, so d(grad_flat)/dV = -grad_flat / V.
+    grad_flat = _rho_moment_grad_forward(
+        grad_rho, cosines, sines, source_phi_hat, volume
+    )
+    ggrad_volume = (-(gg_moments * grad_flat).sum() / volume_f).reshape(volume.shape)
+    return ggrad_rho, ggrad_volume
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_rho_moment_grad",
+    forward=_rho_moment_grad_forward,
+    backward=_rho_moment_grad_backward,
+    diff_input_positions=(0, 4),
+    n_forward_inputs=5,
+    forward_fake=_rho_moment_grad_forward_fake,
+)
+
+
+# ---- positions: grad_rho -> grad_positions via position_gradient_from_rhok ----
+
+
+def _rho_position_grad_forward(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`position_gradient_from_rhok` — closed-form :math:`\partial\rho/\partial r`.
+
+    ``positions`` is unused by the kernel (the dependence is carried by the
+    detached cos/sin tables) but is an explicit input so its position-Hessian
+    second-order grad has a slot in the backward.
+    """
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = charges.shape[0]
+    wp_scalar = wp.float64 if charges.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+    scale_f = float(scale.detach().item())
+    grad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    position_gradient_from_rhok(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        scale_f,
+        wp.from_torch(grad_positions, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_positions
+
+
+def _rho_position_grad_forward_fake(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: position gradient ``(N_atoms, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3), dtype=torch.float64)
+
+
+def _rho_position_grad_backward(
+    gg_positions: torch.Tensor,
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Second-order backward: ``(ggrad_rho, ggrad_charges, ggrad_dipoles, ggrad_positions)``."""
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = wp.float64 if charges.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+    scale_f = float(scale.detach().item())
+
+    ggrad_grad_rho = torch.empty_like(grad_rho)
+    rhok_position_grad_backward_grad_rho(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        scale_f,
+        wp.from_torch(ggrad_grad_rho, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+
+    ggrad_mom = torch.empty((charges.shape[0], 4), dtype=torch.float64, device=device)
+    rhok_position_grad_backward_moments(
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        scale_f,
+        wp.from_torch(ggrad_mom, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    ggrad_charges = ggrad_mom[:, 0].contiguous()
+    # e3nn -> Cartesian permutation for dipole: (mu_x, mu_y, mu_z) = lm(3, 1, 2).
+    ggrad_dipoles = ggrad_mom[:, [3, 1, 2]].contiguous()
+
+    ggrad_positions = torch.zeros(
+        (charges.shape[0], 3), dtype=torch.float64, device=device
+    )
+    rhok_position_grad_backward_positions(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        scale_f,
+        wp.from_torch(ggrad_positions, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return ggrad_grad_rho, ggrad_charges, ggrad_dipoles, ggrad_positions
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_rho_position_grad",
+    forward=_rho_position_grad_forward,
+    backward=_rho_position_grad_backward,
+    diff_input_positions=(0, 1, 2, 3),
+    n_forward_inputs=9,
+    forward_fake=_rho_position_grad_forward_fake,
+)
+
+
+# ---- phi_hat / k-vector phase (forward-only; carry the reciprocal cell-grad) ----
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_phihat_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor charges, Tensor dipoles, Tensor cosines, Tensor sines, "
+        "Tensor grad_rho, Tensor volume) -> Tensor"
+    ),
+)
+def _rho_phihat_grad_op(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dsource_phi_hat`` ``(N_k, 4, 2)`` via the ``rho_phihat_grad`` kernel."""
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = wp.float64 if charges.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_phi = torch.empty((cosines.shape[0], 4, 2), dtype=torch.float64, device=device)
+    rho_phihat_grad(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_phi, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_phi
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_phihat_grad")
+def _rho_phihat_grad_fake(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 4, 2)`` float64."""
+    return cosines.new_empty((cosines.shape[0], 4, 2), dtype=torch.float64)
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_kphase_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor charges, Tensor dipoles, Tensor positions, Tensor cosines, "
+        "Tensor sines, Tensor source_phi_hat, Tensor grad_rho, Tensor volume) "
+        "-> Tensor"
+    ),
+)
+def _rho_kphase_grad_op(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dk_vectors`` ``(N_k, 3)`` through the phase via the ``rho_kphase_grad`` kernel."""
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = wp.float64 if charges.dtype == torch.float64 else wp.float32
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_k = torch.empty((cosines.shape[0], 3), dtype=torch.float64, device=device)
+    rho_kphase_grad(
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(positions.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_k, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_k
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_kphase_grad")
+def _rho_kphase_grad_fake(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 3)`` float64."""
+    return cosines.new_empty((cosines.shape[0], 3), dtype=torch.float64)
+
+
+def _rho_backward_to_moments(
+    grad_rho: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    cache: MultipoleSCFCache,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Closed-form backward of :math:`\rho` assembly w.r.t. (charges, dipoles).
+
+    Delegates to the opaque ``multipole_rho_moment_grad`` op chain (the
+    autograd-wrapped Jacobian transpose), so ``grad_charges`` / ``grad_dipoles``
+    carry their own analytical backward — ``torch.autograd.grad(grad_charges,
+    ...)`` works for force-/stress-loss training under ``create_graph=True`` and
+    the call is compile-clean (opaque op, never AOT-traced into Warp).
+
+    Returns
+    -------
+    grad_charges : torch.Tensor
+        Shape ``(N_atoms,)``, float64.
+    grad_dipoles : torch.Tensor
+        Shape ``(N_atoms, 3)``, float64, in Cartesian ``(x, y, z)`` order.
+    """
+    grad_flat = torch.ops.nvalchemiops.multipole_rho_moment_grad(
+        grad_rho, cosines, sines, cache.source_phi_hat, cache.volume
+    )  # (N_atoms, 4) in e3nn layout
+
+    grad_charges = grad_flat[:, 0].contiguous()
+    grad_dipoles = grad_flat[:, [3, 1, 2]].contiguous()
+    return grad_charges, grad_dipoles
+
+
+def _rho_backward_to_positions(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    cache: MultipoleSCFCache,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r"""Closed-form backward of :math:`\rho` assembly w.r.t. atomic positions.
+
+    Delegates to the opaque ``multipole_rho_position_grad`` op chain (the
+    autograd-wrapped :func:`position_gradient_from_rhok`), so ``grad_positions``
+    carries an analytical backward with the second-order kernels, making
+    ``F = -grad_positions`` usable under ``create_graph=True`` and compile-clean.
+
+    Returns
+    -------
+    grad_positions : torch.Tensor
+        Shape ``(N_atoms, 3)``, float64, on ``cache.device``.
+    """
+    scale = (
+        torch.as_tensor(_TWO_PI_CUBED, dtype=torch.float64, device=cache.device)
+        / cache.volume
+    )
+    return torch.ops.nvalchemiops.multipole_rho_position_grad(
+        grad_rho,
+        charges,
+        dipoles,
+        positions,
+        cosines,
+        sines,
+        cache.source_phi_hat,
+        cache.k_vectors,
+        scale,
+    )
+
+
+def _rho_backward_to_phihat(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    cache: MultipoleSCFCache,
+) -> torch.Tensor:
+    r"""``∂L/∂source_phi_hat`` via the ``multipole_rho_phihat_grad`` op.
+
+    Forward-only opaque op (1st-order cell-grad only; cell 2nd-order is out of
+    scope).
+
+    Returns
+    -------
+    torch.Tensor
+        ``(N_k, 4, 2)`` float64.
+    """
+    return torch.ops.nvalchemiops.multipole_rho_phihat_grad(
+        charges, dipoles, cosines, sines, grad_rho, cache.volume
+    )
+
+
+def _rho_backward_to_kvec(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    cache: MultipoleSCFCache,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r"""``∂L/∂k_vectors`` through the phase via the ``multipole_rho_kphase_grad`` op.
+
+    Phase contribution only; :math:`\hat\phi`'s k-dependence flows separately
+    through ``source_phi_hat`` + ``SourcePhiHatFunction``. Forward-only opaque op
+    (cell 2nd-order out of scope).
+
+    Returns
+    -------
+    torch.Tensor
+        ``(N_k, 3)`` float64.
+    """
+    return torch.ops.nvalchemiops.multipole_rho_kphase_grad(
+        charges,
+        dipoles,
+        positions,
+        cosines,
+        sines,
+        cache.source_phi_hat,
+        grad_rho,
+        cache.volume,
+    )
+
+
+class MultipoleRhoFunction:
+    r"""Back-compat shim for the :math:`\rho(k)` direct-k-space assembly.
+
+    The implementation is the fully-differentiable
+    ``torch.ops.nvalchemiops.multipole_rho`` custom op (opaque forward +
+    analytical backward + ``create_graph`` support, all compile-clean). This
+    class only preserves the historical
+    ``.apply(charges, dipoles, positions, source_phi_hat, k_vectors, cache)``
+    call signature (the dataclass ``cache`` supplies ``volume``); new code
+    should call the op directly.
+
+    Parameters
+    ----------
+    charges : torch.Tensor
+        Per-atom monopole charges, shape ``(N_atoms,)``.
+    dipoles : torch.Tensor
+        Per-atom Cartesian dipoles, shape ``(N_atoms, 3)`` in ``(x, y, z)``
+        order. Pass an all-zero ``(N_atoms, 3)`` tensor for an l=0 system.
+    positions : torch.Tensor
+        Atomic coordinates, shape ``(N_atoms, 3)``.
+    source_phi_hat : torch.Tensor
+        Source-basis :math:`\hat\phi(k)`, shape ``(N_k, 4, 2)``; carries the
+        reciprocal cell-autograd. Value equals ``cache.source_phi_hat``.
+    k_vectors : torch.Tensor
+        Reciprocal-lattice vectors, shape ``(N_k, 3)``. Value equals
+        ``cache.k_vectors``.
+    cache : MultipoleSCFCache
+        Per-system direct-k-space state; supplies ``cache.volume``.
+
+    Returns
+    -------
+    torch.Tensor
+        Assembled :math:`\rho(k)`, shape ``(N_k, 2)`` float64.
+    """
+
+    @staticmethod
+    def apply(
+        charges: torch.Tensor,
+        dipoles: torch.Tensor,
+        positions: torch.Tensor,
+        source_phi_hat: torch.Tensor,
+        k_vectors: torch.Tensor,
+        cache: MultipoleSCFCache,
+    ) -> torch.Tensor:
+        """Dispatch to ``torch.ops.nvalchemiops.multipole_rho`` (``cache`` -> volume)."""
+        return torch.ops.nvalchemiops.multipole_rho(
+            charges, dipoles, positions, source_phi_hat, k_vectors, cache.volume
+        )
+
+
+# =============================================================================
+# torch.library.custom_op chain for the rho(k) assembly (l<=1)
+# =============================================================================
+#
+# Fully-differentiable opaque op. The forward seals the struct-dtype
+# ``wp.from_torch`` inside an opaque node so both the eager and ``torch.compile``
+# forwards are break-free. The ``register_autograd`` backward calls ONLY the
+# opaque sub-op chains above + plain torch, so AOTAutograd can trace it (the
+# compiled backward is break-free too) and ``create_graph`` composes through the
+# differentiable moment/position chains. ``volume`` crosses as a 0-d tensor (the
+# call site stays free of a ``.item()`` break); it is used detached inside (the
+# 1/V cell-grad is restored by the step's value-preserving volume ratio), so its
+# grad slot is ``None``.
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho",
+    mutates_args=(),
+    schema=(
+        "(Tensor charges, Tensor dipoles, Tensor positions, "
+        "Tensor source_phi_hat, Tensor k_vectors, Tensor volume) -> Tensor"
+    ),
+)
+def _multipole_rho_op(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Opaque forward: build the structure-factor table and assemble rho(k)."""
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return _assemble_rho_launch(
+        charges, dipoles, cosines, sines, source_phi_hat, float(volume.detach().item())
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho")
+def _multipole_rho_fake(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: rho is ``(N_k, 2)`` float64."""
+    return k_vectors.new_empty((k_vectors.shape[0], 2), dtype=torch.float64)
+
+
+def _multipole_rho_setup_context(ctx, inputs, output) -> None:
+    """Save the forward inputs for the analytical backward."""
+    charges, dipoles, positions, source_phi_hat, k_vectors, volume = inputs
+    ctx.save_for_backward(
+        charges, dipoles, positions, source_phi_hat, k_vectors, volume
+    )
+
+
+def _multipole_rho_backward(ctx, grad_rho: torch.Tensor):
+    """Analytical grads for charges, dipoles, positions, phi_hat, k_vectors.
+
+    Recomputes the (cos, sin) table via the opaque ``multipole_structure_factor``
+    op and dispatches the four backward sub-op chains through the cache-bound
+    helpers (which read only ``source_phi_hat`` / ``k_vectors`` / ``volume`` —
+    all available as saved tensors). Every call is an opaque op or plain torch,
+    so AOTAutograd traces this backward without touching Warp; ``volume`` gets
+    ``None`` (its cell-grad lives in the step's value-preserving ratio).
+    """
+    charges, dipoles, positions, source_phi_hat, k_vectors, volume = ctx.saved_tensors
+    grad_rho = grad_rho.contiguous()
+    # cos/sin are detached constants: the position second-order is carried in
+    # full by the position-grad kernel, not by differentiating this table (so
+    # the forward-only structure-factor op is never asked for a backward).
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    # Lightweight stand-in exposing the cache fields the helpers read; internal
+    # to the backward (never crosses an op boundary).
+    shim = types.SimpleNamespace(
+        source_phi_hat=source_phi_hat,
+        k_vectors=k_vectors,
+        volume=volume,
+        device=positions.device,
+        n_k=k_vectors.shape[0],
+    )
+    grad_charges, grad_dipoles = _rho_backward_to_moments(
+        grad_rho, cosines, sines, shim, positions
+    )
+    grad_positions = _rho_backward_to_positions(
+        grad_rho, charges, dipoles, cosines, sines, shim, positions
+    )
+    grad_phi = _rho_backward_to_phihat(grad_rho, charges, dipoles, cosines, sines, shim)
+    grad_kvec = _rho_backward_to_kvec(
+        grad_rho, charges, dipoles, cosines, sines, shim, positions
+    )
+    # Match input dtypes (sub-ops emit float64).
+    grad_charges = grad_charges.to(charges.dtype)
+    grad_dipoles = grad_dipoles.to(dipoles.dtype)
+    grad_positions = grad_positions.to(positions.dtype)
+    # Slots: (charges, dipoles, positions, source_phi_hat, k_vectors, volume).
+    return grad_charges, grad_dipoles, grad_positions, grad_phi, grad_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_rho",
+    _multipole_rho_backward,
+    setup_context=_multipole_rho_setup_context,
+)
+
+
+# =============================================================================
+# Cartesian-quadrupole (l=2) rho_Q(k) contribution
+# =============================================================================
+#
+# rho_Q(k) = scale * coeff2(k) * Σ_i (k·Q_i·k) * exp(-ik·r_i), additive onto
+# the l<=1 rho(k).
+
+
+def _rho_q_assemble_launch(
+    quadrupoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume_f: float,
+) -> torch.Tensor:
+    """Cache-free ``assemble_rho_q``; returns ``(N_k, 2)`` float64."""
+    device = quadrupoles.device
+    wp_device = wp.device_from_torch(device)
+    n_k = cosines.shape[0]
+    wp_scalar = wp.float64 if quadrupoles.dtype == torch.float64 else wp.float32
+    mat_dtype = wp.mat33d if wp_scalar == wp.float64 else wp.mat33f
+    rho_q_t = torch.empty((n_k, 2), dtype=torch.float64, device=device)
+    assemble_rho_q(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        volume=volume_f,
+        rho=wp.from_torch(rho_q_t, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return rho_q_t
+
+
+# ---- main forward op ----
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_q",
+    mutates_args=(),
+    schema=(
+        "(Tensor quadrupoles, Tensor positions, Tensor source_coeff2, "
+        "Tensor k_vectors, Tensor volume) -> Tensor"
+    ),
+)
+def _multipole_rho_q_op(
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Opaque additive Cartesian-quadrupole :math:`\\rho_Q(k)`, shape ``(N_k, 2)``."""
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return _rho_q_assemble_launch(
+        quadrupoles,
+        cosines,
+        sines,
+        k_vectors,
+        source_coeff2,
+        float(volume.detach().item()),
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_q")
+def _multipole_rho_q_fake(
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: rho_Q is ``(N_k, 2)`` float64."""
+    return k_vectors.new_empty((k_vectors.shape[0], 2), dtype=torch.float64)
+
+
+# ---- Q-channel moment grad: grad_rho -> grad_Q (register_warp_op_chain) ----
+
+
+def _rho_q_moment_grad_forward(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`rho_q_moment_grad` — ``dL/dQ_i`` ``(N, 3, 3)`` symmetric.
+
+    ``positions`` is unused by the kernel but is an explicit input so its
+    second-order grad (from the transpose backward) has a slot.
+    """
+    device = grad_rho.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_q_t = torch.empty((n_atoms, 9), dtype=torch.float64, device=device)
+    rho_q_moment_grad(
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_q_t, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_q_t.reshape(n_atoms, 3, 3)
+
+
+def _rho_q_moment_grad_forward_fake(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_atoms, 3, 3)`` float64."""
+    return cosines.new_empty((cosines.shape[1], 3, 3), dtype=torch.float64)
+
+
+def _rho_q_moment_grad_backward(
+    gg_q: torch.Tensor,
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose backward of the linear moment map: ``(ggrad_rho, ggrad_positions)``."""
+    device = grad_rho.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_k = cosines.shape[0]
+    volume_f = float(volume.detach().item())
+    scale = _TWO_PI_CUBED / volume_f
+    gg_q_sym = (0.5 * (gg_q + gg_q.transpose(-1, -2))).contiguous()
+    # dL/dgrad_rho == assemble_rho_q(gg_Q).
+    ggrad_rho = torch.empty((n_k, 2), dtype=torch.float64, device=device)
+    assemble_rho_q(
+        wp.from_torch(gg_q_sym, dtype=wp.mat33d),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        volume=volume_f,
+        rho=wp.from_torch(ggrad_rho, dtype=wp.float64),
+        wp_dtype=wp.float64,
+        device=str(wp_device),
+    )
+    # dL/dpositions == position_gradient_from_rhoq(grad_rho, gg_Q).
+    ggrad_pos = torch.empty((n_atoms, 3), dtype=torch.float64, device=device)
+    position_gradient_from_rhoq(
+        wp.from_torch(gg_q_sym, dtype=wp.mat33d),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(ggrad_pos, dtype=wp.float64),
+        wp_dtype=wp.float64,
+        device=str(wp_device),
+    )
+    return ggrad_rho, ggrad_pos
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_rho_q_moment_grad",
+    forward=_rho_q_moment_grad_forward,
+    backward=_rho_q_moment_grad_backward,
+    diff_input_positions=(0, 1),
+    n_forward_inputs=7,
+    forward_fake=_rho_q_moment_grad_forward_fake,
+)
+
+
+# ---- Q-channel position grad: grad_rho -> grad_positions (register_warp_op_chain) ----
+
+
+def _rho_q_position_grad_forward(
+    grad_rho: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`position_gradient_from_rhoq` — Q-channel ``dL/dr_i`` ``(N, 3)``.
+
+    ``positions`` is unused by the kernel (carried by detached cos/sin) but is
+    an explicit input so its position-Hessian second-order grad has a slot.
+    """
+    device = quadrupoles.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    wp_scalar = wp.float64 if quadrupoles.dtype == torch.float64 else wp.float32
+    mat_dtype = wp.mat33d if wp_scalar == wp.float64 else wp.mat33f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_pos_t = torch.empty((n_atoms, 3), dtype=torch.float64, device=device)
+    position_gradient_from_rhoq(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_pos_t, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_pos_t
+
+
+def _rho_q_position_grad_forward_fake(
+    grad_rho: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_atoms, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3), dtype=torch.float64)
+
+
+def _rho_q_position_grad_backward(
+    gg_pos: torch.Tensor,
+    grad_rho: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Second-order backward: ``(ggrad_rho, ggrad_quadrupoles, ggrad_positions)``."""
+    device = quadrupoles.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_k = cosines.shape[0]
+    wp_scalar = wp.float64 if quadrupoles.dtype == torch.float64 else wp.float32
+    mat_dtype = wp.mat33d if wp_scalar == wp.float64 else wp.mat33f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    gg_pos_c = gg_pos.detach().to(torch.float64).contiguous()
+
+    ggrad_rho = torch.empty((n_k, 2), dtype=torch.float64, device=device)
+    rhoq_posgrad_backward_grad_rho(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(gg_pos_c, dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(ggrad_rho, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+
+    ggrad_q = torch.empty((n_atoms, 9), dtype=torch.float64, device=device)
+    rhoq_posgrad_backward_quad(
+        wp.from_torch(gg_pos_c, dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(ggrad_q, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    ggrad_q = ggrad_q.reshape(n_atoms, 3, 3)
+
+    ggrad_pos = torch.empty((n_atoms, 3), dtype=torch.float64, device=device)
+    rhoq_posgrad_backward_positions(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(gg_pos_c, dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(ggrad_pos, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return ggrad_rho, ggrad_q, ggrad_pos
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_rho_q_position_grad",
+    forward=_rho_q_position_grad_forward,
+    backward=_rho_q_position_grad_backward,
+    diff_input_positions=(0, 1, 2),
+    n_forward_inputs=8,
+    forward_fake=_rho_q_position_grad_forward_fake,
+)
+
+
+# ---- coeff2 / k-vector phase (forward-only; carry the l=2 reciprocal cell-grad) ----
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_q_coeff2_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor quadrupoles, Tensor cosines, Tensor sines, Tensor k_vectors, "
+        "Tensor grad_rho, Tensor volume) -> Tensor"
+    ),
+)
+def _rho_q_coeff2_grad_op(
+    quadrupoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dsource_coeff2`` ``(N_k,)`` via ``rho_q_coeff2_grad`` (l=2 stress)."""
+    device = quadrupoles.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = wp.float64 if quadrupoles.dtype == torch.float64 else wp.float32
+    mat_dtype = wp.mat33d if wp_scalar == wp.float64 else wp.mat33f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_c2 = torch.empty(cosines.shape[0], dtype=torch.float64, device=device)
+    rho_q_coeff2_grad(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_c2, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_c2
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_q_coeff2_grad")
+def _rho_q_coeff2_grad_fake(
+    quadrupoles: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k,)`` float64."""
+    return cosines.new_empty((cosines.shape[0],), dtype=torch.float64)
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_q_kvec_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor quadrupoles, Tensor positions, Tensor cosines, Tensor sines, "
+        "Tensor k_vectors, Tensor source_coeff2, Tensor grad_rho, Tensor volume) "
+        "-> Tensor"
+    ),
+)
+def _rho_q_kvec_grad_op(
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dk_vectors`` ``(N_k, 3)`` via the (k.Q.k) form + phase (l=2 stress)."""
+    device = quadrupoles.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = wp.float64 if quadrupoles.dtype == torch.float64 else wp.float32
+    mat_dtype = wp.mat33d if wp_scalar == wp.float64 else wp.mat33f
+    vec_dtype = wp.vec3d if wp_scalar == wp.float64 else wp.vec3f
+    scale = _TWO_PI_CUBED / float(volume.detach().item())
+    grad_k = torch.empty((cosines.shape[0], 3), dtype=torch.float64, device=device)
+    rho_q_kvec_grad(
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=mat_dtype),
+        wp.from_torch(positions.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(source_coeff2.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        scale,
+        wp.from_torch(grad_k, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return grad_k
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_q_kvec_grad")
+def _rho_q_kvec_grad_fake(
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    grad_rho: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 3)`` float64."""
+    return cosines.new_empty((cosines.shape[0], 3), dtype=torch.float64)
+
+
+def _multipole_rho_q_setup_context(ctx, inputs, output) -> None:
+    """Save the forward inputs for the analytical backward."""
+    quadrupoles, positions, source_coeff2, k_vectors, volume = inputs
+    ctx.save_for_backward(quadrupoles, positions, source_coeff2, k_vectors, volume)
+
+
+def _multipole_rho_q_backward(ctx, grad_rho: torch.Tensor):
+    """Analytical grads for quadrupoles, positions, source_coeff2, k_vectors.
+
+    Recomputes (cos, sin) via the opaque structure-factor op (detached inputs:
+    cos/sin are constants) and dispatches the four backward sub-ops. The
+    moment / position chains carry their own second-order backward
+    (``create_graph``); coeff2 / k_vectors are forward-only (1st-order
+    reciprocal cell-grad; cell 2nd-order out of scope). ``volume`` gets ``None``.
+    """
+    quadrupoles, positions, source_coeff2, k_vectors, volume = ctx.saved_tensors
+    grad_rho = grad_rho.contiguous()
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    grad_quadrupoles = torch.ops.nvalchemiops.multipole_rho_q_moment_grad(
+        grad_rho, positions, cosines, sines, k_vectors, source_coeff2, volume
+    )
+    grad_positions = torch.ops.nvalchemiops.multipole_rho_q_position_grad(
+        grad_rho,
+        quadrupoles,
+        positions,
+        cosines,
+        sines,
+        k_vectors,
+        source_coeff2,
+        volume,
+    )
+    grad_coeff2 = torch.ops.nvalchemiops.multipole_rho_q_coeff2_grad(
+        quadrupoles, cosines, sines, k_vectors, grad_rho, volume
+    )
+    grad_kvec = torch.ops.nvalchemiops.multipole_rho_q_kvec_grad(
+        quadrupoles,
+        positions,
+        cosines,
+        sines,
+        k_vectors,
+        source_coeff2,
+        grad_rho,
+        volume,
+    )
+    grad_quadrupoles = grad_quadrupoles.to(quadrupoles.dtype)
+    grad_positions = grad_positions.to(positions.dtype)
+    # Slots: (quadrupoles, positions, source_coeff2, k_vectors, volume).
+    return grad_quadrupoles, grad_positions, grad_coeff2, grad_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_rho_q",
+    _multipole_rho_q_backward,
+    setup_context=_multipole_rho_q_setup_context,
+)
+
+
+class MultipoleRhoQFunction:
+    r"""Back-compat shim for the Cartesian-quadrupole :math:`\rho_Q(k)` contribution.
+
+    The implementation is the fully-differentiable
+    ``torch.ops.nvalchemiops.multipole_rho_q`` custom op (opaque forward +
+    analytical backward + ``create_graph`` through the moment/position chains;
+    forward-only coeff2/k-vector ops carry the l=2 reciprocal cell-grad). This
+    class only preserves the historical ``.apply(quadrupoles, positions,
+    source_coeff2, k_vectors, cache)`` signature (``cache`` supplies ``volume``
+    and is validated for ``l_max>=2``); new code should call the op directly.
+
+    Parameters
+    ----------
+    quadrupoles : torch.Tensor
+        Per-atom Cartesian quadrupoles, shape ``(N_atoms, 3, 3)``.
+    positions : torch.Tensor
+        Atomic coordinates, shape ``(N_atoms, 3)``.
+    source_coeff2 : torch.Tensor
+        Per-k l=2 source coefficient :math:`c_2(k)`, shape ``(N_k,)``; value
+        equals ``cache.source_coeff2``.
+    k_vectors : torch.Tensor
+        Reciprocal-lattice vectors, shape ``(N_k, 3)``; value equals
+        ``cache.k_vectors``.
+    cache : MultipoleSCFCache
+        Per-system direct-k-space state; must be built with ``l_max>=2``.
+
+    Returns
+    -------
+    torch.Tensor
+        Additive Q-channel :math:`\rho_Q(k)`, shape ``(N_k, 2)`` float64.
+    """
+
+    @staticmethod
+    def apply(
+        quadrupoles: torch.Tensor,
+        positions: torch.Tensor,
+        source_coeff2: torch.Tensor,
+        k_vectors: torch.Tensor,
+        cache: MultipoleSCFCache,
+    ) -> torch.Tensor:
+        """Dispatch to ``torch.ops.nvalchemiops.multipole_rho_q`` (``cache`` -> volume)."""
+        if cache.source_coeff2 is None:
+            raise ValueError(
+                "MultipoleRhoQFunction requires a cache built with l_max>=2 "
+                "(cache.source_coeff2 is None)."
+            )
+        return torch.ops.nvalchemiops.multipole_rho_q(
+            quadrupoles, positions, source_coeff2, k_vectors, cache.volume
+        )
+
+
+# =============================================================================
+# Ewald reciprocal-space fused scalar (public entry)
+# =============================================================================
+
+
+def multipole_reciprocal_space_dipole_fused_scalar(
+    positions: torch.Tensor,
+    source_feats: torch.Tensor,
+    cache: MultipoleSCFCache,
+    *,
+    include_self_interaction: bool = True,
+) -> torch.Tensor:
+    r"""Scalar reciprocal-space energy — thin alias of :func:`multipole_scf_step_energy`.
+
+    The rho(k) op chain in :func:`multipole_scf_step_energy` produces exactly
+    this scalar (:math:`V/(2\pi)^6 \sum_k f_k |\rho(k)|^2` minus the optional
+    self term) with full forward + backward + ``create_graph`` autograd, all
+    ``torch.compile``-clean, so this entry just forwards to it.
+
+    Parameters
+    ----------
+    positions : torch.Tensor
+        Atomic coordinates, shape ``(N_atoms, 3)``.
+    source_feats : torch.Tensor
+        Packed source moments ``(N_atoms, 1|4)``.
+    cache : MultipoleSCFCache
+        Per-system direct-k-space state.
+    include_self_interaction : bool, optional
+        When ``False``, subtract the source-source self-overlap term. Defaults
+        to ``True``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar reciprocal-space energy (0-d float64 tensor).
+    """
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+        multipole_scf_step_energy,
+    )
+
+    return multipole_scf_step_energy(
+        cache,
+        positions,
+        source_feats,
+        include_self_interaction=include_self_interaction,
+    )
+
+
+# =============================================================================
+# MultipoleProjectRawFeaturesFunction
+# =============================================================================
+
+
+# Opaque feature-projection sub-op chains (l<=1)
+# -----------------------------------------------------------------------------
+#
+# The raw-feature backward is composed of independent kernel calls (V, position,
+# phi_hat phase, k-vector phase). Each is wrapped as its own opaque
+# ``torch.library.custom_op`` so the ``multipole_project_raw_features`` backward
+# (``register_autograd``, AOTAutograd-traced) calls only opaque ops + plain
+# torch. The two differentiable chains (V, position) carry their own analytical
+# backward, so ``create_graph=True`` (force-loss) composes and stays
+# compile-clean. The phi_hat / k-vector ops are forward-only (1st-order
+# reciprocal cell-grad; cell 2nd-order out of scope). ``n_sigma`` derives from
+# ``receiver_phi_hat.shape[1]``; ``cache`` is never an op argument.
+
+
+def _project_raw_features_launch(
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    r"""Run :func:`project_features_dipole` (no self-subtract, natural layout).
+
+    Returns the raw feature tensor ``(N_atoms, N_σ, 4)`` — the projection of
+    ``V(k)`` onto the receiver basis with the half-origin ``k_factor_proj``
+    weighting, before the self-interaction correction.
+    """
+    device = potential.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_sigma = receiver_phi_hat.shape[1]
+
+    # Zero dummies for the unused self-interaction slots.
+    src_lm_zero = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    oc_zero = torch.zeros((n_sigma, 2), dtype=torch.float64, device=device)
+
+    # Natural-layout LUT — the l<=1 kernel writes column s*4+lm.
+    s_ar = torch.arange(n_sigma, dtype=torch.int32, device=device).unsqueeze(1)
+    lm_ar = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    lut = (s_ar * 4 + lm_ar).contiguous()
+
+    features_flat = torch.empty(
+        (n_atoms, n_sigma * 4), dtype=torch.float64, device=device
+    )
+    project_features_dipole(
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(src_lm_zero, dtype=wp.float64),
+        wp.from_torch(oc_zero, dtype=wp.float64),
+        False,  # subtract_self
+        wp.from_torch(lut, dtype=wp.int32),
+        wp.from_torch(features_flat, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return features_flat.reshape(n_atoms, n_sigma, 4)
+
+
+# ---- V-grad chain: grad_raw -> grad_V (register_warp_op_chain) ----
+
+
+def _feature_v_grad_forward(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`v_gradient_from_feature_grad` — ``∂L/∂V(k)`` ``(N_k, 2)``.
+
+    ``k_vectors`` / ``positions`` are unused by the value kernel (carried by the
+    detached cos/sin table) but are explicit inputs so their second-order grads
+    have a slot in the backward.
+    """
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_k = receiver_phi_hat.shape[0]
+    grad_v = torch.empty((n_k, 2), dtype=torch.float64, device=device)
+    v_gradient_from_feature_grad(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_v, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_v
+
+
+def _feature_v_grad_forward_fake(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 2)`` float64."""
+    return receiver_phi_hat.new_empty(
+        (receiver_phi_hat.shape[0], 2), dtype=torch.float64
+    )
+
+
+def _feature_v_grad_backward(
+    gg_v: torch.Tensor,
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward: ``(ggrad_raw, ggrad_kfp, ggrad_positions)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_sigma = receiver_phi_hat.shape[1]
+
+    # ggrad_raw: transpose = project_features_dipole with V = gg_v.
+    src_lm_zero = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    oc_zero = torch.zeros((n_sigma, 2), dtype=torch.float64, device=device)
+    lut = (
+        torch.arange(n_sigma * 4, dtype=torch.int32, device=device)
+        .view(n_sigma, 4)
+        .contiguous()
+    )
+    ggrad_raw_flat = torch.zeros(
+        (n_atoms, n_sigma * 4), dtype=torch.float64, device=device
+    )
+    project_features_dipole(
+        wp.from_torch(gg_v.contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(src_lm_zero, dtype=wp.float64),
+        wp.from_torch(oc_zero, dtype=wp.float64),
+        False,  # subtract_self
+        wp.from_torch(lut, dtype=wp.int32),
+        wp.from_torch(ggrad_raw_flat, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    ggrad_raw = ggrad_raw_flat.reshape(n_atoms, n_sigma, 4)
+
+    # ggrad_kfp: grad_v[k] is linear in kfp[k], so ∂/∂kfp = grad_v[k] / kfp[k];
+    # kfp == 0 entries have grad_v == 0 -> grad 0.
+    grad_v = _feature_v_grad_forward(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, k_vectors, positions
+    )
+    safe_kfp = torch.where(
+        k_factor_proj != 0, k_factor_proj, torch.ones_like(k_factor_proj)
+    )
+    per_k = (gg_v * grad_v).sum(dim=-1) / safe_kfp
+    ggrad_kfp = torch.where(k_factor_proj != 0, per_k, torch.zeros_like(per_k))
+
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    v_grad_from_feat_grad_backward_positions(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_v.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return ggrad_raw, ggrad_kfp, ggrad_positions
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_feature_v_grad",
+    forward=_feature_v_grad_forward,
+    backward=_feature_v_grad_backward,
+    diff_input_positions=(0, 4, 6),
+    n_forward_inputs=7,
+    forward_fake=_feature_v_grad_forward_fake,
+)
+
+
+# ---- position-grad chain: grad_raw -> grad_positions (register_warp_op_chain) ----
+
+
+def _feature_position_grad_forward(
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`position_gradient_from_feature_grad` — ``∂L/∂r`` ``(N_atoms, 3)``.
+
+    ``positions`` is unused by the value kernel (carried by the detached cos/sin
+    table) but is an explicit input so its position-Hessian grad has a slot.
+    """
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    grad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    position_gradient_from_feature_grad(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_positions
+
+
+def _feature_position_grad_forward_fake(
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: position gradient ``(N_atoms, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3), dtype=torch.float64)
+
+
+def _feature_position_grad_backward(
+    gg_positions: torch.Tensor,
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward: ``(ggrad_raw, ggrad_v, ggrad_positions)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+
+    ggrad_raw = torch.empty_like(grad_raw)
+    feat_position_grad_backward_grad_raw(
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_raw, dtype=wp.float64),
+        device=str(wp_device),
+    )
+
+    ggrad_v = torch.empty_like(potential)
+    feat_position_grad_backward_v(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_v, dtype=wp.float64),
+        device=str(wp_device),
+    )
+
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    feat_position_grad_backward_positions(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return ggrad_raw, ggrad_v, ggrad_positions
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_feature_position_grad",
+    forward=_feature_position_grad_forward,
+    backward=_feature_position_grad_backward,
+    diff_input_positions=(0, 1, 7),
+    n_forward_inputs=8,
+    forward_fake=_feature_position_grad_forward_fake,
+)
+
+
+# ---- phi_hat / k-vector phase (forward-only; carry the reciprocal cell-grad) ----
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_feature_phihat_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_raw, Tensor cosines, Tensor sines, Tensor k_factor_proj, "
+        "Tensor potential, int n_lm) -> Tensor"
+    ),
+)
+def _feature_phihat_grad_op(
+    grad_raw: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    n_lm: int,
+) -> torch.Tensor:
+    """``dL/dreceiver_phi_hat`` ``(N_k, N_σ, n_lm, 2)`` via ``project_phihat_grad_dipole``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_k = cosines.shape[0]
+    n_sigma = grad_raw.shape[1]
+    grad_phi = torch.zeros((n_k, n_sigma, n_lm, 2), dtype=torch.float64, device=device)
+    project_phihat_grad_dipole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_phi, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_phi
+
+
+@torch.library.register_fake("nvalchemiops::multipole_feature_phihat_grad")
+def _feature_phihat_grad_fake(
+    grad_raw: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    n_lm: int,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, N_σ, n_lm, 2)`` float64."""
+    return cosines.new_empty(
+        (cosines.shape[0], grad_raw.shape[1], n_lm, 2), dtype=torch.float64
+    )
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_feature_kphase_grad",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_raw, Tensor receiver_phi_hat, Tensor cosines, "
+        "Tensor sines, Tensor k_factor_proj, Tensor potential, "
+        "Tensor positions) -> Tensor"
+    ),
+)
+def _feature_kphase_grad_op(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dk_vectors`` ``(N_k, 3)`` through the phase via ``project_kphase_grad_dipole``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_k = cosines.shape[0]
+    grad_kvec = torch.zeros((n_k, 3), dtype=torch.float64, device=device)
+    project_kphase_grad_dipole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(positions.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_kvec, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_kvec
+
+
+@torch.library.register_fake("nvalchemiops::multipole_feature_kphase_grad")
+def _feature_kphase_grad_fake(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 3)`` float64."""
+    return cosines.new_empty((cosines.shape[0], 3), dtype=torch.float64)
+
+
+# =============================================================================
+# torch.library.custom_op chain for the raw feature projection (l<=1)
+# =============================================================================
+#
+# Fully-differentiable opaque op. The forward seals the struct-dtype
+# ``wp.from_torch`` inside an opaque node so both the eager and ``torch.compile``
+# forwards are break-free. The ``register_autograd`` backward calls ONLY the
+# opaque sub-op chains above + plain torch, so AOTAutograd can trace it (the
+# compiled backward is break-free too) and ``create_graph`` composes through the
+# differentiable V/position chains. ``cache`` is never an op argument: the
+# kernels read ``receiver_phi_hat`` (the l<=1 ``[:, :, :4, :]`` slice the step
+# threads), ``k_vectors`` and ``k_factor_proj`` — all explicit tensor inputs.
+# ``k_factor_proj`` has zero cell-grad so its grad slot is ``None``.
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_project_raw_features",
+    mutates_args=(),
+    schema=(
+        "(Tensor potential, Tensor positions, Tensor receiver_phi_hat, "
+        "Tensor k_vectors, Tensor k_factor_proj) -> Tensor"
+    ),
+)
+def _multipole_project_raw_features_op(
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    """Opaque forward: build (cos, sin) and run the raw l<=1 projection."""
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return _project_raw_features_launch(
+        potential, receiver_phi_hat, cosines, sines, k_factor_proj
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_project_raw_features")
+def _multipole_project_raw_features_fake(
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: raw features ``(N_atoms, N_σ, 4)`` float64."""
+    n_atoms = positions.shape[0]
+    n_sigma = receiver_phi_hat.shape[1]
+    return positions.new_empty((n_atoms, n_sigma, 4), dtype=torch.float64)
+
+
+def _multipole_project_raw_features_setup_context(ctx, inputs, output) -> None:
+    """Save the forward inputs for the analytical backward."""
+    potential, positions, receiver_phi_hat, k_vectors, k_factor_proj = inputs
+    ctx.save_for_backward(
+        potential, positions, receiver_phi_hat, k_vectors, k_factor_proj
+    )
+
+
+def _multipole_project_raw_features_backward(ctx, grad_raw: torch.Tensor):
+    """Analytical grads for potential, positions, receiver_phi_hat, k_vectors.
+
+    Recomputes (cos, sin) via the opaque ``multipole_structure_factor`` op (on
+    detached positions/k_vectors — cos/sin are constants) and dispatches the V /
+    position chains + the forward-only phi_hat / k-vector ops. Every call is an
+    opaque op or plain torch, so AOTAutograd traces this without touching Warp.
+    ``k_factor_proj`` gets ``None`` (zero cell-grad).
+    """
+    potential, positions, receiver_phi_hat, k_vectors, k_factor_proj = ctx.saved_tensors
+    grad_raw = grad_raw.contiguous()
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    grad_v = torch.ops.nvalchemiops.multipole_feature_v_grad(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, k_vectors, positions
+    )
+    grad_positions = torch.ops.nvalchemiops.multipole_feature_position_grad(
+        grad_raw,
+        potential,
+        receiver_phi_hat,
+        cosines,
+        sines,
+        k_factor_proj,
+        k_vectors,
+        positions,
+    )
+    grad_phihat = torch.ops.nvalchemiops.multipole_feature_phihat_grad(
+        grad_raw, cosines, sines, k_factor_proj, potential, 4
+    )
+    grad_kvec = torch.ops.nvalchemiops.multipole_feature_kphase_grad(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, potential, positions
+    )
+    grad_v = grad_v.to(potential.dtype)
+    grad_positions = grad_positions.to(positions.dtype)
+    grad_phihat = grad_phihat.to(receiver_phi_hat.dtype)
+    grad_kvec = grad_kvec.to(k_vectors.dtype)
+    # Slots: (potential, positions, receiver_phi_hat, k_vectors, k_factor_proj).
+    return grad_v, grad_positions, grad_phihat, grad_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_project_raw_features",
+    _multipole_project_raw_features_backward,
+    setup_context=_multipole_project_raw_features_setup_context,
+)
+
+
+class MultipoleProjectRawFeaturesFunction:
+    r"""Back-compat shim for the raw (un-self-subtracted) l<=1 feature projection.
+
+    The implementation is the fully-differentiable
+    ``torch.ops.nvalchemiops.multipole_project_raw_features`` custom op (opaque
+    forward + analytical backward + ``create_graph`` support, all compile-clean).
+    This class only preserves the historical
+    ``.apply(potential, positions, receiver_phi_hat, k_vectors, cache)`` call
+    signature (the dataclass ``cache`` supplies ``k_factor_proj``); new code
+    should call the op directly.
+
+    Parameters
+    ----------
+    potential : torch.Tensor
+        Reciprocal-space potential :math:`V(k)`, shape ``(N_k, 2)``.
+    positions : torch.Tensor
+        Atomic coordinates, shape ``(N_atoms, 3)``.
+    receiver_phi_hat : torch.Tensor
+        l<=1 receiver block ``[:, :, :4, :]`` of shape ``(N_k, N_σ, 4, 2)``;
+        carries the feature cell-grad.
+    k_vectors : torch.Tensor
+        Reciprocal-lattice vectors, shape ``(N_k, 3)``.
+    cache : MultipoleSCFCache
+        Per-system direct-k-space state; supplies ``cache.k_factor_proj``.
+
+    Returns
+    -------
+    torch.Tensor
+        Raw (un-self-subtracted) features ``(N_atoms, N_σ, 4)`` float64.
+    """
+
+    @staticmethod
+    def apply(
+        potential: torch.Tensor,
+        positions: torch.Tensor,
+        receiver_phi_hat: torch.Tensor,
+        k_vectors: torch.Tensor,
+        cache: MultipoleSCFCache,
+    ) -> torch.Tensor:
+        """Dispatch to ``torch.ops.nvalchemiops.multipole_project_raw_features``."""
+        return torch.ops.nvalchemiops.multipole_project_raw_features(
+            potential, positions, receiver_phi_hat, k_vectors, cache.k_factor_proj
+        )
+
+
+# =============================================================================
+# l=2 raw feature projection (5-channel receiver block)
+# =============================================================================
+
+
+def _l2_receiver_block(cache: MultipoleSCFCache) -> torch.Tensor:
+    r"""Extract the contiguous l=2 sub-block ``(N_k, N_σ, 5, 2)`` of the cache.
+
+    The feature_max_l=2 cache stores a 9-column ``receiver_phi_hat`` with the
+    l<=1 block in columns ``0:4`` and the l=2 block in columns ``4:9``.
+    """
+    if cache.feature_max_l < 2:
+        raise ValueError(
+            "l=2 feature projection requires a cache built with feature_max_l=2 "
+            f"(got feature_max_l={cache.feature_max_l})."
+        )
+    return cache.receiver_phi_hat[:, :, 4:9, :].contiguous()
+
+
+def _project_raw_features_quadrupole_launch(
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    r"""Run :func:`project_features_quadrupole` (no self-subtract). ``(N, N_σ, 5)``."""
+    device = potential.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_sigma = receiver_phi_hat.shape[1]
+
+    features = torch.empty((n_atoms, n_sigma, 5), dtype=torch.float64, device=device)
+    project_features_quadrupole(
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(features, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return features
+
+
+# ---- l=2 V-grad chain: grad_raw -> grad_V (register_warp_op_chain) ----
+
+
+def _feature_v_grad_quadrupole_forward(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`v_gradient_from_feature_grad_quadrupole` — ``∂L/∂V(k)`` ``(N_k, 2)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_k = receiver_phi_hat.shape[0]
+    grad_v = torch.empty((n_k, 2), dtype=torch.float64, device=device)
+    v_gradient_from_feature_grad_quadrupole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(grad_v, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_v
+
+
+def _feature_v_grad_quadrupole_forward_fake(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 2)`` float64."""
+    return receiver_phi_hat.new_empty(
+        (receiver_phi_hat.shape[0], 2), dtype=torch.float64
+    )
+
+
+def _feature_v_grad_quadrupole_backward(
+    gg_v: torch.Tensor,
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Second-order backward: ``(ggrad_raw, ggrad_positions)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    n_sigma = receiver_phi_hat.shape[1]
+
+    # ggrad_raw: transpose = project_features_quadrupole with V = gg_v.
+    ggrad_raw = torch.empty((n_atoms, n_sigma, 5), dtype=torch.float64, device=device)
+    project_features_quadrupole(
+        wp.from_torch(gg_v.contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(ggrad_raw, dtype=wp.float64),
+        device=str(wp_device),
+    )
+
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    v_grad_from_feat_grad_backward_positions_quadrupole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_v.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return ggrad_raw, ggrad_positions
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_feature_v_grad_quadrupole",
+    forward=_feature_v_grad_quadrupole_forward,
+    backward=_feature_v_grad_quadrupole_backward,
+    diff_input_positions=(0, 6),
+    n_forward_inputs=7,
+    forward_fake=_feature_v_grad_quadrupole_forward_fake,
+)
+
+
+# ---- l=2 position-grad chain: grad_raw -> grad_positions (register_warp_op_chain) ----
+
+
+def _feature_position_grad_quadrupole_forward(
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    r""":func:`position_gradient_from_feature_grad_quadrupole` — ``∂L/∂r`` ``(N_atoms, 3)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+    grad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    position_gradient_from_feature_grad_quadrupole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return grad_positions
+
+
+def _feature_position_grad_quadrupole_forward_fake(
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: position gradient ``(N_atoms, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3), dtype=torch.float64)
+
+
+def _feature_position_grad_quadrupole_backward(
+    gg_positions: torch.Tensor,
+    grad_raw: torch.Tensor,
+    potential: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    k_vectors: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward: ``(ggrad_raw, ggrad_v, ggrad_positions)``."""
+    device = grad_raw.device
+    wp_device = wp.device_from_torch(device)
+    n_atoms = cosines.shape[1]
+
+    ggrad_raw = torch.empty_like(grad_raw)
+    feat_position_grad_backward_grad_raw_quadrupole(
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_raw, dtype=wp.float64),
+        device=str(wp_device),
+    )
+
+    ggrad_v = torch.empty_like(potential)
+    feat_position_grad_backward_v_quadrupole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_v, dtype=wp.float64),
+        device=str(wp_device),
+    )
+
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    feat_position_grad_backward_positions_quadrupole(
+        wp.from_torch(grad_raw.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(receiver_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_factor_proj.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(potential.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(gg_positions.contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(ggrad_positions, dtype=wp.float64),
+        device=str(wp_device),
+    )
+    return ggrad_raw, ggrad_v, ggrad_positions
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_feature_position_grad_quadrupole",
+    forward=_feature_position_grad_quadrupole_forward,
+    backward=_feature_position_grad_quadrupole_backward,
+    diff_input_positions=(0, 1, 7),
+    n_forward_inputs=8,
+    forward_fake=_feature_position_grad_quadrupole_forward_fake,
+)
+
+
+# ---- l=2 phi_hat / k-vector phase (forward-only; reuse the channel-generic kernels) ----
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_feature_phihat_grad_quadrupole",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_raw, Tensor cosines, Tensor sines, Tensor k_factor_proj, "
+        "Tensor potential) -> Tensor"
+    ),
+)
+def _feature_phihat_grad_quadrupole_op(
+    grad_raw: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dreceiver_phi_hat`` ``(N_k, N_σ, 5, 2)`` via ``project_phihat_grad_dipole``."""
+    return _feature_phihat_grad_op(
+        grad_raw, cosines, sines, k_factor_proj, potential, 5
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_feature_phihat_grad_quadrupole")
+def _feature_phihat_grad_quadrupole_fake(
+    grad_raw: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, N_σ, 5, 2)`` float64."""
+    return cosines.new_empty(
+        (cosines.shape[0], grad_raw.shape[1], 5, 2), dtype=torch.float64
+    )
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_feature_kphase_grad_quadrupole",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_raw, Tensor receiver_phi_hat, Tensor cosines, "
+        "Tensor sines, Tensor k_factor_proj, Tensor potential, "
+        "Tensor positions) -> Tensor"
+    ),
+)
+def _feature_kphase_grad_quadrupole_op(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """``dL/dk_vectors`` ``(N_k, 3)`` through the phase via ``project_kphase_grad_dipole``."""
+    return _feature_kphase_grad_op(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, potential, positions
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_feature_kphase_grad_quadrupole")
+def _feature_kphase_grad_quadrupole_fake(
+    grad_raw: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 3)`` float64."""
+    return cosines.new_empty((cosines.shape[0], 3), dtype=torch.float64)
+
+
+# =============================================================================
+# torch.library.custom_op chain for the raw l=2 feature projection
+# =============================================================================
+#
+# Fully-differentiable opaque op (l=2 analog of multipole_project_raw_features).
+# The forward seals the struct-dtype ``wp.from_torch`` inside an opaque node; the
+# ``register_autograd`` backward calls only the opaque sub-op chains + plain
+# torch, so AOTAutograd traces it and ``create_graph`` composes through the
+# differentiable V/position chains. ``cache`` is never an op argument: the
+# kernels read the threaded l=2 receiver slice ``[:, :, 4:9, :]`` plus
+# ``k_vectors`` / ``k_factor_proj``. ``k_factor_proj`` has zero cell-grad.
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_project_raw_features_quadrupole",
+    mutates_args=(),
+    schema=(
+        "(Tensor potential, Tensor positions, Tensor receiver_phi_hat, "
+        "Tensor k_vectors, Tensor k_factor_proj) -> Tensor"
+    ),
+)
+def _multipole_project_raw_features_quadrupole_op(
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    """Opaque forward: build (cos, sin) and run the raw l=2 projection."""
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return _project_raw_features_quadrupole_launch(
+        potential, receiver_phi_hat, cosines, sines, k_factor_proj
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_project_raw_features_quadrupole")
+def _multipole_project_raw_features_quadrupole_fake(
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+    receiver_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_factor_proj: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: raw l=2 features ``(N_atoms, N_σ, 5)`` float64."""
+    n_atoms = positions.shape[0]
+    n_sigma = receiver_phi_hat.shape[1]
+    return positions.new_empty((n_atoms, n_sigma, 5), dtype=torch.float64)
+
+
+def _multipole_project_raw_features_quadrupole_setup_context(
+    ctx, inputs, output
+) -> None:
+    """Save the forward inputs for the analytical backward."""
+    potential, positions, receiver_phi_hat, k_vectors, k_factor_proj = inputs
+    ctx.save_for_backward(
+        potential, positions, receiver_phi_hat, k_vectors, k_factor_proj
+    )
+
+
+def _multipole_project_raw_features_quadrupole_backward(ctx, grad_raw: torch.Tensor):
+    """Analytical grads for potential, positions, receiver_phi_hat, k_vectors.
+
+    Recomputes (cos, sin) via the opaque ``multipole_structure_factor`` op (on
+    detached positions/k_vectors) and dispatches the l=2 V / position chains +
+    the forward-only phi_hat / k-vector ops. ``k_factor_proj`` gets ``None``.
+    """
+    potential, positions, receiver_phi_hat, k_vectors, k_factor_proj = ctx.saved_tensors
+    grad_raw = grad_raw.contiguous()
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    grad_v = torch.ops.nvalchemiops.multipole_feature_v_grad_quadrupole(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, k_vectors, positions
+    )
+    grad_positions = torch.ops.nvalchemiops.multipole_feature_position_grad_quadrupole(
+        grad_raw,
+        potential,
+        receiver_phi_hat,
+        cosines,
+        sines,
+        k_factor_proj,
+        k_vectors,
+        positions,
+    )
+    grad_phihat = torch.ops.nvalchemiops.multipole_feature_phihat_grad_quadrupole(
+        grad_raw, cosines, sines, k_factor_proj, potential
+    )
+    grad_kvec = torch.ops.nvalchemiops.multipole_feature_kphase_grad_quadrupole(
+        grad_raw, receiver_phi_hat, cosines, sines, k_factor_proj, potential, positions
+    )
+    grad_v = grad_v.to(potential.dtype)
+    grad_positions = grad_positions.to(positions.dtype)
+    grad_phihat = grad_phihat.to(receiver_phi_hat.dtype)
+    grad_kvec = grad_kvec.to(k_vectors.dtype)
+    # Slots: (potential, positions, receiver_phi_hat, k_vectors, k_factor_proj).
+    return grad_v, grad_positions, grad_phihat, grad_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_project_raw_features_quadrupole",
+    _multipole_project_raw_features_quadrupole_backward,
+    setup_context=_multipole_project_raw_features_quadrupole_setup_context,
+)
+
+
+class MultipoleProjectRawFeaturesQuadrupoleFunction:
+    r"""Back-compat shim for the raw (un-self-subtracted) l=2 feature projection.
+
+    The implementation is the fully-differentiable
+    ``torch.ops.nvalchemiops.multipole_project_raw_features_quadrupole`` custom
+    op (opaque forward + analytical backward + ``create_graph`` support, all
+    compile-clean). This class only preserves the historical
+    ``.apply(potential, positions, receiver_phi_hat_l2, k_vectors, cache)`` call
+    signature (the dataclass ``cache`` supplies ``k_factor_proj``); new code
+    should call the op directly.
+
+    Parameters
+    ----------
+    potential : torch.Tensor
+        Reciprocal-space potential :math:`V(k)`, shape ``(N_k, 2)``.
+    positions : torch.Tensor
+        Atomic coordinates, shape ``(N_atoms, 3)``.
+    receiver_phi_hat_l2 : torch.Tensor
+        l=2 receiver block ``[:, :, 4:9, :]`` of shape ``(N_k, N_σ, 5, 2)``;
+        carries the feature cell-grad.
+    k_vectors : torch.Tensor
+        Reciprocal-lattice vectors, shape ``(N_k, 3)``.
+    cache : MultipoleSCFCache
+        Per-system direct-k-space state; supplies ``cache.k_factor_proj``.
+
+    Returns
+    -------
+    torch.Tensor
+        Raw l=2 features ``(N_atoms, N_σ, 5)`` float64 in natural layout.
+    """
+
+    @staticmethod
+    def apply(
+        potential: torch.Tensor,
+        positions: torch.Tensor,
+        receiver_phi_hat_l2: torch.Tensor,
+        k_vectors: torch.Tensor,
+        cache: MultipoleSCFCache,
+    ) -> torch.Tensor:
+        """Dispatch to ``multipole_project_raw_features_quadrupole``."""
+        return torch.ops.nvalchemiops.multipole_project_raw_features_quadrupole(
+            potential,
+            positions,
+            receiver_phi_hat_l2,
+            k_vectors,
+            cache.k_factor_proj,
+        )
