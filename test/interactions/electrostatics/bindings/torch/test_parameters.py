@@ -697,3 +697,258 @@ class TestIntegration:
         )
 
         assert energies.shape == (20,)
+
+
+# ---------------------------------------------------------------------------
+# Multipole (GTO-Ewald) parameter estimators
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateMultipoleEwaldParameters:
+    """Tests for ``estimate_multipole_ewald_parameters``."""
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_sigma_zero_recovers_monopole(self, device):
+        """``sigma → 0`` should reproduce the monopole estimator's alpha + cutoffs bit-exactly."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(500, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 25.0
+
+        mono = estimate_ewald_parameters(positions, cell, accuracy=1e-6)
+        multi = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=1e-12, accuracy=1e-6
+        )
+        # rcut and kcut should match exactly (formula independent of sigma).
+        assert torch.allclose(
+            mono.real_space_cutoff, multi.real_space_cutoff, rtol=0, atol=0
+        )
+        assert torch.allclose(
+            mono.reciprocal_space_cutoff,
+            multi.reciprocal_space_cutoff,
+            rtol=0,
+            atol=0,
+        )
+        # alpha matches to within float64 round-off (sigma**2 << eta**2 means
+        # the discriminant correction is at the round-off floor).
+        assert torch.allclose(mono.alpha, multi.alpha, rtol=1e-9, atol=0)
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_finite_sigma_alpha_larger_than_monopole(self, device):
+        """Finite sigma forces sigma_c >= sigma, so alpha must be > monopole alpha at the same eta."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(1024, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 30.0
+
+        mono = estimate_ewald_parameters(positions, cell, accuracy=1e-6)
+        multi = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=1.0, accuracy=1e-6
+        )
+        # alpha = 1 / (sqrt(2) sqrt(eta^2 - 2 sigma^2)) > 1 / (sqrt(2) eta) = monopole alpha.
+        assert (multi.alpha > mono.alpha).all()
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_sigma_carried_through(self, device):
+        """``MultipoleEwaldParameters.sigma`` is the broadcast input sigma."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 20.0
+        params = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=0.5, accuracy=1e-6
+        )
+        assert params.sigma.shape == (1,)
+        assert torch.isclose(
+            params.sigma, torch.tensor(0.5, dtype=torch.float64, device=device)
+        ).all()
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_validity_guard_fires_when_sigma_too_large(self, device):
+        """Raise ``ValueError`` when GTO smearing dominates the Kolafa-Perram scale."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 10.0
+        # eta ~ 1.7 for these dims; sigma=10 gives 2 sigma^2 >> eta^2.
+        with pytest.raises(ValueError, match="sigma is too large"):
+            estimate_multipole_ewald_parameters(
+                positions, cell, sigma=10.0, accuracy=1e-6
+            )
+
+
+class TestMultipoleEwaldCostRatio:
+    """Cost-ratio knob in the multipole Ewald estimator."""
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_default_matches_canonical_kp(self, device):
+        """cost_ratio=1.0 (default) reproduces the canonical Kolafa-Perram estimator."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(500, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 25.0
+        a = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=0.5, accuracy=1e-6
+        )
+        b = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=0.5, accuracy=1e-6, cost_ratio=1.0
+        )
+        for fa, fb in zip(
+            (a.alpha, a.real_space_cutoff, a.reciprocal_space_cutoff),
+            (b.alpha, b.real_space_cutoff, b.reciprocal_space_cutoff),
+        ):
+            assert torch.equal(fa, fb)
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_cost_ratio_scales_rcut_as_one_over_sixth_root(self, device):
+        """rcut(R) = rcut(1) / R**(1/6); kcut(R) = kcut(1) * R**(1/6)."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.randn(2000, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 30.0
+        sigma = 0.5
+        a = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=sigma, accuracy=1e-6, cost_ratio=1.0
+        )
+        for R in (8.0, 30.0, 64.0):
+            b = estimate_multipole_ewald_parameters(
+                positions, cell, sigma=sigma, accuracy=1e-6, cost_ratio=R
+            )
+            scale = R ** (1.0 / 6.0)
+            assert torch.allclose(
+                b.real_space_cutoff, a.real_space_cutoff / scale, rtol=1e-12, atol=0
+            )
+            assert torch.allclose(
+                b.reciprocal_space_cutoff,
+                a.reciprocal_space_cutoff * scale,
+                rtol=1e-12,
+                atol=0,
+            )
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_cost_ratio_must_be_positive(self, device):
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+        )
+
+        positions = torch.zeros((100, 3), device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 20.0
+        with pytest.raises(ValueError, match="cost_ratio must be positive"):
+            estimate_multipole_ewald_parameters(
+                positions, cell, sigma=0.5, accuracy=1e-6, cost_ratio=0.0
+            )
+        with pytest.raises(ValueError, match="cost_ratio must be positive"):
+            estimate_multipole_ewald_parameters(
+                positions, cell, sigma=0.5, accuracy=1e-6, cost_ratio=-1.0
+            )
+
+
+class TestEstimateMultipolePMEParameters:
+    """Tests for ``estimate_multipole_pme_parameters``."""
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_sigma_zero_recovers_monopole(self, device):
+        """Mesh dims and rcut should match the monopole PME estimator at sigma → 0."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_pme_parameters,
+        )
+
+        positions = torch.randn(500, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 25.0
+
+        mono = estimate_pme_parameters(positions, cell, accuracy=1e-6)
+        multi = estimate_multipole_pme_parameters(
+            positions, cell, sigma=1e-12, accuracy=1e-6
+        )
+        assert mono.mesh_dimensions == multi.mesh_dimensions
+        assert torch.allclose(
+            mono.real_space_cutoff, multi.real_space_cutoff, rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_validity_guard_fires_when_sigma_too_large(self, device):
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_pme_parameters,
+        )
+
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 10.0
+        with pytest.raises(ValueError, match="sigma too large"):
+            estimate_multipole_pme_parameters(
+                positions, cell, sigma=10.0, accuracy=1e-6
+            )
+
+
+class TestMultipoleEwaldSummationAutoEstimate:
+    """End-to-end: ``multipole_ewald_summation`` with ``alpha=None``."""
+
+    @pytest.mark.parametrize("device", [torch.device("cuda:0")])
+    def test_alpha_none_runs_and_matches_explicit(self, device):
+        """Energy with alpha=None matches the energy from explicit alpha+kcut at the same accuracy."""
+        from nvalchemiops.torch.interactions.electrostatics import (
+            estimate_multipole_ewald_parameters,
+            multipole_ewald_summation,
+        )
+        from nvalchemiops.torch.neighbors import neighbor_list
+
+        torch.manual_seed(0)
+        n_atoms = 256
+        L = 12.0
+        positions = torch.rand(n_atoms, 3, device=device, dtype=torch.float64) * L
+        charges = torch.randn(n_atoms, device=device, dtype=torch.float64)
+        charges = charges - charges.mean()
+        dipoles = torch.randn(n_atoms, 3, device=device, dtype=torch.float64) * 0.1
+        sf = torch.stack([charges, dipoles[:, 1], dipoles[:, 2], dipoles[:, 0]], dim=1)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * L
+        sigma = 0.5
+
+        params = estimate_multipole_ewald_parameters(
+            positions, cell, sigma=sigma, accuracy=1e-6
+        )
+        rcut = float(params.real_space_cutoff.item())
+        rcut_capped = min(rcut, 0.499 * L)
+        pbc = torch.tensor([True, True, True], device=device)
+        pairs, nptr, shifts = neighbor_list(
+            positions, rcut_capped, cell=cell, pbc=pbc, return_neighbor_list=True
+        )
+        idx_j = pairs[1].contiguous().to(torch.int32)
+        nptr = nptr.to(torch.int32)
+        shifts = shifts.to(torch.int32)
+
+        e_explicit = multipole_ewald_summation(
+            positions,
+            sf,
+            cell,
+            idx_j,
+            nptr,
+            shifts,
+            sigma=sigma,
+            alpha=float(params.alpha.item()),
+            kspace_cutoff=float(params.reciprocal_space_cutoff.item()),
+        )
+        e_auto = multipole_ewald_summation(
+            positions,
+            sf,
+            cell,
+            idx_j,
+            nptr,
+            shifts,
+            sigma=sigma,
+            accuracy=1e-6,
+        )
+        # Same estimator + same alpha/kcut → physically same energy. The
+        # reciprocal sum uses atomic_add reductions whose order can vary
+        # by a few ULPs between calls, so allow a tiny relative tolerance.
+        assert torch.allclose(e_explicit, e_auto, rtol=1e-13, atol=1e-15)
