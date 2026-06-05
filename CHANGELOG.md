@@ -1,5 +1,92 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **MTK NPT/NPH cell propagation**: kernels wrote `V·(P − P_ext)/W`
+  (strain-rate units) into `cell_velocity` while consumers read it as
+  `ḣ = dh/dt`, costing a factor of cell length in the cell response.
+  `cell_velocity` is now the strain rate `ε̇ = p_g/W` everywhere and
+  the cell update is `h_new = h + dt · ε̇ · h`.
+- **MTK velocity-half-step coupling**: isotropic kernels used
+  `α = 1 + 1/(3N_atoms)` instead of the canonical
+  `α = 1 + 1/N_atoms` (ASE `IsotropicMTKNPT._integrate_p`).
+  Anisotropic and triclinic kernels used `(1 + 1/N_atoms)·ε̇`,
+  which only matches ASE `MTKNPT._integrate_p` for uniform strain;
+  replaced with `ε̇ + Tr(ε̇)/(3·N)·I` (canonical trace correction).
+- **MTK barostat half-step thermostat coupling**: NPT
+  cell-velocity-update kernels applied `−η̇₁·ε̇` inline, mixing the
+  pressure/kinetic driving operator with NHC drag. Removed; callers
+  apply barostat-NHC coupling separately, matching ASE and TorchSim.
+
+### Deprecated
+
+- `cells_inv` argument on `compute_cell_kinetic_energy`,
+  `npt_velocity_half_step{,_out}`, `npt_position_update{,_out}`,
+  `nph_velocity_half_step{,_out}`, `nph_position_update{,_out}`,
+  `run_npt_step`, and `run_nph_step`. Kernels consume
+  `cell_velocities` directly as the strain rate `ε̇ = p_g/W`. Passing
+  `cells_inv` emits a `DeprecationWarning`; the argument will be
+  removed in a future release.
+- `volumes` argument on `compute_cell_kinetic_energy`,
+  `npt_velocity_half_step{,_out}`, and `nph_velocity_half_step{,_out}`.
+  Kernels consume `cell_velocities` directly as the strain rate and
+  no longer need a volume fallback. Passing `volumes` emits a
+  `DeprecationWarning`; the argument will be removed in a future release.
+
+### Breaking Changes
+
+- `cell_velocities` now stores the strain rate `ε̇ = p_g/W`, not
+  `ḣ = dh/dt`. Kernel signatures unchanged.
+- `npt_barostat_half_step{,_aniso,_triclinic}` drop the `eta_dots`
+  argument; thermostat coupling is now a separate Trotter operator.
+
+### Added (neighbors)
+
+- **Pair potentials evaluated inline**: neighbor kernels now accept a
+  user-supplied `pair_fn` callback (with `pair_params`, `pair_energies`,
+  `pair_forces` buffers) that computes per-pair energy and force as pairs
+  are enumerated, so Lennard-Jones–style potentials no longer require a
+  separate pass over the neighbor list.
+- **Per-pair vectors and distances on demand**: `return_vectors` and
+  `return_distances` keyword arguments return the separation vectors
+  `r_ij` and Euclidean distances `|r_ij|` alongside the neighbor matrix,
+  avoiding a manual recomputation downstream.
+- **Cluster-pair tile algorithm**: a new CUDA strategy for large
+  fully-periodic float32 systems. `neighbor_list` auto-selects it when
+  it is eligible; pass `method="cluster_tile"` (or
+  `"batch_cluster_tile"`) to force it. Supports dual cutoff in
+  matrix format.
+- **Partial rebuild for batched workflows**: callers can pass
+  `rebuild_flags` to re-enumerate only the systems whose atoms have
+  moved enough to need a fresh list; unchanged systems keep their
+  previous output. Supported for matrix and segmented-COO outputs in
+  both the JAX and PyTorch bindings.
+
+### Changed (neighbors)
+
+- Restructured `nvalchemiops/neighbors/` into per-strategy subpackages:
+  `naive/`, `cell_list/`, `cluster_tile/`, `rebuild/`. Public launchers
+  live under `*/launchers.py`; strategy selection lives under
+  `*/dispatch.py`.
+- The flat compatibility modules `nvalchemiops.neighbors.{naive_dual_cutoff,
+  batch_naive, batch_cell_list, batch_naive_dual_cutoff, rebuild_detection}`
+  continue to re-export the new entry points with `DeprecationWarning`.
+  (Note: `nvalchemiops.neighbors.naive` and `nvalchemiops.neighbors.cell_list`
+  are now the canonical subpackages, not deprecated shims.)
+
+### Added (electrostatics)
+
+- Higher-order (multipole) electrostatics for charges, dipoles, and quadrupoles
+  (l = 0, 1, 2): direct-k Ewald (`multipole_ewald_summation`), particle-mesh
+  Ewald (`multipole_particle_mesh_ewald`), reciprocal- and real-space entry
+  points, electrostatic feature extraction (`multipole_electrostatic_features`),
+  and an SCF cache/step API for repeated evaluations on a fixed cell. Provided as
+  Warp kernels and `nvalchemiops.torch` bindings, single-system and batched, with
+  energies, forces, moment gradients, stress, and force-loss (`create_graph`)
+  training; the forward and first-order backward are `torch.compile`-compatible.
+
 ## 0.3.0 - 2026-XX-XX
 
 ### Breaking Changes
@@ -21,14 +108,6 @@ release.
 - JAX bindings in `nvalchemiops.jax.*` that wrap the Warp kernels, providing
   support for neighbor lists, DFT-D3 dispersion, electrostatics (Coulomb, Ewald,
   PME), and splines with `jax.jit` compatibility.
-- Higher-order (multipole) electrostatics for charges, dipoles, and quadrupoles
-  (l = 0, 1, 2): direct-k Ewald (`multipole_ewald_summation`), particle-mesh
-  Ewald (`multipole_particle_mesh_ewald`), reciprocal- and real-space entry
-  points, electrostatic feature extraction (`multipole_electrostatic_features`),
-  and an SCF cache/step API for repeated evaluations on a fixed cell. Provided as
-  Warp kernels and `nvalchemiops.torch` bindings, single-system and batched, with
-  energies, forces, moment gradients, stress, and force-loss (`create_graph`)
-  training; the forward and first-order backward are `torch.compile`-compatible.
 - GPU-accelerated molecular dynamics integrators with single-system and batched modes:
 Velocity Verlet (NVE), Langevin (NVT), Nosé-Hoover Chain (NVT), NPT, NPH, and
 Velocity Rescaling

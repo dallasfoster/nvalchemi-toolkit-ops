@@ -30,6 +30,12 @@ Available methods:
 - **Damped Shifted Force** (`dsf`): pairwise :math:`O(N)` summation where both
   potential and forces vanish smoothly at the cutoff; supports
   geometry-dependent charges.
+- **Slab correction** (`slab_kernels`): Yeh-Berkowitz / Ballenegger correction
+  for 2D-periodic slabs; orthogonal and triclinic cells via projected slab
+  normals. PyTorch ``compute_slab_correction()`` and
+  ``ewald_summation(..., slab_correction=True)``.
+- **Multipole electrostatics** (`multipole_*`): charge/dipole/quadrupole
+  (l = 0, 1, 2) Ewald, PME, and electrostatic feature extraction.
 """
 
 # Coulomb
@@ -164,7 +170,13 @@ from nvalchemiops.interactions.electrostatics.pme_kernels import (
     pme_green_structure_factor,
 )
 
-# DSF
+# Slab correction - Warp launchers (framework-agnostic)
+from nvalchemiops.interactions.electrostatics.slab_kernels import (
+    slab_correction,
+    slab_reduce_moments,
+)
+
+# DSF - Warp launchers (framework-agnostic)
 from .dsf import (
     dsf_csr,
     dsf_matrix,
@@ -279,7 +291,10 @@ __all__ = [
     "batch_feat_position_grad_backward_v",
     "batch_feat_position_grad_backward_positions",
     "batch_v_grad_from_feat_grad_backward_positions",
-    # PME
+    # Slab correction - Warp launchers
+    "slab_reduce_moments",
+    "slab_correction",
+    # PME - Warp launchers
     "pme_green_structure_factor",
     "batch_pme_green_structure_factor",
     "pme_energy_corrections",
@@ -290,6 +305,7 @@ __all__ = [
     "ewald_real_space",
     "ewald_reciprocal_space",
     "ewald_summation",
+    "compute_slab_correction",
     # PME - PyTorch bindings (deprecated, use nvalchemiops.torch.interactions.electrostatics)
     "particle_mesh_ewald",
     "pme_reciprocal_space",
@@ -308,6 +324,8 @@ _DEPRECATED_TORCH_EXPORTS = {
     "pme_green_structure_factor": "nvalchemiops.torch.interactions.electrostatics.pme",
     "pme_energy_corrections": "nvalchemiops.torch.interactions.electrostatics.pme",
     "pme_energy_corrections_with_charge_grad": "nvalchemiops.torch.interactions.electrostatics.pme",
+    # Slab correction
+    "compute_slab_correction": "nvalchemiops.torch.interactions.electrostatics.slab",
     # K-vectors
     "generate_k_vectors_ewald_summation": "nvalchemiops.torch.interactions.electrostatics.k_vectors",
     "generate_k_vectors_pme": "nvalchemiops.torch.interactions.electrostatics.k_vectors",

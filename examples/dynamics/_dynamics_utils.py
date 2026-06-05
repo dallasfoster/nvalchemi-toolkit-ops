@@ -55,17 +55,17 @@ from nvalchemiops.dynamics.utils import (
     wrap_positions_to_cell,
 )
 from nvalchemiops.interactions import lj_energy_forces, lj_energy_forces_virial
-from nvalchemiops.neighbors.batch_cell_list import (
+from nvalchemiops.neighbors.cell_list import (
     batch_build_cell_list,
     batch_query_cell_list,
+    build_cell_list,
+    query_cell_list,
 )
-from nvalchemiops.neighbors.cell_list import build_cell_list, query_cell_list
 from nvalchemiops.neighbors.neighbor_utils import (
     selective_zero_num_neighbors,
     selective_zero_num_neighbors_single,
-    zero_array,
 )
-from nvalchemiops.neighbors.rebuild_detection import (
+from nvalchemiops.neighbors.rebuild import (
     check_batch_neighbor_list_rebuild,
     check_neighbor_list_rebuild,
 )
@@ -479,7 +479,7 @@ class NeighborListManager:
             rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero rebuild flag — kernel only sets True, never clears
-        zero_array(self.wp_rebuild_flag, self.device)
+        self.wp_rebuild_flag.zero_()
 
         # 2. GPU-side displacement check — writes True if any atom moved > skin/2
         check_neighbor_list_rebuild(
@@ -495,7 +495,7 @@ class NeighborListManager:
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
-        zero_array(self.wp_atoms_per_cell_count, self.device)
+        self.wp_atoms_per_cell_count.zero_()
         build_cell_list(
             positions_wp,
             cell_wp,
@@ -689,7 +689,7 @@ class BatchedNeighborListManager:
             the rebuild check uses minimum-image convention (MIC).
         """
         # 1. Zero per-system flags — kernel only sets True, never clears
-        zero_array(self.wp_rebuild_flags, self.device)
+        self.wp_rebuild_flags.zero_()
 
         # 2. GPU-side per-system displacement check — no CPU sync
         check_batch_neighbor_list_rebuild(
@@ -707,7 +707,7 @@ class BatchedNeighborListManager:
         )
 
         # 3. Always rebuild cell structure (cheap O(N) spatial binning)
-        zero_array(self.wp_atoms_per_cell_count, self.device)
+        self.wp_atoms_per_cell_count.zero_()
         batch_build_cell_list(
             positions_wp,
             cells_wp,
@@ -1890,7 +1890,6 @@ def run_nph_mtk(
     nph_pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
     nph_volumes = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
     nph_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
-    nph_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
     nph_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
     nph_num_atoms_per_system = wp.array(
         [system.num_atoms], dtype=wp.int32, device=system.device
@@ -1944,7 +1943,6 @@ def run_nph_mtk(
             pressure_tensors=nph_pressure_tensors,
             volumes=nph_volumes,
             kinetic_energy=nph_kinetic_energy,
-            cells_inv=nph_cells_inv,
             kinetic_tensors=nph_kinetic_tensors,
             num_atoms_per_system=nph_num_atoms_per_system,
             compute_forces_fn=_compute_forces_cb,
@@ -2068,7 +2066,6 @@ def run_npt_mtk(
     npt_pressure_tensors = wp.zeros(1, dtype=tensor_dtype, device=system.device)
     npt_volumes = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
     npt_kinetic_energy = wp.zeros(1, dtype=system.wp_dtype, device=system.device)
-    npt_cells_inv = wp.empty(1, dtype=system.wp_mat_dtype, device=system.device)
     npt_kinetic_tensors = wp.zeros((1, 9), dtype=system.wp_dtype, device=system.device)
     npt_num_atoms_per_system = wp.array(
         [system.num_atoms], dtype=wp.int32, device=system.device
@@ -2129,7 +2126,6 @@ def run_npt_mtk(
             pressure_tensors=npt_pressure_tensors,
             volumes=npt_volumes,
             kinetic_energy=npt_kinetic_energy,
-            cells_inv=npt_cells_inv,
             kinetic_tensors=npt_kinetic_tensors,
             num_atoms_per_system=npt_num_atoms_per_system,
             compute_forces_fn=_compute_forces_cb,

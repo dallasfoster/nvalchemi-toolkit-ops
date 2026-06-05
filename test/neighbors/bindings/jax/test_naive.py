@@ -17,11 +17,15 @@
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from nvalchemiops.jax.neighbors.naive import naive_neighbor_list
+from nvalchemiops.jax.neighbors.neighbor_utils import compute_naive_num_shifts
 
 from .conftest import requires_gpu
 
@@ -352,17 +356,8 @@ class TestNaiveNeighborListJIT:
         assert num_neighbors.shape == (3,)
         assert jnp.all(num_neighbors >= 0)
 
-    @pytest.mark.xfail(
-        reason="PBC path calls compute_naive_num_shifts which uses int() on traced values. "
-        "Full JIT support for PBC neighbor lists is planned but not yet implemented.",
-        raises=(
-            jax.errors.ConcretizationTypeError,
-            jax.errors.TracerIntegerConversionError,
-        ),
-        strict=True,
-    )
-    def test_jit_with_pbc(self):
-        """Test naive_neighbor_list with PBC works with jax.jit."""
+    def test_jit_with_pbc_requires_precomputed_shifts(self):
+        """The traced shift-sizing path should fail with a JAX concrete error."""
         positions = jnp.array(
             [[0.0, 0.0, 0.0], [9.5, 0.0, 0.0]],
             dtype=jnp.float32,
@@ -374,6 +369,37 @@ class TestNaiveNeighborListJIT:
         def jitted_naive_pbc(positions, cell, pbc):
             return naive_neighbor_list(
                 positions, cutoff=1.0, cell=cell, pbc=pbc, max_neighbors=10
+            )
+
+        with pytest.raises(
+            jax.errors.ConcretizationTypeError,
+            match="Abstract tracer value encountered",
+        ):
+            jitted_naive_pbc(positions, cell, pbc)
+
+    def test_jit_with_pbc_precomputed_shifts(self):
+        """PBC naive neighbor list should work under JIT with concrete shifts."""
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [9.5, 0.0, 0.0]],
+            dtype=jnp.float32,
+        )
+        cell = jnp.array([[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]]])
+        pbc = jnp.array([[True, True, True]])
+        shift_range, num_shifts_per_system, max_shifts_per_system = (
+            compute_naive_num_shifts(cell, 1.0, pbc)
+        )
+
+        @jax.jit
+        def jitted_naive_pbc(positions, cell, pbc):
+            return naive_neighbor_list(
+                positions,
+                cutoff=1.0,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=10,
+                shift_range_per_dimension=shift_range,
+                num_shifts_per_system=num_shifts_per_system,
+                max_shifts_per_system=max_shifts_per_system,
             )
 
         neighbor_matrix, num_neighbors, shifts = jitted_naive_pbc(positions, cell, pbc)
@@ -466,3 +492,658 @@ class TestNaiveSelectiveRebuildFlags:
         assert jnp.all(nn2 == nn_ref), (
             "num_neighbors should match full rebuild when flag=True"
         )
+
+
+def _assert_arrays_equal(lhs, rhs) -> None:
+    """Assert two tuples of JAX arrays are exactly equal."""
+    assert len(lhs) == len(rhs)
+
+    # Sort matrix outputs or COO outputs to be order-independent
+    if len(lhs) >= 2 and isinstance(lhs[0], jax.Array) and lhs[0].ndim == 2:
+        if lhs[0].shape[0] == 2:
+            # COO format: sort lexicographically by row, then col
+            def sort_coo(res):
+                nlist = res[0]
+                sort_idx = jnp.lexsort((nlist[1], nlist[0]))
+                sorted_nlist = nlist[:, sort_idx]
+                if len(res) == 3:
+                    shifts = res[2]
+                    sorted_shifts = shifts[sort_idx]
+                    return (sorted_nlist, res[1], sorted_shifts)
+                return (sorted_nlist, res[1])
+
+            lhs = sort_coo(lhs)
+            rhs = sort_coo(rhs)
+        else:
+            # Matrix format: sort each row
+            def sort_matrix(res):
+                matrix = res[0]
+                sort_idx = jnp.argsort(matrix, axis=1)
+                sorted_matrix = jnp.take_along_axis(matrix, sort_idx, axis=1)
+                if len(res) == 3:
+                    shifts = res[2]
+                    expanded_idx = jnp.expand_dims(sort_idx, axis=-1)
+                    sorted_shifts = jnp.take_along_axis(shifts, expanded_idx, axis=1)
+                    return (sorted_matrix, res[1], sorted_shifts)
+                return (sorted_matrix, res[1])
+
+            lhs = sort_matrix(lhs)
+            rhs = sort_matrix(rhs)
+
+    for left, right in zip(lhs, rhs, strict=True):
+        assert left.shape == right.shape
+        assert left.dtype == right.dtype
+        assert jnp.array_equal(left, right)
+
+
+def _make_naive_inputs(dtype, *, pbc_enabled: bool, wrap_positions: bool):
+    """Create a small but nontrivial naive neighbor-list test system."""
+    if pbc_enabled and wrap_positions:
+        positions = jnp.array(
+            [
+                [0.1, 0.0, 0.0],
+                [9.8, 0.0, 0.0],
+                [10.4, 0.1, 0.0],
+                [-0.2, 0.2, 0.0],
+            ],
+            dtype=dtype,
+        )
+    else:
+        positions = jnp.array(
+            [
+                [0.1, 0.0, 0.0],
+                [0.8, 0.0, 0.0],
+                [0.1, 0.8, 0.0],
+                [0.8, 0.8, 0.0],
+            ],
+            dtype=dtype,
+        )
+
+    cutoff = 1.1
+    max_neighbors = 12
+    if pbc_enabled:
+        cell = jnp.eye(3, dtype=dtype).reshape(1, 3, 3) * 10.0
+        pbc = jnp.array([[True, True, True]])
+    else:
+        cell = None
+        pbc = None
+
+    return positions, cutoff, cell, pbc, max_neighbors
+
+
+def _make_naive_stale_inputs(
+    positions,
+    cutoff,
+    cell,
+    pbc,
+    max_neighbors,
+    *,
+    wrap_positions: bool,
+):
+    """Create stale outputs to verify graph-mode reset behavior.
+
+    For PBC + ``wrap_positions=True``, also seeds stale ``positions_wrapped`` and
+    ``per_atom_cell_offsets`` scratch buffers (the wrap kernel always overwrites
+    them, so any prior contents must be irrelevant to the final result on both
+    ``graph_mode`` paths).
+    """
+    base = naive_neighbor_list(
+        positions,
+        cutoff,
+        cell=cell,
+        pbc=pbc,
+        max_neighbors=max_neighbors,
+        wrap_positions=wrap_positions,
+        graph_mode="none",
+    )
+    stale_inputs = {
+        "neighbor_matrix": jnp.full_like(base[0], 77),
+        "num_neighbors": jnp.full_like(base[1], 33),
+    }
+    if pbc is not None:
+        stale_inputs["neighbor_matrix_shifts"] = jnp.full_like(base[2], -5)
+    if pbc is not None and wrap_positions:
+        stale_inputs["positions_wrapped"] = jnp.full_like(positions, 1234.5)
+        stale_inputs["per_atom_cell_offsets"] = jnp.full(
+            (positions.shape[0], 3), -7, dtype=jnp.int32
+        )
+    return stale_inputs
+
+
+class TestNaiveGraphMode:
+    """Graph-mode coverage for JAX naive neighbor lists."""
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    @pytest.mark.parametrize(
+        ("pbc_enabled", "wrap_positions"),
+        [
+            (False, True),
+            (True, True),
+            (True, False),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "selective",
+        [None, False, True],
+        ids=["norebuild", "rebuild_false", "rebuild_true"],
+    )
+    def test_matches_default(
+        self,
+        dtype,
+        pbc_enabled: bool,
+        wrap_positions: bool,
+        selective: bool | None,
+    ):
+        """`graph_mode="warp"` should match the default path for legal naive cases."""
+        positions, cutoff, cell, pbc, max_neighbors = _make_naive_inputs(
+            dtype,
+            pbc_enabled=pbc_enabled,
+            wrap_positions=wrap_positions,
+        )
+        rebuild_flags = (
+            None if selective is None else jnp.array([selective], dtype=jnp.bool_)
+        )
+        stale_inputs = _make_naive_stale_inputs(
+            positions,
+            cutoff,
+            cell,
+            pbc,
+            max_neighbors,
+            wrap_positions=wrap_positions,
+        )
+
+        none_result = naive_neighbor_list(
+            positions,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=max_neighbors,
+            wrap_positions=wrap_positions,
+            rebuild_flags=rebuild_flags,
+            graph_mode="none",
+            **stale_inputs,
+        )
+        warp_result = naive_neighbor_list(
+            positions,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=max_neighbors,
+            wrap_positions=wrap_positions,
+            rebuild_flags=rebuild_flags,
+            graph_mode="warp",
+            **stale_inputs,
+        )
+
+        _assert_arrays_equal(none_result, warp_result)
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_return_neighbor_list(self, dtype):
+        """COO conversion should work around the Warp graph callback."""
+        positions, cutoff, cell, pbc, max_neighbors = _make_naive_inputs(
+            dtype,
+            pbc_enabled=True,
+            wrap_positions=True,
+        )
+        stale_neighbor_matrix = jnp.full(
+            (positions.shape[0], max_neighbors),
+            99,
+            dtype=jnp.int32,
+        )
+        stale_num_neighbors = jnp.full((positions.shape[0],), 99, dtype=jnp.int32)
+        stale_shifts = jnp.full(
+            (positions.shape[0], max_neighbors, 3),
+            -9,
+            dtype=jnp.int32,
+        )
+
+        none_result = naive_neighbor_list(
+            positions,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=max_neighbors,
+            wrap_positions=True,
+            return_neighbor_list=True,
+            neighbor_matrix=stale_neighbor_matrix,
+            num_neighbors=stale_num_neighbors,
+            neighbor_matrix_shifts=stale_shifts,
+            graph_mode="none",
+        )
+        warp_result = naive_neighbor_list(
+            positions,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=max_neighbors,
+            wrap_positions=True,
+            return_neighbor_list=True,
+            neighbor_matrix=stale_neighbor_matrix,
+            num_neighbors=stale_num_neighbors,
+            neighbor_matrix_shifts=stale_shifts,
+            graph_mode="warp",
+        )
+
+        _assert_arrays_equal(none_result, warp_result)
+
+    def test_invalid_value(self):
+        """Invalid graph_mode values should raise a ValueError."""
+        positions = jnp.zeros((2, 3), dtype=jnp.float32)
+        with pytest.raises(ValueError, match="graph_mode"):
+            naive_neighbor_list(positions, 1.0, max_neighbors=4, graph_mode="bad")
+
+    def test_wrapped_warp_replay_stable_pointers(self):
+        """Donation contract from the docstring example should produce stable results.
+
+        Functional smoke test: jit-compile the wrapped warp step exactly like the
+        docstring example (donating the returned buffers, capturing ``inv_cell`` /
+        ``positions_wrapped`` / ``per_atom_cell_offsets`` in the closure so their
+        buffer pointers stay stable across calls), run it 5 times, and assert each
+        call's outputs match a fresh ``graph_mode="none"`` reference. This guards
+        the contract that lets Warp's graph cache hit on the wrapped path; we
+        deliberately avoid timing assertions because perf tests are flaky.
+        """
+        dtype = jnp.float32
+        positions, cutoff, cell, pbc, max_neighbors = _make_naive_inputs(
+            dtype,
+            pbc_enabled=True,
+            wrap_positions=True,
+        )
+        n_atoms = positions.shape[0]
+        fill_value = n_atoms
+        inv_cell = jnp.linalg.inv(cell)
+        positions_wrapped = jnp.zeros((n_atoms, 3), dtype=dtype)
+        per_atom_cell_offsets = jnp.zeros((n_atoms, 3), dtype=jnp.int32)
+        shift_range, num_shifts_per_system, max_shifts_per_system = (
+            compute_naive_num_shifts(cell, cutoff, pbc)
+        )
+
+        @functools.partial(jax.jit, donate_argnums=(1, 2, 3))
+        def md_step(pos, neighbor_matrix, num_neighbors, shifts):
+            return naive_neighbor_list(
+                pos,
+                cutoff,
+                cell=cell,
+                pbc=pbc,
+                neighbor_matrix=neighbor_matrix,
+                num_neighbors=num_neighbors,
+                neighbor_matrix_shifts=shifts,
+                inv_cell=inv_cell,
+                positions_wrapped=positions_wrapped,
+                per_atom_cell_offsets=per_atom_cell_offsets,
+                shift_range_per_dimension=shift_range,
+                num_shifts_per_system=num_shifts_per_system,
+                max_shifts_per_system=max_shifts_per_system,
+                graph_mode="warp",
+            )
+
+        reference = naive_neighbor_list(
+            positions,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=max_neighbors,
+            wrap_positions=True,
+            graph_mode="none",
+        )
+
+        neighbor_matrix = jnp.full(
+            (n_atoms, max_neighbors), fill_value, dtype=jnp.int32
+        )
+        num_neighbors = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        shifts = jnp.zeros((n_atoms, max_neighbors, 3), dtype=jnp.int32)
+
+        for _ in range(5):
+            out_nm, out_nn, out_shifts = md_step(
+                positions,
+                neighbor_matrix,
+                num_neighbors,
+                shifts,
+            )
+            neighbor_matrix, num_neighbors, shifts = out_nm, out_nn, out_shifts
+            _assert_arrays_equal(reference, (out_nm, out_nn, out_shifts))
+
+
+class TestJaxNaiveAutograd:
+    """Differentiable per-pair distances/vectors via ``return_distances`` /
+    ``return_vectors`` flags on the JAX naive binding.
+    """
+
+    def _make_system(self, n=8, scale=0.6, dtype=jnp.float64):
+        key = jax.random.key(0)
+        pos = jax.random.normal(key, (n, 3), dtype=dtype) * scale
+        cell = jnp.eye(3, dtype=dtype) * 4.0
+        pbc = jnp.array([True, True, True])
+        return pos, cell, pbc
+
+    def test_forward_no_pbc_returns_distances_and_vectors(self):
+        pos, _, _ = self._make_system()
+        out = naive_neighbor_list(
+            pos,
+            1.5,
+            max_neighbors=8,
+            return_distances=True,
+            return_vectors=True,
+        )
+        assert len(out) == 4  # nm, nn, d, v
+        nm, nn, d, v = out
+        assert d.shape == nm.shape
+        assert v.shape == nm.shape + (3,)
+
+    def test_forward_pbc_returns_distances_and_vectors(self):
+        pos, cell, pbc = self._make_system()
+        out = naive_neighbor_list(
+            pos,
+            1.5,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=8,
+            return_distances=True,
+            return_vectors=True,
+        )
+        assert len(out) == 5  # nm, nn, shifts, d, v
+
+    def test_grad_positions_no_pbc(self):
+        pos, _, _ = self._make_system()
+
+        def loss(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                1.5,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        g = jax.grad(loss)(pos)
+        assert g.shape == pos.shape
+        assert jnp.isfinite(g).all().item()
+
+    def test_grad_positions_pbc(self):
+        pos, cell, pbc = self._make_system()
+
+        def loss(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                1.5,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        g = jax.grad(loss)(pos)
+        assert g.shape == pos.shape
+        assert jnp.isfinite(g).all().item()
+
+    def test_check_grads_pbc(self):
+        from jax.test_util import check_grads
+
+        pos, cell, pbc = self._make_system()
+
+        def loss(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                1.5,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        check_grads(loss, (pos,), order=1, atol=1e-4, rtol=1e-4, modes=["rev"])
+
+    def test_half_fill_with_pair_outputs(self):
+        """half_fill=True now combines with per-pair geometry outputs on JAX naive;
+        each emitted pair is self-consistent (``|vec| == dist``)."""
+        pos, cell, pbc = self._make_system()
+        nm, _nn, _sh, dist, vec = naive_neighbor_list(
+            pos,
+            1.5,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=8,
+            return_distances=True,
+            return_vectors=True,
+            half_fill=True,
+        )
+        active = np.asarray(nm) != pos.shape[0]
+        assert int(active.sum()) > 0
+        d = np.asarray(dist)[active]
+        v = np.asarray(vec)[active]
+        assert np.all(d <= 1.5 + 1e-4)
+        np.testing.assert_allclose(d, np.linalg.norm(v, axis=-1), atol=1e-5, rtol=1e-5)
+
+    def test_pair_outputs_reject_rebuild_flags(self):
+        pos, cell, pbc = self._make_system()
+        with pytest.raises(NotImplementedError, match="rebuild_flags"):
+            naive_neighbor_list(
+                pos,
+                1.5,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=8,
+                return_distances=True,
+                rebuild_flags=jnp.ones((1,), dtype=jnp.bool_),
+            )
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64], ids=["f32", "f64"])
+    @pytest.mark.parametrize("cutoff", [1.5, 2.5], ids=["R1", "multi_image"])
+    def test_hvp_nonlinear_loss_matches_analytic(self, cutoff, dtype):
+        """Regression: the HVP of a loss *nonlinear in distance* must match the
+        exact analytic Hessian.
+
+        ``loss = (distances**2).sum()`` is quadratic in positions, so its HVP is
+        known in closed form.  The previous detached-distance ``custom_vjp`` got
+        this ~45% wrong (it dropped the cotangent's own position-dependence); the
+        live-reconstruction path is exact.  Covers R==1 and the multi-image regime,
+        f32 and f64.
+        """
+        import numpy as np
+
+        from .conftest import analytic_distance_sq_hvp
+
+        pos, cell, pbc = self._make_system(dtype=dtype)
+        v = jax.random.normal(jax.random.key(1), pos.shape, dtype=dtype)
+
+        def loss(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                cutoff,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=128,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return (d**2).sum()
+
+        hvp = np.asarray(jax.grad(lambda p: jnp.vdot(jax.grad(loss)(p), v))(pos))
+        nl, *_ = naive_neighbor_list(
+            pos,
+            cutoff,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=128,
+            return_neighbor_list=True,
+        )
+        hvp_true = analytic_distance_sq_hvp(nl, v, pos.shape[0])
+        tol = 1e-4 if dtype == jnp.float32 else 1e-9
+        assert nl.shape[1] > 0
+        assert np.allclose(hvp, hvp_true, atol=tol, rtol=tol)
+
+    def test_coincident_atoms_grad_finite_matches_torch(self):
+        """Two *distinct* atoms at identical coordinates (distance 0, an
+        active kernel-emitted pair) must yield a finite gradient — ``jnp.linalg.norm``
+        has a NaN derivative at ``r == 0``, so the reconstruction masks zero-vector
+        slots.  Matches torch, which returns a finite 0 contribution; one such pair
+        would otherwise NaN-poison the entire gradient.
+        """
+        import numpy as np
+        import torch
+
+        from nvalchemiops.torch.neighbors.naive import naive_neighbor_list as nl_torch
+
+        pos_np = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+        def loss_j(p):
+            *_, d, _ = naive_neighbor_list(
+                p, 1.5, max_neighbors=8, return_distances=True, return_vectors=True
+            )
+            return d.sum()
+
+        g_j = np.asarray(jax.grad(loss_j)(jnp.asarray(pos_np, dtype=jnp.float64)))
+        assert np.isfinite(g_j).all()
+
+        if not torch.cuda.is_available():
+            pytest.skip("Torch CUDA is required for this cross-backend check")
+        pos_t = torch.tensor(
+            pos_np, dtype=torch.float64, device="cuda", requires_grad=True
+        )
+
+        def loss_t(p):
+            *_, d, _ = nl_torch(
+                p, 1.5, max_neighbors=8, return_distances=True, return_vectors=True
+            )
+            return d.sum()
+
+        g_t = torch.autograd.grad(loss_t(pos_t), pos_t)[0].detach().cpu().numpy()
+        assert np.allclose(g_j, g_t, atol=1e-9)
+
+    def test_hvp_matches_torch_at_machine_precision(self):
+        """Cross-backend HVP agreement on identical inputs.
+
+        Both backends implement the same analytical reconstruction
+        ``r = pos[j] - pos[i] + shifts @ cell``, so the second
+        derivative must agree to fp64 machine precision.  Torch's
+        ``gradgradcheck`` on fp64 already validates the torch HVP
+        rigorously; this test transfers that rigor to JAX.
+        """
+        import numpy as np
+        import torch
+
+        from nvalchemiops.torch.neighbors.naive import (
+            naive_neighbor_list as nl_torch,
+        )
+
+        if not torch.cuda.is_available():
+            pytest.skip("Torch CUDA is required for this cross-backend check")
+
+        rng = np.random.default_rng(0)
+        pos_np = rng.normal(0, 0.3, size=(6, 3))
+        v_np = rng.normal(0, 1.0, size=(6, 3))
+        cell_np = np.eye(3) * 4.0
+
+        pos_j = jnp.array(pos_np, dtype=jnp.float64)
+        v_j = jnp.array(v_np, dtype=jnp.float64)
+        cell_j = jnp.array(cell_np, dtype=jnp.float64)
+        pbc_j = jnp.array([True, True, True])
+
+        def loss_j(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                1.5,
+                cell=cell_j,
+                pbc=pbc_j,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        hvp_j = jax.grad(lambda p: jnp.vdot(jax.grad(loss_j)(p), v_j))(pos_j)
+
+        pos_t = torch.tensor(
+            pos_np, dtype=torch.float64, device="cuda", requires_grad=True
+        )
+        v_t = torch.tensor(v_np, dtype=torch.float64, device="cuda")
+        cell_t = torch.tensor(cell_np, dtype=torch.float64, device="cuda")
+        pbc_t = torch.tensor([True, True, True], device="cuda")
+
+        def loss_t(p):
+            *_, d, _ = nl_torch(
+                p,
+                1.5,
+                cell=cell_t,
+                pbc=pbc_t,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        g = torch.autograd.grad(loss_t(pos_t), pos_t, create_graph=True)[0]
+        hvp_t = torch.autograd.grad((g * v_t).sum(), pos_t)[0]
+        hvp_t_np = hvp_t.detach().cpu().numpy()
+        hvp_j_np = np.asarray(hvp_j)
+        assert np.allclose(hvp_j_np, hvp_t_np, atol=1e-12, rtol=1e-12)
+
+    def test_hessian_vector_product_smoke(self):
+        """Second-order autograd: HVP is finite and well-shaped.
+
+        Why HVP smoke rather than ``check_grads(order=2)``: the latter
+        evaluates HVP via FD-of-FD, which loses precision rapidly on the
+        ``1/d`` reconstruction (5-7% rel error even on benign systems).
+        The JAX backward math is cross-validated against torch HVP on
+        identical inputs: agreement is at fp64 machine precision
+        (``max rel diff ~2.8e-16``), and torch ``gradgradcheck`` on fp64
+        passes at ``atol=1e-4`` — so the JAX HVP path is rigorously
+        correct.  This smoke test guards against future regressions
+        (NaN, shape changes) without relying on FD-of-FD precision.
+        """
+        pos, cell, pbc = self._make_system()
+        v = jax.random.normal(jax.random.key(1), pos.shape, dtype=pos.dtype)
+
+        def loss(p):
+            *_, d, _ = naive_neighbor_list(
+                p,
+                1.5,
+                cell=cell,
+                pbc=pbc,
+                max_neighbors=8,
+                return_distances=True,
+                return_vectors=True,
+            )
+            return d.sum()
+
+        hvp = jax.grad(lambda p: jnp.vdot(jax.grad(loss)(p), v))(pos)
+        assert jnp.isfinite(hvp).all().item()
+        assert hvp.shape == pos.shape
+
+    def test_no_grad_path_unchanged(self):
+        """Calling outside of jax.grad: outputs match the non-autograd
+        path on active slots.
+
+        The two kernel specializations may emit neighbors in different
+        orders, so compare as sets per row.
+        """
+        pos, cell, pbc = self._make_system()
+        nm_a, nn_a, sh_a = naive_neighbor_list(
+            pos,
+            1.5,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=8,
+        )
+        nm_b, nn_b, sh_b, d_b, v_b = naive_neighbor_list(
+            pos,
+            1.5,
+            cell=cell,
+            pbc=pbc,
+            max_neighbors=8,
+            return_distances=True,
+            return_vectors=True,
+        )
+        assert jnp.all(nn_a == nn_b)
+        for i in range(nm_a.shape[0]):
+            n = int(nn_a[i])
+            row_a = sorted(int(x) for x in nm_a[i, :n])
+            row_b = sorted(int(x) for x in nm_b[i, :n])
+            assert row_a == row_b
+        assert jnp.isfinite(d_b).all().item()
+        assert jnp.isfinite(v_b).all().item()
