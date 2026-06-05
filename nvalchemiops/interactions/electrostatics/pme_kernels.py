@@ -234,7 +234,7 @@ def _pme_green_structure_factor_kernel(
 
     # Raise to spline_order power
     sf = sinc_product
-    for _ in range(1, 4):  # Max order 4
+    for _ in range(1, 6):  # Max supported order = 6
         if _ < spline_order:
             sf = sf * sinc_product
 
@@ -341,7 +341,7 @@ def _batch_pme_green_structure_factor_kernel(
         sinc_product = sinc_x * sinc_y * sinc_z
 
         sf = sinc_product
-        for _ in range(1, 4):
+        for _ in range(1, 6):  # Max supported order = 6
             if _ < spline_order:
                 sf = sf * sinc_product
 

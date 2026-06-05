@@ -14,46 +14,25 @@
 # limitations under the License.
 
 r"""
-Electrostatics Interactions Module
-==================================
+Electrostatics interactions.
 
-This module provides GPU-accelerated implementations of various methods for
-computing long-range electrostatic interactions in molecular simulations.
+GPU-accelerated, framework-agnostic Warp kernel launchers for computing
+long-range electrostatic interactions in molecular simulations. For PyTorch
+bindings, see ``nvalchemiops.torch.interactions.electrostatics``.
 
-Architecture
-------------
-This module provides framework-agnostic Warp kernel launchers.
-For PyTorch bindings, see ``nvalchemiops.torch.interactions.electrostatics``.
+Available methods:
 
-Available Methods
------------------
-
-1. **Coulomb** (`coulomb`)
-   - Direct Coulomb energy and forces
-   - Damped (erfc) Coulomb for Ewald/PME real-space contribution
-   - Warp launchers: ``coulomb_energy()``, ``coulomb_energy_forces()``, etc.
-   - PyTorch API: ``nvalchemiops.torch.interactions.electrostatics.coulomb``
-
-2. **Ewald Summation** (`ewald`)
-   - Classical method splitting interactions into real-space and reciprocal-space
-   - :math:`O(N^2)` scaling for explicit k-vectors, good for small systems
-   - Full autograd support
-
-3. **Particle Mesh Ewald (PME)** (`pme`)
-   - FFT-based method for :math:`O(N \log N)` scaling
-   - Uses B-spline interpolation for charge assignment
-   - Full autograd support
-
-4. **Damped Shifted Force (DSF)** (`dsf`)
-   - Pairwise :math:`O(N)` electrostatic summation
-   - Both potential and forces smoothly vanish at cutoff
-   - Supports geometry-dependent charges (MLIP)
-   - Warp launchers: ``dsf_csr()``, ``dsf_matrix()``
-   - PyTorch API: ``nvalchemiops.torch.interactions.electrostatics.dsf``
-
+- **Coulomb** (`coulomb`): direct and damped (erfc) Coulomb energy/forces.
+- **Ewald summation** (`ewald`): real-space + reciprocal-space split,
+  :math:`O(N^2)` for explicit k-vectors, full autograd support.
+- **Particle Mesh Ewald** (`pme`): FFT-based :math:`O(N \log N)` method using
+  B-spline charge assignment, full autograd support.
+- **Damped Shifted Force** (`dsf`): pairwise :math:`O(N)` summation where both
+  potential and forces vanish smoothly at the cutoff; supports
+  geometry-dependent charges.
 """
 
-# Coulomb - Warp launchers (framework-agnostic)
+# Coulomb
 from nvalchemiops.interactions.electrostatics.coulomb import (
     batch_coulomb_energy,
     batch_coulomb_energy_forces,
@@ -65,12 +44,8 @@ from nvalchemiops.interactions.electrostatics.coulomb import (
     coulomb_energy_matrix,
 )
 
-# Ewald summation - PyTorch bindings are deprecated at this location
-# Use nvalchemiops.torch.interactions.electrostatics.ewald instead
-# Handled via __getattr__ below for lazy import with deprecation warning
-# Ewald - Warp launchers (framework-agnostic)
+# Ewald
 from nvalchemiops.interactions.electrostatics.ewald_kernels import (
-    # Real-space batch
     batch_ewald_real_space_energy,
     batch_ewald_real_space_energy_forces,
     batch_ewald_real_space_energy_forces_charge_grad,
@@ -80,10 +55,8 @@ from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     batch_ewald_reciprocal_space_compute_energy,
     batch_ewald_reciprocal_space_energy_forces,
     batch_ewald_reciprocal_space_energy_forces_charge_grad,
-    # Reciprocal-space batch
     batch_ewald_reciprocal_space_fill_structure_factors,
     batch_ewald_subtract_self_energy,
-    # Real-space single-system
     ewald_real_space_energy,
     ewald_real_space_energy_forces,
     ewald_real_space_energy_forces_charge_grad,
@@ -93,12 +66,95 @@ from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     ewald_reciprocal_space_compute_energy,
     ewald_reciprocal_space_energy_forces,
     ewald_reciprocal_space_energy_forces_charge_grad,
-    # Reciprocal-space single-system
     ewald_reciprocal_space_fill_structure_factors,
     ewald_subtract_self_energy,
 )
 
-# PME - Warp launchers (framework-agnostic)
+# Multipole direct k-space
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
+    apply_per_k_factor,
+    assemble_rho_k_dipole,
+    batch_apply_per_k_factor,
+    batch_assemble_rho_k_dipole,
+    batch_build_structure_factor_table,
+    batch_compute_energy_product_per_k,
+    batch_eval_gto_fourier_dipole,
+    batch_eval_receiver_gto_fourier_dipole,
+    batch_eval_receiver_gto_fourier_quadrupole,
+    batch_feat_position_grad_backward_grad_raw,
+    batch_feat_position_grad_backward_grad_raw_quadrupole,
+    batch_feat_position_grad_backward_positions,
+    batch_feat_position_grad_backward_positions_quadrupole,
+    batch_feat_position_grad_backward_v,
+    batch_feat_position_grad_backward_v_quadrupole,
+    batch_position_gradient_from_feature_grad,
+    batch_position_gradient_from_feature_grad_quadrupole,
+    batch_position_gradient_from_rhok,
+    batch_project_features_dipole,
+    batch_project_features_quadrupole,
+    batch_project_kphase_grad,
+    batch_project_phihat_grad,
+    batch_receiver_phi_hat_backward_dipole,
+    batch_receiver_phi_hat_backward_quadrupole,
+    batch_rhok_position_grad_backward_grad_rho,
+    batch_rhok_position_grad_backward_moments,
+    batch_rhok_position_grad_backward_positions,
+    batch_source_phi_hat_backward_dipole,
+    batch_v_grad_from_feat_grad_backward_positions,
+    batch_v_grad_from_feat_grad_backward_positions_quadrupole,
+    batch_v_gradient_from_feature_grad,
+    batch_v_gradient_from_feature_grad_quadrupole,
+    build_structure_factor_table,
+    compute_energy_product_per_k,
+    eval_gto_fourier_dipole,
+    eval_receiver_gto_fourier_dipole,
+    eval_receiver_gto_fourier_quadrupole,
+    feat_position_grad_backward_grad_raw,
+    feat_position_grad_backward_grad_raw_quadrupole,
+    feat_position_grad_backward_positions,
+    feat_position_grad_backward_positions_quadrupole,
+    feat_position_grad_backward_v,
+    feat_position_grad_backward_v_quadrupole,
+    position_gradient_from_feature_grad,
+    position_gradient_from_feature_grad_quadrupole,
+    position_gradient_from_rhok,
+    project_features_dipole,
+    project_features_quadrupole,
+    project_kphase_grad_dipole,
+    project_phihat_grad_dipole,
+    receiver_phi_hat_backward_dipole,
+    receiver_phi_hat_backward_quadrupole,
+    rhok_position_grad_backward_grad_rho,
+    rhok_position_grad_backward_moments,
+    rhok_position_grad_backward_positions,
+    source_phi_hat_backward_dipole,
+    v_grad_from_feat_grad_backward_positions,
+    v_grad_from_feat_grad_backward_positions_quadrupole,
+    v_gradient_from_feature_grad,
+    v_gradient_from_feature_grad_quadrupole,
+)
+
+# Multipole Ewald
+from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
+    batch_multipole_real_space_dipole_csr_energy,
+    batch_multipole_real_space_dipole_csr_energy_2nd_backward,
+    batch_multipole_real_space_dipole_csr_energy_backward,
+    batch_multipole_real_space_dipole_csr_energy_fused,
+    batch_multipole_real_space_monopole_csr_energy,
+    batch_multipole_real_space_monopole_csr_energy_2nd_backward,
+    batch_multipole_real_space_monopole_csr_energy_backward,
+    batch_multipole_real_space_monopole_csr_energy_fused,
+    multipole_real_space_dipole_csr_energy,
+    multipole_real_space_dipole_csr_energy_2nd_backward,
+    multipole_real_space_dipole_csr_energy_backward,
+    multipole_real_space_dipole_csr_energy_fused,
+    multipole_real_space_monopole_csr_energy,
+    multipole_real_space_monopole_csr_energy_2nd_backward,
+    multipole_real_space_monopole_csr_energy_backward,
+    multipole_real_space_monopole_csr_energy_fused,
+)
+
+# PME
 from nvalchemiops.interactions.electrostatics.pme_kernels import (
     batch_pme_energy_corrections,
     batch_pme_energy_corrections_with_charge_grad,
@@ -108,17 +164,17 @@ from nvalchemiops.interactions.electrostatics.pme_kernels import (
     pme_green_structure_factor,
 )
 
-# DSF - Warp launchers (framework-agnostic)
+# DSF
 from .dsf import (
     dsf_csr,
     dsf_matrix,
 )
 
 __all__ = [
-    # DSF - Warp launchers
+    # DSF
     "dsf_csr",
     "dsf_matrix",
-    # Coulomb - Warp launchers
+    # Coulomb
     "coulomb_energy",
     "coulomb_energy_forces",
     "coulomb_energy_matrix",
@@ -127,7 +183,7 @@ __all__ = [
     "batch_coulomb_energy_forces",
     "batch_coulomb_energy_matrix",
     "batch_coulomb_energy_forces_matrix",
-    # Ewald - Warp launchers (real-space)
+    # Ewald (real-space)
     "ewald_real_space_energy",
     "ewald_real_space_energy_forces",
     "ewald_real_space_energy_matrix",
@@ -140,7 +196,7 @@ __all__ = [
     "batch_ewald_real_space_energy_forces_matrix",
     "batch_ewald_real_space_energy_forces_charge_grad",
     "batch_ewald_real_space_energy_forces_charge_grad_matrix",
-    # Ewald - Warp launchers (reciprocal-space)
+    # Ewald (reciprocal-space)
     "ewald_reciprocal_space_fill_structure_factors",
     "ewald_reciprocal_space_compute_energy",
     "ewald_subtract_self_energy",
@@ -151,7 +207,79 @@ __all__ = [
     "batch_ewald_subtract_self_energy",
     "batch_ewald_reciprocal_space_energy_forces",
     "batch_ewald_reciprocal_space_energy_forces_charge_grad",
-    # PME - Warp launchers
+    # Multipole Ewald
+    "multipole_real_space_monopole_csr_energy",
+    "multipole_real_space_monopole_csr_energy_backward",
+    "multipole_real_space_monopole_csr_energy_2nd_backward",
+    "multipole_real_space_monopole_csr_energy_fused",
+    "multipole_real_space_dipole_csr_energy",
+    "multipole_real_space_dipole_csr_energy_backward",
+    "multipole_real_space_dipole_csr_energy_2nd_backward",
+    "multipole_real_space_dipole_csr_energy_fused",
+    "batch_multipole_real_space_monopole_csr_energy",
+    "batch_multipole_real_space_monopole_csr_energy_backward",
+    "batch_multipole_real_space_monopole_csr_energy_2nd_backward",
+    "batch_multipole_real_space_monopole_csr_energy_fused",
+    "batch_multipole_real_space_dipole_csr_energy",
+    "batch_multipole_real_space_dipole_csr_energy_backward",
+    "batch_multipole_real_space_dipole_csr_energy_2nd_backward",
+    "batch_multipole_real_space_dipole_csr_energy_fused",
+    # Multipole direct k-space
+    "build_structure_factor_table",
+    "eval_gto_fourier_dipole",
+    "assemble_rho_k_dipole",
+    "apply_per_k_factor",
+    "compute_energy_product_per_k",
+    "eval_receiver_gto_fourier_dipole",
+    "eval_receiver_gto_fourier_quadrupole",
+    "position_gradient_from_rhok",
+    "project_features_dipole",
+    "v_gradient_from_feature_grad",
+    "position_gradient_from_feature_grad",
+    "project_phihat_grad_dipole",
+    "project_kphase_grad_dipole",
+    "batch_project_phihat_grad",
+    "batch_project_kphase_grad",
+    # l=2 feature projection
+    "project_features_quadrupole",
+    "batch_project_features_quadrupole",
+    "v_gradient_from_feature_grad_quadrupole",
+    "batch_v_gradient_from_feature_grad_quadrupole",
+    "position_gradient_from_feature_grad_quadrupole",
+    "batch_position_gradient_from_feature_grad_quadrupole",
+    # l=2 feature second-order (force-loss / create_graph)
+    "feat_position_grad_backward_grad_raw_quadrupole",
+    "feat_position_grad_backward_v_quadrupole",
+    "feat_position_grad_backward_positions_quadrupole",
+    "v_grad_from_feat_grad_backward_positions_quadrupole",
+    "batch_feat_position_grad_backward_grad_raw_quadrupole",
+    "batch_feat_position_grad_backward_v_quadrupole",
+    "batch_feat_position_grad_backward_positions_quadrupole",
+    "batch_v_grad_from_feat_grad_backward_positions_quadrupole",
+    # Multipole direct k-space - second-order backward kernels
+    "source_phi_hat_backward_dipole",
+    "receiver_phi_hat_backward_dipole",
+    "receiver_phi_hat_backward_quadrupole",
+    "batch_eval_receiver_gto_fourier_quadrupole",
+    "batch_receiver_phi_hat_backward_quadrupole",
+    "rhok_position_grad_backward_grad_rho",
+    "rhok_position_grad_backward_moments",
+    "rhok_position_grad_backward_positions",
+    "feat_position_grad_backward_grad_raw",
+    "feat_position_grad_backward_v",
+    "feat_position_grad_backward_positions",
+    "v_grad_from_feat_grad_backward_positions",
+    # Multipole direct k-space - batched K-family
+    "batch_source_phi_hat_backward_dipole",
+    "batch_receiver_phi_hat_backward_dipole",
+    "batch_rhok_position_grad_backward_grad_rho",
+    "batch_rhok_position_grad_backward_moments",
+    "batch_rhok_position_grad_backward_positions",
+    "batch_feat_position_grad_backward_grad_raw",
+    "batch_feat_position_grad_backward_v",
+    "batch_feat_position_grad_backward_positions",
+    "batch_v_grad_from_feat_grad_backward_positions",
+    # PME
     "pme_green_structure_factor",
     "batch_pme_green_structure_factor",
     "pme_energy_corrections",
