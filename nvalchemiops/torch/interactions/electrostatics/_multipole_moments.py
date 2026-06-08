@@ -365,19 +365,23 @@ def pack_multipole_moments(
                 "require the (N, 4) charge+dipole block. Pass dipoles "
                 "(use zeros for a pure quadrupole)."
             )
-        # Detach for the diagnostic: a grad-requiring Q would otherwise emit a
-        # spurious "tensor with requires_grad to a scalar" warning.
-        tr_max = float(
-            quadrupoles.detach().diagonal(dim1=-2, dim2=-1).sum(-1).abs().max()
-        )
-        if tr_max > trace_atol:
-            import warnings
-
-            warnings.warn(
-                "pack_multipole_moments: quadrupoles have a non-zero trace "
-                f"(max |Tr Q| = {tr_max:.3e}); the l=2 channel "
-                "is traceless, so the trace is dropped.",
-                stacklevel=2,
+        # Diagnostic only: warn if Q is not traceless. Skipped under
+        # ``torch.compile`` because ``float(...)`` is a device sync (a graph
+        # break on the hot path); ``cartesian_quadrupole_to_e3nn`` below drops
+        # the trace regardless of this check. Detach so a grad-requiring Q does
+        # not emit a spurious "requires_grad to a scalar" warning.
+        if not torch.compiler.is_compiling():
+            tr_max = float(
+                quadrupoles.detach().diagonal(dim1=-2, dim2=-1).sum(-1).abs().max()
             )
+            if tr_max > trace_atol:
+                import warnings
+
+                warnings.warn(
+                    "pack_multipole_moments: quadrupoles have a non-zero trace "
+                    f"(max |Tr Q| = {tr_max:.3e}); the l=2 channel "
+                    "is traceless, so the trace is dropped.",
+                    stacklevel=2,
+                )
         cols.append(cartesian_quadrupole_to_e3nn(quadrupoles))  # (N, 5)
     return torch.cat(cols, dim=-1).contiguous()

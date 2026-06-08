@@ -2731,3 +2731,47 @@ class TestBatchQuadrupole:
             (g_s,) = torch.autograd.grad(e_single, p_g)
             torch.testing.assert_close(g_b[off : off + n], g_s, rtol=1e-7, atol=1e-7)
             off += n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestStepGraphBreaks:
+    """Regression guard: the SCF-step hot path must stay torch.compile
+    graph-break-free.
+
+    The other compile tests use ``torch.compile(..., fullgraph=False)`` and only
+    assert eager-vs-compiled equivalence, so a ``.item()``/device sync added to
+    the hot path (a real graph break) would pass silently. These tests use
+    ``torch._dynamo.explain`` to assert *zero* user-visible graph breaks across
+    single + batched systems and l = 0/1/2.
+    """
+
+    @pytest.mark.parametrize("mode", ["single", "batch"])
+    @pytest.mark.parametrize("l_max", [0, 1, 2])
+    def test_scf_step_energy_zero_graph_breaks(self, mode, l_max):
+        import torch._dynamo as dynamo
+
+        td = torch.device("cuda:0")
+        sys = _build_system(mode, l_max, td, seed=0)
+        charges, dipoles, quads, _ = split_multipole_moments(sys["mm"])
+        source_feats = pack_charges_dipoles(charges, dipoles)
+        cache = prepare_multipole_scf_cache(
+            sys["cell"],
+            sigma=_SIGMA,
+            receiver_sigmas=list(_RSIG),
+            kspace_cutoff=_KCUT,
+            l_max=l_max,
+        )
+        pos, bidx = sys["pos"], sys["batch_idx"]
+
+        def step(sf, q):
+            return multipole_scf_step_energy(
+                cache, pos, sf, batch_idx=bidx, quadrupoles=q
+            )
+
+        dynamo.reset()
+        explanation = dynamo.explain(step)(source_feats, quads)
+        assert explanation.graph_break_count == 0, (
+            f"{mode} l={l_max}: expected 0 graph breaks on the SCF-step hot path, "
+            f"got {explanation.graph_break_count}; reasons: "
+            f"{[r.reason for r in explanation.break_reasons]}"
+        )

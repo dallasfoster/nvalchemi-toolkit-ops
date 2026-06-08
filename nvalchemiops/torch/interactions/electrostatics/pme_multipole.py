@@ -2901,6 +2901,7 @@ def multipole_pme_energy_corrections(
     *,
     batch_idx: torch.Tensor | None = None,
     quadrupoles: torch.Tensor | None = None,
+    n_systems: int | None = None,
 ) -> torch.Tensor:
     r"""GTO-Ewald multipole self + background energy corrections.
 
@@ -3032,7 +3033,10 @@ def multipole_pme_energy_corrections(
 
     # Batched: per-system total charge + per-system volume (B,).
     batch_idx_long = batch_idx.long()
-    n_systems = int(batch_idx_long.max().item()) + 1
+    if n_systems is None:
+        # Eager fallback only; the batched composite passes n_systems to
+        # avoid this device sync (a torch.compile graph break) on the hot path.
+        n_systems = int(batch_idx_long.max().item()) + 1
     total_charge = torch.zeros(n_systems, dtype=torch.float64, device=device)
     total_charge.scatter_add_(0, batch_idx_long, charges_f64)
     vol_per_system = volume.to(torch.float64).reshape(-1)
@@ -4586,5 +4590,6 @@ def _batch_multipole_pme_reciprocal_space_impl(
         volume=volumes,
         batch_idx=batch_idx,
         quadrupoles=quadrupoles,
+        n_systems=B,
     )
     return e_recip_per_system - corrections
