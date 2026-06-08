@@ -174,6 +174,7 @@ class TestAutogradGraphable:
         assert g[:, :4].abs().max() == 0.0  # charge/dipole untouched
         assert g[:, 4:9].abs().max() > 0.0  # l=2 block carries it
 
+    @pytest.mark.slow
     def test_converter_compiles_fullgraph(self):
         rng = np.random.default_rng(31)
         f = torch.tensor(rng.standard_normal((16, 5)))

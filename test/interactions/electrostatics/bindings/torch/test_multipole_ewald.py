@@ -559,6 +559,7 @@ class TestMultipoleRealSpaceEnergyDipoleDoubleBackward:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 class TestMultipoleRealSpaceDipoleCompile:
     r"""The :math:`l_{max}=1` single-system path is a ``torch.library.custom_op``
     chain (not a ``torch.autograd.Function``), so ``torch.compile`` must trace it
@@ -616,6 +617,7 @@ class TestMultipoleRealSpaceDipoleCompile:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 class TestMultipoleRealSpaceMonopoleCompile:
     r"""``torch.compile`` regression for the :math:`l_{max}=0` single-system path
     (``nvalchemiops::multipole_real_space_monopole`` custom_op chain)."""
@@ -665,6 +667,7 @@ class TestMultipoleRealSpaceMonopoleCompile:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 class TestMultipoleRealSpaceQuadrupoleCompile:
     r"""``torch.compile`` regression for the :math:`l_{max}=2` single-system path
     (``nvalchemiops::multipole_real_space_quadrupole`` custom_op chain, whose
@@ -725,6 +728,7 @@ class TestMultipoleRealSpaceQuadrupoleCompile:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 @pytest.mark.parametrize("l_max", [0, 1, 2])
 class TestBatchMultipoleRealSpaceCompile:
     r"""``torch.compile`` regression for the batched real-space path
@@ -801,6 +805,7 @@ class TestBatchMultipoleRealSpaceCompile:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 @pytest.mark.parametrize("l_max", [0, 1])
 class TestMultipoleRealSpaceFusedScalarCompile:
     r"""``torch.compile`` regression for the fused-scalar real-space ops
@@ -868,6 +873,7 @@ class TestMultipoleRealSpaceFusedScalarCompile:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="torch.compile / Warp path is GPU-only here"
 )
+@pytest.mark.slow
 @pytest.mark.parametrize("l_max", [0, 1])
 class TestBatchMultipoleRealSpaceFusedScalarCompile:
     r"""``torch.compile`` regression for the batched fused-scalar ops

@@ -921,8 +921,14 @@ def _build_test_system(*, seed: int, n_atoms: int, box_len: float, device: str):
     return positions, charges, dipoles, cell, source_feats
 
 
+@pytest.mark.slow
 class TestTorchCompile:
-    r"""``torch.compile`` smoke tests — the custom op should appear as a single opaque node and numerics must match eager."""
+    r"""``torch.compile`` smoke tests — the custom op should appear as a single opaque node and numerics must match eager.
+
+    Marked ``slow``: these exercise the full Inductor codegen (expensive under
+    coverage). The 0-graph-break contract stays in the default lane via
+    ``TestStepGraphBreaks`` (``torch._dynamo.explain``, no codegen).
+    """
 
     def test_compile_scf_step_energy(self, device):
         td = _torch_device(device)
@@ -1335,6 +1341,7 @@ class TestAutogradOneShotEnergy:
         )
 
 
+@pytest.mark.slow
 class TestCompileAutograd:
     """``torch.compile``-wrapped autograd still produces the same gradients."""
 
