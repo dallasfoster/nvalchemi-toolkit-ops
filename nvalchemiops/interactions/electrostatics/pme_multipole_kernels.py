@@ -1022,11 +1022,6 @@ def multipole_pme_gather_hessian_launch(
 # =============================================================================
 # k_squared compute
 # =============================================================================
-#
-# A single Warp kernel that reads three 1-D Miller index arrays plus the
-# 3x3 ``cell_inv_T`` matrix and writes the 3-D ``k_squared`` grid in one
-# pass over rfft cells — avoiding a cuBLAS ``(M, 3) @ (3, 3)`` matmul and
-# its (Nx, Ny, Nz_rfft, 3) intermediate k-vector tensor.
 
 
 @wp.kernel(enable_backward=False)
@@ -1403,12 +1398,8 @@ def batch_pme_k_squared_launch(
 # Fused PME convolve kernel
 # =============================================================================
 #
-# A single Warp kernel that fuses the Green's function + structure
-# factor + complex × real multiply: it consumes a precomputed B-spline
-# modulus LUT triplet and writes the convolved complex mesh in one pass,
-# with no intermediate Green's / struct_sq tensors. The multipole-
-# specific ``exp(-σ²k²)`` factor (vs monopole PME) collapses to the
-# monopole convolve at σ → 0.
+# The multipole-specific ``exp(-σ²k²)`` factor (vs monopole PME) collapses to
+# the monopole convolve at σ → 0.
 
 
 @wp.kernel(enable_backward=False)
@@ -2174,12 +2165,6 @@ def batch_multipole_pme_convolve_backward_launch(
 # =============================================================================
 # Per-order specialized multipole spread kernel
 # =============================================================================
-#
-# A factory emits a per-(order, dtype) kernel: 1 thread per atom, 1D
-# B-spline weights / derivatives kept in registers, fully unrolled
-# order^3 stencil walk. Each (kind, order, dtype) lives in its own named
-# Warp module so that Warp NVRTC-compiles only the variants launched at
-# runtime — the import-time loop below only registers overloads.
 #
 # Per-cell math:
 #     contrib = q_i · B + μ_i · ∇_cart B
@@ -3455,22 +3440,6 @@ def batch_multipole_pme_gather_gradient_launch(
 # =============================================================================
 # Unified per-(ORDER, LMAX, dtype) factory
 # =============================================================================
-#
-# A single kernel parameterized by both ORDER and LMAX. Codegen-time ``if LMAX >= N``
-# gates select which multipole channels NVRTC emits. At LMAX=0 the
-# kernel is bit-identical to a charges-only kernel; at LMAX=1 it adds
-# the dipole branch; at LMAX=2 it adds the quadrupole branch on top.
-#
-# Variants registered: ORDER ∈ {3,4,5,6} × LMAX ∈ {0,1,2} × {fp32,fp64}
-# = 24 specialized kernels per family (spread, spread_backward,
-# gather_third_deriv). All NVRTC-compiled lazily on first launch.
-#
-# Kernel signature is FIXED across LMAX values (always takes
-# ``dipoles`` and ``quadrupoles`` arrays as inputs) so the dispatch
-# dict and launcher stay simple. For LMAX < 1 the dipole array is
-# unused but still bound; for LMAX < 2 the quadrupole array is
-# unused. Caller is responsible for binding dummy zero-sized arrays
-# when the corresponding channel is absent.
 
 
 def _pme_multipole_per_order_lmax_module(
@@ -4440,14 +4409,10 @@ def multipole_pme_spread_backward_unified_launch(
 # Batched unified spread (forward + backward) — l_max 0/1/2
 # =============================================================================
 #
-# Structurally identical to the single-system unified spread/backward factories
-# above, with three batch substitutions per the ``_make_batch_pme_multipole_
-# spread_kernel`` (l<=1) convention:
+# Three batch substitutions:
 #   * ``sys_idx = batch_idx[atom_idx]`` selects the per-system grid slice;
 #   * ``cell_inv_t[sys_idx]`` (per-system 3x3) replaces ``cell_inv_t[0]``;
 #   * the mesh / grad_mesh / grad_cell_inv_t arrays gain a leading batch axis.
-# Keeping the math byte-for-byte identical to the single path is what makes the
-# batched==per-system parity test pass at rtol=0.
 
 
 def _make_batch_pme_multipole_spread_unified_kernel(
@@ -5400,14 +5365,6 @@ for _order in _PER_ORDER_SUPPORTED:
 # =============================================================================
 # Double-backward per-atom moment algebra (effective moments + readouts)
 # =============================================================================
-#
-# The unified-spread double-backward (create_graph / force-loss) combines the
-# incoming 2nd-order cotangents (gg_*) with the saved forward inputs and the
-# spread-backward readouts using only per-atom vec3/mat33 algebra. These two
-# kernels keep that algebra framework-native (no torch einsum/transpose), so
-# the whole double-backward wrapper stays Warp-only. Both are pure per-atom
-# (one thread per atom) and shared by the single- and batched-system wrappers
-# (the moment algebra does not depend on batch_idx).
 
 
 @wp.kernel
@@ -5985,9 +5942,8 @@ def multipole_pme_octupole_backward_launch(
 # =============================================================================
 # Batched octupole (∇³ / ∇⁴) kernels — batched spread double-back
 # =============================================================================
-# Batched analogs of the two octupole kernels above: ``sys_idx =
-# batch_idx[atom]`` selects the per-system grid slice + ``cell_inv_t[sys_idx]``.
-# Math byte-for-byte identical to the single-system kernels.
+# ``sys_idx = batch_idx[atom]`` selects the per-system grid slice +
+# ``cell_inv_t[sys_idx]``.
 
 
 def _make_batch_pme_octupole_spread_kernel(
@@ -6567,9 +6523,6 @@ def batch_multipole_pme_octupole_backward_launch(
 #          + (c_bg_no_v / V) · q_i · Q_total       (background share)
 #
 # where Σ_i (c_bg_no_v / V) · q_i · Q_total = (c_bg_no_v / V) · Q_total².
-# The scalar coefficients (which fold in σ_c, α, F) are precomputed in the
-# torch wrapper and passed as fp64 length-1 arrays; the per-element physics
-# (squares, Frobenius norm, per-atom background share) lives entirely here.
 
 
 @wp.kernel(enable_backward=False)
@@ -7510,11 +7463,7 @@ def batch_multipole_pme_corrections_double_backward_launch(
 #
 #   e_k = 2 * per_k_factor[k] * (rho[k, 0]^2 + rho[k, 1]^2)
 #
-# The torch wrapper reduces with ``.sum()`` (single) / per-system ``sum``
-# (batched, dense (B, K) layout) and applies the ``0.5 * V / (2 pi)^6``
-# scale; only the per-element ``|rho|^2`` physics lives in this kernel.
-# Single- and batched-system callers share the kernel by flattening the
-# leading axes to ``M = K`` or ``M = B * K``.
+# The torch wrapper applies the ``0.5 * V / (2 pi)^6`` scale after reduction.
 
 
 @wp.kernel(enable_backward=False)
@@ -7766,9 +7715,7 @@ def multipole_reciprocal_rho_energy_double_backward_launch(
 #
 #   e_self_i = c0 * q_i^2 + c1 * |mu_i|^2 + c2 * |Q_i|_F^2
 #
-# with the overlap-constant coefficients precomputed by the torch wrapper
-# and the optional l=1 / l=2 channels gated by flags. The wrapper reduces
-# with ``.sum()`` (single) / ``scatter_add`` (batched).
+# with the optional l=1 / l=2 channels gated by flags.
 
 
 @wp.kernel(enable_backward=False)
@@ -8150,15 +8097,8 @@ def multipole_self_energy_double_backward_launch(
 #
 #   E = Σ_g rho_grid[g] * phi_grid[g]
 #
-# (single-system ``.sum()`` over a 3D ``(Nx, Ny, Nz)`` mesh, batched
-# per-system ``sum`` over a 4D ``(B, Nx, Ny, Nz)`` mesh). Only the
-# per-grid-point product physics ``e_g = rho_grid[g] * phi_grid[g]`` lives in
-# this kernel; the torch wrapper owns the reduction + ``F/(4 pi)`` scale.
-# Single- and batched-system callers flatten the mesh to ``M`` grid points
-# (``M = Nx*Ny*Nz`` or ``M = B*Nx*Ny*Nz``) so both share one flat kernel.
-# Both grids carry position/moment/cell autograd (via spread + convolve), and
-# the product is bilinear, so a constant cross-Hessian double-backward closes
-# the create_graph (force-loss / stress) path.
+# The per-grid-point product physics ``e_g = rho_grid[g] * phi_grid[g]`` lives
+# in this kernel; the torch wrapper owns the reduction + ``F/(4 pi)`` scale.
 
 
 @wp.kernel(enable_backward=False)

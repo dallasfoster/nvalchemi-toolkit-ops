@@ -661,9 +661,6 @@ def batch_multipole_real_space_quadrupole_csr_cell_grad(
 # =============================================================================
 # LMAX=1 cell gradient
 # =============================================================================
-#
-# Same scattering pattern as LMAX=2 but uses
-# ``_dipole_pair_contribution_fused.dPE_dr_j`` and drops the ``quadrupoles`` slot.
 
 _DIPOLE_CELL_GRAD_KERNEL_CACHE: dict = {}
 _DIPOLE_CELL_GRAD_OVERLOAD_CACHE: dict = {}

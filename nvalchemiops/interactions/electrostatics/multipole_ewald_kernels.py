@@ -257,11 +257,6 @@ def _gto_ewald_ab(sigma: wp.float64, alpha: wp.float64) -> wp.vec2d:
 
 # -----------------------------------------------------------------------------
 # Fused per-pair physics: shared energy + radial-derivative factors.
-#
-# `_gto_ewald_monopole_pair_terms_fused` returns both the energy factor `t0` and
-# the radial-derivative factor `a_scalar = -d t0 / dr` from a single shared
-# computation, saving 2 of 4 `wp_erfc` calls per pair vs separate energy +
-# analytical-backward kernels.
 # -----------------------------------------------------------------------------
 
 
@@ -982,15 +977,13 @@ def _quadrupole_pair_energy_only(
 # =============================================================================
 # l_max = 2 fused per-pair contribution — energy + all 7 gradient slots
 # =============================================================================
-# Mirror of ``_DipolePairContrib`` / ``_dipole_pair_contribution_fused`` for
-# LMAX=2. Builds energy + (∂E/∂q_i, ∂E/∂q_j, ∂E/∂μ_i, ∂E/∂μ_j,
-# ∂E/∂Q_i, ∂E/∂Q_j, ∂E/∂r_j) in one fused call sharing the radial helpers
-# from ``_gto_ewald_quadrupole_pair_terms_fused``.
+# Builds energy + (∂E/∂q_i, ∂E/∂q_j, ∂E/∂μ_i, ∂E/∂μ_j, ∂E/∂Q_i, ∂E/∂Q_j,
+# ∂E/∂r_j).
 #
 # The quadrupole gradients use the "free-index" partial convention
 # (∂/∂Q_i[α,β] treats each matrix entry as an independent variable);
 # the resulting matrix is symmetric for the qQ and QQ channels but
-# NOT for the μQ channel — the torch wrapper symmetrizes if needed.
+# NOT for the μQ channel.
 
 
 @wp.struct
@@ -1784,9 +1777,6 @@ def _quadrupole_pair_contribution_fused(
 
 # =============================================================================
 # l_max = 0 (charges only) — energy, CSR, single-system
-#
-# Public launcher only; the kernel lives in the unified factory
-# ``_make_real_space_pair_kernel(LMAX=0, storage="csr", is_batch=False, ...)``.
 # =============================================================================
 
 
@@ -1884,17 +1874,6 @@ def multipole_real_space_monopole_csr_energy(
 # -----------------------------------------------------------------------------
 # Unified real-space pair-kernel factory.
 # -----------------------------------------------------------------------------
-#
-# ``_make_real_space_pair_kernel`` builds one ``@wp.kernel`` per requested
-# capability combination, keyed on ``(LMAX, storage, is_batch, gradient
-# flags)``. Codegen-time ``if`` guards on the Python closure flags select the
-# right body fragments; Warp's NVRTC source-hash cache deduplicates the
-# resulting PTX across imports.
-#
-# The kernel signature is stable across LMAX (``dipoles`` and ``quadrupoles``
-# are positional slots present at every LMAX). Gradient-output slots
-# (``grad_positions``, ``grad_charges``, ``grad_dipoles``, ``grad_quadrupoles``)
-# are written only when the matching ``with_*_grad`` flag is True.
 
 
 def _make_real_space_pair_kernel(
@@ -3384,9 +3363,6 @@ def _real_space_pair_sig_monopole_csr(v, t):
     ]
 
 
-# Sig-builder dispatch table keyed on ``(LMAX, storage, is_batch)``.
-# The lazy-overload helper below indexes into this table to pick the right
-# sig builder when first registering a dtype-specific overload.
 _REAL_SPACE_PAIR_SIG_BUILDERS: dict[tuple[int, str, bool], callable] = {
     (0, "csr", False): _real_space_pair_sig_monopole_csr,
     (0, "csr", True): _real_space_pair_sig_monopole_csr_batched,
@@ -3396,16 +3372,6 @@ _REAL_SPACE_PAIR_SIG_BUILDERS: dict[tuple[int, str, bool], callable] = {
     (2, "csr", True): _real_space_pair_sig_quadrupole_csr_batched,
 }
 
-# Lazy kernel + overload caches: each unique (LMAX, storage, batch,
-# collapsed-grad-flags) kernel is built on first use, and per-dtype
-# overloads are registered lazily too.
-#
-# Flag-matrix collapse: any non-empty grad request routes to the per-LMAX
-# all-grads specialization (T at every applicable flag); energy-only
-# requests use the (F, F, F, F) kernel. Per-flag specialization balloons
-# NVCC compile time with little runtime payoff. Launchers requesting
-# selective gradient emission must provide real-sized scratch arrays for
-# the un-flagged slots; the kernel writes them but the caller discards.
 _REAL_SPACE_PAIR_KERNEL_CACHE: dict = {}
 _REAL_SPACE_PAIR_OVERLOAD_CACHE: dict = {}
 
@@ -3792,11 +3758,8 @@ def multipole_real_space_monopole_csr_energy_backward(
 # l_max = 0 — fused energy + gradient, CSR neighbor-list, single-system
 # =============================================================================
 #
-# `_gto_ewald_monopole_pair_terms_fused` shares erfc evaluations between the
-# energy and radial-derivative paths. One thread per atom, inner loop over the
-# neighbor pointer slice. Gradient outputs assume uniform upstream
-# `grad_energies = 1`; the torch wrapper scalar-broadcasts the actual upstream
-# gradient.
+# Gradient outputs assume uniform upstream `grad_energies = 1`; the torch
+# wrapper scalar-broadcasts the actual upstream gradient.
 
 
 def multipole_real_space_monopole_csr_energy_fused(
@@ -5191,14 +5154,6 @@ def multipole_real_space_dipole_csr_energy_fused(
 # =============================================================================
 # Batched variants — l_max = 0
 # =============================================================================
-#
-# Same pair-energy math as the single-system kernels; the only change is
-# that per-system state (``cell``, ``alpha``) lives in ``(B, ...)`` arrays
-# that threads look up with ``b = batch_idx[atom_i]``. Atoms are flat
-# ``(N_total, ...)`` with ``batch_idx`` mapping each atom to its system.
-# The CSR neighbor list (``idx_j``, ``neighbor_ptr``, ``unit_shifts``) is
-# already flat across the batch — every atom's neighbors live in the same
-# system by the caller's convention.
 
 
 def batch_multipole_real_space_monopole_csr_energy(
@@ -5512,11 +5467,6 @@ def batch_multipole_real_space_monopole_csr_energy_backward(
 # =============================================================================
 # Batched l_max = 0 — fused energy + gradient
 # =============================================================================
-#
-# Batched analog of the single-system CSR fused kernels. Same
-# `_gto_ewald_monopole_pair_terms_fused` per-pair physics; only the
-# per-system `(cells[b], sigmas[b], alphas[b])` lookup via
-# `batch_idx[atom_i]` differs.
 
 
 def batch_multipole_real_space_monopole_csr_energy_fused(
@@ -6039,11 +5989,6 @@ def batch_multipole_real_space_dipole_csr_energy_backward(
 # =============================================================================
 # Batched l_max = 1 — fused energy + gradient
 # =============================================================================
-#
-# Batched analog of the single-system lmax=1 fused kernels. Per-system
-# (cells[b], sigmas[b], alphas[b]) lookup via batch_idx[atom_i]; per-pair
-# physics shared via `_dipole_pair_contribution_fused` and
-# `_dipole_pair_energy_only`.
 
 
 def batch_multipole_real_space_dipole_csr_energy_fused(
@@ -6908,8 +6853,7 @@ def batch_multipole_real_space_dipole_csr_energy_2nd_backward(
 # =============================================================================
 # l_max = 2 — public launchers
 # =============================================================================
-# Wrap the unified-factory entries `(2, storage, is_batch, ...)`. The
-# symmetric quadrupoles array is stored as wp.mat33d (3x3, both triangles
+# The symmetric quadrupoles array is stored as wp.mat33d (3x3, both triangles
 # populated by caller).
 
 

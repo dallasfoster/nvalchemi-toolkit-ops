@@ -91,9 +91,7 @@ _FOUR_PI_SQRT_PI_OVER_2 = wp.constant(
 # density scale (matches ``graph_longrange.features.assemble_fourier_series_batch``).
 _TWO_PI_CUBED = wp.constant(wp.float64((2.0 * math.pi) ** 3))
 
-# 1 / (2π)^3 — the inverse-Fourier scaling used by the Phase 4 feature
-# projection. Pre-computed as a float64 constant because Warp's `wp.float64`
-# literal arithmetic inside kernels is more ULP-volatile than constant folding.
+# 1 / (2π)^3 — the inverse-Fourier scaling for the feature projection.
 _INV_TWO_PI_CUBED = wp.constant(wp.float64(1.0 / (2.0 * math.pi) ** 3))
 
 
@@ -977,8 +975,7 @@ def batch_assemble_rho_k_dipole(
 #   B(k, i)   = −grad_ρ_r(k) · P_r(k, i) − grad_ρ_i(k) · P_i(k, i)
 #
 # and ``q_{i, lm}`` follows the same e3nn lm layout as ``assemble_rho_k_dipole``
-# (``lm = 0`` → charge, ``lm = 1, 2, 3`` → ``μ_y, μ_z, μ_x``). The derivation
-# was verified to finite-difference float64 precision during design review.
+# (``lm = 0`` → charge, ``lm = 1, 2, 3`` → ``μ_y, μ_z, μ_x``).
 
 
 @wp.kernel
@@ -1118,11 +1115,6 @@ _position_gradient_from_rhok_overloads = register_overloads(
 # Tile-based GPU implementation of position_gradient_from_rhok
 # -----------------------------------------------------------------------------
 #
-# The per-atom kernel above has a serial inner loop over ``N_k`` that
-# doesn't parallelize across the k axis — which at ``N_k ≳ 10 k`` leaves
-# a lot of compute on the table. We refactor the math into a matrix
-# multiplication that ``wp.tile_matmul`` can dispatch to Tensor Cores.
-#
 # Derivation (same as the per-atom kernel, rearranged):
 #
 # .. math::
@@ -1170,16 +1162,6 @@ _position_gradient_from_rhok_overloads = register_overloads(
 # -----------------------------------------------------------------------------
 # Shared tile-matmul primitive
 # -----------------------------------------------------------------------------
-#
-# Many of the tiled kernels below (pos_grad forward, K4, K5, K6, K8, K9,
-# feat_pos_grad) share a structurally identical ``cosᵀ @ m_cos + sinᵀ @
-# m_sin → contribs`` matmul. They all call the one shared
-# :func:`_cossin_native_matmul_kernel`, which reads cos/sin in their native
-# ``(N_k, N_atoms)`` layout and transposes per-tile via ``wp.tile_transpose``
-# — no materialized ``(N_atoms, N_k)`` transpose+pad copy — and uses
-# bounds-checked ``wp.tile_load`` / ``wp.tile_store`` so ``N_k`` / ``N_atoms``
-# / ``N_cols`` need not be tile multiples (ceil grid, no padding). Precompute
-# and reduce kernels remain per-physics-case because their math differs.
 
 _TILE_I = wp.constant(8)  # atoms per block (tuned on GB10)
 _TILE_K = wp.constant(32)  # k-vectors per inner iteration
@@ -2847,12 +2829,6 @@ def batch_project_features_dipole(
 #
 #     \text{contribs}(i, sl)
 #         = \sum_k \bigl[ \cos(k, i) \, a_{\text{flat}} + \sin(k, i) \, b_{\text{flat}} \bigr]
-#
-# Three kernels: (1) elementwise per-(k, σ) precompute to build
-# ``a_flat`` / ``b_flat`` with the ``2/(2π)³ · kfp`` factor already
-# folded in; (2) tile-matmul; (3) per-(i, σ, lm) post-process that
-# applies the optional self-interaction subtract and the
-# ``out_col_lut`` permutation to the final ``features`` layout.
 
 _PROJ_TILE_I = wp.constant(8)  # atoms per block (matches pos_grad sweet spot)
 _PROJ_TILE_K = wp.constant(32)  # k-vectors per inner iteration
@@ -5216,8 +5192,7 @@ def rhok_position_grad_backward_positions(
 #
 #     gg_{pos}[i, \beta] = \mathrm{scale} \sum_p G(i, p) \, T(i, \beta*12 + p)
 #
-# with ``G(i, p) = g_{α(p)}(i) · q(i, lm(p))``. Three kernels match
-# the pattern we used for the forward ``position_gradient_from_rhok``.
+# with ``G(i, p) = g_{α(p)}(i) · q(i, lm(p))``.
 
 _RPGP_TILE_I = wp.constant(8)
 _RPGP_TILE_K = wp.constant(32)
@@ -6836,13 +6811,6 @@ def _v_grad_back_positions_tiled_launch(
 #   ``(b, k_idx)`` lookup;
 # * pad k-rows in the cache are filled with zeros, so they contribute
 #   nothing to any of the math below without explicit bounds checks.
-#
-# These implementations use the serial (per-thread) pattern on both CPU
-# and CUDA to keep the scope tractable. Tile-matmul variants can be
-# added later if a batched workload profile shows they're needed —
-# following the same cue the parent first-order backward did (the tile
-# rewrite of v_grad_from_feature_grad was reverted once measurement
-# showed the matmul ``N`` dim is too narrow for Tensor Cores).
 
 
 # -----------------------------------------------------------------------------
