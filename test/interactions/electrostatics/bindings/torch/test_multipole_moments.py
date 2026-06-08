@@ -23,6 +23,8 @@ import torch
 
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     cartesian_quadrupole_to_e3nn,
+    dipole_cartesian_to_spherical,
+    dipole_spherical_to_cartesian,
     e3nn_to_cartesian_quadrupole,
     infer_l_max,
     pack_multipole_moments,
@@ -102,6 +104,26 @@ class TestL2Converter:
         rhs = Y @ c
         rel = np.abs(lhs - rhs).max() / (np.abs(lhs).max() + 1e-30)
         assert rel < 1e-10, f"e3nn match rel={rel:.2e}"
+
+
+class TestDipolePerm:
+    def test_cart_to_e3nn_order(self):
+        # e3nn l=1 order is (m=-1, m=0, m=+1) = (y, z, x).
+        cart = torch.tensor([[1.0, 2.0, 3.0]])  # (x, y, z)
+        sph = dipole_cartesian_to_spherical(cart)
+        assert torch.allclose(sph, torch.tensor([[2.0, 3.0, 1.0]]))
+
+    def test_roundtrip_cart_sph_cart(self):
+        rng = np.random.default_rng(40)
+        cart = torch.tensor(rng.standard_normal((32, 3)))
+        rt = dipole_spherical_to_cartesian(dipole_cartesian_to_spherical(cart))
+        assert torch.allclose(rt, cart, atol=1e-14)
+
+    def test_roundtrip_sph_cart_sph(self):
+        rng = np.random.default_rng(41)
+        sph = torch.tensor(rng.standard_normal((32, 3)))
+        rt = dipole_cartesian_to_spherical(dipole_spherical_to_cartesian(sph))
+        assert torch.allclose(rt, sph, atol=1e-14)
 
 
 class TestPackSplit:

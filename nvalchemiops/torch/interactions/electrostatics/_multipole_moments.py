@@ -69,9 +69,11 @@ __all__ = [
     "dipole_cartesian_to_spherical",
 ]
 
-# Dipole: e3nn (y, z, x) at slots [1, 2, 3] <-> Cartesian (x, y, z).
-_DIP_SPH_TO_CART = (3, 1, 2)
+# Dipole bare (N, 3): e3nn (y, z, x) <-> Cartesian (x, y, z); inverse perms.
 _DIP_CART_TO_SPH = (1, 2, 0)
+_DIP_SPH_TO_CART = (2, 0, 1)
+# Packed (N, 4) [charge, e3nn dipole]: gather Cartesian (x, y, z) from slots 3,1,2.
+_DIP_PACKED_SPH_TO_CART = (3, 1, 2)
 
 _S5 = math.sqrt(5.0)
 _S15 = math.sqrt(15.0)
@@ -147,7 +149,7 @@ def dipole_spherical_to_cartesian(dipole_sph: torch.Tensor) -> torch.Tensor:
     torch.Tensor, shape ``(..., 3)``
         Same data permuted to Cartesian ``(x, y, z)`` (contiguous).
     """
-    return dipole_sph[..., _DIP_CART_TO_SPH].contiguous()
+    return dipole_sph[..., _DIP_SPH_TO_CART].contiguous()
 
 
 def dipole_cartesian_to_spherical(dipole_cart: torch.Tensor) -> torch.Tensor:
@@ -244,7 +246,7 @@ def split_multipole_moments(
     dipoles_cart = None
     quadrupoles_cart = None
     if l_max >= 1:
-        dipoles_cart = multipole_moments[:, _DIP_SPH_TO_CART].contiguous()
+        dipoles_cart = multipole_moments[:, _DIP_PACKED_SPH_TO_CART].contiguous()
     if l_max >= 2:
         quadrupoles_cart = e3nn_to_cartesian_quadrupole(multipole_moments[:, 4:9])
     return charges, dipoles_cart, quadrupoles_cart, l_max
@@ -299,7 +301,7 @@ def split_source_feats(
     charges = source_feats[..., 0]
     if l_max == 0:
         return charges, None, 0
-    dipoles_cart = source_feats[..., _DIP_SPH_TO_CART].contiguous()
+    dipoles_cart = source_feats[..., _DIP_PACKED_SPH_TO_CART].contiguous()
     return charges, dipoles_cart, l_max
 
 
