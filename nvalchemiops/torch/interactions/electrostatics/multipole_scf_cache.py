@@ -620,10 +620,11 @@ def _prepare_multipole_scf_cache_batch(
         k_full_b = _prepend_origin(k_half_b).to(dtype=torch.float64)
         per_system_k.append(k_full_b)
 
-    valid_k_counts = torch.tensor(
-        [k.shape[0] for k in per_system_k], dtype=torch.int32, device=device
-    )
-    k_max = int(valid_k_counts.max().item())
+    # Per-system k-counts are Python ints (materialized-tensor .shape[0]), so
+    # take K_max host-side — no device round trip / .item() sync.
+    k_counts = [int(k.shape[0]) for k in per_system_k]
+    valid_k_counts = torch.tensor(k_counts, dtype=torch.int32, device=device)
+    k_max = max(k_counts)
 
     # Pad rows are zero so they contribute nothing to any k-weighted sum.
     k_vectors = torch.zeros((batch_size, k_max, 3), dtype=torch.float64, device=device)
