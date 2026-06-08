@@ -433,16 +433,6 @@ def _convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
     )
 
 
-# The convolve forward is an elementwise multiply by a real ``factor`` that
-# depends only on ``k_squared``, the B-spline moduli, ``alpha``, ``sigma`` and
-# ``volume`` (all constant w.r.t. positions). Hence the map
-# ``grad_convolved -> grad_mesh_fft = factor · grad_convolved`` is a real,
-# diagonal, self-adjoint linear operator, and its double-backward
-# w.r.t. ``grad_convolved`` is the same forward convolve applied to the
-# upstream cotangent ``gg_mesh_fft``. Only position-HVP needs the
-# ``gg_mesh_fft`` slot (k_squared / volume are position-independent).
-
-
 def _multipole_pme_convolve_double_backward(
     gg_mesh_fft,
     gg_k_squared,
@@ -527,10 +517,6 @@ _BATCH_CONVOLVE_DBWD_SCHEMA = (
     "Tensor sigma, Tensor volume) -> Tensor"
 )
 
-# Backward signature is ``(grad_convolved, mesh_fft, ...)`` (cotangent
-# first per ``_warp_op_helpers`` convention) — works for the multipole
-# convolve because we don't need the original mesh_fft to compute
-# grad_mesh_fft (the kernel is multiplicative with a real factor).
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_convolve",
     forward=_multipole_pme_convolve_forward,
@@ -692,17 +678,6 @@ def _resolve_cell_inv_t(
 # ---------------------------------------------------------------------------
 # Unified (charges + dipoles + quadrupoles) spread custom_op — l_max = 2
 # ---------------------------------------------------------------------------
-#
-# A single Warp kernel (parameterized by ``LMAX`` at codegen time) emits only
-# the active multipole channels. ``LMAX`` is an int kwarg; the kernel factory
-# builds one Warp kernel per (ORDER, LMAX, dtype) tuple and the launcher picks
-# the right overload at launch time.
-#
-# Both forward and backward are registered as torch.library.custom_op, so PME
-# at l_max = 2 has full autograd through positions / charges / dipoles /
-# quadrupoles. The position gradient includes the
-# ``∂L/∂r_i = (1/2) Q^{αβ} ∂_α∂_β∂_γ B`` Q-channel contribution via the
-# ``bspline_third_derivative`` primitive.
 
 
 def _multipole_pme_spread_unified_forward(
@@ -821,26 +796,6 @@ def _spread_unified_forward_fake(positions, *_args):
 # ---------------------------------------------------------------------------
 # Spread double-backward (create_graph=True through PME)
 # ---------------------------------------------------------------------------
-#
-# The spread ``ρ = SF(r; q, μ, Q)`` is multilinear — linear in the moments,
-# with the first backward being its transpose. The double-backward (VJP of the
-# backward) therefore needs no new kernels for l_max <= 1: it reuses the
-# existing forward + backward spread with "effective moments" derived from the
-# backward-cotangents. Given backward-cotangents ``(gg_pos, gg_q, gg_μ, gg_Q)``,
-# define
-#     eff_c = gg_q
-#     eff_d = gg_μ + q·gg_pos
-#     eff_Q = gg_Q + (gg_pos⊗μ + μ⊗gg_pos)        (full symmetric outer)
-# Then (exactly for l_max <= 1; l_max = 2 additionally needs ∇³/∇⁴ octupole
-# terms, NotImplemented below):
-#     ∂L/∂grad_mesh = forward_spread(r, eff_c, eff_d, eff_Q)
-#     bwd2          = backward_spread(grad_mesh, r, eff_c, eff_d, eff_Q)
-#     ∂L/∂positions = bwd2.grad_positions
-#     ∂L/∂q         = gg_pos · bwd2.grad_dipoles         (= gg_pos·Mᵀ acc_f)
-#     ∂L/∂μ         = 2·bwd2.grad_quadrupoles · gg_pos    (= Mᵀ acc_H M gg_pos)
-# (grad_dipoles / grad_quadrupoles of the effective backward call are the
-# moment-independent field readouts ``Mᵀ acc_f`` / ``½ Mᵀ acc_H M``, so the two
-# launches above cover every slot.) ``cell_inv_t`` 2nd-order is deferred (None).
 
 
 def _multipole_pme_spread_unified_double_backward(
@@ -2502,13 +2457,6 @@ def multipole_pme_gather_hessian(
 # =============================================================================
 # Energy corrections — self + background
 # =============================================================================
-#
-# The per-element physics (per-atom self-energy squares, Frobenius norm,
-# per-atom background share, and the analytic input gradients) lives in
-# Warp kernels (``multipole_pme_corrections[_backward]_launch`` and their
-# batched variants). The torch wrapper below precomputes the scalar
-# coefficients (folding in σ_c, α, F), feeds fp64 inputs to the op, and
-# the op reduces the per-atom output with ``.sum()`` / ``scatter_add``.
 
 
 def _corr_scalar_array(value: float, device: torch.device) -> torch.Tensor:
@@ -2865,11 +2813,6 @@ def _corrections_double_backward_fake(
     )
 
 
-# The correction is position-independent (force-loss differentiates w.r.t.
-# positions, which this op never touches), but moment-moment HVPs (e.g. the
-# l=2 Q-Q Hessian through the PME composite) DO need a double-backward
-# w.r.t. grad_out + the moment/volume inputs. ``volume`` (position 3) gets
-# the cell-grad slot; charges/dipoles/quadrupoles the moment-grad slots.
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_corrections",
     forward=_multipole_pme_corrections_forward,
@@ -3061,12 +3004,6 @@ def multipole_pme_energy_corrections(
 # =============================================================================
 # Reciprocal-space per-k energy from rho (shared by direct k-space + Ewald reciprocal)
 # =============================================================================
-#
-# The per-element ``|rho|^2`` physics moves into a Warp kernel; the wrapper
-# owns the ``.sum()`` / per-system reduction and the ``0.5 V / (2 pi)^6``
-# scale (which keeps the cell-grad through ``volume`` in torch). Three sites
-# share this op: ``multipole_scf_step.{energy,features}`` (+ batched) and the
-# reciprocal fused-scalar Functions in ``multipole_autograd{,_batch}.py``.
 
 
 def _multipole_reciprocal_rho_energy_forward(
@@ -3198,11 +3135,6 @@ def _rho_energy_double_backward_fake(
     )
 
 
-# Both ``rho`` and ``per_k_factor`` are differentiable: rho carries the
-# position/moment grad (and a value-preserving volume factor), while
-# ``per_k_factor`` carries the cell-grad (it depends on the cell via k²).
-# The op is quadratic in rho → double-backward is required for force-loss /
-# stress HVPs.
 _RHO_ENERGY_DBWD_SCHEMA = (
     "(Tensor? gg_rho, Tensor? gg_per_k_factor, Tensor grad_out, Tensor rho, "
     "Tensor per_k_factor) -> (Tensor, Tensor, Tensor)"
@@ -3263,10 +3195,6 @@ def multipole_reciprocal_rho_energy(
 # =============================================================================
 # Multipole self-energy: weighted sum of per-atom moment squares
 # =============================================================================
-#
-# Shared by the same three sites for the ``Σ_l c_l Σ_i moment_l^2`` self
-# term. The wrapper keeps the overlap-constant coefficients + final
-# reduction (``.sum()`` / ``scatter_add``) in torch.
 
 
 def _multipole_self_energy_forward(
@@ -3522,15 +3450,6 @@ def multipole_self_energy(
 # =============================================================================
 # PME mesh inner product: ``Σ_g rho_grid · phi_grid``
 # =============================================================================
-#
-# The PME reciprocal energy is the mesh inner product of the spread density
-# ``rho_grid`` and the convolved potential ``phi_grid``. Only the per-element
-# product physics ``e_g = rho_grid[g] * phi_grid[g]`` moves into a Warp
-# kernel; the wrapper owns the ``.sum()`` (single) / per-system ``sum``
-# (batched) reduction and the ``F/(4 pi)`` scale. Both grids carry
-# position/moment/cell autograd (spread + convolve), and the product is
-# bilinear, so a constant cross-Hessian double-backward closes the
-# create_graph (force-loss / stress) path.
 
 
 def _multipole_pme_mesh_inner_product_forward(
@@ -3657,9 +3576,6 @@ def _mesh_inner_product_double_backward_fake(
     )
 
 
-# Both grids are differentiable (each depends on positions / moments / cell via
-# spread + convolve). The op is bilinear → double-backward is required for the
-# PME force-loss / stress HVPs.
 _MESH_INNER_PRODUCT_DBWD_SCHEMA = (
     "(Tensor? gg_rho_grid, Tensor? gg_phi_grid, Tensor grad_out, "
     "Tensor rho_grid, Tensor phi_grid) -> (Tensor, Tensor, Tensor)"
@@ -4410,10 +4326,6 @@ def multipole_particle_mesh_ewald(
 
 # =============================================================================
 # Batched reciprocal-space + top-level helpers
-#
-# These back the batched branches of ``multipole_pme_reciprocal_space`` and
-# ``multipole_particle_mesh_ewald`` above. Kept private; callers reach the
-# batched paths by passing ``batch_idx`` to the unified entry points.
 # =============================================================================
 
 

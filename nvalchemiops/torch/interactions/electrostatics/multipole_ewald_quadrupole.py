@@ -412,12 +412,6 @@ class MultipoleRealSpaceQuadrupoleFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 # l_max = 2 single-system real-space — torch.library.custom_op chain
 # ---------------------------------------------------------------------------
-# Compile-friendly equivalent of MultipoleRealSpaceQuadrupoleFunction. Unlike
-# l<=1, the backward fires two kernels: the fused moment-gradient kernel
-# (positions/charges/dipoles/quadrupoles, always computed) and — only when
-# ``cell`` needs a gradient (stress) — a separate cell-grad kernel. Autograd is
-# wired by hand (not register_warp_op_chain) to keep that conditional + the
-# create_graph path (moments only; cell has no second-order kernel).
 
 
 @torch.library.custom_op(
@@ -1403,10 +1397,6 @@ class BatchMultipoleRealSpaceQuadrupoleFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 # Batched l_max = 2 real-space — torch.library.custom_op chain
 # ---------------------------------------------------------------------------
-# Batched analog of the single-system l=2 chain: per-system scatter_add to a
-# ``(B,)`` energy, an extra ``batch_idx``, and per-system cells/sigmas/alphas.
-# The backward expands grad_per_system to per-atom via batch_idx, then fires the
-# moment-grad kernel + (only when needed) the batched cell-grad kernel.
 
 
 @torch.library.custom_op(

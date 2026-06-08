@@ -143,17 +143,6 @@ def _atom_bounds_from_batch_idx(
 # =============================================================================
 # Opaque batched rho-backward sub-op chains (l<=1)
 # =============================================================================
-#
-# Batched analog of the single-system multipole_rho op chain. A
-# register_autograd backward is TRACED by AOTAutograd, so it must call ONLY
-# opaque ops + plain torch. The four rho-backward sub-routines (moments,
-# positions, phi_hat phase, k-vector phase) are each wrapped as their own
-# opaque ``torch.library.custom_op``. The two differentiable chains (moments,
-# positions) carry their own analytical backward so ``create_graph=True``
-# (force-/stress-loss) composes and stays compile-clean. The phi_hat /
-# k-vector ops are forward-only (1st-order reciprocal cell-grad; cell
-# 2nd-order out of scope). ``volume`` / ``batch_idx`` cross as explicit op
-# inputs; ``atom_start`` / ``atom_end`` are derived inside the op bodies.
 
 
 @torch.library.custom_op(
@@ -610,12 +599,6 @@ def _batch_rho_kphase_grad_fake(
 # =============================================================================
 # Batched opaque feature-projection sub-op chains (l<=1)
 # =============================================================================
-#
-# Batched analog of the single-system feature sub-op chains. Each
-# register_autograd backward is AOTAutograd-traced, so it calls only opaque
-# ops + plain torch. The two differentiable chains (V, position) carry their
-# analytical backward so create_graph composes. ``batch_idx`` is an explicit
-# non-diff op input and ``atom_start`` / ``atom_end`` are derived inside.
 
 
 # ---- V-grad chain: grad_raw -> grad_V (register_warp_op_chain) ----
@@ -1133,15 +1116,6 @@ register_warp_op_chain(
 # =============================================================================
 # torch.library.custom_op chain for the batched rho(k) assembly (l<=1)
 # =============================================================================
-#
-# Fully-differentiable opaque op (batched analog of multipole_rho). The forward
-# seals the struct-dtype wp.from_torch inside an opaque node so the eager and
-# compiled forwards are break-free. The register_autograd backward calls ONLY
-# the opaque sub-op chains above + plain torch, so AOTAutograd traces it (the
-# compiled backward is break-free too) and create_graph composes through the
-# differentiable moment/position chains. ``volume`` and ``batch_idx`` cross as
-# explicit op inputs (the step passes cache.volume); both get a ``None`` grad
-# slot.
 
 
 @torch.library.custom_op(
@@ -2214,13 +2188,6 @@ def _batch_feature_kphase_grad_fake(
 # =============================================================================
 # torch.library.custom_op chain for the batched raw feature projection (l<=1)
 # =============================================================================
-#
-# Fully-differentiable opaque op (batched analog of
-# multipole_project_raw_features). The register_autograd backward calls only the
-# opaque sub-op chains above + plain torch, so AOTAutograd traces it and
-# create_graph composes. ``batch_idx`` is an explicit non-diff op input; the
-# kernels read the threaded l<=1 receiver slice ``[:, :, :, :4, :]`` plus
-# ``k_vectors`` / ``k_factor_proj``. ``k_factor_proj`` has zero cell-grad.
 
 
 @torch.library.custom_op(

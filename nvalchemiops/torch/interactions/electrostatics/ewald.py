@@ -199,14 +199,6 @@ def _prepare_cell(cell: torch.Tensor) -> tuple[torch.Tensor, int]:
 ########################### Real-Space Internal Custom Ops ################################
 ###########################################################################################
 
-# Output dtype convention:
-#   - Energies: always wp.float64 for numerical stability during accumulation.
-#   - Forces: match input precision via get_wp_vec_dtype(pos.dtype) -- vec3f for
-#     float32 inputs, vec3d for float64.  This was changed from the previous
-#     hardcoded wp.vec3d to fix a dtype mismatch when positions are float32.
-#   - Virial: match input precision via get_wp_mat_dtype(pos.dtype) -- mat33f for
-#     float32 inputs, mat33d for float64.
-
 
 @warp_custom_op(
     name="alchemiops::_ewald_real_space_energy",

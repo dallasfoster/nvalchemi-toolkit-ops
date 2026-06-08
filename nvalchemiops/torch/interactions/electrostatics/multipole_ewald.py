@@ -973,12 +973,6 @@ class MultipoleRealSpaceFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 # l_max = 1 single-system real-space — torch.library.custom_op chain
 # ---------------------------------------------------------------------------
-# Compile-friendly equivalent of the MultipoleRealSpaceFunction +
-# MultipoleRealSpaceBackwardFunction pair. The custom_op bodies are opaque to
-# Dynamo, so ``torch.compile`` emits one graph node per launch (no graph break
-# on the struct-dtype ``wp.from_torch`` calls) and the sequence is
-# CUDA-graph-capturable. The public ``multipole_real_space_energy`` routes the
-# l_max=1 single-system path through this op.
 
 
 def _real_space_dipole_forward(
@@ -1128,10 +1122,6 @@ def _real_space_dipole_double_backward(
     return gg_grad_energies_2nd, gg_positions_2nd, gg_charges_2nd, gg_dipoles_2nd
 
 
-# Forward inputs: (positions, charges, dipoles, cell, sigma, alpha, idx_j,
-# neighbor_ptr, unit_shifts). Differentiable: positions/charges/dipoles (0,1,2).
-# Backward inputs add the cotangent at position 0, so its differentiable slots
-# are (grad_energies, positions, charges, dipoles) = (0, 1, 2, 3).
 register_warp_op_chain(
     name="nvalchemiops::multipole_real_space_dipole",
     forward=_real_space_dipole_forward,
@@ -1284,9 +1274,6 @@ def _real_space_monopole_double_backward(
     return gg_grad_energies_2nd, gg_positions_2nd, gg_charges_2nd
 
 
-# Forward inputs: (positions, charges, cell, sigma, alpha, idx_j, neighbor_ptr,
-# unit_shifts). Differentiable: positions/charges (0,1). Backward differentiable
-# slots: (grad_energies, positions, charges) = (0, 1, 2).
 register_warp_op_chain(
     name="nvalchemiops::multipole_real_space_monopole",
     forward=_real_space_monopole_forward,
@@ -1303,13 +1290,6 @@ register_warp_op_chain(
 # ---------------------------------------------------------------------------
 # Fused-scalar real-space (l=0/1 single-system) — torch.library.custom_op chains
 # ---------------------------------------------------------------------------
-# Compile-friendly equivalents of the MultipoleRealSpace{Monopole,Dipole}
-# FusedScalarFunction classes used by ``multipole_ewald_summation``. One fused
-# Warp launch yields the scalar total energy AND the per-atom moment gradients,
-# which are returned as extra op outputs and saved by setup_context. The
-# backward broadcasts those precomputed grads for plain forces, routes through
-# the (differentiable) moment-backward op under ``create_graph`` for force-loss,
-# and computes the unweighted cell gradient (stress) only when needed.
 
 
 @torch.library.custom_op(
@@ -2297,10 +2277,6 @@ class BatchMultipoleRealSpaceMonopoleFunction(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 # Batched l_max = 0 / 1 real-space — torch.library.custom_op chains
 # ---------------------------------------------------------------------------
-# Batched analogs of the single-system chains: an extra ``batch_idx`` input and
-# per-system ``cells``/``sigmas``/``alphas``. Energy entry points only (the
-# fused-scalar composite variants are separate). Routed from
-# ``_batch_multipole_real_space_energy``.
 
 
 def _batch_real_space_monopole_forward(
@@ -2601,9 +2577,6 @@ register_warp_op_chain(
 # ---------------------------------------------------------------------------
 # Batched fused-scalar real-space (l=0/1) — torch.library.custom_op chains
 # ---------------------------------------------------------------------------
-# Batched analogs of the single-system fused-scalar ops: scatter_add to a
-# per-system ``(B,)`` energy, an extra ``batch_idx``, and the per-system
-# ``grad_E[batch_idx]`` cotangent expansion in the broadcast/on-tape backward.
 
 
 @torch.library.custom_op(

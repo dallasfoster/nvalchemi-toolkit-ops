@@ -73,9 +73,6 @@ __all__ = [
 _DIP_SPH_TO_CART = (3, 1, 2)
 _DIP_CART_TO_SPH = (1, 2, 0)
 
-# l=2 e3nn 'component' real-SH <-> Cartesian symmetric-traceless quadrupole.
-# Columns of B / rows of T are e3nn component order m = (-2, -1, 0, +1, +2);
-# q6 = [Qxx, Qyy, Qzz, Qxy, Qxz, Qyz]. B is hardcoded, T = pinv(B) at import.
 _S5 = math.sqrt(5.0)
 _S15 = math.sqrt(15.0)
 _HALF_S5 = _S5 / 2.0
