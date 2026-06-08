@@ -40,6 +40,7 @@ import math
 import torch
 
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
+    split_packed_for_kernels,
     split_source_feats,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
@@ -48,6 +49,27 @@ from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
 from nvalchemiops.torch.math import FIELD_CONSTANT
 
 _TWO_PI_6 = (2.0 * math.pi) ** 6
+
+
+def _resolve_step_moments(
+    source_feats: torch.Tensor,
+    quadrupoles: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Normalize step inputs to ``(l<=1 block, quadrupoles)``.
+
+    Accepts either the e3nn l<=1 block (``(N, 1)`` / ``(N, 4)``) with the l=2
+    moment passed via ``quadrupoles``, or a fully packed ``(N, 9)`` tensor,
+    which is split here so the packed form never silently drops the l=2 block.
+    """
+    if source_feats.ndim == 2 and source_feats.shape[-1] == 9:
+        if quadrupoles is not None:
+            raise ValueError(
+                "pass either a packed (N, 9) source_feats or the l<=1 block plus "
+                "quadrupoles=, not both."
+            )
+        l1, quadrupoles, _ = split_packed_for_kernels(source_feats)
+        return l1, quadrupoles
+    return source_feats, quadrupoles
 
 
 def _self_energy_op(
@@ -194,6 +216,7 @@ def multipole_scf_step_energy(
             f"positions/source_feats must live on cache.device={cache.device}"
         )
 
+    source_feats, quadrupoles = _resolve_step_moments(source_feats, quadrupoles)
     charges, dipoles_cart, l_max = split_source_feats(source_feats)
     dip = (
         dipoles_cart.contiguous()
@@ -216,6 +239,11 @@ def multipole_scf_step_energy(
             MultipoleRhoQFunction,
         )
 
+        if cache.source_coeff2 is None:
+            raise ValueError(
+                "quadrupoles requires a cache built with l_max>=2 "
+                "(cache.source_coeff2 is None)."
+            )
         if quadrupoles.shape != (n_atoms, 3, 3):
             raise ValueError(
                 f"quadrupoles must be (N, 3, 3); got {tuple(quadrupoles.shape)}"
@@ -318,6 +346,7 @@ def multipole_scf_step_features(
             f"positions/source_feats must live on cache.device={cache.device}"
         )
 
+    source_feats, quadrupoles = _resolve_step_moments(source_feats, quadrupoles)
     charges, dipoles_cart, l_max = split_source_feats(source_feats)
     dip = (
         dipoles_cart.contiguous()
@@ -337,6 +366,11 @@ def multipole_scf_step_features(
             MultipoleRhoQFunction,
         )
 
+        if cache.source_coeff2 is None:
+            raise ValueError(
+                "quadrupoles requires a cache built with l_max>=2 "
+                "(cache.source_coeff2 is None)."
+            )
         if quadrupoles.shape != (n_atoms, 3, 3):
             raise ValueError(
                 f"quadrupoles must be (N, 3, 3); got {tuple(quadrupoles.shape)}"
@@ -502,6 +536,7 @@ def _multipole_scf_step_energy_batch(
     _validate_batch_inputs(cache, positions, source_feats, batch_idx)
     n_total = positions.shape[0]
 
+    source_feats, quadrupoles = _resolve_step_moments(source_feats, quadrupoles)
     charges, dipoles_cart, l_max = split_source_feats(source_feats)
     dip = (
         dipoles_cart.contiguous()
@@ -611,6 +646,7 @@ def _multipole_scf_step_features_batch(
     _validate_batch_inputs(cache, positions, source_feats, batch_idx)
     n_total = positions.shape[0]
 
+    source_feats, quadrupoles = _resolve_step_moments(source_feats, quadrupoles)
     charges, dipoles_cart, l_max = split_source_feats(source_feats)
     dip = (
         dipoles_cart.contiguous()
@@ -732,7 +768,7 @@ def _multipole_scf_step_features_batch(
 def multipole_ewald_scf_step_energy(
     cache: MultipoleSCFCache,
     positions: torch.Tensor,
-    source_feats: torch.Tensor,
+    multipole_moments: torch.Tensor,
     idx_j: torch.Tensor,
     neighbor_ptr: torch.Tensor,
     unit_shifts: torch.Tensor,
@@ -773,9 +809,12 @@ def multipole_ewald_scf_step_energy(
     Parameters
     ----------
     cache :
-        Prebuilt Ewald cache.
+        Prebuilt Ewald cache. Must be built with source ``l_max>=2`` for the
+        :math:`(N, 9)` (quadrupole) path.
     positions : torch.Tensor, shape (N, 3) or (N_total, 3)
-    source_feats : torch.Tensor
+    multipole_moments : torch.Tensor, shape (N, (l_max + 1)**2)
+        Packed e3nn moments: :math:`(N, 1)` / :math:`(N, 4)` / :math:`(N, 9)`
+        for :math:`l_{max} = 0/1/2`.
     idx_j, neighbor_ptr, unit_shifts : torch.Tensor
         Flat CSR neighbor list; same convention as
         :func:`multipole_ewald_summation`.
@@ -787,7 +826,7 @@ def multipole_ewald_scf_step_energy(
     torch.Tensor
         :math:`\text{float64}` total GTO-Ewald energy (scalar or
         :math:`(B,)`). Autograd-connected to ``positions`` and
-        ``source_feats``.
+        ``multipole_moments``.
     """
     if cache.alpha is None:
         raise ValueError(
@@ -807,6 +846,16 @@ def multipole_ewald_scf_step_energy(
         multipole_real_space_energy,
     )
 
+    # Split the packed moments: the l<=1 block (+ separate Cartesian quadrupole)
+    # is what the reciprocal step and self-energy consume; the real-space term
+    # takes the full packed tensor.
+    source_feats_l1, quadrupoles, l_max = split_packed_for_kernels(multipole_moments)
+    if quadrupoles is not None and cache.source_coeff2 is None:
+        raise ValueError(
+            "an (N, 9) multipole_moments requires a cache built with l_max>=2 "
+            "(cache.source_coeff2 is None)."
+        )
+
     device = positions.device
     input_dtype = positions.dtype
     coulomb_scale = FIELD_CONSTANT / (4.0 * math.pi)
@@ -815,10 +864,9 @@ def multipole_ewald_scf_step_energy(
         B = cache.batch_size
         sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
         alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
-
-        per_atom_real = multipole_real_space_energy(
+        real = multipole_real_space_energy(
             positions,
-            source_feats,
+            multipole_moments,
             cache.cell,
             idx_j,
             neighbor_ptr,
@@ -827,42 +875,48 @@ def multipole_ewald_scf_step_energy(
             alphas,
             batch_idx=batch_idx,
         )
-        e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-            0, batch_idx.long(), coulomb_scale * per_atom_real
-        )
-        # Reciprocal via cache (no per-step k-space rebuild).
-        # include_self_interaction=True returns the raw reciprocal; the Ewald
-        # self term is handled analytically below.
-        e_recip = _multipole_scf_step_energy_batch(
-            cache,
+        # multipole_real_space_energy returns per-atom for l<=1 (reduce per
+        # system) but per-system (B,) for l=2.
+        if l_max == 2:
+            e_real = coulomb_scale * real
+        else:
+            e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
+                0, batch_idx.long(), coulomb_scale * real
+            )
+    else:
+        sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
+        alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
+        real = multipole_real_space_energy(
             positions,
-            source_feats,
-            batch_idx,
-            include_self_interaction=True,
+            multipole_moments,
+            cache.cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigma_t,
+            alpha_t,
         )
-        atom_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
-        e_self = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-            0, batch_idx.long(), atom_self
-        )
-        return (e_real + e_recip - e_self).to(torch.float64)
+        e_real = coulomb_scale * real.sum()
 
-    # Single-system path.
-    sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
-    alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
-
-    per_atom_real = multipole_real_space_energy(
-        positions,
-        source_feats,
-        cache.cell,
-        idx_j,
-        neighbor_ptr,
-        unit_shifts,
-        sigma_t,
-        alpha_t,
-    )
-    e_real = coulomb_scale * per_atom_real.sum()
+    # Reciprocal via cache (no per-step k-space rebuild).
+    # include_self_interaction=True returns the raw reciprocal; the Ewald self
+    # term is handled analytically below.
     e_recip = multipole_scf_step_energy(
-        cache, positions, source_feats, include_self_interaction=True
+        cache,
+        positions,
+        source_feats_l1,
+        batch_idx=batch_idx,
+        include_self_interaction=True,
+        quadrupoles=quadrupoles,
     )
-    e_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha).sum()
+
+    atom_self = _multipole_ewald_self_energy_per_atom(
+        source_feats_l1, sigma, alpha, quadrupoles=quadrupoles
+    )
+    if is_batch:
+        e_self = torch.zeros(
+            cache.batch_size, dtype=torch.float64, device=device
+        ).scatter_add(0, batch_idx.long(), atom_self)
+    else:
+        e_self = atom_self.sum()
     return (e_real + e_recip - e_self).to(torch.float64)

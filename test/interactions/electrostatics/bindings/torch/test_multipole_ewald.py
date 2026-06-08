@@ -2120,13 +2120,21 @@ def _build(n: int, device: str, seed: int, l_max: int):
     if abs(chg_np.sum()) > 1e-12:
         chg_np[-1] -= chg_np.sum()
     dip_np = 0.3 * rng.standard_normal((N, 3)) if l_max >= 1 else None
+    quad_np = None
+    if l_max >= 2:
+        Qr = 0.2 * rng.standard_normal((N, 3, 3))
+        quad_np = 0.5 * (Qr + Qr.transpose(0, 2, 1))  # symmetric; packer drops trace
 
     td = _torch_device(device)
     pos = torch.from_numpy(pos_np).to(td, torch.float64)
     chg = torch.from_numpy(chg_np).to(td, torch.float64)
     dip = torch.from_numpy(dip_np).to(td, torch.float64) if dip_np is not None else None
     cell = torch.from_numpy(cell_np).to(td, torch.float64)
-    source_feats = pack_charges_dipoles(chg, dip)
+    if quad_np is not None:
+        quad = torch.from_numpy(quad_np).to(td, torch.float64)
+        source_feats = pack_multipole_moments(chg, dip, quad)
+    else:
+        source_feats = pack_charges_dipoles(chg, dip)
     return pos, source_feats, cell, cell_np, pos_np
 
 
@@ -2426,7 +2434,7 @@ class TestEwaldSCFStepEnergy:
     built with matching (σ, α, kspace_cutoff)."""
 
     @pytest.mark.parametrize("alpha", [0.4, 0.9])
-    @pytest.mark.parametrize("l_max", [0, 1])
+    @pytest.mark.parametrize("l_max", [0, 1, 2])
     def test_single_matches_one_shot(self, device, l_max: int, alpha: float):
         td = _torch_device(device)
         sigma = 1.0
@@ -2474,7 +2482,7 @@ class TestEwaldSCFStepEnergy:
             f"one-shot={E_one_shot:.6e}  |Δ|={abs(E_cached - E_one_shot):.3e}"
         )
 
-    @pytest.mark.parametrize("l_max", [0, 1])
+    @pytest.mark.parametrize("l_max", [0, 1, 2])
     def test_batched_matches_one_shot(self, device, l_max: int):
         td = _torch_device(device)
         sigma, alpha = 1.0, 0.6
