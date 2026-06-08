@@ -101,7 +101,7 @@ from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels im
     rhoq_posgrad_backward_positions,
     rhoq_posgrad_backward_quad,
 )
-from nvalchemiops.torch.interactions.electrostatics._warp_op_helpers import (
+from nvalchemiops.torch._warp_op_helpers import (
     register_warp_op_chain,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (

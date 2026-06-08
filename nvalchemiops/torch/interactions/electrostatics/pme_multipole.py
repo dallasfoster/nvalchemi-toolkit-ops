@@ -85,12 +85,12 @@ from nvalchemiops.math.spline import (
     spline_gather,
     spline_gather_gradient,
 )
+from nvalchemiops.torch._warp_op_helpers import (
+    register_warp_op_chain,
+)
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     infer_l_max,
     split_multipole_moments,
-)
-from nvalchemiops.torch.interactions.electrostatics._warp_op_helpers import (
-    register_warp_op_chain,
 )
 from nvalchemiops.torch.math import FIELD_CONSTANT
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype

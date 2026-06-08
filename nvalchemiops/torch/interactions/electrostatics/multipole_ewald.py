@@ -71,11 +71,11 @@ from nvalchemiops.interactions.electrostatics.multipole_ewald_cell_grad import (
     multipole_real_space_dipole_csr_cell_grad,
     multipole_real_space_monopole_csr_cell_grad,
 )
+from nvalchemiops.torch._warp_op_helpers import (
+    register_warp_op_chain,
+)
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     split_multipole_moments,
-)
-from nvalchemiops.torch.interactions.electrostatics._warp_op_helpers import (
-    register_warp_op_chain,
 )
 from nvalchemiops.torch.math import FIELD_CONSTANT
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
