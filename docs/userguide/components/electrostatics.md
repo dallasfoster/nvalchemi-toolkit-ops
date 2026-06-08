@@ -1413,9 +1413,9 @@ extractors and an amortized SCF cache for repeated evaluations at fixed cell.
 ```{tip}
 For an end-to-end walkthrough (energy, forces, stress, and force-loss training at
 $l_{\max}=0/1/2$), see the gallery examples
-{ref}`sphx_glr_examples_electrostatics_05_multipole_ewald_summation_example.py`
+{ref}`sphx_glr_examples_electrostatics_07_multipole_ewald_summation_example.py`
 (Ewald) and
-{ref}`sphx_glr_examples_electrostatics_06_multipole_pme_example.py` (PME).
+{ref}`sphx_glr_examples_electrostatics_08_multipole_pme_example.py` (PME).
 ```
 
 ### Packed Multipole Moments
@@ -1679,10 +1679,10 @@ floats when shared across the batch.
 
 For end-to-end batched walkthroughs (energy, forces, stress, force-loss), see the
 gallery examples
-{ref}`sphx_glr_examples_electrostatics_05_multipole_ewald_summation_example.py`,
-{ref}`sphx_glr_examples_electrostatics_06_multipole_pme_example.py`,
-{ref}`sphx_glr_examples_electrostatics_07_multipole_features_example.py`, and
-{ref}`sphx_glr_examples_electrostatics_08_multipole_scf_cache_example.py`.
+{ref}`sphx_glr_examples_electrostatics_07_multipole_ewald_summation_example.py`,
+{ref}`sphx_glr_examples_electrostatics_08_multipole_pme_example.py`,
+{ref}`sphx_glr_examples_electrostatics_09_multipole_features_example.py`, and
+{ref}`sphx_glr_examples_electrostatics_10_multipole_scf_cache_example.py`.
 
 ### Autograd: Forces, Stress, and Force-Loss
 

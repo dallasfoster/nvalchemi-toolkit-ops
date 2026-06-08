@@ -122,7 +122,7 @@ def _atom_bounds_from_batch_idx(
     tensors on the same device.
     """
     device = batch_idx.device
-    counts = torch.bincount(batch_idx.long(), minlength=batch_size)
+    counts = torch.bincount(batch_idx, minlength=batch_size)
     atom_end = counts.cumsum(dim=0).to(torch.int32)
     atom_start = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), atom_end[:-1]]
@@ -301,7 +301,7 @@ def _batch_rho_moment_grad_backward(
     )
     per_atom_dot = (gg_moments * grad_flat).sum(dim=-1)
     gg_volume = torch.zeros_like(volume)
-    gg_volume.scatter_add_(0, batch_idx.long(), per_atom_dot)
+    gg_volume.scatter_add_(0, batch_idx, per_atom_dot)
     gg_volume = -gg_volume / volume.detach()
     return ggrad_rho, gg_volume
 

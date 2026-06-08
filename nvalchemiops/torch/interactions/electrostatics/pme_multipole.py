@@ -2533,7 +2533,7 @@ def _multipole_pme_corrections_forward(
         return per_atom.sum()
     n_systems = volume.shape[0]
     out = torch.zeros(n_systems, dtype=torch.float64, device=device)
-    out.scatter_add_(0, batch_idx.long(), per_atom)
+    out.scatter_add_(0, batch_idx, per_atom)
     return out
 
 
@@ -2673,7 +2673,7 @@ def _multipole_pme_corrections_double_backward(
         sum_gg = gg_charges.sum().reshape(1)
     else:
         sum_gg = torch.zeros(n_sys, dtype=torch.float64, device=device)
-        sum_gg.scatter_add_(0, batch_idx.long(), gg_charges)
+        sum_gg.scatter_add_(0, batch_idx, gg_charges)
 
     grad_grad_out = torch.zeros(n_sys, dtype=torch.float64, device=device)
     grad_charges = torch.empty(n_atoms, dtype=torch.float64, device=device)
@@ -2975,13 +2975,12 @@ def multipole_pme_energy_corrections(
         )
 
     # Batched: per-system total charge + per-system volume (B,).
-    batch_idx_long = batch_idx.long()
     if n_systems is None:
         # Eager fallback only; the batched composite passes n_systems to
         # avoid this device sync (a torch.compile graph break) on the hot path.
-        n_systems = int(batch_idx_long.max().item()) + 1
+        n_systems = int(batch_idx.max().item()) + 1
     total_charge = torch.zeros(n_systems, dtype=torch.float64, device=device)
-    total_charge.scatter_add_(0, batch_idx_long, charges_f64)
+    total_charge.scatter_add_(0, batch_idx, charges_f64)
     vol_per_system = volume.to(torch.float64).reshape(-1)
     if vol_per_system.numel() == 1 and n_systems > 1:
         vol_per_system = vol_per_system.expand(n_systems)

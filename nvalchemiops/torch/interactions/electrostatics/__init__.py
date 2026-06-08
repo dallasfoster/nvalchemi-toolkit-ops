@@ -88,6 +88,9 @@ from nvalchemiops.torch.interactions.electrostatics.pme import (
     pme_green_structure_factor,
     pme_reciprocal_space,
 )
+from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
+    multipole_particle_mesh_ewald,
+)
 from nvalchemiops.torch.interactions.electrostatics.slab import (
     compute_slab_correction,
 )
@@ -137,6 +140,8 @@ __all__ = [
     "MultipoleRealSpaceQuadrupoleBackwardFunction",
     # Composite Ewald summation (real + reciprocal - self)
     "multipole_ewald_summation",
+    # Composite Particle-Mesh Ewald (l_max=0/1/2)
+    "multipole_particle_mesh_ewald",
     # Cache-aware Ewald SCF step
     "multipole_ewald_scf_step_energy",
     # Parameters

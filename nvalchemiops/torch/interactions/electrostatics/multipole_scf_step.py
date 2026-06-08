@@ -595,7 +595,7 @@ def _multipole_scf_step_energy_batch(
     dip_self = dipoles_cart if l_max == 1 else None
     atom_self = _self_energy_op(cache, charges, dip_self, quadrupoles)
     e_self = torch.zeros(cache.batch_size, dtype=torch.float64, device=cache.device)
-    e_self = e_self.scatter_add(0, batch_idx.long(), atom_self)
+    e_self = e_self.scatter_add(0, batch_idx, atom_self)
     return (raw_energy - 0.5 * e_self).to(torch.float64)
 
 
@@ -881,7 +881,7 @@ def multipole_ewald_scf_step_energy(
             e_real = coulomb_scale * real
         else:
             e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-                0, batch_idx.long(), coulomb_scale * real
+                0, batch_idx, coulomb_scale * real
             )
     else:
         sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
@@ -916,7 +916,7 @@ def multipole_ewald_scf_step_energy(
     if is_batch:
         e_self = torch.zeros(
             cache.batch_size, dtype=torch.float64, device=device
-        ).scatter_add(0, batch_idx.long(), atom_self)
+        ).scatter_add(0, batch_idx, atom_self)
     else:
         e_self = atom_self.sum()
     return (e_real + e_recip - e_self).to(torch.float64)

@@ -3900,7 +3900,7 @@ def multipole_ewald_summation(
                 quadrupoles=quadrupoles,
             )
             e_self_b = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-                0, batch_idx.long(), atom_self
+                0, batch_idx, atom_self
             )
             return (e_real_b + e_recip_b - e_self_b).to(torch.float64)
 
@@ -4016,7 +4016,7 @@ def multipole_ewald_summation(
 
         atom_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
         e_self = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-            0, batch_idx.long(), atom_self
+            0, batch_idx, atom_self
         )
 
         return (e_real + e_recip - e_self).to(torch.float64)
