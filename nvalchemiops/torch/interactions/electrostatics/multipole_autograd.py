@@ -808,75 +808,6 @@ def _rho_backward_to_positions(
     )
 
 
-def _moments_e3nn(charges: torch.Tensor, dipoles: torch.Tensor) -> torch.Tensor:
-    """Per-atom moments in the kernel's e3nn layout ``[q, mu_y, mu_z, mu_x]``."""
-    return torch.stack(
-        [charges, dipoles[:, 1], dipoles[:, 2], dipoles[:, 0]], dim=1
-    )  # (N_atoms, 4)
-
-
-def _phihat_grad_torch(
-    grad_rho: torch.Tensor,
-    charges: torch.Tensor,
-    dipoles: torch.Tensor,
-    positions: torch.Tensor,
-    k_vectors: torch.Tensor,
-    volume: torch.Tensor,
-) -> torch.Tensor:
-    r"""Differentiable torch twin of the phihat grad (batched per-system path).
-
-    Retained ONLY for the not-yet-converted batched reciprocal stress-loss
-    (``_batch_phihat_grad_torch`` calls this per system). The single-system path
-    now uses the Warp ``multipole_rho_phihat_grad`` op chain. Matches the Warp
-    op: ``grad_phi[lm] = (gr·c_lm − gi·s_lm, gr·s_lm + gi·c_lm)·(2π)³/V`` with
-    ``c_lm = Σ_i Q_{i,lm}·cos(k·r_i)``.
-    """
-    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
-    cos = torch.cos(phase)
-    sin = torch.sin(phase)
-    moments = _moments_e3nn(charges, dipoles)  # (N_atoms, 4)
-    c_lm = cos @ moments  # (N_k, 4)
-    s_lm = sin @ moments
-    gr = grad_rho[:, 0:1]
-    gi = grad_rho[:, 1:2]
-    grad_phi_r = gr * c_lm - gi * s_lm
-    grad_phi_i = gr * s_lm + gi * c_lm
-    grad_phi = torch.stack([grad_phi_r, grad_phi_i], dim=-1)  # (N_k, 4, 2)
-    return grad_phi * (_TWO_PI_CUBED / volume.detach())
-
-
-def _kphase_grad_torch(
-    grad_rho: torch.Tensor,
-    charges: torch.Tensor,
-    dipoles: torch.Tensor,
-    positions: torch.Tensor,
-    k_vectors: torch.Tensor,
-    source_phi_hat: torch.Tensor,
-    volume: torch.Tensor,
-) -> torch.Tensor:
-    r"""Differentiable torch twin of ``multipole_rho_kphase_grad`` (stress-loss).
-
-    ``grad_k[k] = Σ_i r_i·(a·cos + b·sin)·(2π)³/V`` with ``a = gr·p_i − gi·p_r``,
-    ``b = −(gr·p_r + gi·p_i)`` and ``p_{r/i} = Σ_lm φ̂_{r/i}[lm]·Q_{i,lm}``.
-    Live ``positions`` / ``k_vectors`` carry the second-order grad.
-    """
-    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
-    cos = torch.cos(phase)
-    sin = torch.sin(phase)
-    moments = _moments_e3nn(charges, dipoles)  # (N_atoms, 4)
-    phi_r = source_phi_hat[:, :, 0]  # (N_k, 4)
-    phi_i = source_phi_hat[:, :, 1]
-    p_r = phi_r @ moments.t()  # (N_k, N_atoms)
-    p_i = phi_i @ moments.t()
-    gr = grad_rho[:, 0:1]
-    gi = grad_rho[:, 1:2]
-    a = gr * p_i - gi * p_r
-    b = -(gr * p_r + gi * p_i)
-    contrib = a * cos + b * sin  # (N_k, N_atoms)
-    grad_k = contrib @ positions  # (N_k, 3)
-    return grad_k * (_TWO_PI_CUBED / volume.detach())
-
-
 def _rho_backward_to_phihat(
     grad_rho: torch.Tensor,
     charges: torch.Tensor,
@@ -1647,59 +1578,6 @@ register_warp_op_chain(
     diff_input_positions=(0, 1, 2, 5, 6),
     n_forward_inputs=8,
 )
-
-
-def _coeff2_grad_torch(
-    grad_rho: torch.Tensor,
-    quadrupoles: torch.Tensor,
-    positions: torch.Tensor,
-    k_vectors: torch.Tensor,
-    volume: torch.Tensor,
-) -> torch.Tensor:
-    r"""Differentiable torch twin of ``multipole_rho_q_coeff2_grad`` (l=2 stress-loss).
-
-    ``grad_coeff2[k] = (gr·C_Q − gi·S_Q)·(2π)³/V`` with
-    ``C_Q = Σ_i (k·Q_i·k)·cos``, ``S_Q = Σ_i (k·Q_i·k)·sin``.
-    """
-    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
-    cos = torch.cos(phase)
-    sin = torch.sin(phase)
-    kQ = torch.einsum("iab,kb->kia", quadrupoles, k_vectors)  # (N_k, N_atoms, 3)
-    kQk = torch.einsum("kia,ka->ki", kQ, k_vectors)  # (N_k, N_atoms)
-    c_q = (kQk * cos).sum(dim=1)
-    s_q = (kQk * sin).sum(dim=1)
-    gr = grad_rho[:, 0]
-    gi = grad_rho[:, 1]
-    grad_coeff2 = gr * c_q - gi * s_q
-    return grad_coeff2 * (_TWO_PI_CUBED / volume.detach())
-
-
-def _kvec_q_grad_torch(
-    grad_rho: torch.Tensor,
-    quadrupoles: torch.Tensor,
-    positions: torch.Tensor,
-    k_vectors: torch.Tensor,
-    source_coeff2: torch.Tensor,
-    volume: torch.Tensor,
-) -> torch.Tensor:
-    r"""Differentiable torch twin of ``multipole_rho_q_kvec_grad`` (l=2 stress-loss).
-
-    ``grad_k = c2·Σ_i [ 2(gr·cos − gi·sin)·(Q·k) − (k·Q·k)(gr·sin + gi·cos)·r_i ]``
-    ``·(2π)³/V`` (coeff2 held fixed; phase + ``(k·Q·k)`` k-dependence).
-    """
-    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
-    cos = torch.cos(phase)
-    sin = torch.sin(phase)
-    qk = torch.einsum("iab,kb->kia", quadrupoles, k_vectors)  # (N_k, N_atoms, 3) = Q·k
-    kQk = torch.einsum("kia,ka->ki", qk, k_vectors)  # (N_k, N_atoms)
-    gr = grad_rho[:, 0:1]
-    gi = grad_rho[:, 1:2]
-    w1 = 2.0 * (gr * cos - gi * sin)  # (N_k, N_atoms)
-    w2 = -kQk * (gr * sin + gi * cos)  # (N_k, N_atoms)
-    term1 = (w1.unsqueeze(-1) * qk).sum(dim=1)  # (N_k, 3)
-    term2 = (w2.unsqueeze(-1) * positions.unsqueeze(0)).sum(dim=1)  # (N_k, 3)
-    grad_k = source_coeff2.unsqueeze(-1) * (term1 + term2)
-    return grad_k * (_TWO_PI_CUBED / volume.detach())
 
 
 def _multipole_rho_q_setup_context(ctx, inputs, output) -> None:
