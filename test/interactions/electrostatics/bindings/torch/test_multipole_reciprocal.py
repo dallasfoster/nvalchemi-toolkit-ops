@@ -1331,3 +1331,216 @@ def test_reciprocal_quadrupole_batched_hvp_matches_per_system():
         qh = torch.autograd.grad((gQ * vQ[sl]).sum(), [Qt], retain_graph=True)[0]
         assert (ph - poshvp_b[sl].detach()).abs().max() < 1e-12
         assert (qh - qhvp_b[sl].detach()).abs().max() < 1e-12
+
+
+# =============================================================================
+# Stress-loss (create_graph through dE/dcell): the S5 regression column.
+# =============================================================================
+#
+# Guards ∂²E/∂cell∂pos on the direct-k reciprocal path (single + batched,
+# l=0/1/2) against a PURE double finite-difference of the ENERGY — the
+# value-only oracle that exposed the original silent-wrong stress-loss (a
+# self-consistent autograd stress can still disagree with the energy's true
+# second derivative). "StressLoss" in the name auto-marks these slow.
+
+
+def _recip_stress_dot(positions, mm, cell, g, *, batch_idx=None):
+    """``⟨g, dE/dcell⟩`` with ``create_graph`` so it is differentiable in pos."""
+    cell = cell.clone().requires_grad_(True)
+    e = multipole_reciprocal_space_energy(
+        positions,
+        mm,
+        cell,
+        batch_idx=batch_idx,
+        sigma=0.5,
+        alpha=0.45,
+        kspace_cutoff=9.0,
+    )
+    if batch_idx is not None:
+        e = e.sum()
+    (stress,) = torch.autograd.grad(e, cell, create_graph=True)
+    return (stress * g).sum()
+
+
+class TestReciprocalStressLoss:
+    """∂²E/∂cell∂pos on the direct-k reciprocal path matches a double-FD of E."""
+
+    @pytest.mark.parametrize("level", [0, 1, 2])
+    def test_stress_loss_fd_single(self, level):
+        cell_np, pos, q, mu, Q, _ = _fixture()
+        if level == 0:
+            mu = np.zeros_like(mu)
+        mm = _mm(q, mu, Q if level == 2 else None)
+        cell0 = torch.tensor(cell_np)
+        g = torch.tensor(
+            np.random.default_rng(level).normal(size=(3, 3)), dtype=torch.float64
+        )
+        p = torch.tensor(pos, requires_grad=True)
+        (gp,) = torch.autograd.grad(_recip_stress_dot(p, mm, cell0, g), p)
+        assert gp.norm() > 1e-6  # not a silent zero
+
+        # double finite-difference of the energy: d/dpos ( d/dcell ⟨g, E⟩ ).
+        def stress_g_fd(p_):
+            ec = 1e-5
+            acc = 0.0
+            for i in range(3):
+                for j in range(3):
+                    cp = cell0.clone()
+                    cp[i, j] += ec
+                    cm = cell0.clone()
+                    cm[i, j] -= ec
+                    ep = multipole_reciprocal_space_energy(
+                        p_, mm, cp, sigma=0.5, alpha=0.45, kspace_cutoff=9.0
+                    )
+                    em = multipole_reciprocal_space_energy(
+                        p_, mm, cm, sigma=0.5, alpha=0.45, kspace_cutoff=9.0
+                    )
+                    acc += float(g[i, j]) * (float(ep) - float(em)) / (2 * ec)
+            return acc
+
+        eps = 1e-4
+        fd = torch.zeros_like(p)
+        for a in range(p.shape[0]):
+            for d in range(3):
+                pp = p.detach().clone()
+                pp[a, d] += eps
+                pm = p.detach().clone()
+                pm[a, d] -= eps
+                fd[a, d] = (stress_g_fd(pp) - stress_g_fd(pm)) / (2 * eps)
+        assert (gp - fd).norm() / fd.norm() < 1e-4
+
+    @pytest.mark.parametrize("level", [0, 1, 2])
+    def test_stress_loss_fd_batched(self, level):
+        syss = [_fixture(seed=s) for s in (3, 7)]
+        cells = np.stack([s[0] for s in syss])
+        pos = np.concatenate([s[1] for s in syss])
+        q = np.concatenate([s[2] for s in syss])
+        mu = np.concatenate([s[3] for s in syss])
+        Q = np.concatenate([s[4] for s in syss])
+        n = syss[0][1].shape[0]
+        batch_idx = torch.tensor([0] * n + [1] * n, dtype=torch.int32)
+        if level == 0:
+            mu = np.zeros_like(mu)
+        mm = _mm(q, mu, Q if level == 2 else None)
+        cell0 = torch.tensor(cells)
+        g = torch.tensor(
+            np.random.default_rng(level + 5).normal(size=cells.shape),
+            dtype=torch.float64,
+        )
+        p = torch.tensor(pos, requires_grad=True)
+        (gp,) = torch.autograd.grad(
+            _recip_stress_dot(p, mm, cell0, g, batch_idx=batch_idx), p
+        )
+        assert gp.norm() > 1e-6
+
+        def stress_g_fd(p_):
+            ec = 1e-5
+            acc = 0.0
+            for b in range(2):
+                for i in range(3):
+                    for j in range(3):
+                        cp = cell0.clone()
+                        cp[b, i, j] += ec
+                        cm = cell0.clone()
+                        cm[b, i, j] -= ec
+                        ep = multipole_reciprocal_space_energy(
+                            p_,
+                            mm,
+                            cp,
+                            batch_idx=batch_idx,
+                            sigma=0.5,
+                            alpha=0.45,
+                            kspace_cutoff=9.0,
+                        ).sum()
+                        em = multipole_reciprocal_space_energy(
+                            p_,
+                            mm,
+                            cm,
+                            batch_idx=batch_idx,
+                            sigma=0.5,
+                            alpha=0.45,
+                            kspace_cutoff=9.0,
+                        ).sum()
+                        acc += float(g[b, i, j]) * (float(ep) - float(em)) / (2 * ec)
+            return acc
+
+        eps = 1e-4
+        fd = torch.zeros_like(p)
+        for a in range(p.shape[0]):
+            for d in range(3):
+                pp = p.detach().clone()
+                pp[a, d] += eps
+                pm = p.detach().clone()
+                pm[a, d] -= eps
+                fd[a, d] = (stress_g_fd(pp) - stress_g_fd(pm)) / (2 * eps)
+        assert (gp - fd).norm() / fd.norm() < 1e-4
+
+
+class TestEwaldCompositeStressLoss:
+    """``multipole_ewald_summation`` stress-loss (real-space + reciprocal + self).
+
+    The S5 acceptance test: ``create_graph`` through ``dE/dcell`` on the full
+    composite (previously raised in the reciprocal half). Guarded vs a double-FD
+    of the composite energy, l=0/1/2.
+    """
+
+    @pytest.mark.parametrize("level", [0, 1, 2])
+    def test_composite_stress_loss_fd(self, level):
+        cell_np, pos, q, mu, Q, _ = _fixture()
+        if level == 0:
+            mu = np.zeros_like(mu)
+        mm = _mm(q, mu, Q if level == 2 else None)
+        idx_j, ptr, shifts = _build_csr(pos, cell_np, 5.0)
+        cell0 = torch.tensor(cell_np)
+        g = torch.tensor(
+            np.random.default_rng(level + 2).normal(size=(3, 3)), dtype=torch.float64
+        )
+
+        def energy(p_, cell_):
+            return multipole_ewald_summation(
+                p_,
+                mm,
+                cell_,
+                idx_j,
+                ptr,
+                shifts,
+                sigma=0.5,
+                alpha=0.45,
+                kspace_cutoff=9.0,
+            )
+
+        def stress_dot(p_):
+            cell = cell0.clone().requires_grad_(True)
+            (stress,) = torch.autograd.grad(energy(p_, cell), cell, create_graph=True)
+            return (stress * g).sum()
+
+        p = torch.tensor(pos, requires_grad=True)
+        (gp,) = torch.autograd.grad(stress_dot(p), p)
+        assert gp.norm() > 1e-6
+
+        def stress_g_fd(p_):
+            ec = 1e-5
+            acc = 0.0
+            for i in range(3):
+                for j in range(3):
+                    cp = cell0.clone()
+                    cp[i, j] += ec
+                    cm = cell0.clone()
+                    cm[i, j] -= ec
+                    acc += (
+                        float(g[i, j])
+                        * (float(energy(p_, cp)) - float(energy(p_, cm)))
+                        / (2 * ec)
+                    )
+            return acc
+
+        eps = 1e-4
+        fd = torch.zeros_like(p)
+        for a in range(p.shape[0]):
+            for d in range(3):
+                pp = p.detach().clone()
+                pp[a, d] += eps
+                pm = p.detach().clone()
+                pm[a, d] -= eps
+                fd[a, d] = (stress_g_fd(pp) - stress_g_fd(pm)) / (2 * eps)
+        assert (gp - fd).norm() / fd.norm() < 1e-4
