@@ -56,6 +56,48 @@ from nvalchemiops.warp_dispatch import register_overloads
 
 _TWOPI = 2.0 * math.pi
 
+
+@wp.kernel(enable_backward=False)
+def _bspline_moduli_1d_kernel(
+    miller: wp.array(dtype=wp.float64),  # (n_axis,) integer Miller indices (float)
+    inv_n: wp.float64,  # 1 / mesh dim along this axis
+    order: wp.int32,  # B-spline order p
+    moduli: wp.array(dtype=wp.float64),  # (n_axis,) OUTPUT b[i] = sinc(m_i/N)^p
+):
+    r"""Fill a 1-D B-spline modulus LUT ``b[i] = sinc(m_i / N)^order``.
+
+    One thread per axis index. Reuses the monopole PME ``compute_sinc``
+    ``@wp.func`` (``pme_kernels.py``); precomputing the per-axis 1-D LUT lets the
+    multipole Green's kernel read 3 entries + 2 multiplies instead of
+    recomputing ``sinc`` at every grid point (the MZ-1 LUT optimization, now
+    Warp-native — replaces the previous ``torch.sinc`` host compute).
+    """
+    i = wp.tid()
+    s = compute_sinc(miller[i] * inv_n)
+    val = wp.float64(1.0)
+    for _ in range(order):
+        val = val * s
+    moduli[i] = val
+
+
+def bspline_moduli_1d_launch(
+    miller: wp.array,
+    inv_n: float,
+    order: int,
+    moduli: wp.array,
+    device: str | None = None,
+) -> None:
+    """Launcher for :func:`_bspline_moduli_1d_kernel` (one thread per axis index)."""
+    if device is None:
+        device = str(miller.device)
+    wp.launch(
+        _bspline_moduli_1d_kernel,
+        dim=miller.shape[0],
+        inputs=[miller, wp.float64(inv_n), wp.int32(order), moduli],
+        device=device,
+    )
+
+
 # =============================================================================
 # Single-system spread
 # =============================================================================

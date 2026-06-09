@@ -53,6 +53,7 @@ from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
     batch_multipole_pme_spread_backward_unified_launch,
     batch_multipole_pme_spread_launch,
     batch_multipole_pme_spread_unified_launch,
+    bspline_moduli_1d_launch,
     multipole_pme_convolve_backward_launch,
     multipole_pme_convolve_double_backward_launch,
     multipole_pme_convolve_launch,
@@ -127,6 +128,39 @@ def _wp_from_torch(tensor: torch.Tensor, dtype):
     return wp.from_torch(tensor, dtype=dtype, requires_grad=False)
 
 
+@torch.library.custom_op(
+    "nvalchemiops::multipole_pme_bspline_moduli_1d",
+    mutates_args=(),
+)
+def _bspline_moduli_1d_op(miller: torch.Tensor, n: int, order: int) -> torch.Tensor:
+    r"""``b[i] = sinc(miller[i] / n)^order`` via the Warp ``bspline_moduli_1d`` kernel.
+
+    Opaque (``torch.compile``-safe) wrapper around the Warp moduli kernel —
+    keeps the ``sinc^order`` transcendental in Warp (mirroring the monopole
+    ``compute_sinc``) instead of host ``torch.sinc``. Non-differentiable: the
+    moduli depend only on integer Miller indices and the mesh dim, so there is
+    no gradient to register.
+    """
+    device = miller.device
+    wp_device = str(wp.device_from_torch(device))
+    miller64 = miller.to(torch.float64).contiguous()
+    out = torch.empty(miller.shape[0], dtype=torch.float64, device=device)
+    bspline_moduli_1d_launch(
+        wp.from_torch(miller64, dtype=wp.float64),
+        1.0 / float(n),
+        int(order),
+        wp.from_torch(out, dtype=wp.float64),
+        device=wp_device,
+    )
+    return out
+
+
+@torch.library.register_fake("nvalchemiops::multipole_pme_bspline_moduli_1d")
+def _bspline_moduli_1d_fake(miller: torch.Tensor, n: int, order: int) -> torch.Tensor:
+    """Shape/dtype metadata: ``(n_axis,)`` float64."""
+    return miller.new_empty((miller.shape[0],), dtype=torch.float64)
+
+
 def _compute_bspline_moduli(
     mesh_dimensions: tuple[int, int, int],
     spline_order: int,
@@ -136,20 +170,23 @@ def _compute_bspline_moduli(
     r"""Precompute 1-D B-spline modulus LUTs ``b_a[i] = sinc(mi/N_a)^order``.
 
     Hoisting the per-axis ``sinc^order`` to 1-D LUTs reduces the Green's
-    kernel cost to 3 reads + 2 multiplies per thread. Computed in fp32 sinc
-    (accurate to ~7 digits) then cast to the requested ``dtype``. The
-    returned LUTs cover the rfft layout: ``b_z`` is length
+    kernel cost to 3 reads + 2 multiplies per thread. The ``sinc^order`` math
+    runs in the opaque Warp ``multipole_pme_bspline_moduli_1d`` op (Warp
+    ``compute_sinc``); only the integer Miller-index generation stays in torch.
+    The returned LUTs cover the rfft layout: ``b_z`` is length
     ``Nz_rfft = Nz // 2 + 1``.
     """
     nx, ny, nz = mesh_dimensions
     nz_rfft = nz // 2 + 1
-    miller_x = torch.fft.fftfreq(nx, d=1.0 / nx, device=device, dtype=torch.float32)
-    miller_y = torch.fft.fftfreq(ny, d=1.0 / ny, device=device, dtype=torch.float32)
-    miller_z = torch.arange(nz_rfft, device=device, dtype=torch.float32)
-    # torch.sinc uses the normalized sinc(πx)/(πx) convention; sinc(0)=1.
-    bx = torch.sinc(miller_x / nx) ** spline_order
-    by = torch.sinc(miller_y / ny) ** spline_order
-    bz = torch.sinc(miller_z / nz) ** spline_order
+    # Integer Miller indices (fftfreq layout for the full axes, 0..Nz_rfft-1 for
+    # the rfft axis). Index generation only; the sinc^order is the Warp op.
+    miller_x = torch.fft.fftfreq(nx, d=1.0 / nx, device=device, dtype=torch.float64)
+    miller_y = torch.fft.fftfreq(ny, d=1.0 / ny, device=device, dtype=torch.float64)
+    miller_z = torch.arange(nz_rfft, device=device, dtype=torch.float64)
+    op = torch.ops.nvalchemiops.multipole_pme_bspline_moduli_1d
+    bx = op(miller_x, nx, spline_order)
+    by = op(miller_y, ny, spline_order)
+    bz = op(miller_z, nz, spline_order)
     return (
         bx.to(dtype).contiguous(),
         by.to(dtype).contiguous(),
