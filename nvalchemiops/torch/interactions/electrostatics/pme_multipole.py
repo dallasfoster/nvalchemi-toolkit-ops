@@ -3730,6 +3730,56 @@ def _pme_k_squared_forward_fake(inv_cell_t, _mx, _my, _mz, nx, ny, nz_rfft):
     )
 
 
+def _pme_k_squared_double_backward(
+    v_grad_m: torch.Tensor,
+    grad_k_squared: torch.Tensor,
+    inv_cell_t: torch.Tensor,
+    miller_x: torch.Tensor,
+    miller_y: torch.Tensor,
+    miller_z: torch.Tensor,
+    nx: int,
+    ny: int,
+    nz_rfft: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Second-order backward for ``multipole_pme_k_squared`` (stress-loss).
+
+    The first backward is :math:`G[c,d] = \sum_g \text{grad\_k}^2[g]\,J[g][c,d]`
+    with per-grid Jacobian :math:`J[g][c,d] = 2(2\pi)^2 k_\text{red}[g][c]\,m[g][d]`
+    and :math:`k_\text{red} = M m` (:math:`M=\text{inv\_cell\_t}`,
+    :math:`m=(m_x,m_y,m_z)`). Given the cotangent :math:`v` on :math:`G`, returns
+    the exact closed-form :math:`\partial(v\cdot G)/\partial\text{grad\_k}^2` and
+    :math:`\partial(v\cdot G)/\partial M` (the constant ``2(2\pi)^2`` matches the
+    kernel's ``eightpi_sq``).
+    """
+    const = 2.0 * (2.0 * math.pi) ** 2
+    m_mat = inv_cell_t[0]
+    v = v_grad_m[0]
+    dtype = m_mat.dtype
+    mx = miller_x.to(dtype).view(nx, 1, 1)
+    my = miller_y.to(dtype).view(1, ny, 1)
+    mz = miller_z.to(dtype).view(1, 1, nz_rfft)
+    m_axes = (mx, my, mz)
+    # k_red[c] = Σ_d M[c, d] m[d];  w[e] = Σ_d v[e, d] m[d]  (broadcast over grid)
+    kred = [m_mat[c, 0] * mx + m_mat[c, 1] * my + m_mat[c, 2] * mz for c in range(3)]
+    w = [v[e, 0] * mx + v[e, 1] * my + v[e, 2] * mz for e in range(3)]
+    # ∂(v·G)/∂grad_k² = const · Σ_c k_red[c]·w[c]
+    grad_grad_k_squared = (
+        (const * (kred[0] * w[0] + kred[1] * w[1] + kred[2] * w[2]))
+        .expand(nx, ny, nz_rfft)
+        .contiguous()
+    )
+    # ∂(v·G)/∂M[e,f] = const · Σ_g grad_k²[g]·w[e][g]·m[f][g]
+    grad_m = torch.stack(
+        [
+            torch.stack(
+                [const * (grad_k_squared * w[e] * m_axes[f]).sum() for f in range(3)]
+            )
+            for e in range(3)
+        ]
+    )
+    return grad_grad_k_squared, grad_m.unsqueeze(0).contiguous()
+
+
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_k_squared",
     forward=_pme_k_squared_forward,
@@ -3738,6 +3788,10 @@ register_warp_op_chain(
     backward_return_arity=1,
     diff_input_positions=(0,),  # inv_cell_t only (miller indices constant)
     n_forward_inputs=7,
+    double_backward=_pme_k_squared_double_backward,
+    second_order_diff_positions=(0, 1),  # grad_k_squared, inv_cell_t
+    n_backward_inputs=8,
+    double_backward_return_arity=2,
 )
 
 
