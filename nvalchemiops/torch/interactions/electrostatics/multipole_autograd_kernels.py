@@ -54,7 +54,7 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-from nvalchemiops.interactions.electrostatics import (
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
     eval_gto_fourier_dipole,
     eval_receiver_gto_fourier_dipole,
     eval_receiver_gto_fourier_quadrupole,

@@ -23,17 +23,21 @@ import numpy as np
 import pytest
 import warp as wp
 
-from nvalchemiops.interactions.electrostatics import (
+from nvalchemiops.interactions.electrostatics.ewald_kernels import (
+    ewald_real_space_energy,
+)
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
     apply_per_k_factor,
     assemble_rho_k_dipole,
     build_structure_factor_table,
     compute_energy_product_per_k,
     eval_gto_fourier_dipole,
     eval_receiver_gto_fourier_dipole,
-    ewald_real_space_energy,
+    project_features_dipole,
+)
+from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
     multipole_real_space_dipole_csr_energy,
     multipole_real_space_monopole_csr_energy,
-    project_features_dipole,
 )
 from nvalchemiops.torch.math.gto import NormMode, inv_cl
 
@@ -768,7 +772,7 @@ class TestSourcePhiHatBackward:
     """Backward of :func:`eval_gto_fourier_dipole`."""
 
     def test_k1_vs_fd(self):
-        from nvalchemiops.interactions.electrostatics import (
+        from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (  # noqa: E501
             source_phi_hat_backward_dipole,
         )
 
@@ -838,7 +842,7 @@ class TestReceiverPhiHatBackward:
     """Backward of :func:`eval_receiver_gto_fourier_dipole`."""
 
     def test_k2_vs_fd(self):
-        from nvalchemiops.interactions.electrostatics import (
+        from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (  # noqa: E501
             receiver_phi_hat_backward_dipole,
         )
 

@@ -65,8 +65,9 @@ import types
 import torch
 import warp as wp
 
-from nvalchemiops.interactions.electrostatics import (
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
     assemble_rho_k_dipole,
+    assemble_rho_q,
     build_structure_factor_table,
     feat_position_grad_backward_grad_raw,
     feat_position_grad_backward_grad_raw_quadrupole,
@@ -77,29 +78,26 @@ from nvalchemiops.interactions.electrostatics import (
     position_gradient_from_feature_grad,
     position_gradient_from_feature_grad_quadrupole,
     position_gradient_from_rhok,
+    position_gradient_from_rhoq,
     project_features_dipole,
     project_features_quadrupole,
     project_kphase_grad_dipole,
     project_phihat_grad_dipole,
-    rhok_position_grad_backward_grad_rho,
-    rhok_position_grad_backward_moments,
-    rhok_position_grad_backward_positions,
-    v_grad_from_feat_grad_backward_positions,
-    v_grad_from_feat_grad_backward_positions_quadrupole,
-    v_gradient_from_feature_grad,
-    v_gradient_from_feature_grad_quadrupole,
-)
-from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
-    assemble_rho_q,
-    position_gradient_from_rhoq,
     rho_kphase_grad,
     rho_phihat_grad,
     rho_q_coeff2_grad,
     rho_q_kvec_grad,
     rho_q_moment_grad,
+    rhok_position_grad_backward_grad_rho,
+    rhok_position_grad_backward_moments,
+    rhok_position_grad_backward_positions,
     rhoq_posgrad_backward_grad_rho,
     rhoq_posgrad_backward_positions,
     rhoq_posgrad_backward_quad,
+    v_grad_from_feat_grad_backward_positions,
+    v_grad_from_feat_grad_backward_positions_quadrupole,
+    v_gradient_from_feature_grad,
+    v_gradient_from_feature_grad_quadrupole,
 )
 from nvalchemiops.torch._warp_op_helpers import (
     register_warp_op_chain,

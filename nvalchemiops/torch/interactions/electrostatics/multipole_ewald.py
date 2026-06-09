@@ -47,7 +47,13 @@ import math
 import torch
 import warp as wp
 
-from nvalchemiops.interactions.electrostatics import (
+from nvalchemiops.interactions.electrostatics.multipole_ewald_cell_grad import (
+    batch_multipole_real_space_dipole_csr_cell_grad,
+    batch_multipole_real_space_monopole_csr_cell_grad,
+    multipole_real_space_dipole_csr_cell_grad,
+    multipole_real_space_monopole_csr_cell_grad,
+)
+from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
     batch_multipole_real_space_dipole_csr_energy,
     batch_multipole_real_space_dipole_csr_energy_2nd_backward,
     batch_multipole_real_space_dipole_csr_energy_backward,
@@ -64,12 +70,6 @@ from nvalchemiops.interactions.electrostatics import (
     multipole_real_space_monopole_csr_energy_2nd_backward,
     multipole_real_space_monopole_csr_energy_backward,
     multipole_real_space_monopole_csr_energy_fused,
-)
-from nvalchemiops.interactions.electrostatics.multipole_ewald_cell_grad import (
-    batch_multipole_real_space_dipole_csr_cell_grad,
-    batch_multipole_real_space_monopole_csr_cell_grad,
-    multipole_real_space_dipole_csr_cell_grad,
-    multipole_real_space_monopole_csr_cell_grad,
 )
 from nvalchemiops.torch._warp_op_helpers import (
     register_warp_op_chain,
