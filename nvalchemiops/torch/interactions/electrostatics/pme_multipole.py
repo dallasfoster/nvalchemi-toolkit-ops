@@ -1605,6 +1605,568 @@ register_warp_op_chain(
 )
 
 
+# ===========================================================================
+# Gather-via-spread-transpose — the per-atom reciprocal energy primitive
+# ===========================================================================
+#
+# The mesh-side reciprocal energy ``<ρ, φ>`` is *exactly* the moment-weighted
+# sum of the spread-transpose ``Sᵀφ`` gathered to atoms:
+#
+#   <ρ, φ> = <S·m, φ> = <m, Sᵀφ> = Σ_i [ q_i g_q_i + d_i·g_d_i + Q_i:g_Q_i ]
+#
+# where ``(g_q, g_d, g_Q) = Sᵀφ`` are the gathered potential / field / hessian
+# (the ½ on the quad channel matches the spread's own ½). Assembling the energy
+# this way gives a genuine PER-ATOM decomposition (``E_i`` is atom i's share)
+# while staying *bit-identical* to the mesh-mesh inner product — because ``Sᵀ``
+# here is the spread's OWN backward, not the discretization-mismatched
+# ``spline_gather``. Forward/backward/double-backward all reuse the unified
+# spread's three Python launchers, so 2nd-order training composes for free.
+
+
+def _mask_gather_cotangents(
+    cg_d: torch.Tensor, cg_Q: torch.Tensor, lmax: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero the dipole/quad cotangents above ``lmax`` and symmetrize the quad.
+
+    The spread ignores channels above ``lmax`` (their gathered outputs are
+    constant zero), so feeding their cotangents into the spread's
+    double-backward — which always promotes to an ``lmax=2`` effective spread —
+    would synthesize spurious gradients. Masking keeps every spread primitive
+    consistent with the op's actual ``lmax``.
+    """
+    if lmax < 1:
+        cg_d = torch.zeros_like(cg_d)
+    if lmax < 2:
+        cg_Q = torch.zeros_like(cg_Q)
+    else:
+        cg_Q = 0.5 * (cg_Q + cg_Q.transpose(-1, -2))
+    return cg_d, cg_Q
+
+
+def _multipole_pme_gather_via_spread_t_forward(
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Gather ``Sᵀφ`` to atoms → ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``.
+
+    ``Sᵀ`` is the unified-spread backward: the spread ``ρ = S·m`` is linear in
+    the moments, so its moment-gradients evaluated at *zero* moments are the
+    gathered potential (``g_q``), field (``g_d``) and ½·hessian (``g_Q``).
+    """
+    n = p_frac.shape[0]
+    dtype = p_frac.dtype
+    device = p_frac.device
+    zc = torch.zeros(n, dtype=dtype, device=device)
+    zd = torch.zeros((n, 3), dtype=dtype, device=device)
+    zq = torch.zeros((n, 3, 3), dtype=dtype, device=device)
+    _gpos, g_q, g_d, g_Q, _gcell = _multipole_pme_spread_unified_backward(
+        phi_grid,
+        p_frac,
+        zc,
+        zd,
+        zq,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        spline_order,
+        lmax,
+    )
+    return g_q, g_d, g_Q
+
+
+def _gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
+    """Fake: ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``."""
+    del phi_grid
+    n = p_frac.shape[0]
+    return (
+        torch.empty(n, dtype=p_frac.dtype, device=p_frac.device),
+        torch.empty((n, 3), dtype=p_frac.dtype, device=p_frac.device),
+        torch.empty((n, 3, 3), dtype=p_frac.dtype, device=p_frac.device),
+    )
+
+
+def _multipole_pme_gather_via_spread_t_backward(
+    cg_q: torch.Tensor,
+    cg_d: torch.Tensor,
+    cg_Q: torch.Tensor,
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Adjoint of ``g = Sᵀφ`` → grads w.r.t. ``(phi_grid, p_frac)``.
+
+    With cotangent ``cg = (cg_q, cg_d, cg_Q)`` on ``g``:
+
+    .. math::
+
+        \partial/\partial\varphi &= S\cdot cg \quad
+            (\text{forward spread of the cotangent-as-moments}) \\
+        \partial/\partial p &= \partial\langle S\cdot cg, \varphi\rangle/\partial p
+            \quad (\text{spread-backward grad\_positions, moments}=cg)
+
+    Channels above ``lmax`` are inert in the spread (``g_d``/``g_Q`` are constant
+    zero there), so their cotangents are masked out; the quad channel is also
+    symmetrized to match the spread's symmetric storage (a no-op for real use).
+    """
+    cg_d, cg_Q = _mask_gather_cotangents(cg_d, cg_Q, lmax)
+    d_phi = _multipole_pme_spread_unified_forward(
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        spline_order,
+        lmax,
+    )
+    d_p, _gc, _gd, _gQ, _gcell = _multipole_pme_spread_unified_backward(
+        phi_grid,
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        spline_order,
+        lmax,
+    )
+    return d_phi, d_p
+
+
+def _gather_via_spread_t_backward_fake(cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args):
+    """Fake: grads of ``(phi_grid, p_frac)``."""
+    del cg_q, cg_d, cg_Q
+    return torch.empty_like(phi_grid), torch.empty_like(p_frac)
+
+
+def _multipole_pme_gather_via_spread_t_double_backward(
+    gg_phi: torch.Tensor | None,
+    gg_p: torch.Tensor | None,
+    cg_q: torch.Tensor,
+    cg_d: torch.Tensor,
+    cg_Q: torch.Tensor,
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward of :func:`_multipole_pme_gather_via_spread_t_backward`.
+
+    The backward maps ``cg`` to ``d_phi = S·cg`` and ``d_p = ∂<S·cg, φ>/∂p``.
+    With cotangents ``gg_phi`` (on ``d_phi``) and ``gg_p`` (on ``d_p``), the
+    scalar ``Φ = <gg_phi, S·cg> + <gg_p, ∂<S·cg, φ>/∂p>`` splits into two groups
+    whose derivatives are *exactly* the unified spread's own backward and
+    double-backward:
+
+    * group A ``<gg_phi, S·cg>`` → ``∂/∂cg = Sᵀ·gg_phi`` (= gather of ``gg_phi``)
+      and ``∂/∂p = ∂<S·cg, gg_phi>/∂p`` (spread-backward grad_positions).
+    * group B ``<gg_p, Bpos(p, cg, φ)>`` is exactly the spread double-backward
+      with ``gg_positions = gg_p``, ``grad_mesh = φ``, moments ``= cg`` —
+      returning ``∂/∂φ``, ``∂/∂p`` and ``∂/∂cg``.
+
+    Returns grads for the backward's diff inputs at
+    ``second_order_diff_positions = (0, 1, 2, 3, 4)`` =
+    ``(cg_q, cg_d, cg_Q, phi_grid, p_frac)``.
+    """
+    if gg_phi is None:
+        gg_phi = torch.zeros_like(phi_grid)
+    if gg_p is None:
+        gg_p = torch.zeros_like(p_frac)
+    # Mask inert channels above ``lmax`` (and symmetrize the quad) so every
+    # spread primitive below agrees with the op's actual ``lmax``.
+    cg_d, cg_Q = _mask_gather_cotangents(cg_d, cg_Q, lmax)
+
+    # Group A: gather(gg_phi) = Sᵀ·gg_phi  (the op's own forward applied to gg_phi).
+    gth_q, gth_d, gth_Q = _multipole_pme_gather_via_spread_t_forward(
+        gg_phi,
+        p_frac,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        spline_order,
+        lmax,
+    )
+    # Group A: ∂<S·cg, gg_phi>/∂p  (spread-backward grad_positions, grad_mesh=gg_phi).
+    a_dp, _gc, _gd, _gQ, _gcell = _multipole_pme_spread_unified_backward(
+        gg_phi,
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        spline_order,
+        lmax,
+    )
+    # Group B: spread double-backward with gg_positions = gg_p, grad_mesh = φ,
+    # moments = cg → (∂/∂φ, ∂/∂p, ∂/∂cg_q, ∂/∂cg_d, ∂/∂cg_Q).
+    d_phi_b, d_p_b, d_cg_q_b, d_cg_d_b, d_cg_Q_b = (
+        _multipole_pme_spread_unified_double_backward(
+            gg_p,
+            None,
+            None,
+            None,
+            None,
+            phi_grid,
+            p_frac,
+            cg_q,
+            cg_d,
+            cg_Q,
+            identity_cell,
+            mesh_nx,
+            mesh_ny,
+            mesh_nz,
+            spline_order,
+            lmax,
+        )
+    )
+    d_cg_q = gth_q + d_cg_q_b
+    d_cg_d = gth_d + d_cg_d_b
+    d_cg_Q = gth_Q + d_cg_Q_b
+    d_phi = d_phi_b
+    d_p = a_dp + d_p_b
+    # ``Φ`` is independent of the cotangents on inert channels above ``lmax``;
+    # zero their grads (the spread double-back's l=2 promotion would leak here).
+    if lmax < 1:
+        d_cg_d = torch.zeros_like(d_cg_d)
+    if lmax < 2:
+        d_cg_Q = torch.zeros_like(d_cg_Q)
+    return d_cg_q, d_cg_d, d_cg_Q, d_phi, d_p
+
+
+def _gather_via_spread_t_double_backward_fake(
+    gg_phi, gg_p, cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
+):
+    """Fake: grads of ``(cg_q, cg_d, cg_Q, phi_grid, p_frac)``."""
+    del gg_phi, gg_p
+    return (
+        torch.empty_like(cg_q),
+        torch.empty_like(cg_d),
+        torch.empty_like(cg_Q),
+        torch.empty_like(phi_grid),
+        torch.empty_like(p_frac),
+    )
+
+
+_GATHER_VST_FWD_SCHEMA = (
+    "(Tensor phi_grid, Tensor p_frac, Tensor identity_cell, int mesh_nx, "
+    "int mesh_ny, int mesh_nz, int spline_order, int lmax) "
+    "-> (Tensor, Tensor, Tensor)"
+)
+
+_GATHER_VST_BWD_SCHEMA = (
+    "(Tensor cg_q, Tensor cg_d, Tensor cg_Q, Tensor phi_grid, Tensor p_frac, "
+    "Tensor identity_cell, int mesh_nx, int mesh_ny, int mesh_nz, "
+    "int spline_order, int lmax) -> (Tensor, Tensor)"
+)
+
+_GATHER_VST_DBWD_SCHEMA = (
+    "(Tensor? gg_phi, Tensor? gg_p, Tensor cg_q, Tensor cg_d, Tensor cg_Q, "
+    "Tensor phi_grid, Tensor p_frac, Tensor identity_cell, int mesh_nx, "
+    "int mesh_ny, int mesh_nz, int spline_order, int lmax) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_pme_gather_via_spread_t",
+    forward=_multipole_pme_gather_via_spread_t_forward,
+    forward_fake=_gather_via_spread_t_forward_fake,
+    forward_return_arity=3,
+    forward_schema=_GATHER_VST_FWD_SCHEMA,
+    backward=_multipole_pme_gather_via_spread_t_backward,
+    backward_fake=_gather_via_spread_t_backward_fake,
+    backward_schema=_GATHER_VST_BWD_SCHEMA,
+    backward_return_arity=2,
+    # Differentiate w.r.t. phi_grid (0) and p_frac (1); identity_cell is the
+    # fixed identity (cell-grad flows through fractionalize, not here).
+    diff_input_positions=(0, 1),
+    n_forward_inputs=8,
+    # Backward inputs: cg_q=0, cg_d=1, cg_Q=2, phi_grid=3, p_frac=4,
+    # identity_cell=5, mesh_nx=6, ... (11 total).
+    double_backward=_multipole_pme_gather_via_spread_t_double_backward,
+    double_backward_fake=_gather_via_spread_t_double_backward_fake,
+    double_backward_schema=_GATHER_VST_DBWD_SCHEMA,
+    second_order_diff_positions=(0, 1, 2, 3, 4),
+    n_backward_inputs=11,
+    double_backward_return_arity=5,
+)
+
+
+# --- Batched gather-via-spread-transpose -----------------------------------
+
+
+def _batch_multipole_pme_gather_via_spread_t_forward(
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    batch_idx: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    B: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched ``Sᵀφ`` gather → ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``."""
+    n = p_frac.shape[0]
+    dtype = p_frac.dtype
+    device = p_frac.device
+    zc = torch.zeros(n, dtype=dtype, device=device)
+    zd = torch.zeros((n, 3), dtype=dtype, device=device)
+    zq = torch.zeros((n, 3, 3), dtype=dtype, device=device)
+    _gpos, g_q, g_d, g_Q, _gcell = _batch_multipole_pme_spread_unified_backward(
+        phi_grid,
+        p_frac,
+        zc,
+        zd,
+        zq,
+        batch_idx,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        B,
+        spline_order,
+        lmax,
+    )
+    return g_q, g_d, g_Q
+
+
+def _batch_gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
+    """Fake: ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``."""
+    del phi_grid
+    n = p_frac.shape[0]
+    return (
+        torch.empty(n, dtype=p_frac.dtype, device=p_frac.device),
+        torch.empty((n, 3), dtype=p_frac.dtype, device=p_frac.device),
+        torch.empty((n, 3, 3), dtype=p_frac.dtype, device=p_frac.device),
+    )
+
+
+def _batch_multipole_pme_gather_via_spread_t_backward(
+    cg_q: torch.Tensor,
+    cg_d: torch.Tensor,
+    cg_Q: torch.Tensor,
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    batch_idx: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    B: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched adjoint of ``g = Sᵀφ`` → grads w.r.t. ``(phi_grid, p_frac)``."""
+    cg_d, cg_Q = _mask_gather_cotangents(cg_d, cg_Q, lmax)
+    d_phi = _batch_multipole_pme_spread_unified_forward(
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        batch_idx,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        B,
+        spline_order,
+        lmax,
+    )
+    d_p, _gc, _gd, _gQ, _gcell = _batch_multipole_pme_spread_unified_backward(
+        phi_grid,
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        batch_idx,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        B,
+        spline_order,
+        lmax,
+    )
+    return d_phi, d_p
+
+
+def _batch_gather_via_spread_t_backward_fake(
+    cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
+):
+    """Fake: grads of ``(phi_grid, p_frac)``."""
+    del cg_q, cg_d, cg_Q
+    return torch.empty_like(phi_grid), torch.empty_like(p_frac)
+
+
+def _batch_multipole_pme_gather_via_spread_t_double_backward(
+    gg_phi: torch.Tensor | None,
+    gg_p: torch.Tensor | None,
+    cg_q: torch.Tensor,
+    cg_d: torch.Tensor,
+    cg_Q: torch.Tensor,
+    phi_grid: torch.Tensor,
+    p_frac: torch.Tensor,
+    batch_idx: torch.Tensor,
+    identity_cell: torch.Tensor,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    B: int,
+    spline_order: int,
+    lmax: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched second-order backward (see the single-system docstring)."""
+    if gg_phi is None:
+        gg_phi = torch.zeros_like(phi_grid)
+    if gg_p is None:
+        gg_p = torch.zeros_like(p_frac)
+    cg_d, cg_Q = _mask_gather_cotangents(cg_d, cg_Q, lmax)
+
+    gth_q, gth_d, gth_Q = _batch_multipole_pme_gather_via_spread_t_forward(
+        gg_phi,
+        p_frac,
+        batch_idx,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        B,
+        spline_order,
+        lmax,
+    )
+    a_dp, _gc, _gd, _gQ, _gcell = _batch_multipole_pme_spread_unified_backward(
+        gg_phi,
+        p_frac,
+        cg_q,
+        cg_d,
+        cg_Q,
+        batch_idx,
+        identity_cell,
+        mesh_nx,
+        mesh_ny,
+        mesh_nz,
+        B,
+        spline_order,
+        lmax,
+    )
+    d_phi_b, d_p_b, d_cg_q_b, d_cg_d_b, d_cg_Q_b = (
+        _batch_multipole_pme_spread_unified_double_backward(
+            gg_p,
+            None,
+            None,
+            None,
+            None,
+            phi_grid,
+            p_frac,
+            cg_q,
+            cg_d,
+            cg_Q,
+            batch_idx,
+            identity_cell,
+            mesh_nx,
+            mesh_ny,
+            mesh_nz,
+            B,
+            spline_order,
+            lmax,
+        )
+    )
+    d_cg_q = gth_q + d_cg_q_b
+    d_cg_d = gth_d + d_cg_d_b
+    d_cg_Q = gth_Q + d_cg_Q_b
+    d_phi = d_phi_b
+    d_p = a_dp + d_p_b
+    if lmax < 1:
+        d_cg_d = torch.zeros_like(d_cg_d)
+    if lmax < 2:
+        d_cg_Q = torch.zeros_like(d_cg_Q)
+    return d_cg_q, d_cg_d, d_cg_Q, d_phi, d_p
+
+
+def _batch_gather_via_spread_t_double_backward_fake(
+    gg_phi, gg_p, cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
+):
+    """Fake: grads of ``(cg_q, cg_d, cg_Q, phi_grid, p_frac)``."""
+    del gg_phi, gg_p
+    return (
+        torch.empty_like(cg_q),
+        torch.empty_like(cg_d),
+        torch.empty_like(cg_Q),
+        torch.empty_like(phi_grid),
+        torch.empty_like(p_frac),
+    )
+
+
+_BATCH_GATHER_VST_FWD_SCHEMA = (
+    "(Tensor phi_grid, Tensor p_frac, Tensor batch_idx, Tensor identity_cell, "
+    "int mesh_nx, int mesh_ny, int mesh_nz, int B, int spline_order, int lmax) "
+    "-> (Tensor, Tensor, Tensor)"
+)
+
+_BATCH_GATHER_VST_BWD_SCHEMA = (
+    "(Tensor cg_q, Tensor cg_d, Tensor cg_Q, Tensor phi_grid, Tensor p_frac, "
+    "Tensor batch_idx, Tensor identity_cell, int mesh_nx, int mesh_ny, "
+    "int mesh_nz, int B, int spline_order, int lmax) -> (Tensor, Tensor)"
+)
+
+_BATCH_GATHER_VST_DBWD_SCHEMA = (
+    "(Tensor? gg_phi, Tensor? gg_p, Tensor cg_q, Tensor cg_d, Tensor cg_Q, "
+    "Tensor phi_grid, Tensor p_frac, Tensor batch_idx, Tensor identity_cell, "
+    "int mesh_nx, int mesh_ny, int mesh_nz, int B, int spline_order, int lmax) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+register_warp_op_chain(
+    name="nvalchemiops::multipole_pme_gather_via_spread_t_batch",
+    forward=_batch_multipole_pme_gather_via_spread_t_forward,
+    forward_fake=_batch_gather_via_spread_t_forward_fake,
+    forward_return_arity=3,
+    forward_schema=_BATCH_GATHER_VST_FWD_SCHEMA,
+    backward=_batch_multipole_pme_gather_via_spread_t_backward,
+    backward_fake=_batch_gather_via_spread_t_backward_fake,
+    backward_schema=_BATCH_GATHER_VST_BWD_SCHEMA,
+    backward_return_arity=2,
+    diff_input_positions=(0, 1),
+    n_forward_inputs=10,
+    batch_match=True,
+    # Backward inputs: cg_q=0, cg_d=1, cg_Q=2, phi_grid=3, p_frac=4,
+    # batch_idx=5, identity_cell=6, mesh_nx=7, ... (13 total).
+    double_backward=_batch_multipole_pme_gather_via_spread_t_double_backward,
+    double_backward_fake=_batch_gather_via_spread_t_double_backward_fake,
+    double_backward_schema=_BATCH_GATHER_VST_DBWD_SCHEMA,
+    second_order_diff_positions=(0, 1, 2, 3, 4),
+    n_backward_inputs=13,
+    double_backward_return_arity=5,
+)
+
+
 def _resolve_batch_cell_inv_t(
     cell: torch.Tensor, cell_inv_t: torch.Tensor | None
 ) -> torch.Tensor:
@@ -5133,28 +5695,30 @@ def multipole_pme_reciprocal_space(
     with nvtx.range("pme_irfftn"):
         phi_grid = torch.fft.irfftn(convolved, s=(nx, ny, nz), norm="forward").to(dtype)
 
-    # Mesh-side ``E = Σ_g ρ_grid(g) · φ_grid(g)`` energy assembly.
-    # Algebraically identical to the atom-side gather
-    # ``Σ_i [q_i φ(r_i) + μ_i · ∇φ(r_i) + (1/2) Q_i : ∇²φ(r_i)]``: the
-    # ``1/2`` pair-double-counting factor is already baked into the Green's
-    # function (``G̃ = 2π/Vk²``, not ``4π/Vk²``).
+    # Per-atom reciprocal energy via the spread-transpose gather
+    # ``g = Sᵀφ``: ``E_i = q_i g_q_i + d_i·g_d_i + Q_i:g_Q_i`` (fractional
+    # moments, since ``g`` lives in the spread's identity-cell fractional frame;
+    # the ``1/2`` pair factor is baked into ``G̃ = 2π/Vk²`` and the quad ``g_Q``
+    # channel). ``Σ_i E_i`` equals the mesh-mesh ``<ρ, φ>`` *bit-for-bit*
+    # (``Sᵀ`` is the spread's own backward, not the discretization-mismatched
+    # ``spline_gather``), but yields a genuine per-atom decomposition. The op is
+    # twice-differentiable (force-loss + stress-loss compose through its
+    # double-backward), so it routes the whole 2nd-order graph cleanly.
     #
     # Unit conversion: the Green's function ``2π/V · exp(...)/k²`` lands the
-    # mesh-derived ``Σ_grid ρ · φ`` in natural Coulomb units, so multiply by
-    # ``F/(4π)`` to reach F-scaled units; corrections are already F-scaled.
-    #
-    # Mesh-mesh form is used for all LMAX: both ``rho_grid`` (directly via
-    # the unified spread custom_op) and ``phi_grid`` (via the FFT chain)
-    # depend on the inputs, and the discrete convolution is real-symmetric,
-    # so autograd sums the two paths to ``2 · (φ · ∂ρ/∂var)`` — exactly
-    # right since the convolve already halved ``G̃``. This routes the whole
-    # graph through the unified-spread backward, avoiding the gather_field
-    # position-grad gap.
+    # gathered energy in natural Coulomb units → multiply by ``F/(4π)`` to reach
+    # F-scaled units; corrections are already F-scaled.
     coulomb_scale = FIELD_CONSTANT / (4.0 * math.pi)
-    with nvtx.range("pme_energy_mesh_inner_product"):
-        e_recip_raw = coulomb_scale * multipole_pme_mesh_inner_product(
-            rho_grid, phi_grid
+    with nvtx.range("pme_energy_gather_via_spread_t"):
+        g_q, g_d, g_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+            phi_grid, p_frac, identity_cell, nx, ny, nz, spline_order, lmax
         )
+        e_per_atom = (
+            charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
+        )
+        # NOTE: scalar reduction kept here for the current contract; Phase 4
+        # returns the per-atom ``coulomb_scale * e_per_atom`` directly.
+        e_recip_raw = coulomb_scale * e_per_atom.sum()
 
     with nvtx.range("pme_corrections"):
         corrections = multipole_pme_energy_corrections(
@@ -5673,15 +6237,24 @@ def _batch_multipole_pme_reciprocal_space_impl(
         convolved, s=(nx, ny, nz), dim=(1, 2, 3), norm="forward"
     ).to(dtype)
 
-    # Steps 6/7: mesh-side ``E_b = Σ_g ρ_grid[b, g] · φ_grid[b, g]``
-    # inner-product assembly, per system. Algebraically identical to the
-    # atom-side gather ``Σ_i [q_i φ(r_i) + μ_i · ∇φ(r_i)]`` (the convolve's
-    # ``G̃ = 2π/Vk²`` already bakes in the pair 1/2 factor), but routes the
-    # entire autograd graph through the batched spread's registered backward.
+    # Steps 6/7: per-atom reciprocal energy via the batched spread-transpose
+    # gather ``g = Sᵀφ`` — ``E_i = q_i g_q_i + d_i·g_d_i + Q_i:g_Q_i`` in the
+    # identity-cell fractional frame (the convolve's ``G̃ = 2π/Vk²`` bakes in the
+    # pair 1/2 factor; ``g_Q`` carries its own 1/2). ``Σ_i E_i`` per system is
+    # bit-identical to the mesh-mesh ``<ρ, φ>`` but yields a per-atom
+    # decomposition that is twice-differentiable through the op's
+    # double-backward (force-loss + stress-loss).
     coulomb_scale = FIELD_CONSTANT / (4.0 * math.pi)
-    e_recip_per_system = coulomb_scale * multipole_pme_mesh_inner_product(
-        rho_grid, phi_grid
+    g_q, g_d, g_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t_batch(
+        phi_grid, p_frac, batch_idx, identity_cell, nx, ny, nz, B, spline_order, lmax
     )
+    e_per_atom = charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
+    # NOTE: scatter to per-system kept here for the current contract; Phase 4
+    # returns the per-atom ``coulomb_scale * e_per_atom`` directly (caller
+    # reduces).
+    e_recip_per_system = coulomb_scale * torch.zeros(
+        B, dtype=dtype, device=positions.device
+    ).scatter_add(0, batch_idx.long(), e_per_atom)
 
     # Step 8: subtract per-system corrections (incl. l=2 self-energy).
     corrections = multipole_pme_energy_corrections(
