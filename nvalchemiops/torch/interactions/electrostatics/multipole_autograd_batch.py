@@ -57,7 +57,9 @@ from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels im
     batch_project_kphase_grad,
     batch_project_phihat_grad,
     batch_rho_kphase_grad,
+    batch_rho_kphase_grad_double_backward,
     batch_rho_phihat_grad,
+    batch_rho_phihat_grad_double_backward,
     batch_rho_q_coeff2_grad,
     batch_rho_q_kvec_grad,
     batch_rho_q_moment_grad,
@@ -474,24 +476,25 @@ register_warp_op_chain(
 # ---- phi_hat / k-vector phase (forward-only; carry the reciprocal cell-grad) ----
 
 
-@torch.library.custom_op(
-    "nvalchemiops::batch_multipole_rho_phihat_grad",
-    mutates_args=(),
-    schema=(
-        "(Tensor charges, Tensor dipoles, Tensor cosines, Tensor sines, "
-        "Tensor grad_rho, Tensor volume, Tensor batch_idx) -> Tensor"
-    ),
-)
-def _batch_rho_phihat_grad_op(
+def _batch_rho_phihat_grad_forward(
+    grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
+    positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
-    grad_rho: torch.Tensor,
+    k_vectors: torch.Tensor,
     volume: torch.Tensor,
     batch_idx: torch.Tensor,
 ) -> torch.Tensor:
-    """``dL/dsource_phi_hat`` ``(B, K_max, 4, 2)`` via ``batch_rho_phihat_grad``."""
+    r"""``∂L/∂source_phi_hat`` ``(B, K_max, 4, 2)`` via ``batch_rho_phihat_grad``.
+
+    ``positions`` / ``k_vectors`` are unused by the forward kernel (the cos/sin
+    dependence is carried by the detached tables) but are explicit diff-input
+    slots so the Warp second-order backward can place their Hessian grads
+    (batched reciprocal stress-loss). Mirrors the single-system
+    :func:`~...multipole_autograd._rho_phihat_grad_forward`.
+    """
     device = charges.device
     wp_device = wp.device_from_torch(device)
     wp_scalar = _wp_scalar(charges.dtype)
@@ -519,13 +522,14 @@ def _batch_rho_phihat_grad_op(
     return grad_phi
 
 
-@torch.library.register_fake("nvalchemiops::batch_multipole_rho_phihat_grad")
-def _batch_rho_phihat_grad_fake(
+def _batch_rho_phihat_grad_forward_fake(
+    grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
+    positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
-    grad_rho: torch.Tensor,
+    k_vectors: torch.Tensor,
     volume: torch.Tensor,
     batch_idx: torch.Tensor,
 ) -> torch.Tensor:
@@ -535,27 +539,106 @@ def _batch_rho_phihat_grad_fake(
     )
 
 
-@torch.library.custom_op(
-    "nvalchemiops::batch_multipole_rho_kphase_grad",
-    mutates_args=(),
-    schema=(
-        "(Tensor charges, Tensor dipoles, Tensor positions, Tensor cosines, "
-        "Tensor sines, Tensor source_phi_hat, Tensor grad_rho, Tensor volume, "
-        "Tensor batch_idx) -> Tensor"
-    ),
+def _batch_rho_phihat_grad_backward(
+    g_phi: torch.Tensor,
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Warp second-order backward: grads for ``(grad_rho, charges, dipoles, positions, k_vectors)``.
+
+    Per-system mirror of the single-system
+    :func:`~...multipole_autograd._rho_phihat_grad_backward`; ``scale =
+    (2π)³/volume[b]`` is folded inside the kernel.
+    """
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = _wp_scalar(charges.dtype)
+    vec_dtype = _wp_vec(charges.dtype)
+    n_atoms = charges.shape[0]
+    batch_size = volume.shape[0]
+    atom_start, atom_end = _atom_bounds_from_batch_idx(batch_idx, batch_size)
+
+    ggrad_rho = torch.empty_like(grad_rho, dtype=torch.float64)
+    ggrad_moments = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    ggrad_kvec = torch.empty(
+        (batch_size, cosines.shape[0], 3), dtype=torch.float64, device=device
+    )
+    batch_rho_phihat_grad_double_backward(
+        wp.from_torch(g_phi.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(positions.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(volume.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(atom_start.contiguous(), dtype=wp.int32),
+        wp.from_torch(atom_end.contiguous(), dtype=wp.int32),
+        wp.from_torch(ggrad_rho, dtype=wp.float64),
+        wp.from_torch(ggrad_moments, dtype=wp.float64),
+        wp.from_torch(ggrad_positions, dtype=wp.vec3d),
+        wp.from_torch(ggrad_kvec, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    ggrad_charges = ggrad_moments[:, 0].contiguous().to(charges.dtype)
+    # e3nn -> Cartesian permutation for dipole: (mu_x, mu_y, mu_z) = lm(3, 1, 2).
+    ggrad_dipoles = ggrad_moments[:, [3, 1, 2]].contiguous().to(dipoles.dtype)
+    return ggrad_rho, ggrad_charges, ggrad_dipoles, ggrad_positions, ggrad_kvec
+
+
+_BATCH_PHIHAT_GRAD_SCHEMA = (
+    "(Tensor grad_rho, Tensor charges, Tensor dipoles, Tensor positions, "
+    "Tensor cosines, Tensor sines, Tensor k_vectors, Tensor volume, "
+    "Tensor batch_idx) -> Tensor"
 )
-def _batch_rho_kphase_grad_op(
+_BATCH_PHIHAT_GRAD_BWD_SCHEMA = (
+    "(Tensor g_phi, Tensor grad_rho, Tensor charges, Tensor dipoles, "
+    "Tensor positions, Tensor cosines, Tensor sines, Tensor k_vectors, "
+    "Tensor volume, Tensor batch_idx) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+)
+register_warp_op_chain(
+    name="nvalchemiops::batch_multipole_rho_phihat_grad",
+    forward=_batch_rho_phihat_grad_forward,
+    forward_schema=_BATCH_PHIHAT_GRAD_SCHEMA,
+    forward_fake=_batch_rho_phihat_grad_forward_fake,
+    backward=_batch_rho_phihat_grad_backward,
+    backward_schema=_BATCH_PHIHAT_GRAD_BWD_SCHEMA,
+    backward_return_arity=5,
+    # grad_rho(0), charges(1), dipoles(2), positions(3), k_vectors(6) are diff.
+    diff_input_positions=(0, 1, 2, 3, 6),
+    n_forward_inputs=9,
+)
+
+
+def _batch_rho_kphase_grad_forward(
+    grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
     positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
     source_phi_hat: torch.Tensor,
-    grad_rho: torch.Tensor,
+    k_vectors: torch.Tensor,
     volume: torch.Tensor,
     batch_idx: torch.Tensor,
 ) -> torch.Tensor:
-    """``dL/dk_vectors`` ``(B, K_max, 3)`` through the phase via ``batch_rho_kphase_grad``."""
+    r"""``∂L/∂k_vectors`` ``(B, K_max, 3)`` (phase channel) via ``batch_rho_kphase_grad``.
+
+    ``k_vectors`` is an explicit diff slot (kernel-unused in forward; the cos/sin
+    dependence is carried by the detached tables) so the Warp second-order
+    backward can place its Hessian grad. Mirrors the single-system
+    :func:`~...multipole_autograd._rho_kphase_grad_forward`.
+    """
     device = charges.device
     wp_device = wp.device_from_torch(device)
     wp_scalar = _wp_scalar(charges.dtype)
@@ -583,15 +666,15 @@ def _batch_rho_kphase_grad_op(
     return grad_k
 
 
-@torch.library.register_fake("nvalchemiops::batch_multipole_rho_kphase_grad")
-def _batch_rho_kphase_grad_fake(
+def _batch_rho_kphase_grad_forward_fake(
+    grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
     positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
     source_phi_hat: torch.Tensor,
-    grad_rho: torch.Tensor,
+    k_vectors: torch.Tensor,
     volume: torch.Tensor,
     batch_idx: torch.Tensor,
 ) -> torch.Tensor:
@@ -599,6 +682,100 @@ def _batch_rho_kphase_grad_fake(
     return cosines.new_empty(
         (volume.shape[0], cosines.shape[0], 3), dtype=torch.float64
     )
+
+
+def _batch_rho_kphase_grad_backward(
+    g_k: torch.Tensor,
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    cosines: torch.Tensor,
+    sines: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Warp second-order backward: grads for ``(grad_rho, charges, dipoles, positions, source_phi_hat, k_vectors)``.
+
+    Per-system mirror of the single-system
+    :func:`~...multipole_autograd._rho_kphase_grad_backward`.
+    """
+    device = charges.device
+    wp_device = wp.device_from_torch(device)
+    wp_scalar = _wp_scalar(charges.dtype)
+    vec_dtype = _wp_vec(charges.dtype)
+    n_atoms = charges.shape[0]
+    batch_size = volume.shape[0]
+    atom_start, atom_end = _atom_bounds_from_batch_idx(batch_idx, batch_size)
+
+    ggrad_rho = torch.empty_like(grad_rho, dtype=torch.float64)
+    ggrad_moments = torch.zeros((n_atoms, 4), dtype=torch.float64, device=device)
+    ggrad_positions = torch.zeros((n_atoms, 3), dtype=torch.float64, device=device)
+    ggrad_phi = torch.empty_like(source_phi_hat, dtype=torch.float64)
+    ggrad_kvec = torch.empty(
+        (batch_size, cosines.shape[0], 3), dtype=torch.float64, device=device
+    )
+    batch_rho_kphase_grad_double_backward(
+        wp.from_torch(g_k.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(positions.detach().contiguous(), dtype=vec_dtype),
+        wp.from_torch(cosines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(sines.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(source_phi_hat.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(k_vectors.detach().contiguous(), dtype=wp.vec3d),
+        wp.from_torch(grad_rho.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(volume.detach().contiguous(), dtype=wp.float64),
+        wp.from_torch(atom_start.contiguous(), dtype=wp.int32),
+        wp.from_torch(atom_end.contiguous(), dtype=wp.int32),
+        wp.from_torch(ggrad_rho, dtype=wp.float64),
+        wp.from_torch(ggrad_moments, dtype=wp.float64),
+        wp.from_torch(ggrad_positions, dtype=wp.vec3d),
+        wp.from_torch(ggrad_phi, dtype=wp.float64),
+        wp.from_torch(ggrad_kvec, dtype=wp.float64),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    ggrad_charges = ggrad_moments[:, 0].contiguous().to(charges.dtype)
+    ggrad_dipoles = ggrad_moments[:, [3, 1, 2]].contiguous().to(dipoles.dtype)
+    return (
+        ggrad_rho,
+        ggrad_charges,
+        ggrad_dipoles,
+        ggrad_positions,
+        ggrad_phi,
+        ggrad_kvec,
+    )
+
+
+_BATCH_KPHASE_GRAD_SCHEMA = (
+    "(Tensor grad_rho, Tensor charges, Tensor dipoles, Tensor positions, "
+    "Tensor cosines, Tensor sines, Tensor source_phi_hat, Tensor k_vectors, "
+    "Tensor volume, Tensor batch_idx) -> Tensor"
+)
+_BATCH_KPHASE_GRAD_BWD_SCHEMA = (
+    "(Tensor g_k, Tensor grad_rho, Tensor charges, Tensor dipoles, "
+    "Tensor positions, Tensor cosines, Tensor sines, Tensor source_phi_hat, "
+    "Tensor k_vectors, Tensor volume, Tensor batch_idx) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+)
+register_warp_op_chain(
+    name="nvalchemiops::batch_multipole_rho_kphase_grad",
+    forward=_batch_rho_kphase_grad_forward,
+    forward_schema=_BATCH_KPHASE_GRAD_SCHEMA,
+    forward_fake=_batch_rho_kphase_grad_forward_fake,
+    backward=_batch_rho_kphase_grad_backward,
+    backward_schema=_BATCH_KPHASE_GRAD_BWD_SCHEMA,
+    backward_return_arity=6,
+    # grad_rho(0), charges(1), dipoles(2), positions(3), source_phi_hat(6),
+    # k_vectors(7) are the diff inputs.
+    diff_input_positions=(0, 1, 2, 3, 6, 7),
+    n_forward_inputs=10,
+)
 
 
 # =============================================================================
@@ -1206,51 +1383,6 @@ def _batch_multipole_rho_setup_context(ctx, inputs, output) -> None:
     )
 
 
-def _batch_phihat_grad_torch(
-    grad_rho, charges, dipoles, positions, k_vectors, volume, batch_idx
-):
-    """Per-system pure-torch :math:`\\partial L/\\partial\\hat\\phi` (stress-loss)."""
-    from nvalchemiops.torch.interactions.electrostatics.multipole_autograd import (
-        _phihat_grad_torch,
-    )
-
-    outs = [
-        _phihat_grad_torch(
-            grad_rho[b],
-            charges[batch_idx == b],
-            dipoles[batch_idx == b],
-            positions[batch_idx == b],
-            k_vectors[b],
-            volume[b],
-        )
-        for b in range(volume.shape[0])
-    ]
-    return torch.stack(outs, dim=0)
-
-
-def _batch_kphase_grad_torch(
-    grad_rho, charges, dipoles, positions, source_phi_hat, k_vectors, volume, batch_idx
-):
-    """Per-system pure-torch :math:`\\partial L/\\partial k` via phase (stress-loss)."""
-    from nvalchemiops.torch.interactions.electrostatics.multipole_autograd import (
-        _kphase_grad_torch,
-    )
-
-    outs = [
-        _kphase_grad_torch(
-            grad_rho[b],
-            charges[batch_idx == b],
-            dipoles[batch_idx == b],
-            positions[batch_idx == b],
-            k_vectors[b],
-            source_phi_hat[b],
-            volume[b],
-        )
-        for b in range(volume.shape[0])
-    ]
-    return torch.stack(outs, dim=0)
-
-
 def _batch_multipole_rho_backward(ctx, grad_rho: torch.Tensor):
     """Analytical grads for charges, dipoles, positions, phi_hat, k_vectors.
 
@@ -1289,39 +1421,33 @@ def _batch_multipole_rho_backward(ctx, grad_rho: torch.Tensor):
         scale,
         batch_idx,
     )
-    # Hybrid (mirror the single-system rho backward): differentiable per-system
-    # torch twins under create_graph (stress-loss) so the cell<->{positions,
-    # moments} second-order cross-terms flow; fast forward-only Warp ops for
-    # plain 1st-order cell-grad.
-    if torch.is_grad_enabled():
-        grad_phi = _batch_phihat_grad_torch(
-            grad_rho, charges, dipoles, positions, k_vectors, volume, batch_idx
-        )
-        grad_kvec = _batch_kphase_grad_torch(
-            grad_rho,
-            charges,
-            dipoles,
-            positions,
-            source_phi_hat,
-            k_vectors,
-            volume,
-            batch_idx,
-        )
-    else:
-        grad_phi = torch.ops.nvalchemiops.batch_multipole_rho_phihat_grad(
-            charges, dipoles, cosines, sines, grad_rho, volume, batch_idx
-        )
-        grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_kphase_grad(
-            charges,
-            dipoles,
-            positions,
-            cosines,
-            sines,
-            source_phi_hat,
-            grad_rho,
-            volume,
-            batch_idx,
-        )
+    # phi_hat / k-vector phase grads (carry the reciprocal cell-grad). Both are
+    # twice-differentiable Warp op chains (batched second-order backward) so the
+    # cell<->{positions, moments} cross-terms flow under create_graph for
+    # stress-loss while plain 1st-order cell-grad stays on the fast forward.
+    grad_phi = torch.ops.nvalchemiops.batch_multipole_rho_phihat_grad(
+        grad_rho,
+        charges,
+        dipoles,
+        positions,
+        cosines,
+        sines,
+        k_vectors,
+        volume,
+        batch_idx,
+    )
+    grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_kphase_grad(
+        grad_rho,
+        charges,
+        dipoles,
+        positions,
+        cosines,
+        sines,
+        source_phi_hat,
+        k_vectors,
+        volume,
+        batch_idx,
+    )
     grad_charges = grad_charges.to(charges.dtype)
     grad_dipoles = grad_dipoles.to(dipoles.dtype)
     grad_positions = grad_positions.to(positions.dtype)
