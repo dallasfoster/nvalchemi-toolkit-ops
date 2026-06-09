@@ -1206,6 +1206,51 @@ def _batch_multipole_rho_setup_context(ctx, inputs, output) -> None:
     )
 
 
+def _batch_phihat_grad_torch(
+    grad_rho, charges, dipoles, positions, k_vectors, volume, batch_idx
+):
+    """Per-system pure-torch :math:`\\partial L/\\partial\\hat\\phi` (stress-loss)."""
+    from nvalchemiops.torch.interactions.electrostatics.multipole_autograd import (
+        _phihat_grad_torch,
+    )
+
+    outs = [
+        _phihat_grad_torch(
+            grad_rho[b],
+            charges[batch_idx == b],
+            dipoles[batch_idx == b],
+            positions[batch_idx == b],
+            k_vectors[b],
+            volume[b],
+        )
+        for b in range(volume.shape[0])
+    ]
+    return torch.stack(outs, dim=0)
+
+
+def _batch_kphase_grad_torch(
+    grad_rho, charges, dipoles, positions, source_phi_hat, k_vectors, volume, batch_idx
+):
+    """Per-system pure-torch :math:`\\partial L/\\partial k` via phase (stress-loss)."""
+    from nvalchemiops.torch.interactions.electrostatics.multipole_autograd import (
+        _kphase_grad_torch,
+    )
+
+    outs = [
+        _kphase_grad_torch(
+            grad_rho[b],
+            charges[batch_idx == b],
+            dipoles[batch_idx == b],
+            positions[batch_idx == b],
+            k_vectors[b],
+            source_phi_hat[b],
+            volume[b],
+        )
+        for b in range(volume.shape[0])
+    ]
+    return torch.stack(outs, dim=0)
+
+
 def _batch_multipole_rho_backward(ctx, grad_rho: torch.Tensor):
     """Analytical grads for charges, dipoles, positions, phi_hat, k_vectors.
 
@@ -1244,20 +1289,39 @@ def _batch_multipole_rho_backward(ctx, grad_rho: torch.Tensor):
         scale,
         batch_idx,
     )
-    grad_phi = torch.ops.nvalchemiops.batch_multipole_rho_phihat_grad(
-        charges, dipoles, cosines, sines, grad_rho, volume, batch_idx
-    )
-    grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_kphase_grad(
-        charges,
-        dipoles,
-        positions,
-        cosines,
-        sines,
-        source_phi_hat,
-        grad_rho,
-        volume,
-        batch_idx,
-    )
+    # Hybrid (mirror the single-system rho backward): differentiable per-system
+    # torch twins under create_graph (stress-loss) so the cell<->{positions,
+    # moments} second-order cross-terms flow; fast forward-only Warp ops for
+    # plain 1st-order cell-grad.
+    if torch.is_grad_enabled():
+        grad_phi = _batch_phihat_grad_torch(
+            grad_rho, charges, dipoles, positions, k_vectors, volume, batch_idx
+        )
+        grad_kvec = _batch_kphase_grad_torch(
+            grad_rho,
+            charges,
+            dipoles,
+            positions,
+            source_phi_hat,
+            k_vectors,
+            volume,
+            batch_idx,
+        )
+    else:
+        grad_phi = torch.ops.nvalchemiops.batch_multipole_rho_phihat_grad(
+            charges, dipoles, cosines, sines, grad_rho, volume, batch_idx
+        )
+        grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_kphase_grad(
+            charges,
+            dipoles,
+            positions,
+            cosines,
+            sines,
+            source_phi_hat,
+            grad_rho,
+            volume,
+            batch_idx,
+        )
     grad_charges = grad_charges.to(charges.dtype)
     grad_dipoles = grad_dipoles.to(dipoles.dtype)
     grad_positions = grad_positions.to(positions.dtype)
@@ -1841,20 +1905,54 @@ def _batch_multipole_rho_q_backward(ctx, grad_rho: torch.Tensor):
         volume,
         batch_idx,
     )
-    grad_coeff2 = torch.ops.nvalchemiops.batch_multipole_rho_q_coeff2_grad(
-        quadrupoles, cosines, sines, k_vectors, grad_rho, volume, batch_idx
-    )
-    grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_q_kvec_grad(
-        quadrupoles,
-        positions,
-        cosines,
-        sines,
-        k_vectors,
-        source_coeff2,
-        grad_rho,
-        volume,
-        batch_idx,
-    )
+    if torch.is_grad_enabled():
+        from nvalchemiops.torch.interactions.electrostatics.multipole_autograd import (
+            _coeff2_grad_torch,
+            _kvec_q_grad_torch,
+        )
+
+        grad_coeff2 = torch.stack(
+            [
+                _coeff2_grad_torch(
+                    grad_rho[b],
+                    quadrupoles[batch_idx == b],
+                    positions[batch_idx == b],
+                    k_vectors[b],
+                    volume[b],
+                )
+                for b in range(volume.shape[0])
+            ],
+            dim=0,
+        )
+        grad_kvec = torch.stack(
+            [
+                _kvec_q_grad_torch(
+                    grad_rho[b],
+                    quadrupoles[batch_idx == b],
+                    positions[batch_idx == b],
+                    k_vectors[b],
+                    source_coeff2[b],
+                    volume[b],
+                )
+                for b in range(volume.shape[0])
+            ],
+            dim=0,
+        )
+    else:
+        grad_coeff2 = torch.ops.nvalchemiops.batch_multipole_rho_q_coeff2_grad(
+            quadrupoles, cosines, sines, k_vectors, grad_rho, volume, batch_idx
+        )
+        grad_kvec = torch.ops.nvalchemiops.batch_multipole_rho_q_kvec_grad(
+            quadrupoles,
+            positions,
+            cosines,
+            sines,
+            k_vectors,
+            source_coeff2,
+            grad_rho,
+            volume,
+            batch_idx,
+        )
     grad_quadrupoles = grad_quadrupoles.to(quadrupoles.dtype)
     grad_positions = grad_positions.to(positions.dtype)
     # Slots: (quadrupoles, positions, source_coeff2, k_vectors, volume,

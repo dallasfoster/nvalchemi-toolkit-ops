@@ -649,24 +649,101 @@ def _rho_backward_to_positions(
     )
 
 
+def _moments_e3nn(charges: torch.Tensor, dipoles: torch.Tensor) -> torch.Tensor:
+    """Per-atom moments in the kernel's e3nn layout ``[q, mu_y, mu_z, mu_x]``."""
+    return torch.stack(
+        [charges, dipoles[:, 1], dipoles[:, 2], dipoles[:, 0]], dim=1
+    )  # (N_atoms, 4)
+
+
+def _phihat_grad_torch(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Differentiable torch twin of ``multipole_rho_phihat_grad`` (stress-loss).
+
+    Recomputes the ``(cos, sin)`` table from live ``positions`` / ``k_vectors``
+    so ``∂(grad_phi)/∂{positions, k_vectors, moments, grad_rho}`` flows through
+    autograd (``create_graph`` stress-loss). Matches the Warp op bit-for-bit:
+    ``grad_phi[lm] = (gr·c_lm − gi·s_lm, gr·s_lm + gi·c_lm)·(2π)³/V`` with
+    ``c_lm = Σ_i Q_{i,lm}·cos(k·r_i)`` (``volume`` detached — its cell-grad lives
+    in the step's value-preserving ratio).
+    """
+    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
+    cos = torch.cos(phase)
+    sin = torch.sin(phase)
+    moments = _moments_e3nn(charges, dipoles)  # (N_atoms, 4)
+    c_lm = cos @ moments  # (N_k, 4)
+    s_lm = sin @ moments
+    gr = grad_rho[:, 0:1]
+    gi = grad_rho[:, 1:2]
+    grad_phi_r = gr * c_lm - gi * s_lm
+    grad_phi_i = gr * s_lm + gi * c_lm
+    grad_phi = torch.stack([grad_phi_r, grad_phi_i], dim=-1)  # (N_k, 4, 2)
+    return grad_phi * (_TWO_PI_CUBED / volume.detach())
+
+
+def _kphase_grad_torch(
+    grad_rho: torch.Tensor,
+    charges: torch.Tensor,
+    dipoles: torch.Tensor,
+    positions: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Differentiable torch twin of ``multipole_rho_kphase_grad`` (stress-loss).
+
+    ``grad_k[k] = Σ_i r_i·(a·cos + b·sin)·(2π)³/V`` with ``a = gr·p_i − gi·p_r``,
+    ``b = −(gr·p_r + gi·p_i)`` and ``p_{r/i} = Σ_lm φ̂_{r/i}[lm]·Q_{i,lm}``.
+    Live ``positions`` / ``k_vectors`` carry the second-order grad.
+    """
+    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
+    cos = torch.cos(phase)
+    sin = torch.sin(phase)
+    moments = _moments_e3nn(charges, dipoles)  # (N_atoms, 4)
+    phi_r = source_phi_hat[:, :, 0]  # (N_k, 4)
+    phi_i = source_phi_hat[:, :, 1]
+    p_r = phi_r @ moments.t()  # (N_k, N_atoms)
+    p_i = phi_i @ moments.t()
+    gr = grad_rho[:, 0:1]
+    gi = grad_rho[:, 1:2]
+    a = gr * p_i - gi * p_r
+    b = -(gr * p_r + gi * p_i)
+    contrib = a * cos + b * sin  # (N_k, N_atoms)
+    grad_k = contrib @ positions  # (N_k, 3)
+    return grad_k * (_TWO_PI_CUBED / volume.detach())
+
+
 def _rho_backward_to_phihat(
     grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
+    positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
     cache: MultipoleSCFCache,
 ) -> torch.Tensor:
     r"""``∂L/∂source_phi_hat`` via the ``multipole_rho_phihat_grad`` op.
 
-    Forward-only opaque op (1st-order cell-grad only; cell 2nd-order is out of
-    scope).
+    Hybrid: under ``torch.is_grad_enabled()`` (stress-loss ``create_graph``)
+    route the differentiable :func:`_phihat_grad_torch` twin so the cell↔
+    {positions, moments} second-order cross-terms flow; otherwise the fast
+    forward-only Warp op (plain 1st-order reciprocal cell-grad).
 
     Returns
     -------
     torch.Tensor
         ``(N_k, 4, 2)`` float64.
     """
+    if torch.is_grad_enabled():
+        return _phihat_grad_torch(
+            grad_rho, charges, dipoles, positions, cache.k_vectors, cache.volume
+        )
     return torch.ops.nvalchemiops.multipole_rho_phihat_grad(
         charges, dipoles, cosines, sines, grad_rho, cache.volume
     )
@@ -676,22 +753,33 @@ def _rho_backward_to_kvec(
     grad_rho: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
+    positions: torch.Tensor,
     cosines: torch.Tensor,
     sines: torch.Tensor,
     cache: MultipoleSCFCache,
-    positions: torch.Tensor,
 ) -> torch.Tensor:
     r"""``∂L/∂k_vectors`` through the phase via the ``multipole_rho_kphase_grad`` op.
 
     Phase contribution only; :math:`\hat\phi`'s k-dependence flows separately
-    through ``source_phi_hat`` + ``SourcePhiHatFunction``. Forward-only opaque op
-    (cell 2nd-order out of scope).
+    through ``source_phi_hat`` + ``SourcePhiHatFunction``. Hybrid: differentiable
+    :func:`_kphase_grad_torch` twin under ``torch.is_grad_enabled()`` (stress-
+    loss), else the fast forward-only Warp op.
 
     Returns
     -------
     torch.Tensor
         ``(N_k, 3)`` float64.
     """
+    if torch.is_grad_enabled():
+        return _kphase_grad_torch(
+            grad_rho,
+            charges,
+            dipoles,
+            positions,
+            cache.k_vectors,
+            cache.source_phi_hat,
+            cache.volume,
+        )
     return torch.ops.nvalchemiops.multipole_rho_kphase_grad(
         charges,
         dipoles,
@@ -835,9 +923,11 @@ def _multipole_rho_backward(ctx, grad_rho: torch.Tensor):
     grad_positions = _rho_backward_to_positions(
         grad_rho, charges, dipoles, cosines, sines, shim, positions
     )
-    grad_phi = _rho_backward_to_phihat(grad_rho, charges, dipoles, cosines, sines, shim)
+    grad_phi = _rho_backward_to_phihat(
+        grad_rho, charges, dipoles, positions, cosines, sines, shim
+    )
     grad_kvec = _rho_backward_to_kvec(
-        grad_rho, charges, dipoles, cosines, sines, shim, positions
+        grad_rho, charges, dipoles, positions, cosines, sines, shim
     )
     # Match input dtypes (sub-ops emit float64).
     grad_charges = grad_charges.to(charges.dtype)
@@ -1285,6 +1375,59 @@ def _rho_q_kvec_grad_fake(
     return cosines.new_empty((cosines.shape[0], 3), dtype=torch.float64)
 
 
+def _coeff2_grad_torch(
+    grad_rho: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Differentiable torch twin of ``multipole_rho_q_coeff2_grad`` (l=2 stress-loss).
+
+    ``grad_coeff2[k] = (gr·C_Q − gi·S_Q)·(2π)³/V`` with
+    ``C_Q = Σ_i (k·Q_i·k)·cos``, ``S_Q = Σ_i (k·Q_i·k)·sin``.
+    """
+    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
+    cos = torch.cos(phase)
+    sin = torch.sin(phase)
+    kQ = torch.einsum("iab,kb->kia", quadrupoles, k_vectors)  # (N_k, N_atoms, 3)
+    kQk = torch.einsum("kia,ka->ki", kQ, k_vectors)  # (N_k, N_atoms)
+    c_q = (kQk * cos).sum(dim=1)
+    s_q = (kQk * sin).sum(dim=1)
+    gr = grad_rho[:, 0]
+    gi = grad_rho[:, 1]
+    grad_coeff2 = gr * c_q - gi * s_q
+    return grad_coeff2 * (_TWO_PI_CUBED / volume.detach())
+
+
+def _kvec_q_grad_torch(
+    grad_rho: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    positions: torch.Tensor,
+    k_vectors: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Differentiable torch twin of ``multipole_rho_q_kvec_grad`` (l=2 stress-loss).
+
+    ``grad_k = c2·Σ_i [ 2(gr·cos − gi·sin)·(Q·k) − (k·Q·k)(gr·sin + gi·cos)·r_i ]``
+    ``·(2π)³/V`` (coeff2 held fixed; phase + ``(k·Q·k)`` k-dependence).
+    """
+    phase = k_vectors @ positions.t()  # (N_k, N_atoms)
+    cos = torch.cos(phase)
+    sin = torch.sin(phase)
+    qk = torch.einsum("iab,kb->kia", quadrupoles, k_vectors)  # (N_k, N_atoms, 3) = Q·k
+    kQk = torch.einsum("kia,ka->ki", qk, k_vectors)  # (N_k, N_atoms)
+    gr = grad_rho[:, 0:1]
+    gi = grad_rho[:, 1:2]
+    w1 = 2.0 * (gr * cos - gi * sin)  # (N_k, N_atoms)
+    w2 = -kQk * (gr * sin + gi * cos)  # (N_k, N_atoms)
+    term1 = (w1.unsqueeze(-1) * qk).sum(dim=1)  # (N_k, 3)
+    term2 = (w2.unsqueeze(-1) * positions.unsqueeze(0)).sum(dim=1)  # (N_k, 3)
+    grad_k = source_coeff2.unsqueeze(-1) * (term1 + term2)
+    return grad_k * (_TWO_PI_CUBED / volume.detach())
+
+
 def _multipole_rho_q_setup_context(ctx, inputs, output) -> None:
     """Save the forward inputs for the analytical backward."""
     quadrupoles, positions, source_coeff2, k_vectors, volume = inputs
@@ -1318,19 +1461,30 @@ def _multipole_rho_q_backward(ctx, grad_rho: torch.Tensor):
         source_coeff2,
         volume,
     )
-    grad_coeff2 = torch.ops.nvalchemiops.multipole_rho_q_coeff2_grad(
-        quadrupoles, cosines, sines, k_vectors, grad_rho, volume
-    )
-    grad_kvec = torch.ops.nvalchemiops.multipole_rho_q_kvec_grad(
-        quadrupoles,
-        positions,
-        cosines,
-        sines,
-        k_vectors,
-        source_coeff2,
-        grad_rho,
-        volume,
-    )
+    # Hybrid (mirror the l<=1 rho backward): differentiable torch twins under
+    # create_graph (stress-loss) so cell<->{positions, quadrupoles, k} second-
+    # order flows; fast forward-only Warp ops for plain 1st-order cell-grad.
+    if torch.is_grad_enabled():
+        grad_coeff2 = _coeff2_grad_torch(
+            grad_rho, quadrupoles, positions, k_vectors, volume
+        )
+        grad_kvec = _kvec_q_grad_torch(
+            grad_rho, quadrupoles, positions, k_vectors, source_coeff2, volume
+        )
+    else:
+        grad_coeff2 = torch.ops.nvalchemiops.multipole_rho_q_coeff2_grad(
+            quadrupoles, cosines, sines, k_vectors, grad_rho, volume
+        )
+        grad_kvec = torch.ops.nvalchemiops.multipole_rho_q_kvec_grad(
+            quadrupoles,
+            positions,
+            cosines,
+            sines,
+            k_vectors,
+            source_coeff2,
+            grad_rho,
+            volume,
+        )
     grad_quadrupoles = grad_quadrupoles.to(quadrupoles.dtype)
     grad_positions = grad_positions.to(positions.dtype)
     # Slots: (quadrupoles, positions, source_coeff2, k_vectors, volume).
