@@ -1128,3 +1128,56 @@ class TestRealSpaceMonopoleStressLoss:
 
         fdq = (sval_q(q0 + eps * vq) - sval_q(q0 - eps * vq)) / (2 * eps)
         assert abs((gq * vq).sum().item() - fdq) / (abs(fdq) + 1e-12) < 1e-5
+
+
+class TestRealSpaceDipoleStressLoss:
+    """l=1 real-space cell-grad double-backward (∂²E/∂cell∂θ) — Tier-1 S2.
+
+    Exercises the fused l=1 op directly (the standalone l=1 entry has no
+    cell-grad): stress-loss to positions/charges/dipoles/cell must FD-match.
+    """
+
+    def test_stress_loss_fd(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dt = torch.float64
+        rng = np.random.default_rng(7)
+        n, lbox = 5, 4.0
+        cell_np = np.diag([lbox, lbox, lbox]) + rng.normal(scale=0.2, size=(3, 3))
+        pos_np = rng.uniform(0, lbox, size=(n, 3))
+        idx_j, nptr, shifts = _periodic_csr(pos_np, cell_np, 5.0, device)
+        sigma = torch.tensor([0.5], dtype=dt, device=device)
+        alpha = torch.tensor([0.35], dtype=dt, device=device)
+        q0 = torch.tensor(rng.normal(size=n), dtype=dt, device=device)
+        q0 = q0 - q0.mean()
+        mu0 = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+        cell0 = torch.tensor(cell_np, dtype=dt, device=device).unsqueeze(0)
+        pos0 = torch.tensor(pos_np, dtype=dt, device=device)
+        w = torch.tensor(rng.normal(size=(1, 3, 3)), dtype=dt, device=device)
+        op = torch.ops.nvalchemiops.multipole_real_space_dipole_fused
+
+        def sloss(pos, cell, q, mu):
+            e, _, _, _ = op(pos, q, mu, cell, sigma, alpha, idx_j, nptr, shifts, False)
+            (stress,) = torch.autograd.grad(e, cell, create_graph=True)
+            return (stress * w).sum()
+
+        eps = 1e-6
+        cs = lambda: cell0.clone().requires_grad_(True)  # noqa: E731
+        # positions
+        pos = pos0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(sloss(pos, cs(), q0, mu0), pos)
+        assert gp.abs().max() > 1e-8, "silent zero (positions)"
+        vp = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+        fdp = (
+            sloss(pos0 + eps * vp, cs(), q0, mu0).item()
+            - sloss(pos0 - eps * vp, cs(), q0, mu0).item()
+        ) / (2 * eps)
+        assert abs((gp * vp).sum().item() - fdp) / (abs(fdp) + 1e-12) < 1e-5
+        # dipoles
+        mg = mu0.clone().requires_grad_(True)
+        (gm,) = torch.autograd.grad(sloss(pos0, cs(), q0, mg), mg)
+        vm = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+        fdm = (
+            sloss(pos0, cs(), q0, mu0 + eps * vm).item()
+            - sloss(pos0, cs(), q0, mu0 - eps * vm).item()
+        ) / (2 * eps)
+        assert abs((gm * vm).sum().item() - fdm) / (abs(fdm) + 1e-12) < 1e-5

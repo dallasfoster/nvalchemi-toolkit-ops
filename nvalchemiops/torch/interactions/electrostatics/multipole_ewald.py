@@ -62,6 +62,7 @@ from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
     batch_multipole_real_space_monopole_csr_energy_2nd_backward,
     batch_multipole_real_space_monopole_csr_energy_backward,
     batch_multipole_real_space_monopole_csr_energy_fused,
+    multipole_real_space_dipole_csr_cell_grad_backward,
     multipole_real_space_dipole_csr_energy,
     multipole_real_space_dipole_csr_energy_2nd_backward,
     multipole_real_space_dipole_csr_energy_backward,
@@ -1334,6 +1335,103 @@ def _rs_dipole_cell_grad_op(
 @_rs_dipole_cell_grad_op.register_fake
 def _(positions, charges, dipoles, cell, sigma, alpha, idx_j, nptr, shifts, half):
     return torch.empty_like(cell)
+
+
+def _rs_dipole_cell_grad_setup(ctx, inputs, output):
+    """Save inputs for the l=1 cell-grad double-backward (stress-loss)."""
+    (
+        positions,
+        charges,
+        dipoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        half_neighbor_list,
+    ) = inputs
+    ctx.save_for_backward(
+        positions,
+        charges,
+        dipoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+    )
+    ctx.half_neighbor_list = half_neighbor_list
+
+
+def _rs_dipole_cell_grad_backward(ctx, g_cell):
+    """∂/∂{positions, charges, dipoles, cell} of ⟨g_cell, dE/dcell⟩ (l=1)."""
+    (
+        positions,
+        charges,
+        dipoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+    ) = ctx.saved_tensors
+    need = ctx.needs_input_grad
+    if not (need[0] or need[1] or need[2] or need[3]):
+        return (None,) * 10
+    device = positions.device
+    wp_device = wp.device_from_torch(device)
+    dtype = positions.dtype
+    wp_scalar = get_wp_dtype(dtype)
+    wp_vec = get_wp_vec_dtype(dtype)
+    wp_mat = get_wp_mat_dtype(dtype)
+    n = positions.shape[0]
+    scale_val = 1.0 if ctx.half_neighbor_list else 0.5
+    scale = torch.tensor([scale_val], dtype=torch.float64, device=device)
+    grad_positions = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_charges = torch.zeros(n, dtype=dtype, device=device)
+    grad_dipoles = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_cell_cc = torch.zeros((1, 3, 3), dtype=dtype, device=device)
+    multipole_real_space_dipole_csr_cell_grad_backward(
+        wp.from_torch(positions.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(idx_j.contiguous(), dtype=wp.int32),
+        wp.from_torch(neighbor_ptr.contiguous(), dtype=wp.int32),
+        wp.from_torch(unit_shifts.contiguous(), dtype=wp.vec3i),
+        wp.from_torch(sigma.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(alpha.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(scale, dtype=wp.float64),
+        wp.from_torch(g_cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(grad_positions, dtype=wp_vec),
+        wp.from_torch(grad_charges, dtype=wp_scalar),
+        wp.from_torch(grad_dipoles, dtype=wp_vec),
+        wp.from_torch(grad_cell_cc, dtype=wp_mat),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return (
+        grad_positions if need[0] else None,
+        grad_charges if need[1] else None,
+        grad_dipoles if need[2] else None,
+        grad_cell_cc.reshape(cell.shape) if need[3] else None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_real_space_dipole_cell_grad",
+    _rs_dipole_cell_grad_backward,
+    setup_context=_rs_dipole_cell_grad_setup,
+)
 
 
 @torch.library.custom_op(

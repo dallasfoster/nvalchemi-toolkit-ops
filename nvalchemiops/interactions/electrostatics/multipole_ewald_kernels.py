@@ -5240,6 +5240,389 @@ def multipole_real_space_dipole_csr_energy_2nd_backward(
     )
 
 
+@wp.kernel
+def _multipole_real_space_dipole_csr_cell_grad_backward_kernel(
+    positions: wp.array(dtype=Any),
+    charges: wp.array(dtype=Any),
+    dipoles: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    idx_j: wp.array(dtype=wp.int32),
+    neighbor_ptr: wp.array(dtype=wp.int32),
+    unit_shifts: wp.array(dtype=wp.vec3i),
+    sigma: wp.array(dtype=Any),
+    alpha: wp.array(dtype=Any),
+    per_direction_scale: wp.array(dtype=wp.float64),
+    g_cell: wp.array(dtype=Any),  # (1,) mat33 cotangent on grad_cell
+    grad_positions: wp.array(dtype=Any),  # (N,) OUT
+    grad_charges: wp.array(dtype=Any),  # (N,) OUT
+    grad_dipoles: wp.array(dtype=Any),  # (N,) OUT
+    grad_cell_out: wp.array(dtype=Any),  # (1,) mat33 OUT (atomic)
+):
+    r"""Double-backward of the l=1 real-space cell-grad (stress-loss).
+
+    Reuses the force-loss dipole Hessian (``∂Ω/∂θ``) with the incoming
+    charge/dipole directions set to zero and the position direction replaced by
+    the per-pair ``w = g_cellᵀ·n`` (n = unit_shifts), so ``Ω_gp = -w·f`` with
+    ``f = ∂E_pair/∂r``. With ``S = ⟨g_cell, grad_cell⟩ = Σ scale·(w·f) =
+    -scale·Σ Ω_gp``: ``grad_r_i = +scale·G_pos``, ``grad_r_j = -scale·G_pos``,
+    ``grad_θ = -scale·∂Ω/∂θ`` (θ = q_i,q_j,μ_i,μ_j),
+    ``grad_cell[a,b] = -scale·n[a]·G_pos[b]``. Verified to reduce to the
+    monopole kernel when dipoles vanish.
+    """
+    atom_i = wp.tid()
+    qi = wp.float64(charges[atom_i])
+    pos_i = positions[atom_i]
+    mu_i_native = dipoles[atom_i]
+    mu_i = wp.vec3d(
+        wp.float64(mu_i_native[0]),
+        wp.float64(mu_i_native[1]),
+        wp.float64(mu_i_native[2]),
+    )
+    sigma_ = wp.float64(sigma[0])
+    alpha_ = wp.float64(alpha[0])
+    scale = per_direction_scale[0]
+    cell_t = wp.transpose(cell[0])
+    gcell = g_cell[0]
+    g00 = wp.float64(gcell[0, 0])
+    g01 = wp.float64(gcell[0, 1])
+    g02 = wp.float64(gcell[0, 2])
+    g10 = wp.float64(gcell[1, 0])
+    g11 = wp.float64(gcell[1, 1])
+    g12 = wp.float64(gcell[1, 2])
+    g20 = wp.float64(gcell[2, 0])
+    g21 = wp.float64(gcell[2, 1])
+    g22 = wp.float64(gcell[2, 2])
+
+    ab = _gto_ewald_ab(sigma_, alpha_)
+    a_coef = ab[0]
+    b_coef = ab[1]
+
+    j_range_start = neighbor_ptr[atom_i]
+    j_range_end = neighbor_ptr[atom_i + 1]
+    for edge_idx in range(j_range_start, j_range_end):
+        j = idx_j[edge_idx]
+        qj = wp.float64(charges[j])
+        pos_j = positions[j]
+        mu_j_native = dipoles[j]
+        mu_j = wp.vec3d(
+            wp.float64(mu_j_native[0]),
+            wp.float64(mu_j_native[1]),
+            wp.float64(mu_j_native[2]),
+        )
+        shift_vec = unit_shifts[edge_idx]
+        periodic_shift = cell_t * type(pos_i)(
+            type(pos_i[0])(shift_vec[0]),
+            type(pos_i[0])(shift_vec[1]),
+            type(pos_i[0])(shift_vec[2]),
+        )
+        separation_vector = pos_j - pos_i + periodic_shift
+        distance = wp.float64(wp.length(separation_vector))
+        if distance > wp.float64(1e-8):
+            r_vec = wp.vec3d(
+                wp.float64(separation_vector[0]),
+                wp.float64(separation_vector[1]),
+                wp.float64(separation_vector[2]),
+            )
+            inv_r = wp.float64(1.0) / distance
+            inv_r2 = inv_r * inv_r
+            inv_r3 = inv_r * inv_r2
+            inv_r4 = inv_r2 * inv_r2
+            inv_r5 = inv_r2 * inv_r3
+            inv_r6 = inv_r3 * inv_r3
+            inv_r7 = inv_r3 * inv_r4
+            ra = _gto_ewald_A_single(distance, a_coef)
+            rb = _gto_ewald_A_single(distance, b_coef)
+            a_scalar = ra[0] - rb[0]
+            a_prime = ra[1] - rb[1]
+            a_double_prime = ra[2] - rb[2]
+            a_triple_prime = ra[3] - rb[3]
+            c_diag = a_scalar * inv_r
+            c_quad = a_prime * inv_r2 - a_scalar * inv_r3
+            c3 = (
+                a_double_prime * inv_r3
+                - wp.float64(3.0) * a_prime * inv_r4
+                + wp.float64(3.0) * a_scalar * inv_r5
+            )
+            c4 = (
+                a_triple_prime * inv_r4
+                - wp.float64(6.0) * a_double_prime * inv_r5
+                + wp.float64(15.0) * a_prime * inv_r6
+                - wp.float64(15.0) * a_scalar * inv_r7
+            )
+
+            # Per-pair direction w = g_cellᵀ·n (replaces the gp_i of force-loss).
+            sh0 = wp.float64(shift_vec[0])
+            sh1 = wp.float64(shift_vec[1])
+            sh2 = wp.float64(shift_vec[2])
+            w = wp.vec3d(
+                g00 * sh0 + g10 * sh1 + g20 * sh2,
+                g01 * sh0 + g11 * sh1 + g21 * sh2,
+                g02 * sh0 + g12 * sh1 + g22 * sh2,
+            )
+
+            mu_i_dot_r = mu_i[0] * r_vec[0] + mu_i[1] * r_vec[1] + mu_i[2] * r_vec[2]
+            mu_j_dot_r = mu_j[0] * r_vec[0] + mu_j[1] * r_vec[1] + mu_j[2] * r_vec[2]
+            mu_dot = mu_i[0] * mu_j[0] + mu_i[1] * mu_j[1] + mu_i[2] * mu_j[2]
+            w_dot_r = w[0] * r_vec[0] + w[1] * r_vec[1] + w[2] * r_vec[2]
+            w_dot_mu_i = w[0] * mu_i[0] + w[1] * mu_i[1] + w[2] * mu_i[2]
+            w_dot_mu_j = w[0] * mu_j[0] + w[1] * mu_j[1] + w[2] * mu_j[2]
+            dqmu_dot_r = qi * mu_j_dot_r - qj * mu_i_dot_r
+            w_dot_dqmu = qi * w_dot_mu_j - qj * w_dot_mu_i
+
+            rad = (
+                -qi * qj * c_diag
+                - c_quad * dqmu_dot_r
+                + c_quad * mu_dot
+                + c3 * mu_i_dot_r * mu_j_dot_r
+            )
+
+            # ∂Ω/∂q_i and ∂Ω/∂q_j  (gc_i = gd_i = 0).
+            d_omega_dqi = (
+                qj * c_diag + c_quad * mu_j_dot_r
+            ) * w_dot_r + c_diag * w_dot_mu_j
+            d_omega_dqj = (
+                qi * c_diag - c_quad * mu_i_dot_r
+            ) * w_dot_r - c_diag * w_dot_mu_i
+
+            # ∂Ω/∂μ_i.
+            coeff_r_dmui = (
+                -c_quad * qj * w_dot_r - c3 * mu_j_dot_r * w_dot_r - c_quad * w_dot_mu_j
+            )
+            coeff_muj_dmui = -c_quad * w_dot_r
+            coeff_w_dmui = -c_diag * qj - c_quad * mu_j_dot_r
+            # ∂Ω/∂μ_j.
+            coeff_r_dmuj = (
+                c_quad * qi * w_dot_r - c3 * mu_i_dot_r * w_dot_r - c_quad * w_dot_mu_i
+            )
+            coeff_mui_dmuj = -c_quad * w_dot_r
+            coeff_w_dmuj = c_diag * qi - c_quad * mu_i_dot_r
+
+            # ∂Ω/∂r_vec = G_pos.
+            s_rad = (
+                w_dot_r
+                * (
+                    qi * qj * c_quad
+                    + c3 * dqmu_dot_r
+                    - c3 * mu_dot
+                    - c4 * mu_i_dot_r * mu_j_dot_r
+                )
+                + c_quad * w_dot_dqmu
+                - c3 * w_dot_mu_i * mu_j_dot_r
+                - c3 * w_dot_mu_j * mu_i_dot_r
+            )
+            coeff_muj_dr = -w_dot_r * c3 * mu_i_dot_r - c_quad * w_dot_mu_i
+            coeff_mui_dr = -w_dot_r * c3 * mu_j_dot_r - c_quad * w_dot_mu_j
+            coeff_w_dr = -rad
+            coeff_dqmu_dr = w_dot_r * c_quad
+
+            # Scatter (signs verified against the monopole reduction):
+            # grad_q = -scale·∂Ω/∂q ; grad_μ = -scale·∂Ω/∂μ ;
+            # grad_r_i = +scale·G_pos ; grad_r_j = -scale·G_pos ;
+            # grad_cell[a,b] = -scale·n[a]·G_pos[b].
+            wp.atomic_add(
+                grad_charges, atom_i, type(charges[atom_i])(-scale * d_omega_dqi)
+            )
+            wp.atomic_add(grad_charges, j, type(charges[atom_i])(-scale * d_omega_dqj))
+            wp.atomic_add(
+                grad_dipoles,
+                atom_i,
+                type(mu_i_native)(
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmui * r_vec[0]
+                            + coeff_muj_dmui * mu_j[0]
+                            + coeff_w_dmui * w[0]
+                        )
+                    ),
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmui * r_vec[1]
+                            + coeff_muj_dmui * mu_j[1]
+                            + coeff_w_dmui * w[1]
+                        )
+                    ),
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmui * r_vec[2]
+                            + coeff_muj_dmui * mu_j[2]
+                            + coeff_w_dmui * w[2]
+                        )
+                    ),
+                ),
+            )
+            wp.atomic_add(
+                grad_dipoles,
+                j,
+                type(mu_i_native)(
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmuj * r_vec[0]
+                            + coeff_mui_dmuj * mu_i[0]
+                            + coeff_w_dmuj * w[0]
+                        )
+                    ),
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmuj * r_vec[1]
+                            + coeff_mui_dmuj * mu_i[1]
+                            + coeff_w_dmuj * w[1]
+                        )
+                    ),
+                    type(mu_i_native[0])(
+                        -scale
+                        * (
+                            coeff_r_dmuj * r_vec[2]
+                            + coeff_mui_dmuj * mu_i[2]
+                            + coeff_w_dmuj * w[2]
+                        )
+                    ),
+                ),
+            )
+            dqmu_x = qi * mu_j[0] - qj * mu_i[0]
+            dqmu_y = qi * mu_j[1] - qj * mu_i[1]
+            dqmu_z = qi * mu_j[2] - qj * mu_i[2]
+            gpx = (
+                s_rad * r_vec[0]
+                + coeff_muj_dr * mu_j[0]
+                + coeff_mui_dr * mu_i[0]
+                + coeff_w_dr * w[0]
+                + coeff_dqmu_dr * dqmu_x
+            )
+            gpy = (
+                s_rad * r_vec[1]
+                + coeff_muj_dr * mu_j[1]
+                + coeff_mui_dr * mu_i[1]
+                + coeff_w_dr * w[1]
+                + coeff_dqmu_dr * dqmu_y
+            )
+            gpz = (
+                s_rad * r_vec[2]
+                + coeff_muj_dr * mu_j[2]
+                + coeff_mui_dr * mu_i[2]
+                + coeff_w_dr * w[2]
+                + coeff_dqmu_dr * dqmu_z
+            )
+            sgx = scale * gpx
+            sgy = scale * gpy
+            sgz = scale * gpz
+            wp.atomic_add(
+                grad_positions,
+                atom_i,
+                type(pos_i)(
+                    type(pos_i[0])(sgx),
+                    type(pos_i[0])(sgy),
+                    type(pos_i[0])(sgz),
+                ),
+            )
+            wp.atomic_add(
+                grad_positions,
+                j,
+                type(pos_i)(
+                    type(pos_i[0])(-sgx),
+                    type(pos_i[0])(-sgy),
+                    type(pos_i[0])(-sgz),
+                ),
+            )
+            cgx = -sgx
+            cgy = -sgy
+            cgz = -sgz
+            wp.atomic_add(
+                grad_cell_out,
+                0,
+                type(gcell)(
+                    type(gcell[0, 0])(sh0 * cgx),
+                    type(gcell[0, 0])(sh0 * cgy),
+                    type(gcell[0, 0])(sh0 * cgz),
+                    type(gcell[0, 0])(sh1 * cgx),
+                    type(gcell[0, 0])(sh1 * cgy),
+                    type(gcell[0, 0])(sh1 * cgz),
+                    type(gcell[0, 0])(sh2 * cgx),
+                    type(gcell[0, 0])(sh2 * cgy),
+                    type(gcell[0, 0])(sh2 * cgz),
+                ),
+            )
+
+
+def _dipole_csr_cell_grad_backward_sig(v, t):
+    """Signature builder for the l=1 cell-grad double-backward kernel."""
+    m = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=t),  # charges
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=m),  # cell
+        wp.array(dtype=wp.int32),  # idx_j
+        wp.array(dtype=wp.int32),  # neighbor_ptr
+        wp.array(dtype=wp.vec3i),  # unit_shifts
+        wp.array(dtype=t),  # sigma
+        wp.array(dtype=t),  # alpha
+        wp.array(dtype=wp.float64),  # per_direction_scale
+        wp.array(dtype=m),  # g_cell
+        wp.array(dtype=v),  # grad_positions (out)
+        wp.array(dtype=t),  # grad_charges (out)
+        wp.array(dtype=v),  # grad_dipoles (out)
+        wp.array(dtype=m),  # grad_cell_out (out)
+    ]
+
+
+_multipole_real_space_dipole_csr_cell_grad_backward_overloads = register_overloads(
+    _multipole_real_space_dipole_csr_cell_grad_backward_kernel,
+    _dipole_csr_cell_grad_backward_sig,
+)
+
+
+def multipole_real_space_dipole_csr_cell_grad_backward(
+    positions: wp.array,
+    charges: wp.array,
+    dipoles: wp.array,
+    cell: wp.array,
+    idx_j: wp.array,
+    neighbor_ptr: wp.array,
+    unit_shifts: wp.array,
+    sigma: wp.array,
+    alpha: wp.array,
+    per_direction_scale: wp.array,
+    g_cell: wp.array,
+    grad_positions: wp.array,
+    grad_charges: wp.array,
+    grad_dipoles: wp.array,
+    grad_cell_out: wp.array,
+    wp_dtype: type,
+    device: str | None = None,
+) -> None:
+    r"""Launcher for the l=1 cell-grad double-backward (stress-loss).
+
+    Caller pre-zeroes the four output arrays.
+    """
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    if device is None:
+        device = str(positions.device)
+    wp.launch(
+        _multipole_real_space_dipole_csr_cell_grad_backward_overloads[vec_dtype],
+        dim=positions.shape[0],
+        inputs=[
+            positions,
+            charges,
+            dipoles,
+            cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigma,
+            alpha,
+            per_direction_scale,
+            g_cell,
+        ],
+        outputs=[grad_positions, grad_charges, grad_dipoles, grad_cell_out],
+        device=device,
+    )
+
+
 # =============================================================================
 # l_max = 1 — fused energy + gradient, CSR neighbor-list, single-system
 # =============================================================================
