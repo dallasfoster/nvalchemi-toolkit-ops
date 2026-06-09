@@ -77,6 +77,7 @@ from nvalchemiops.torch._warp_op_helpers import (
 from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
     MultipoleSCFCache,
 )
+from nvalchemiops.torch.neighbors.neighbor_utils import prepare_batch_idx_ptr
 
 _TWO_PI_CUBED = (2.0 * math.pi) ** 3
 _TWO_PI_SIXTH = (2.0 * math.pi) ** 6
@@ -119,15 +120,19 @@ def _atom_bounds_from_batch_idx(
 
     Assumes ``batch_idx`` is sorted (atoms grouped by system), the convention
     :class:`MultipoleSCFCache` callers follow. Returns ``(B,)`` int32
-    tensors on the same device.
+    tensors on the same device. Reuses the shared CSR-pointer utility
+    :func:`prepare_batch_idx_ptr`; ``atom_start``/``atom_end`` are the
+    pointer's ``[:-1]``/``[1:]`` slices, padded to ``batch_size`` so trailing
+    empty systems map to empty ranges.
     """
-    device = batch_idx.device
-    counts = torch.bincount(batch_idx, minlength=batch_size)
-    atom_end = counts.cumsum(dim=0).to(torch.int32)
-    atom_start = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), atom_end[:-1]]
+    _, batch_ptr = prepare_batch_idx_ptr(
+        batch_idx, None, batch_idx.shape[0], batch_idx.device
     )
-    return atom_start, atom_end
+    if batch_ptr.shape[0] < batch_size + 1:
+        # Pad trailing empty systems with the final offset (no host sync).
+        pad = batch_ptr[-1:].expand(batch_size + 1 - batch_ptr.shape[0])
+        batch_ptr = torch.cat([batch_ptr, pad])
+    return batch_ptr[:-1].contiguous(), batch_ptr[1:].contiguous()
 
 
 # ---------------------------------------------------------------------------
