@@ -40,6 +40,7 @@ import warp as wp
 
 from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
     batch_multipole_pme_convolve_backward_launch,
+    batch_multipole_pme_convolve_double_backward_launch,
     batch_multipole_pme_convolve_launch,
     batch_multipole_pme_corrections_backward_launch,
     batch_multipole_pme_corrections_double_backward_launch,
@@ -53,6 +54,7 @@ from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
     batch_multipole_pme_spread_launch,
     batch_multipole_pme_spread_unified_launch,
     multipole_pme_convolve_backward_launch,
+    multipole_pme_convolve_double_backward_launch,
     multipole_pme_convolve_launch,
     multipole_pme_corrections_backward_launch,
     multipole_pme_corrections_double_backward_launch,
@@ -450,6 +452,86 @@ def _convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
     )
 
 
+def _convolve_double_backward_run(
+    gg_mesh_fft,
+    gg_k_squared,
+    gg_volume,
+    grad_convolved,
+    mesh_fft,
+    k_squared,
+    moduli_x,
+    moduli_y,
+    moduli_z,
+    alpha,
+    sigma,
+    volume,
+    launch_fn,
+    grad_volume_shape,
+):
+    r"""Shared single/batched convolve double-backward.
+
+    Returns grads w.r.t. the backward's inputs at
+    ``second_order_diff_positions = (0, 1, 2, 8)`` =
+    ``(grad_convolved, mesh_fft, k_squared, volume)``. The ``gg_mesh_fft``
+    cotangent is the force-loss path; ``gg_k_squared``/``gg_volume`` are the
+    cell-coupled stress-loss paths (``create_graph`` through ``dE/dcell``).
+    """
+    device = mesh_fft.device
+    real_dtype = k_squared.dtype
+    wp_scalar = get_wp_dtype(real_dtype)
+    wp_vec2 = wp.vec2d if wp_scalar == wp.float64 else wp.vec2f
+    cdtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+
+    if gg_mesh_fft is None:
+        gg_mesh_fft = torch.zeros_like(mesh_fft)
+    elif not gg_mesh_fft.is_complex():
+        gg_mesh_fft = gg_mesh_fft.to(cdtype)
+    if gg_k_squared is None:
+        gg_k_squared = torch.zeros_like(k_squared)
+    if gg_volume is None:
+        gg_volume = torch.zeros(grad_volume_shape, dtype=real_dtype, device=device)
+
+    mesh_fft_real = torch.view_as_real(mesh_fft.resolve_conj()).contiguous()
+    grad_conv_real = torch.view_as_real(grad_convolved.resolve_conj()).contiguous()
+    gg_mesh_real = torch.view_as_real(gg_mesh_fft.resolve_conj()).contiguous()
+
+    d_gc_real = torch.empty_like(mesh_fft_real)
+    d_mf_real = torch.empty_like(mesh_fft_real)
+    d_ksq = torch.empty_like(k_squared)
+    d_vol = torch.zeros(grad_volume_shape, dtype=real_dtype, device=device)
+
+    def _as(t):
+        return t.detach().to(real_dtype).contiguous()
+
+    with _scoped_warp_stream(device):
+        launch_fn(
+            _wp_from_torch(mesh_fft_real, dtype=wp_vec2),
+            _wp_from_torch(k_squared.contiguous(), dtype=wp_scalar),
+            _wp_from_torch(moduli_x.contiguous(), dtype=wp_scalar),
+            _wp_from_torch(moduli_y.contiguous(), dtype=wp_scalar),
+            _wp_from_torch(moduli_z.contiguous(), dtype=wp_scalar),
+            _wp_from_torch(_as(alpha), dtype=wp_scalar),
+            _wp_from_torch(_as(sigma), dtype=wp_scalar),
+            _wp_from_torch(_as(volume), dtype=wp_scalar),
+            _wp_from_torch(grad_conv_real, dtype=wp_vec2),
+            _wp_from_torch(gg_mesh_real, dtype=wp_vec2),
+            _wp_from_torch(gg_k_squared.contiguous(), dtype=wp_scalar),
+            _wp_from_torch(_as(gg_volume), dtype=wp_scalar),
+            _wp_from_torch(d_gc_real, dtype=wp_vec2),
+            _wp_from_torch(d_mf_real, dtype=wp_vec2),
+            _wp_from_torch(d_ksq, dtype=wp_scalar),
+            _wp_from_torch(d_vol, dtype=wp_scalar),
+            wp_dtype=wp_scalar,
+            device=str(wp.device_from_torch(device)),
+        )
+    return (
+        torch.view_as_complex(d_gc_real),
+        torch.view_as_complex(d_mf_real),
+        d_ksq,
+        d_vol,
+    )
+
+
 def _multipole_pme_convolve_double_backward(
     gg_mesh_fft,
     gg_k_squared,
@@ -464,11 +546,14 @@ def _multipole_pme_convolve_double_backward(
     sigma,
     volume,
 ):
-    """Double-backward of the single-system convolve (∂/∂grad_convolved)."""
-    if gg_mesh_fft is None:
-        return torch.zeros_like(grad_convolved)
-    return _multipole_pme_convolve_forward(
+    """Single-system convolve double-backward → (grad_convolved, mesh_fft,
+    k_squared, volume) grads."""
+    return _convolve_double_backward_run(
         gg_mesh_fft,
+        gg_k_squared,
+        gg_volume,
+        grad_convolved,
+        mesh_fft,
         k_squared,
         moduli_x,
         moduli_y,
@@ -476,6 +561,8 @@ def _multipole_pme_convolve_double_backward(
         alpha,
         sigma,
         volume,
+        multipole_pme_convolve_double_backward_launch,
+        (1,),
     )
 
 
@@ -493,11 +580,14 @@ def _batch_multipole_pme_convolve_double_backward(
     sigma,
     volume,
 ):
-    """Double-backward of the batched convolve (∂/∂grad_convolved)."""
-    if gg_mesh_fft is None:
-        return torch.zeros_like(grad_convolved)
-    return _batch_multipole_pme_convolve_forward(
+    """Batched convolve double-backward → (grad_convolved, mesh_fft, k_squared,
+    volume) grads; ``volume`` grad is per-system ``(B,)``."""
+    return _convolve_double_backward_run(
         gg_mesh_fft,
+        gg_k_squared,
+        gg_volume,
+        grad_convolved,
+        mesh_fft,
         k_squared,
         moduli_x,
         moduli_y,
@@ -505,6 +595,8 @@ def _batch_multipole_pme_convolve_double_backward(
         alpha,
         sigma,
         volume,
+        batch_multipole_pme_convolve_double_backward_launch,
+        (mesh_fft.shape[0],),
     )
 
 
@@ -521,18 +613,42 @@ def _batch_convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
     )
 
 
+def _convolve_double_backward_fake(
+    gg_mesh_fft, gg_k_squared, gg_volume, grad_convolved, mesh_fft, k_squared, *_args
+):
+    """Fake: grads of (grad_convolved, mesh_fft, k_squared, volume).
+
+    The first two are complex (fresh contiguous buffers); k_squared real;
+    volume ``(1,)`` single-system."""
+    return (
+        mesh_fft.new_empty(mesh_fft.shape),
+        mesh_fft.new_empty(mesh_fft.shape),
+        torch.empty_like(k_squared),
+        torch.empty((1,), dtype=k_squared.dtype, device=k_squared.device),
+    )
+
+
+def _batch_convolve_double_backward_fake(
+    gg_mesh_fft, gg_k_squared, gg_volume, grad_convolved, mesh_fft, k_squared, *_args
+):
+    """Batched fake: ``volume`` grad is per-system ``(B,)``."""
+    return (
+        mesh_fft.new_empty(mesh_fft.shape),
+        mesh_fft.new_empty(mesh_fft.shape),
+        torch.empty_like(k_squared),
+        torch.empty(
+            (mesh_fft.shape[0],), dtype=k_squared.dtype, device=k_squared.device
+        ),
+    )
+
+
 _CONVOLVE_DBWD_SCHEMA = (
     "(Tensor? gg_mesh_fft, Tensor? gg_k_squared, Tensor? gg_volume, "
     "Tensor grad_convolved, Tensor mesh_fft, Tensor k_squared, "
     "Tensor moduli_x, Tensor moduli_y, Tensor moduli_z, Tensor alpha, "
-    "Tensor sigma, Tensor volume) -> Tensor"
+    "Tensor sigma, Tensor volume) -> (Tensor, Tensor, Tensor, Tensor)"
 )
-_BATCH_CONVOLVE_DBWD_SCHEMA = (
-    "(Tensor? gg_mesh_fft, Tensor? gg_k_squared, Tensor? gg_volume, "
-    "Tensor grad_convolved, Tensor mesh_fft, Tensor k_squared, "
-    "Tensor moduli_x, Tensor moduli_y, Tensor moduli_z, Tensor alpha, "
-    "Tensor sigma, Tensor volume) -> Tensor"
-)
+_BATCH_CONVOLVE_DBWD_SCHEMA = _CONVOLVE_DBWD_SCHEMA
 
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_convolve",
@@ -544,13 +660,16 @@ register_warp_op_chain(
     # mesh_fft (0), k_squared (1), volume (7) — cell-grad.
     diff_input_positions=(0, 1, 7),
     n_forward_inputs=8,
-    # create_graph force-loss: the double-back w.r.t. grad_convolved
-    # (position 0 of the 9 backward inputs) is the same forward convolve
-    # applied to the upstream cotangent gg_mesh_fft.
+    # create_graph (force-loss + stress-loss). Backward inputs:
+    # grad_convolved=0, mesh_fft=1, k_squared=2, ..., volume=8. The double-back
+    # covers grad_convolved (force-loss) AND the k_squared/volume cotangent
+    # directions (stress-loss: create_graph through dE/dcell).
     double_backward=_multipole_pme_convolve_double_backward,
+    double_backward_fake=_convolve_double_backward_fake,
     double_backward_schema=_CONVOLVE_DBWD_SCHEMA,
-    second_order_diff_positions=(0,),
+    second_order_diff_positions=(0, 1, 2, 8),
     n_backward_inputs=9,
+    double_backward_return_arity=4,
 )
 
 
@@ -565,11 +684,13 @@ register_warp_op_chain(
     # cell-grad) through the convolve.
     diff_input_positions=(0, 1, 7),
     n_forward_inputs=8,
-    # create_graph force-loss (batched).
+    # create_graph force-loss + stress-loss (batched).
     double_backward=_batch_multipole_pme_convolve_double_backward,
+    double_backward_fake=_batch_convolve_double_backward_fake,
     double_backward_schema=_BATCH_CONVOLVE_DBWD_SCHEMA,
-    second_order_diff_positions=(0,),
+    second_order_diff_positions=(0, 1, 2, 8),
     n_backward_inputs=9,
+    double_backward_return_arity=4,
 )
 
 
@@ -4764,13 +4885,30 @@ def _batch_multipole_pme_reciprocal_space_impl(
         )
     else:
         quadrupoles_in = quadrupoles
-    rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified_batch(
+    # B-warp stress-loss path (mirror the single composite): factor all cell
+    # coupling into fractionalize (p=M·r, df=Mμ, Qf=MQMᵀ) so the batched spread
+    # runs cell-free with a per-system identity cell — bit-identical forward,
+    # cell autograd (stress + stress-loss) flows through fractionalize's
+    # analytic backward + the convolve k²/volume double-back.
+    p_frac, df_frac, qf_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
         positions,
-        charges,
+        cell_inv_t_resolved,
         dipoles,
         quadrupoles_in,
         batch_idx,
-        cell_inv_t_resolved,
+    )
+    identity_cell = (
+        torch.eye(3, dtype=positions.dtype, device=positions.device)
+        .unsqueeze(0)
+        .expand(B, 3, 3)
+    )
+    rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified_batch(
+        p_frac,
+        charges,
+        df_frac,
+        qf_frac,
+        batch_idx,
+        identity_cell,
         nx,
         ny,
         nz,

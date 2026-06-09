@@ -1805,6 +1805,180 @@ def multipole_pme_convolve_backward_launch(
     )
 
 
+@wp.kernel
+def _pme_multipole_convolve_double_backward_kernel(
+    mesh_fft: wp.array3d(dtype=Any),  # (Nx, Ny, Nz_rfft), vec2
+    k_squared: wp.array3d(dtype=Any),
+    moduli_x: wp.array(dtype=Any),
+    moduli_y: wp.array(dtype=Any),
+    moduli_z: wp.array(dtype=Any),
+    alpha: wp.array(dtype=Any),
+    sigma: wp.array(dtype=Any),
+    volume: wp.array(dtype=Any),
+    grad_convolved: wp.array3d(dtype=Any),  # (Nx, Ny, Nz_rfft), vec2 — gc
+    gg_mesh_fft: wp.array3d(dtype=Any),  # cotangent on grad_mesh_fft (vec2)
+    gg_k_squared: wp.array3d(dtype=Any),  # cotangent on grad_k_squared (scalar)
+    gg_volume: wp.array(dtype=Any),  # (1,) cotangent on grad_volume
+    d_grad_convolved: wp.array3d(dtype=Any),  # (out) ∂/∂grad_convolved (vec2)
+    d_mesh_fft: wp.array3d(dtype=Any),  # (out) ∂/∂mesh_fft (vec2)
+    d_k_squared: wp.array3d(dtype=Any),  # (out) ∂/∂k_squared (scalar)
+    d_volume: wp.array(dtype=Any),  # (1,) (out, atomic) ∂/∂volume
+):
+    r"""Double-backward (stress-loss) of the fused PME convolve.
+
+    Second-order of the backward
+    :math:`(gc, mf, k^2, V) \mapsto (g_{mf}, g_{k^2}, g_V)`. With
+    ``factor`` and ``β = -(1/4α² + σ²) - 1/k²`` as in the backward, the real
+    dots ``P = gg_mf·gc``, ``D = gc·mf``, the scalar
+    ``s = gg_ksq·β - gg_vol/V`` and ``W = P + D·s``:
+
+    - ``∂/∂grad_convolved = factor·gg_mf + factor·s·mf``
+    - ``∂/∂mesh_fft = factor·s·gc``
+    - ``∂/∂k² = factor·(β·W + gg_ksq·D/k⁴)``
+    - ``∂/∂V = Σ_g (factor/V)·(-W + D·gg_vol/V)`` (atomic).
+
+    The ``mesh_fft`` cotangent path (``gg_mesh_fft``) is the force-loss term;
+    the ``gg_k_squared``/``gg_volume`` paths are the cell-coupled stress-loss
+    terms that ``create_graph`` through ``dE/dcell`` requires.
+    """
+    i, j, k = wp.tid()
+
+    k_sq = k_squared[i, j, k]
+    alpha_ = alpha[0]
+    sigma_ = sigma[0]
+    volume_ = volume[0]
+
+    zero = type(k_sq)(0.0)
+    one = type(k_sq)(1.0)
+    four = type(k_sq)(4.0)
+    threshold = type(k_sq)(1e-10)
+    clamp_threshold = type(k_sq)(1e-10)
+    twopi = type(k_sq)(_TWOPI)
+
+    sf = moduli_x[i] * moduli_y[j] * moduli_z[k]
+    if sf < clamp_threshold:
+        sf = clamp_threshold
+    sf_sq = sf * sf
+
+    gc = grad_convolved[i, j, k]
+    mf = mesh_fft[i, j, k]
+    gmf = gg_mesh_fft[i, j, k]
+    gksq = gg_k_squared[i, j, k]
+    gvol = gg_volume[0]
+
+    zero_c = type(gc)(zero, zero)
+    if k_sq < threshold:
+        d_grad_convolved[i, j, k] = zero_c
+        d_mesh_fft[i, j, k] = zero_c
+        d_k_squared[i, j, k] = zero
+        return
+    if i == 0 and j == 0 and k == 0:
+        d_grad_convolved[i, j, k] = zero_c
+        d_mesh_fft[i, j, k] = zero_c
+        d_k_squared[i, j, k] = zero
+        return
+
+    combined_prefactor = one / (four * alpha_ * alpha_) + sigma_ * sigma_
+    factor = twopi * (wp.exp(-combined_prefactor * k_sq) / k_sq) / (volume_ * sf_sq)
+    beta = -combined_prefactor - one / k_sq
+
+    p_dot = gmf[0] * gc[0] + gmf[1] * gc[1]  # gg_mf · gc
+    d_dot = gc[0] * mf[0] + gc[1] * mf[1]  # gc · mf  (= dL_dfactor)
+    s = gksq * beta - gvol / volume_
+    w = p_dot + d_dot * s
+
+    # ∂/∂grad_convolved = factor·gg_mf + factor·s·mf.
+    d_grad_convolved[i, j, k] = type(gc)(
+        factor * gmf[0] + factor * s * mf[0],
+        factor * gmf[1] + factor * s * mf[1],
+    )
+    # ∂/∂mesh_fft = factor·s·gc.
+    d_mesh_fft[i, j, k] = type(gc)(factor * s * gc[0], factor * s * gc[1])
+    # ∂/∂k² = factor·(β·W + gg_ksq·D/k⁴).
+    d_k_squared[i, j, k] = factor * (beta * w + gksq * d_dot / (k_sq * k_sq))
+    # ∂/∂V = (factor/V)·(-W + D·gg_vol/V), summed.
+    wp.atomic_add(d_volume, 0, (factor / volume_) * (-w + d_dot * gvol / volume_))
+
+
+def _pme_multipole_convolve_double_backward_sig(v, t):
+    """Signature builder for the convolve double-backward kernel."""
+    vec2 = wp.vec2d if t == wp.float64 else wp.vec2f
+    return [
+        wp.array(dtype=vec2, ndim=3),  # mesh_fft
+        wp.array(dtype=t, ndim=3),  # k_squared
+        wp.array(dtype=t),  # moduli_x
+        wp.array(dtype=t),  # moduli_y
+        wp.array(dtype=t),  # moduli_z
+        wp.array(dtype=t),  # alpha
+        wp.array(dtype=t),  # sigma
+        wp.array(dtype=t),  # volume
+        wp.array(dtype=vec2, ndim=3),  # grad_convolved
+        wp.array(dtype=vec2, ndim=3),  # gg_mesh_fft
+        wp.array(dtype=t, ndim=3),  # gg_k_squared
+        wp.array(dtype=t),  # gg_volume
+        wp.array(dtype=vec2, ndim=3),  # d_grad_convolved (out)
+        wp.array(dtype=vec2, ndim=3),  # d_mesh_fft (out)
+        wp.array(dtype=t, ndim=3),  # d_k_squared (out)
+        wp.array(dtype=t),  # d_volume (out, atomic)
+    ]
+
+
+_pme_multipole_convolve_double_backward_overloads = register_overloads(
+    _pme_multipole_convolve_double_backward_kernel,
+    _pme_multipole_convolve_double_backward_sig,
+)
+
+
+def multipole_pme_convolve_double_backward_launch(
+    mesh_fft,
+    k_squared,
+    moduli_x,
+    moduli_y,
+    moduli_z,
+    alpha,
+    sigma,
+    volume,
+    grad_convolved,
+    gg_mesh_fft,
+    gg_k_squared,
+    gg_volume,
+    d_grad_convolved,
+    d_mesh_fft,
+    d_k_squared,
+    d_volume,
+    wp_dtype: type,
+    device: str | None = None,
+) -> None:
+    r"""Launch :func:`_pme_multipole_convolve_double_backward_kernel`.
+
+    ``d_volume`` is a ``(1,)`` array — must be zero-initialized.
+    """
+    if device is None:
+        device = str(mesh_fft.device)
+    nx, ny, nz_rfft = mesh_fft.shape
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    wp.launch(
+        _pme_multipole_convolve_double_backward_overloads[vec_dtype],
+        dim=(nx, ny, nz_rfft),
+        inputs=[
+            mesh_fft,
+            k_squared,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            alpha,
+            sigma,
+            volume,
+            grad_convolved,
+            gg_mesh_fft,
+            gg_k_squared,
+            gg_volume,
+        ],
+        outputs=[d_grad_convolved, d_mesh_fft, d_k_squared, d_volume],
+        device=device,
+    )
+
+
 @wp.kernel(enable_backward=False)
 def _batch_pme_multipole_convolve_kernel(
     mesh_fft: wp.array4d(dtype=Any),  # (B, Nx, Ny, Nz_rfft), complex as vec2
@@ -2158,6 +2332,160 @@ def batch_multipole_pme_convolve_backward_launch(
             grad_convolved,
         ],
         outputs=[grad_mesh_fft, grad_k_squared, grad_volume],
+        device=device,
+    )
+
+
+@wp.kernel
+def _batch_pme_multipole_convolve_double_backward_kernel(
+    mesh_fft: wp.array4d(dtype=Any),  # (B, Nx, Ny, Nz_rfft), vec2
+    k_squared: wp.array4d(dtype=Any),
+    moduli_x: wp.array(dtype=Any),
+    moduli_y: wp.array(dtype=Any),
+    moduli_z: wp.array(dtype=Any),
+    alpha: wp.array(dtype=Any),  # (B,)
+    sigma: wp.array(dtype=Any),  # (B,)
+    volume: wp.array(dtype=Any),  # (B,)
+    grad_convolved: wp.array4d(dtype=Any),  # (B, Nx, Ny, Nz_rfft), vec2 — gc
+    gg_mesh_fft: wp.array4d(dtype=Any),  # cotangent on grad_mesh_fft (vec2)
+    gg_k_squared: wp.array4d(dtype=Any),  # cotangent on grad_k_squared (scalar)
+    gg_volume: wp.array(dtype=Any),  # (B,) cotangent on grad_volume
+    d_grad_convolved: wp.array4d(dtype=Any),  # (out) ∂/∂grad_convolved (vec2)
+    d_mesh_fft: wp.array4d(dtype=Any),  # (out) ∂/∂mesh_fft (vec2)
+    d_k_squared: wp.array4d(dtype=Any),  # (out) ∂/∂k_squared (scalar)
+    d_volume: wp.array(dtype=Any),  # (B,) (out, atomic) ∂/∂volume
+):
+    r"""Batched analog of :func:`_pme_multipole_convolve_double_backward_kernel`
+    (per-system ``alpha``/``sigma``/``volume`` and per-system ``grad_volume``)."""
+    b, i, j, k = wp.tid()
+
+    k_sq = k_squared[b, i, j, k]
+    alpha_ = alpha[b]
+    sigma_ = sigma[b]
+    volume_ = volume[b]
+
+    zero = type(k_sq)(0.0)
+    one = type(k_sq)(1.0)
+    four = type(k_sq)(4.0)
+    threshold = type(k_sq)(1e-10)
+    clamp_threshold = type(k_sq)(1e-10)
+    twopi = type(k_sq)(_TWOPI)
+
+    sf = moduli_x[i] * moduli_y[j] * moduli_z[k]
+    if sf < clamp_threshold:
+        sf = clamp_threshold
+    sf_sq = sf * sf
+
+    gc = grad_convolved[b, i, j, k]
+    mf = mesh_fft[b, i, j, k]
+    gmf = gg_mesh_fft[b, i, j, k]
+    gksq = gg_k_squared[b, i, j, k]
+    gvol = gg_volume[b]
+
+    zero_c = type(gc)(zero, zero)
+    if k_sq < threshold:
+        d_grad_convolved[b, i, j, k] = zero_c
+        d_mesh_fft[b, i, j, k] = zero_c
+        d_k_squared[b, i, j, k] = zero
+        return
+    if i == 0 and j == 0 and k == 0:
+        d_grad_convolved[b, i, j, k] = zero_c
+        d_mesh_fft[b, i, j, k] = zero_c
+        d_k_squared[b, i, j, k] = zero
+        return
+
+    combined_prefactor = one / (four * alpha_ * alpha_) + sigma_ * sigma_
+    factor = twopi * (wp.exp(-combined_prefactor * k_sq) / k_sq) / (volume_ * sf_sq)
+    beta = -combined_prefactor - one / k_sq
+
+    p_dot = gmf[0] * gc[0] + gmf[1] * gc[1]
+    d_dot = gc[0] * mf[0] + gc[1] * mf[1]
+    s = gksq * beta - gvol / volume_
+    w = p_dot + d_dot * s
+
+    d_grad_convolved[b, i, j, k] = type(gc)(
+        factor * gmf[0] + factor * s * mf[0],
+        factor * gmf[1] + factor * s * mf[1],
+    )
+    d_mesh_fft[b, i, j, k] = type(gc)(factor * s * gc[0], factor * s * gc[1])
+    d_k_squared[b, i, j, k] = factor * (beta * w + gksq * d_dot / (k_sq * k_sq))
+    wp.atomic_add(d_volume, b, (factor / volume_) * (-w + d_dot * gvol / volume_))
+
+
+def _batch_pme_multipole_convolve_double_backward_sig(v, t):
+    """Signature builder for the batched convolve double-backward kernel."""
+    vec2 = wp.vec2d if t == wp.float64 else wp.vec2f
+    return [
+        wp.array(dtype=vec2, ndim=4),  # mesh_fft
+        wp.array(dtype=t, ndim=4),  # k_squared
+        wp.array(dtype=t),  # moduli_x
+        wp.array(dtype=t),  # moduli_y
+        wp.array(dtype=t),  # moduli_z
+        wp.array(dtype=t),  # alpha (B,)
+        wp.array(dtype=t),  # sigma (B,)
+        wp.array(dtype=t),  # volume (B,)
+        wp.array(dtype=vec2, ndim=4),  # grad_convolved
+        wp.array(dtype=vec2, ndim=4),  # gg_mesh_fft
+        wp.array(dtype=t, ndim=4),  # gg_k_squared
+        wp.array(dtype=t),  # gg_volume (B,)
+        wp.array(dtype=vec2, ndim=4),  # d_grad_convolved (out)
+        wp.array(dtype=vec2, ndim=4),  # d_mesh_fft (out)
+        wp.array(dtype=t, ndim=4),  # d_k_squared (out)
+        wp.array(dtype=t),  # d_volume (B,) (out, atomic)
+    ]
+
+
+_batch_pme_multipole_convolve_double_backward_overloads = register_overloads(
+    _batch_pme_multipole_convolve_double_backward_kernel,
+    _batch_pme_multipole_convolve_double_backward_sig,
+)
+
+
+def batch_multipole_pme_convolve_double_backward_launch(
+    mesh_fft,
+    k_squared,
+    moduli_x,
+    moduli_y,
+    moduli_z,
+    alpha,
+    sigma,
+    volume,
+    grad_convolved,
+    gg_mesh_fft,
+    gg_k_squared,
+    gg_volume,
+    d_grad_convolved,
+    d_mesh_fft,
+    d_k_squared,
+    d_volume,
+    wp_dtype: type,
+    device: str | None = None,
+) -> None:
+    r"""Batched launcher for :func:`_batch_pme_multipole_convolve_double_backward_kernel`.
+
+    ``d_volume`` is a ``(B,)`` array — must be zero-initialized."""
+    if device is None:
+        device = str(mesh_fft.device)
+    B, nx, ny, nz_rfft = mesh_fft.shape
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    wp.launch(
+        _batch_pme_multipole_convolve_double_backward_overloads[vec_dtype],
+        dim=(B, nx, ny, nz_rfft),
+        inputs=[
+            mesh_fft,
+            k_squared,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            alpha,
+            sigma,
+            volume,
+            grad_convolved,
+            gg_mesh_fft,
+            gg_k_squared,
+            gg_volume,
+        ],
+        outputs=[d_grad_convolved, d_mesh_fft, d_k_squared, d_volume],
         device=device,
     )
 

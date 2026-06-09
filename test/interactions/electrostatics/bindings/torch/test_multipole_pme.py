@@ -2919,3 +2919,135 @@ class TestFractionalizeOp:
         assert torch.autograd.gradgradcheck(
             fn, (pos, cell_inv_t, dip, quad), atol=1e-6, rtol=1e-4
         )
+
+
+class TestPMEStressLoss:
+    """Single-system PME reciprocal stress-LOSS (∂²E/∂cell∂pos) — Tier-1.
+
+    ``create_graph=True`` through ``dE/dcell`` then backprop to positions must
+    not raise, must be nonzero (silent-zero guard), and must FD-match. Covers
+    the B-warp ``fractionalize`` cell path + the convolve k²/volume double-back.
+    """
+
+    @pytest.mark.parametrize("lmax", [0, 1, 2])
+    def test_stress_loss_fd(self, lmax):
+        device = _torch_device()
+        torch.manual_seed(3 + lmax)
+        dt = torch.float64
+        n = 6
+        mesh = (20, 20, 20)
+        sigma, alpha = 1.0, 0.4
+
+        q = torch.randn(n, dtype=dt, device=device)
+        q = q - q.mean()
+        mu = torch.randn(n, 3, dtype=dt, device=device) if lmax >= 1 else None
+        if lmax >= 2:
+            qd = torch.randn(n, 3, 3, dtype=dt, device=device)
+            qd = 0.5 * (qd + qd.transpose(1, 2))
+            tr = torch.diagonal(qd, dim1=1, dim2=2).mean(-1)
+            qd = qd - tr[:, None, None] * torch.eye(3, dtype=dt, device=device)
+        else:
+            qd = None
+        mm = pack_multipole_moments(q, dipoles=mu, quadrupoles=qd)
+        cell0 = torch.randn(3, 3, dtype=dt, device=device) * 0.3 + 6 * torch.eye(
+            3, dtype=dt, device=device
+        )
+        # Off-grid jitter to avoid the B-spline-knot FD artifact.
+        pos0 = (torch.rand(n, 3, dtype=dt, device=device) - 0.5) * 5.0 + 0.137
+        w = torch.randn(3, 3, dtype=dt, device=device)
+
+        def stress_loss(pos, cell):
+            E = multipole_pme_reciprocal_space(
+                pos,
+                mm,
+                cell,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh,
+                spline_order=4,
+            )
+            (stress,) = torch.autograd.grad(E, cell, create_graph=True)
+            return (stress * w).sum()
+
+        pos = pos0.clone().requires_grad_(True)
+        cell = cell0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(stress_loss(pos, cell), pos)
+        assert gp.abs().max() > 1e-8, "silent zero: d(stress-loss)/dpos == 0"
+
+        v = torch.randn(n, 3, dtype=dt, device=device)
+        eps = 1e-5
+
+        def sval(p):
+            return stress_loss(
+                p.clone().requires_grad_(True), cell0.clone().requires_grad_(True)
+            ).item()
+
+        fd = (sval(pos0 + eps * v) - sval(pos0 - eps * v)) / (2 * eps)
+        ana = (gp * v).sum().item()
+        rel = abs(ana - fd) / (abs(fd) + 1e-12)
+        assert rel < 1e-5, f"lmax={lmax}: stress-loss FD rel={rel:.2e}"
+
+    @pytest.mark.parametrize("lmax", [0, 1, 2])
+    def test_stress_loss_fd_batched(self, lmax):
+        device = _torch_device()
+        torch.manual_seed(11 + lmax)
+        dt = torch.float64
+        counts = [5, 4]
+        B = len(counts)
+        ntot = sum(counts)
+        mesh = (20, 20, 20)
+        sigma, alpha = 1.0, 0.4
+        batch_idx = torch.cat(
+            [torch.full((c,), b, dtype=torch.int32) for b, c in enumerate(counts)]
+        ).to(device)
+
+        q = torch.randn(ntot, dtype=dt, device=device)
+        for b in range(B):
+            m = batch_idx == b
+            q[m] = q[m] - q[m].mean()
+        mu = torch.randn(ntot, 3, dtype=dt, device=device) if lmax >= 1 else None
+        if lmax >= 2:
+            qd = torch.randn(ntot, 3, 3, dtype=dt, device=device)
+            qd = 0.5 * (qd + qd.transpose(1, 2))
+            tr = torch.diagonal(qd, dim1=1, dim2=2).mean(-1)
+            qd = qd - tr[:, None, None] * torch.eye(3, dtype=dt, device=device)
+        else:
+            qd = None
+        mm = pack_multipole_moments(q, dipoles=mu, quadrupoles=qd)
+        cell0 = torch.randn(B, 3, 3, dtype=dt, device=device) * 0.3 + 6 * torch.eye(
+            3, dtype=dt, device=device
+        )
+        pos0 = (torch.rand(ntot, 3, dtype=dt, device=device) - 0.5) * 5.0 + 0.137
+        w = torch.randn(B, 3, 3, dtype=dt, device=device)
+
+        def stress_loss(pos, cell):
+            E = multipole_pme_reciprocal_space(
+                pos,
+                mm,
+                cell,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh,
+                spline_order=4,
+                batch_idx=batch_idx,
+            )
+            (stress,) = torch.autograd.grad(E.sum(), cell, create_graph=True)
+            return (stress * w).sum()
+
+        pos = pos0.clone().requires_grad_(True)
+        cell = cell0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(stress_loss(pos, cell), pos)
+        assert gp.abs().max() > 1e-8, "batched silent zero"
+
+        v = torch.randn(ntot, 3, dtype=dt, device=device)
+        eps = 1e-5
+
+        def sval(p):
+            return stress_loss(
+                p.clone().requires_grad_(True), cell0.clone().requires_grad_(True)
+            ).item()
+
+        fd = (sval(pos0 + eps * v) - sval(pos0 - eps * v)) / (2 * eps)
+        ana = (gp * v).sum().item()
+        rel = abs(ana - fd) / (abs(fd) + 1e-12)
+        assert rel < 1e-5, f"lmax={lmax}: batched stress-loss FD rel={rel:.2e}"
