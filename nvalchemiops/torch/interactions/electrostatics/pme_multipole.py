@@ -184,6 +184,13 @@ def _resolve_pme_k_squared(
     ``mesh_dimensions`` (both constant once equilibrated).
     """
     if k_squared is not None:
+        nx, ny, nz = mesh_dimensions
+        expected = (nx, ny, nz // 2 + 1)
+        if tuple(k_squared.shape) != expected:
+            raise ValueError(
+                f"k_squared shape {tuple(k_squared.shape)} != expected {expected} "
+                f"(rfft grid for mesh_dimensions={mesh_dimensions})"
+            )
         return k_squared.to(dtype=dtype, device=cell.device).contiguous()
     return _build_pme_k_grids(cell, mesh_dimensions, dtype)
 
@@ -196,6 +203,13 @@ def _resolve_batch_pme_k_squared(
 ) -> torch.Tensor:
     """Batched companion to :func:`_resolve_pme_k_squared`."""
     if k_squared is not None:
+        nx, ny, nz = mesh_dimensions
+        expected = (cells.shape[0], nx, ny, nz // 2 + 1)
+        if tuple(k_squared.shape) != expected:
+            raise ValueError(
+                f"k_squared shape {tuple(k_squared.shape)} != expected {expected} "
+                f"(B={cells.shape[0]}, rfft grid for mesh_dimensions={mesh_dimensions})"
+            )
         return k_squared.to(dtype=dtype, device=cells.device).contiguous()
     return _build_batch_pme_k_grids(cells, mesh_dimensions, dtype)
 
@@ -3944,7 +3958,10 @@ def multipole_pme_reciprocal_space(
         k_squared = _resolve_pme_k_squared(cell_2d, mesh_dimensions, dtype, k_squared)
         alpha_t = torch.tensor([alpha], dtype=dtype, device=positions.device)
         sigma_t = torch.tensor([sigma], dtype=dtype, device=positions.device)
-        volume_t = volume.to(dtype).unsqueeze(0)
+        # ``volume`` may be ``()`` or ``(1,)``; reshape to a definite ``(1,)`` to
+        # match the ``alpha_t``/``sigma_t`` convention (unsqueeze turns ``(1,)``
+        # into ``(1, 1)``). reshape keeps the cell-autograd graph for stress.
+        volume_t = volume.to(dtype).reshape(1)
         moduli_x, moduli_y, moduli_z = _resolve_pme_moduli(
             mesh_dimensions, spline_order, dtype, positions.device, moduli
         )
@@ -4423,17 +4440,24 @@ def _batch_multipole_pme_reciprocal_space_impl(
     # quadrupoles tensors (no None), so materialize zeros for lower orders.
     # Routing through the unified op gives batched create_graph (force-loss)
     # at every l_max via its double-back.
+    # l_max from which channels are actually supplied (mirror the single path):
+    # quadrupoles -> 2, dipoles -> 1, charges-only -> 0. Materialize zeros for the
+    # absent higher channels (the unified op needs concrete tensors).
+    if quadrupoles is not None:
+        lmax = 2
+    elif dipoles is not None:
+        lmax = 1
+    else:
+        lmax = 0
     if dipoles is None:
         dipoles = torch.zeros(
             (positions.shape[0], 3), dtype=positions.dtype, device=positions.device
         )
     if quadrupoles is None:
-        lmax = 1
         quadrupoles_in = torch.zeros(
             (positions.shape[0], 3, 3), dtype=positions.dtype, device=positions.device
         )
     else:
-        lmax = 2
         quadrupoles_in = quadrupoles
     rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified_batch(
         positions,

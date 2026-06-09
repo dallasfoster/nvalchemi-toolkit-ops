@@ -45,16 +45,10 @@ from nvalchemiops.torch.interactions.electrostatics.multipole_electrostatics imp
     multipole_reciprocal_space_energy,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
-    MultipoleRealSpaceBackwardFunction,
-    MultipoleRealSpaceFunction,
-    MultipoleRealSpaceMonopoleBackwardFunction,
-    MultipoleRealSpaceMonopoleFunction,
     multipole_ewald_summation,
     multipole_real_space_energy,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_ewald_quadrupole import (
-    MultipoleRealSpaceQuadrupoleBackwardFunction,
-    MultipoleRealSpaceQuadrupoleFunction,
     multipole_real_space_quadrupole_energy,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_features import (
@@ -130,14 +124,8 @@ __all__ = [
     "multipole_scf_step_features",
     # Multipole Ewald (real-space l_max=0/1)
     "multipole_real_space_energy",
-    "MultipoleRealSpaceFunction",
-    "MultipoleRealSpaceBackwardFunction",
-    "MultipoleRealSpaceMonopoleFunction",
-    "MultipoleRealSpaceMonopoleBackwardFunction",
     # Multipole Ewald (real-space l_max=2 per-atom)
     "multipole_real_space_quadrupole_energy",
-    "MultipoleRealSpaceQuadrupoleFunction",
-    "MultipoleRealSpaceQuadrupoleBackwardFunction",
     # Composite Ewald summation (real + reciprocal - self)
     "multipole_ewald_summation",
     # Composite Particle-Mesh Ewald (l_max=0/1/2)
