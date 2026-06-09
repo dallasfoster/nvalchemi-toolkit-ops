@@ -11167,6 +11167,149 @@ def _rho_phihat_grad_sig(v, t):
 
 
 @wp.kernel
+def _rho_phihat_grad_double_backward_kernel(
+    g_phi: wp.array3d(dtype=wp.float64),  # (N_k, 4, 2) cotangent on grad_phi
+    charges: wp.array(dtype=Any),  # (N_atoms,)
+    dipoles: wp.array(dtype=Any),  # (N_atoms,) vec3
+    positions: wp.array(dtype=Any),  # (N_atoms,) vec3
+    cosines: wp.array2d(dtype=wp.float64),  # (N_k, N_atoms)
+    sines: wp.array2d(dtype=wp.float64),  # (N_k, N_atoms)
+    k_vectors: wp.array(dtype=wp.vec3d),  # (N_k,)
+    grad_rho: wp.array2d(dtype=wp.float64),  # (N_k, 2)
+    scale: wp.float64,
+    ggrad_rho: wp.array2d(dtype=wp.float64),  # (N_k, 2) OUTPUT (per-k)
+    ggrad_moments: wp.array2d(dtype=wp.float64),  # (N_atoms, 4) OUTPUT (atomic)
+    ggrad_positions: wp.array(dtype=wp.vec3d),  # (N_atoms,) OUTPUT (atomic)
+    ggrad_kvec: wp.array2d(dtype=wp.float64),  # (N_k, 3) OUTPUT (per-k)
+):
+    r"""Second-order backward of :func:`_rho_phihat_grad_kernel`.
+
+    The first backward is ``grad_phi[lm] = scale·(gr·c_lm − gi·s_lm,
+    gr·s_lm + gi·c_lm)`` with ``c_lm = Σ_i Q_{i,lm}·cos(k·r_i)``. With cotangent
+    ``G = ∂L/∂grad_phi`` and ``dLdc[lm] = scale·(gr·G_{lm,r} + gi·G_{lm,i})``,
+    ``dLds[lm] = scale·(−gi·G_{lm,r} + gr·G_{lm,i})``:
+
+    .. math::
+
+        \partial L/\partial gr &= scale·Σ_{lm}(G_{lm,r} c_{lm} + G_{lm,i} s_{lm}) \\
+        \partial L/\partial gi &= scale·Σ_{lm}(−G_{lm,r} s_{lm} + G_{lm,i} c_{lm}) \\
+        \partial L/\partial Q_{i,lm} &= Σ_k(dLdc[lm]\cos_{ki} + dLds[lm]\sin_{ki}) \\
+        \partial L/\partial r_i &= Σ_k w_{ki}\,k, \quad
+        \partial L/\partial k &= Σ_i w_{ki}\,r_i
+
+    with ``w_{ki} = Σ_{lm} Q_{i,lm}(−dLdc[lm]\sin_{ki} + dLds[lm]\cos_{ki})``.
+    ``Q_{i,lm}`` layout: ``(q, μ_y, μ_z, μ_x)``. ``ggrad_moments`` /
+    ``ggrad_positions`` accumulate over k (per-k threads) so must be pre-zeroed.
+
+    Launch Grid
+    -----------
+    dim = [N_k] — one thread per k-vector; sweeps all atoms.
+    """
+    k_idx = wp.tid()
+    n_atoms = cosines.shape[1]
+    gr = grad_rho[k_idx, 0]
+    gi = grad_rho[k_idx, 1]
+    kv = k_vectors[k_idx]
+
+    dLdc0 = scale * (gr * g_phi[k_idx, 0, 0] + gi * g_phi[k_idx, 0, 1])
+    dLds0 = scale * (-gi * g_phi[k_idx, 0, 0] + gr * g_phi[k_idx, 0, 1])
+    dLdc1 = scale * (gr * g_phi[k_idx, 1, 0] + gi * g_phi[k_idx, 1, 1])
+    dLds1 = scale * (-gi * g_phi[k_idx, 1, 0] + gr * g_phi[k_idx, 1, 1])
+    dLdc2 = scale * (gr * g_phi[k_idx, 2, 0] + gi * g_phi[k_idx, 2, 1])
+    dLds2 = scale * (-gi * g_phi[k_idx, 2, 0] + gr * g_phi[k_idx, 2, 1])
+    dLdc3 = scale * (gr * g_phi[k_idx, 3, 0] + gi * g_phi[k_idx, 3, 1])
+    dLds3 = scale * (-gi * g_phi[k_idx, 3, 0] + gr * g_phi[k_idx, 3, 1])
+
+    c0 = wp.float64(0.0)
+    c1 = wp.float64(0.0)
+    c2 = wp.float64(0.0)
+    c3 = wp.float64(0.0)
+    s0 = wp.float64(0.0)
+    s1 = wp.float64(0.0)
+    s2 = wp.float64(0.0)
+    s3 = wp.float64(0.0)
+    gkx = wp.float64(0.0)
+    gky = wp.float64(0.0)
+    gkz = wp.float64(0.0)
+    for i in range(n_atoms):
+        cos_ki = cosines[k_idx, i]
+        sin_ki = sines[k_idx, i]
+        q = wp.float64(charges[i])
+        mu = dipoles[i]
+        mu_x = wp.float64(mu[0])
+        mu_y = wp.float64(mu[1])
+        mu_z = wp.float64(mu[2])
+        c0 += cos_ki * q
+        s0 += sin_ki * q
+        c1 += cos_ki * mu_y
+        s1 += sin_ki * mu_y
+        c2 += cos_ki * mu_z
+        s2 += sin_ki * mu_z
+        c3 += cos_ki * mu_x
+        s3 += sin_ki * mu_x
+
+        wp.atomic_add(ggrad_moments, i, 0, dLdc0 * cos_ki + dLds0 * sin_ki)
+        wp.atomic_add(ggrad_moments, i, 1, dLdc1 * cos_ki + dLds1 * sin_ki)
+        wp.atomic_add(ggrad_moments, i, 2, dLdc2 * cos_ki + dLds2 * sin_ki)
+        wp.atomic_add(ggrad_moments, i, 3, dLdc3 * cos_ki + dLds3 * sin_ki)
+
+        a0 = -dLdc0 * sin_ki + dLds0 * cos_ki
+        a1 = -dLdc1 * sin_ki + dLds1 * cos_ki
+        a2 = -dLdc2 * sin_ki + dLds2 * cos_ki
+        a3 = -dLdc3 * sin_ki + dLds3 * cos_ki
+        w_ki = q * a0 + mu_y * a1 + mu_z * a2 + mu_x * a3
+        wp.atomic_add(
+            ggrad_positions, i, wp.vec3d(w_ki * kv[0], w_ki * kv[1], w_ki * kv[2])
+        )
+        pos_i = positions[i]
+        gkx += w_ki * wp.float64(pos_i[0])
+        gky += w_ki * wp.float64(pos_i[1])
+        gkz += w_ki * wp.float64(pos_i[2])
+
+    ggrad_rho[k_idx, 0] = scale * (
+        g_phi[k_idx, 0, 0] * c0
+        + g_phi[k_idx, 1, 0] * c1
+        + g_phi[k_idx, 2, 0] * c2
+        + g_phi[k_idx, 3, 0] * c3
+        + g_phi[k_idx, 0, 1] * s0
+        + g_phi[k_idx, 1, 1] * s1
+        + g_phi[k_idx, 2, 1] * s2
+        + g_phi[k_idx, 3, 1] * s3
+    )
+    ggrad_rho[k_idx, 1] = scale * (
+        -g_phi[k_idx, 0, 0] * s0
+        - g_phi[k_idx, 1, 0] * s1
+        - g_phi[k_idx, 2, 0] * s2
+        - g_phi[k_idx, 3, 0] * s3
+        + g_phi[k_idx, 0, 1] * c0
+        + g_phi[k_idx, 1, 1] * c1
+        + g_phi[k_idx, 2, 1] * c2
+        + g_phi[k_idx, 3, 1] * c3
+    )
+    ggrad_kvec[k_idx, 0] = gkx
+    ggrad_kvec[k_idx, 1] = gky
+    ggrad_kvec[k_idx, 2] = gkz
+
+
+def _rho_phihat_grad_double_backward_sig(v, t):
+    return [
+        wp.array3d(dtype=wp.float64),  # g_phi
+        wp.array(dtype=t),  # charges
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=v),  # positions
+        wp.array2d(dtype=wp.float64),  # cosines
+        wp.array2d(dtype=wp.float64),  # sines
+        wp.array(dtype=wp.vec3d),  # k_vectors
+        wp.array2d(dtype=wp.float64),  # grad_rho
+        wp.float64,  # scale
+        wp.array2d(dtype=wp.float64),  # ggrad_rho
+        wp.array2d(dtype=wp.float64),  # ggrad_moments
+        wp.array(dtype=wp.vec3d),  # ggrad_positions
+        wp.array2d(dtype=wp.float64),  # ggrad_kvec
+    ]
+
+
+@wp.kernel
 def _rho_q_coeff2_grad_kernel(
     quadrupoles: wp.array(dtype=Any),  # (N_atoms,) mat33
     cosines: wp.array2d(dtype=wp.float64),  # (N_k, N_atoms)
@@ -13854,6 +13997,53 @@ def rho_phihat_grad(
     )
 
 
+def rho_phihat_grad_double_backward(
+    g_phi: wp.array,
+    charges: wp.array,
+    dipoles: wp.array,
+    positions: wp.array,
+    cosines: wp.array,
+    sines: wp.array,
+    k_vectors: wp.array,
+    grad_rho: wp.array,
+    scale: float,
+    ggrad_rho: wp.array,
+    ggrad_moments: wp.array,
+    ggrad_positions: wp.array,
+    ggrad_kvec: wp.array,
+    wp_dtype: type,
+    device: str | None = None,
+) -> None:
+    """Launcher for :func:`_rho_phihat_grad_double_backward_kernel`.
+
+    ``ggrad_moments`` / ``ggrad_positions`` accumulate over k via atomics and
+    must be pre-zeroed by the caller.
+    """
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    if device is None:
+        device = str(cosines.device)
+    wp.launch(
+        _rho_phihat_grad_double_backward_overloads[vec_dtype],
+        dim=cosines.shape[0],
+        inputs=[
+            g_phi,
+            charges,
+            dipoles,
+            positions,
+            cosines,
+            sines,
+            k_vectors,
+            grad_rho,
+            wp.float64(scale),
+            ggrad_rho,
+            ggrad_moments,
+            ggrad_positions,
+            ggrad_kvec,
+        ],
+        device=device,
+    )
+
+
 def rho_q_coeff2_grad(
     quadrupoles: wp.array,
     cosines: wp.array,
@@ -14314,6 +14504,9 @@ _batch_rhoq_posgrad_bw_positions_overloads = register_overloads(
 )
 _rho_phihat_grad_overloads = register_overloads(
     _rho_phihat_grad_kernel, _rho_phihat_grad_sig
+)
+_rho_phihat_grad_double_backward_overloads = register_overloads(
+    _rho_phihat_grad_double_backward_kernel, _rho_phihat_grad_double_backward_sig
 )
 _rho_kphase_grad_overloads = register_overloads(
     _rho_kphase_grad_kernel, _rho_kphase_grad_sig
