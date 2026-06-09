@@ -1532,8 +1532,12 @@ energy = multipole_particle_mesh_ewald(
 ```
 
 As with point-charge PME, `alpha` and `mesh_dimensions` are estimated from the
-requested `accuracy` when omitted, and within a batch each system may use a
-different `alpha` but shares the same mesh dimensions.
+requested `accuracy` when omitted. Unlike point-charge PME, batched multipole
+PME requires a **single shared `alpha`** across the batch: when `alpha` is
+auto-estimated and the per-system estimates differ,
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_particle_mesh_ewald`
+raises a `ValueError` — pass an explicit `alpha` (and `mesh_dimensions`) for
+heterogeneous batches.
 
 ### Atom-Centered Features
 

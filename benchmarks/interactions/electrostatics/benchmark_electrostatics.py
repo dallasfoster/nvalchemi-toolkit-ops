@@ -855,10 +855,15 @@ def prepare_multipole_single_system(
         "batch_idx": None,
         "alpha": _MULTIPOLE_ALPHA,
         "spline_order": 4,
-        "mesh_dimensions": None,
     }
     _attach_multipole_moments(system_data, l_max, device, dtype)
     _attach_multipole_csr(system_data, _MULTIPOLE_SIGMA, _MULTIPOLE_ALPHA)
+    # Precompute the PME mesh before timing so the timed call excludes
+    # auto-estimation (matches the monopole PME path; fair single-call timing).
+    pme_params = _torch_electrostatics.estimate_multipole_pme_parameters(
+        system_data["positions"], cell, sigma=_MULTIPOLE_SIGMA
+    )
+    system_data["mesh_dimensions"] = pme_params.mesh_dimensions
     return system_data
 
 
@@ -914,10 +919,15 @@ def prepare_multipole_batch_system(
         "batch_size": batch_size,
         "alpha": _MULTIPOLE_ALPHA,
         "spline_order": 4,
-        "mesh_dimensions": None,
     }
     _attach_multipole_moments(system_data, l_max, device, dtype)
     _attach_multipole_csr(system_data, _MULTIPOLE_SIGMA, _MULTIPOLE_ALPHA)
+    # Precompute the shared PME mesh before timing so the timed call excludes
+    # auto-estimation (matches the monopole PME path; fair single-call timing).
+    pme_params = _torch_electrostatics.estimate_multipole_pme_parameters(
+        positions, cells, sigma=_MULTIPOLE_SIGMA, batch_idx=batch_idx
+    )
+    system_data["mesh_dimensions"] = pme_params.mesh_dimensions
     return system_data
 
 
@@ -2207,7 +2217,15 @@ def run_torch_dsf(
 
 
 def run_benchmark(
-    method: Literal["ewald", "ewald_slab", "pme", "pme_slab", "dsf"],
+    method: Literal[
+        "ewald",
+        "ewald_slab",
+        "pme",
+        "pme_slab",
+        "dsf",
+        "multipole_ewald",
+        "multipole_pme",
+    ],
     backend: Literal["torch", "jax", "torchpme", "torch_dsf"],
     system_data: dict,
     component: Literal["real", "reciprocal", "full"],
