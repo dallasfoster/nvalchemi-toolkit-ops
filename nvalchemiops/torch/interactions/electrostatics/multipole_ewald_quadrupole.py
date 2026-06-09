@@ -35,6 +35,7 @@ from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
 )
 from nvalchemiops.interactions.electrostatics.multipole_ewald_quadrupole_2nd_backward import (
     batch_multipole_real_space_quadrupole_csr_energy_2nd_backward,
+    multipole_real_space_quadrupole_csr_cell_grad_backward,
     multipole_real_space_quadrupole_csr_energy_2nd_backward,
 )
 from nvalchemiops.torch.types import (
@@ -614,6 +615,120 @@ def _(
     half_neighbor_list,
 ):
     return torch.empty_like(cell)
+
+
+def _rs_quadrupole_cell_grad_setup(ctx, inputs, output):
+    """Save inputs for the l=2 cell-grad double-backward (stress-loss)."""
+    (
+        grad_energies,
+        positions,
+        charges,
+        dipoles,
+        quadrupoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        half_neighbor_list,
+    ) = inputs
+    ctx.save_for_backward(
+        grad_energies,
+        positions,
+        charges,
+        dipoles,
+        quadrupoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+    )
+    ctx.half_neighbor_list = half_neighbor_list
+
+
+def _rs_quadrupole_cell_grad_backward(ctx, g_cell):
+    """∂/∂{grad_energies, positions, charges, dipoles, quadrupoles, cell} of
+    ⟨g_cell, dE/dcell⟩ (l=2 stress-loss)."""
+    (
+        grad_energies,
+        positions,
+        charges,
+        dipoles,
+        quadrupoles,
+        cell,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+    ) = ctx.saved_tensors
+    need = ctx.needs_input_grad
+    if not any(need[:6]):
+        return (None,) * 12
+    device = positions.device
+    wp_device = wp.device_from_torch(device)
+    dtype = positions.dtype
+    wp_scalar = get_wp_dtype(dtype)
+    wp_vec = get_wp_vec_dtype(dtype)
+    wp_mat = get_wp_mat_dtype(dtype)
+    n = positions.shape[0]
+    scale_val = 1.0 if ctx.half_neighbor_list else 0.5
+    scale = torch.tensor([scale_val], dtype=torch.float64, device=device)
+    grad_ge = torch.zeros(n, dtype=torch.float64, device=device)
+    grad_positions = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_charges = torch.zeros(n, dtype=dtype, device=device)
+    grad_dipoles = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_quadrupoles = torch.zeros((n, 3, 3), dtype=dtype, device=device)
+    grad_cell_cc = torch.zeros((1, 3, 3), dtype=dtype, device=device)
+    multipole_real_space_quadrupole_csr_cell_grad_backward(
+        wp.from_torch(positions.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(quadrupoles.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(idx_j.contiguous(), dtype=wp.int32),
+        wp.from_torch(neighbor_ptr.contiguous(), dtype=wp.int32),
+        wp.from_torch(unit_shifts.contiguous(), dtype=wp.vec3i),
+        wp.from_torch(sigma.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(alpha.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(scale, dtype=wp.float64),
+        wp.from_torch(
+            grad_energies.detach().to(torch.float64).contiguous(), dtype=wp.float64
+        ),
+        wp.from_torch(g_cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(grad_ge, dtype=wp.float64),
+        wp.from_torch(grad_positions, dtype=wp_vec),
+        wp.from_torch(grad_charges, dtype=wp_scalar),
+        wp.from_torch(grad_dipoles, dtype=wp_vec),
+        wp.from_torch(grad_quadrupoles, dtype=wp_mat),
+        wp.from_torch(grad_cell_cc, dtype=wp_mat),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return (
+        grad_ge.to(grad_energies.dtype) if need[0] else None,
+        grad_positions if need[1] else None,
+        grad_charges if need[2] else None,
+        grad_dipoles if need[3] else None,
+        grad_quadrupoles if need[4] else None,
+        grad_cell_cc.reshape(cell.shape) if need[5] else None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_real_space_quadrupole_cell_grad",
+    _rs_quadrupole_cell_grad_backward,
+    setup_context=_rs_quadrupole_cell_grad_setup,
+)
 
 
 @torch.library.custom_op(

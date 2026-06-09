@@ -1181,3 +1181,64 @@ class TestRealSpaceDipoleStressLoss:
             - sloss(pos0, cs(), q0, mu0 - eps * vm).item()
         ) / (2 * eps)
         assert abs((gm * vm).sum().item() - fdm) / (abs(fdm) + 1e-12) < 1e-5
+
+
+class TestRealSpaceQuadrupoleStressLoss:
+    """l=2 real-space cell-grad double-backward (∂²E/∂cell∂θ) — Tier-1 S3.
+
+    Validates stress-loss to positions/charges/dipoles/quadrupoles/cell via
+    the public l=2 entry (whose backward routes the cell-grad op).
+    """
+
+    def test_stress_loss_fd(self):
+        from nvalchemiops.torch.interactions.electrostatics.multipole_ewald_quadrupole import (  # noqa: E501
+            multipole_real_space_quadrupole_energy as qe,
+        )
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dt = torch.float64
+        rng = np.random.default_rng(7)
+        n, lbox = 5, 4.0
+        cell_np = np.diag([lbox, lbox, lbox]) + rng.normal(scale=0.2, size=(3, 3))
+        pos_np = rng.uniform(0, lbox, size=(n, 3))
+        idx_j, nptr, shifts = _periodic_csr(pos_np, cell_np, 5.0, device)
+        sigma = torch.tensor([0.5], dtype=dt, device=device)
+        alpha = torch.tensor([0.35], dtype=dt, device=device)
+        q0 = torch.tensor(rng.normal(size=n), dtype=dt, device=device)
+        q0 = q0 - q0.mean()
+        mu0 = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+        Qr = rng.normal(size=(n, 3, 3))
+        Qr = 0.5 * (Qr + Qr.transpose(0, 2, 1))
+        Q0 = torch.tensor(Qr, dtype=dt, device=device)
+        cell0 = torch.tensor(cell_np, dtype=dt, device=device).unsqueeze(0)
+        pos0 = torch.tensor(pos_np, dtype=dt, device=device)
+        w = torch.tensor(rng.normal(size=(1, 3, 3)), dtype=dt, device=device)
+        cs = lambda: cell0.clone().requires_grad_(True)  # noqa: E731
+
+        def sloss(pos, cell, q, mu, Q):
+            e = qe(pos, q, mu, Q, cell, idx_j, nptr, shifts, sigma, alpha).sum()
+            (stress,) = torch.autograd.grad(e, cell, create_graph=True)
+            return (stress * w).sum()
+
+        eps = 1e-6
+        # positions
+        pos = pos0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(sloss(pos, cs(), q0, mu0, Q0), pos)
+        assert gp.abs().max() > 1e-8, "silent zero (positions)"
+        vp = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+        fdp = (
+            sloss(pos0 + eps * vp, cs(), q0, mu0, Q0).item()
+            - sloss(pos0 - eps * vp, cs(), q0, mu0, Q0).item()
+        ) / (2 * eps)
+        assert abs((gp * vp).sum().item() - fdp) / (abs(fdp) + 1e-12) < 1e-5
+        # quadrupoles
+        Qg = Q0.clone().requires_grad_(True)
+        (gQ,) = torch.autograd.grad(sloss(pos0, cs(), q0, mu0, Qg), Qg)
+        vQr = rng.normal(size=(n, 3, 3))
+        vQr = 0.5 * (vQr + vQr.transpose(0, 2, 1))
+        vQ = torch.tensor(vQr, dtype=dt, device=device)
+        fdQ = (
+            sloss(pos0, cs(), q0, mu0, Q0 + eps * vQ).item()
+            - sloss(pos0, cs(), q0, mu0, Q0 - eps * vQ).item()
+        ) / (2 * eps)
+        assert abs((gQ * vQ).sum().item() - fdQ) / (abs(fdQ) + 1e-12) < 1e-5

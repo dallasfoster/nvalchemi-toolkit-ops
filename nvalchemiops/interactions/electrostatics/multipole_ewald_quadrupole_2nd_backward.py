@@ -21,6 +21,7 @@ import warp as wp
 from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
     _gto_ewald_ab,
 )
+from nvalchemiops.warp_dispatch import register_overloads
 
 _TWO_OVER_SQRT_PI = wp.float64(1.1283791670955126)
 
@@ -1808,6 +1809,357 @@ def _make_scale_array(half_neighbor_list: bool, device: str):
             device=device,
         )
     return _QUADRUPOLE_2ND_BACKWARD_SCALE_CACHE[key]
+
+
+@wp.kernel
+def _multipole_real_space_quadrupole_csr_cell_grad_backward_kernel(
+    positions: wp.array(dtype=Any),
+    charges: wp.array(dtype=Any),
+    dipoles: wp.array(dtype=Any),
+    quadrupoles: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    idx_j: wp.array(dtype=wp.int32),
+    neighbor_ptr: wp.array(dtype=wp.int32),
+    unit_shifts: wp.array(dtype=wp.vec3i),
+    sigma: wp.array(dtype=Any),
+    alpha: wp.array(dtype=Any),
+    per_direction_scale: wp.array(dtype=wp.float64),
+    grad_energies: wp.array(dtype=wp.float64),  # (N,) per-atom energy weight
+    g_cell: wp.array(dtype=Any),  # (1,) mat33 cotangent on grad_cell
+    grad_grad_energies: wp.array(dtype=wp.float64),  # (N,) OUT (atomic)
+    grad_positions: wp.array(dtype=Any),  # (N,) OUT
+    grad_charges: wp.array(dtype=Any),  # (N,) OUT
+    grad_dipoles: wp.array(dtype=Any),  # (N,) OUT
+    grad_quadrupoles: wp.array(dtype=Any),  # (N,) OUT
+    grad_cell_out: wp.array(dtype=Any),  # (1,) mat33 OUT (atomic)
+):
+    r"""Double-backward of the l=2 real-space cell-grad (stress-loss).
+
+    Reuses :func:`_quadrupole_2nd_order_pair_contribution` with the per-pair
+    position direction ``gpd = gp_j - gp_i = w = g_cellᵀ·n`` (set ``gp_j=w``,
+    ``gp_i=0``) and all charge/dipole/quadrupole directions zero, so
+    ``Ω = -w·f`` (f = ∂E_pair/∂r). The forward cell-grad weights each pair by
+    ``weight = scale·(ge_i+ge_j)/2`` (``scale`` = 1.0 half / 0.5 full;
+    ``ge`` = grad_energies, ones for plain ``dE/dcell``). With
+    ``S = ⟨g_cell, grad_cell⟩``: ``grad_r_i = +weight·dw_dr_vec``,
+    ``grad_r_j = -weight·dw_dr_vec``, ``grad_θ = -weight·dw_dθ`` (θ = q,μ,Q),
+    ``grad_cell[a,b] = -weight·n[a]·dw_dr_vec[b]``, and
+    ``grad_ge_{i,j} += -scale·½·Ω`` (= ``+scale·½·(w·f)``).
+    """
+    atom_i = wp.tid()
+    sigma_ = wp.float64(sigma[0])
+    alpha_ = wp.float64(alpha[0])
+    ab = _gto_ewald_ab(sigma_, alpha_)
+    a_coef = ab[0]
+    b_coef = ab[1]
+    scale = per_direction_scale[0]
+    cell_t = wp.transpose(cell[0])
+    gcell = g_cell[0]
+    g00 = wp.float64(gcell[0, 0])
+    g01 = wp.float64(gcell[0, 1])
+    g02 = wp.float64(gcell[0, 2])
+    g10 = wp.float64(gcell[1, 0])
+    g11 = wp.float64(gcell[1, 1])
+    g12 = wp.float64(gcell[1, 2])
+    g20 = wp.float64(gcell[2, 0])
+    g21 = wp.float64(gcell[2, 1])
+    g22 = wp.float64(gcell[2, 2])
+
+    zero_v = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+    zero_m = wp.mat33d(
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+        wp.float64(0.0),
+    )
+
+    qi = wp.float64(charges[atom_i])
+    pos_i = positions[atom_i]
+    mu_i_n = dipoles[atom_i]
+    mu_i = wp.vec3d(wp.float64(mu_i_n[0]), wp.float64(mu_i_n[1]), wp.float64(mu_i_n[2]))
+    Q_i_n = quadrupoles[atom_i]
+    Q_i = wp.mat33d(
+        wp.float64(Q_i_n[0, 0]),
+        wp.float64(Q_i_n[0, 1]),
+        wp.float64(Q_i_n[0, 2]),
+        wp.float64(Q_i_n[1, 0]),
+        wp.float64(Q_i_n[1, 1]),
+        wp.float64(Q_i_n[1, 2]),
+        wp.float64(Q_i_n[2, 0]),
+        wp.float64(Q_i_n[2, 1]),
+        wp.float64(Q_i_n[2, 2]),
+    )
+    ge_i = grad_energies[atom_i]
+
+    k_start = neighbor_ptr[atom_i]
+    k_end = neighbor_ptr[atom_i + 1]
+    for k in range(k_start, k_end):
+        j = idx_j[k]
+        shift_vec = unit_shifts[k]
+        qj = wp.float64(charges[j])
+        pos_j = positions[j]
+        ge_j = grad_energies[j]
+        mu_j_n = dipoles[j]
+        mu_j = wp.vec3d(
+            wp.float64(mu_j_n[0]), wp.float64(mu_j_n[1]), wp.float64(mu_j_n[2])
+        )
+        Q_j_n = quadrupoles[j]
+        Q_j = wp.mat33d(
+            wp.float64(Q_j_n[0, 0]),
+            wp.float64(Q_j_n[0, 1]),
+            wp.float64(Q_j_n[0, 2]),
+            wp.float64(Q_j_n[1, 0]),
+            wp.float64(Q_j_n[1, 1]),
+            wp.float64(Q_j_n[1, 2]),
+            wp.float64(Q_j_n[2, 0]),
+            wp.float64(Q_j_n[2, 1]),
+            wp.float64(Q_j_n[2, 2]),
+        )
+        periodic_shift = cell_t * type(pos_i)(
+            type(pos_i[0])(shift_vec[0]),
+            type(pos_i[0])(shift_vec[1]),
+            type(pos_i[0])(shift_vec[2]),
+        )
+        sep = pos_j - pos_i + periodic_shift
+        distance = wp.float64(wp.length(sep))
+        if distance > wp.float64(1e-8):
+            r_vec = wp.vec3d(wp.float64(sep[0]), wp.float64(sep[1]), wp.float64(sep[2]))
+            sh0 = wp.float64(shift_vec[0])
+            sh1 = wp.float64(shift_vec[1])
+            sh2 = wp.float64(shift_vec[2])
+            # Per-pair direction w = g_cellᵀ·n. The func's Ω uses
+            # gpd = gp_j - gp_i with the opposite sign convention to the
+            # hand-derived l≤1 kernels, so feed gp_j = -w (gpd = -w); the
+            # resulting slot/Ω flip cancels against the scatter signs below
+            # (FD-validated all channels).
+            w = wp.vec3d(
+                -(g00 * sh0 + g10 * sh1 + g20 * sh2),
+                -(g01 * sh0 + g11 * sh1 + g21 * sh2),
+                -(g02 * sh0 + g12 * sh1 + g22 * sh2),
+            )
+            contrib = _quadrupole_2nd_order_pair_contribution(
+                r_vec,
+                distance,
+                qi,
+                mu_i,
+                Q_i,
+                qj,
+                mu_j,
+                Q_j,
+                zero_v,  # gp_i
+                zero_v,  # gd_i
+                zero_m,  # gQ_i
+                wp.float64(0.0),  # gc_i
+                w,  # gp_j = w
+                zero_v,  # gd_j
+                zero_m,  # gQ_j
+                wp.float64(0.0),  # gc_j
+                a_coef,
+                b_coef,
+            )
+            # Forward weight per pair: scale·(ge_i+ge_j)/2 (ge=ones for plain
+            # stress). grad_ge_{i,j} += scale·½·(w·f) = -scale·½·Ω.
+            weight = scale * (ge_i + ge_j) * wp.float64(0.5)
+            ge_contrib = -scale * wp.float64(0.5) * contrib.omega
+            wp.atomic_add(grad_grad_energies, atom_i, ge_contrib)
+            wp.atomic_add(grad_grad_energies, j, ge_contrib)
+            wp.atomic_add(
+                grad_charges,
+                atom_i,
+                type(charges[atom_i])(-weight * contrib.dw_dq_i),
+            )
+            wp.atomic_add(
+                grad_charges, j, type(charges[atom_i])(-weight * contrib.dw_dq_j)
+            )
+            dmu_i = contrib.dw_dmu_i
+            dmu_j = contrib.dw_dmu_j
+            wp.atomic_add(
+                grad_dipoles,
+                atom_i,
+                type(mu_i_n)(
+                    type(mu_i_n[0])(-weight * dmu_i[0]),
+                    type(mu_i_n[0])(-weight * dmu_i[1]),
+                    type(mu_i_n[0])(-weight * dmu_i[2]),
+                ),
+            )
+            wp.atomic_add(
+                grad_dipoles,
+                j,
+                type(mu_i_n)(
+                    type(mu_i_n[0])(-weight * dmu_j[0]),
+                    type(mu_i_n[0])(-weight * dmu_j[1]),
+                    type(mu_i_n[0])(-weight * dmu_j[2]),
+                ),
+            )
+            dQi = contrib.dw_dQ_i
+            dQj = contrib.dw_dQ_j
+            wp.atomic_add(
+                grad_quadrupoles,
+                atom_i,
+                type(Q_i_n)(
+                    type(Q_i_n[0, 0])(-weight * dQi[0, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQi[0, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQi[0, 2]),
+                    type(Q_i_n[0, 0])(-weight * dQi[1, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQi[1, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQi[1, 2]),
+                    type(Q_i_n[0, 0])(-weight * dQi[2, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQi[2, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQi[2, 2]),
+                ),
+            )
+            wp.atomic_add(
+                grad_quadrupoles,
+                j,
+                type(Q_i_n)(
+                    type(Q_i_n[0, 0])(-weight * dQj[0, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQj[0, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQj[0, 2]),
+                    type(Q_i_n[0, 0])(-weight * dQj[1, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQj[1, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQj[1, 2]),
+                    type(Q_i_n[0, 0])(-weight * dQj[2, 0]),
+                    type(Q_i_n[0, 0])(-weight * dQj[2, 1]),
+                    type(Q_i_n[0, 0])(-weight * dQj[2, 2]),
+                ),
+            )
+            dr = contrib.dw_dr_vec
+            sgx = weight * dr[0]
+            sgy = weight * dr[1]
+            sgz = weight * dr[2]
+            wp.atomic_add(
+                grad_positions,
+                atom_i,
+                type(pos_i)(
+                    type(pos_i[0])(sgx),
+                    type(pos_i[0])(sgy),
+                    type(pos_i[0])(sgz),
+                ),
+            )
+            wp.atomic_add(
+                grad_positions,
+                j,
+                type(pos_i)(
+                    type(pos_i[0])(-sgx),
+                    type(pos_i[0])(-sgy),
+                    type(pos_i[0])(-sgz),
+                ),
+            )
+            cgx = -sgx
+            cgy = -sgy
+            cgz = -sgz
+            wp.atomic_add(
+                grad_cell_out,
+                0,
+                type(gcell)(
+                    type(gcell[0, 0])(sh0 * cgx),
+                    type(gcell[0, 0])(sh0 * cgy),
+                    type(gcell[0, 0])(sh0 * cgz),
+                    type(gcell[0, 0])(sh1 * cgx),
+                    type(gcell[0, 0])(sh1 * cgy),
+                    type(gcell[0, 0])(sh1 * cgz),
+                    type(gcell[0, 0])(sh2 * cgx),
+                    type(gcell[0, 0])(sh2 * cgy),
+                    type(gcell[0, 0])(sh2 * cgz),
+                ),
+            )
+
+
+def _quadrupole_csr_cell_grad_backward_sig(v, t):
+    """Signature builder for the l=2 cell-grad double-backward kernel."""
+    m = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=t),  # charges
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=m),  # quadrupoles
+        wp.array(dtype=m),  # cell
+        wp.array(dtype=wp.int32),  # idx_j
+        wp.array(dtype=wp.int32),  # neighbor_ptr
+        wp.array(dtype=wp.vec3i),  # unit_shifts
+        wp.array(dtype=t),  # sigma
+        wp.array(dtype=t),  # alpha
+        wp.array(dtype=wp.float64),  # per_direction_scale
+        wp.array(dtype=wp.float64),  # grad_energies
+        wp.array(dtype=m),  # g_cell
+        wp.array(dtype=wp.float64),  # grad_grad_energies (out)
+        wp.array(dtype=v),  # grad_positions (out)
+        wp.array(dtype=t),  # grad_charges (out)
+        wp.array(dtype=v),  # grad_dipoles (out)
+        wp.array(dtype=m),  # grad_quadrupoles (out)
+        wp.array(dtype=m),  # grad_cell_out (out)
+    ]
+
+
+_quadrupole_csr_cell_grad_backward_overloads = register_overloads(
+    _multipole_real_space_quadrupole_csr_cell_grad_backward_kernel,
+    _quadrupole_csr_cell_grad_backward_sig,
+)
+
+
+def multipole_real_space_quadrupole_csr_cell_grad_backward(
+    positions,
+    charges,
+    dipoles,
+    quadrupoles,
+    cell,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma,
+    alpha,
+    per_direction_scale,
+    grad_energies,
+    g_cell,
+    grad_grad_energies,
+    grad_positions,
+    grad_charges,
+    grad_dipoles,
+    grad_quadrupoles,
+    grad_cell_out,
+    wp_dtype,
+    device=None,
+):
+    r"""Launcher for the l=2 cell-grad double-backward (stress-loss).
+
+    Caller pre-zeroes the six output arrays.
+    """
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    if device is None:
+        device = str(positions.device)
+    wp.launch(
+        _quadrupole_csr_cell_grad_backward_overloads[vec_dtype],
+        dim=positions.shape[0],
+        inputs=[
+            positions,
+            charges,
+            dipoles,
+            quadrupoles,
+            cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigma,
+            alpha,
+            per_direction_scale,
+            grad_energies,
+            g_cell,
+        ],
+        outputs=[
+            grad_grad_energies,
+            grad_positions,
+            grad_charges,
+            grad_dipoles,
+            grad_quadrupoles,
+            grad_cell_out,
+        ],
+        device=device,
+    )
 
 
 def multipole_real_space_quadrupole_csr_energy_2nd_backward(
