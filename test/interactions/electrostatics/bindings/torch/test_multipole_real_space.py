@@ -1242,3 +1242,118 @@ class TestRealSpaceQuadrupoleStressLoss:
             - sloss(pos0, cs(), q0, mu0, Q0 - eps * vQ).item()
         ) / (2 * eps)
         assert abs((gQ * vQ).sum().item() - fdQ) / (abs(fdQ) + 1e-12) < 1e-5
+
+
+def _periodic_csr_batched(pos_list, cell_list, cutoff, device):
+    """Concatenated systems -> global CSR with per-system shifts + batch_idx."""
+    pi, pj, sh, bidx = [], [], [], []
+    off = 0
+    for s, (pn, cn) in enumerate(zip(pos_list, cell_list)):
+        ns = pn.shape[0]
+        bidx.extend([s] * ns)
+        for i in range(ns):
+            for j in range(ns):
+                for a in (-1, 0, 1):
+                    for b in (-1, 0, 1):
+                        for c in (-1, 0, 1):
+                            if i == j and a == 0 and b == 0 and c == 0:
+                                continue
+                            if (
+                                np.linalg.norm(pn[j] + np.array([a, b, c]) @ cn - pn[i])
+                                < cutoff
+                            ):
+                                pi.append(off + i)
+                                pj.append(off + j)
+                                sh.append([a, b, c])
+        off += ns
+    o = sorted(range(len(pi)), key=lambda k: (pi[k], pj[k]))
+    idx = torch.tensor([pj[k] for k in o], dtype=torch.int32, device=device)
+    nptr = torch.zeros(off + 1, dtype=torch.int32, device=device)
+    for ii in pi:
+        nptr[ii + 1] += 1
+    nptr = torch.cumsum(nptr, 0).to(torch.int32)
+    shifts = torch.tensor([sh[k] for k in o], dtype=torch.int32, device=device)
+    return idx, nptr, shifts, torch.tensor(bidx, dtype=torch.int32, device=device)
+
+
+class TestRealSpaceBatchedStressLoss:
+    """Batched real-space cell-grad double-backward (∂²E/∂cell∂pos) — Tier-1 S4.
+
+    l=0/1 via the batched fused ops; l=2 via the public batched l=2 energy.
+    Per-system stress + create_graph to positions must FD-match.
+    """
+
+    @pytest.mark.parametrize("lmax", [0, 1, 2])
+    def test_stress_loss_fd(self, lmax):
+        from nvalchemiops.torch.interactions.electrostatics.multipole_ewald_quadrupole import (  # noqa: E501
+            multipole_real_space_quadrupole_energy as qe,
+        )
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dt = torch.float64
+        rng = np.random.default_rng(5 + lmax)
+        counts = [4, 5]
+        B, lbox = 2, 4.0
+        cells = [
+            np.diag([lbox, lbox, lbox]) + rng.normal(scale=0.2, size=(3, 3))
+            for _ in range(B)
+        ]
+        poss = [rng.uniform(0, lbox, size=(c, 3)) for c in counts]
+        idx_j, nptr, shifts, bidx = _periodic_csr_batched(poss, cells, 5.0, device)
+        ntot = sum(counts)
+        cell0 = torch.tensor(np.stack(cells), dtype=dt, device=device)
+        pos0 = torch.tensor(np.concatenate(poss), dtype=dt, device=device)
+        sigma = torch.full((B,), 0.5, dtype=dt, device=device)
+        alpha = torch.full((B,), 0.35, dtype=dt, device=device)
+        q0 = torch.tensor(rng.normal(size=ntot), dtype=dt, device=device)
+        for b in range(B):
+            m = bidx == b
+            q0[m] = q0[m] - q0[m].mean()
+        mu0 = torch.tensor(rng.normal(size=(ntot, 3)), dtype=dt, device=device)
+        Qr = rng.normal(size=(ntot, 3, 3))
+        Qr = 0.5 * (Qr + Qr.transpose(0, 2, 1))
+        Q0 = torch.tensor(Qr, dtype=dt, device=device)
+        w = torch.tensor(rng.normal(size=(B, 3, 3)), dtype=dt, device=device)
+        cs = lambda: cell0.clone().requires_grad_(True)  # noqa: E731
+
+        dop = torch.ops.nvalchemiops.batch_multipole_real_space_dipole_fused
+        mop = torch.ops.nvalchemiops.batch_multipole_real_space_monopole_fused
+
+        def sloss(pos, cell):
+            if lmax == 0:
+                e = mop(pos, q0, cell, sigma, alpha, idx_j, nptr, shifts, bidx, False)[
+                    0
+                ]
+            elif lmax == 1:
+                e = dop(
+                    pos, q0, mu0, cell, sigma, alpha, idx_j, nptr, shifts, bidx, False
+                )[0]
+            else:
+                e = qe(
+                    pos,
+                    q0,
+                    mu0,
+                    Q0,
+                    cell,
+                    idx_j,
+                    nptr,
+                    shifts,
+                    sigma,
+                    alpha,
+                    batch_idx=bidx,
+                )
+            (stress,) = torch.autograd.grad(e.sum(), cell, create_graph=True)
+            return (stress * w).sum()
+
+        pos = pos0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(sloss(pos, cs()), pos)
+        assert gp.abs().max() > 1e-8, f"lmax={lmax}: batched silent zero"
+        v = torch.tensor(rng.normal(size=(ntot, 3)), dtype=dt, device=device)
+        eps = 1e-6
+        fd = (
+            sloss(pos0 + eps * v, cs()).item() - sloss(pos0 - eps * v, cs()).item()
+        ) / (2 * eps)
+        # Tol 1e-4: the l=2 batched config can draw close periodic pairs giving
+        # large-magnitude stress whose 2nd-order central difference floors near
+        # ~3e-5 (analytic matches to that); still catches sign flips/silent zeros.
+        assert abs((gp * v).sum().item() - fd) / (abs(fd) + 1e-12) < 1e-4

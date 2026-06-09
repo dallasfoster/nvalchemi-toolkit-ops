@@ -54,10 +54,12 @@ from nvalchemiops.interactions.electrostatics.multipole_ewald_cell_grad import (
     multipole_real_space_monopole_csr_cell_grad,
 )
 from nvalchemiops.interactions.electrostatics.multipole_ewald_kernels import (
+    batch_multipole_real_space_dipole_csr_cell_grad_backward,
     batch_multipole_real_space_dipole_csr_energy,
     batch_multipole_real_space_dipole_csr_energy_2nd_backward,
     batch_multipole_real_space_dipole_csr_energy_backward,
     batch_multipole_real_space_dipole_csr_energy_fused,
+    batch_multipole_real_space_monopole_csr_cell_grad_backward,
     batch_multipole_real_space_monopole_csr_energy,
     batch_multipole_real_space_monopole_csr_energy_2nd_backward,
     batch_multipole_real_space_monopole_csr_energy_backward,
@@ -2822,6 +2824,109 @@ def _(
     return torch.empty_like(cells)
 
 
+def _batch_rs_dipole_cell_grad_setup(ctx, inputs, output):
+    """Save inputs for the batched l=1 cell-grad double-backward."""
+    (
+        positions,
+        charges,
+        dipoles,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+        half_neighbor_list,
+    ) = inputs
+    ctx.save_for_backward(
+        positions,
+        charges,
+        dipoles,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+    )
+    ctx.half_neighbor_list = half_neighbor_list
+
+
+def _batch_rs_dipole_cell_grad_backward(ctx, g_cell):
+    """Batched ∂/∂{positions, charges, dipoles, cells} of ⟨g_cell, dE/dcell⟩."""
+    (
+        positions,
+        charges,
+        dipoles,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+    ) = ctx.saved_tensors
+    need = ctx.needs_input_grad
+    if not (need[0] or need[1] or need[2] or need[3]):
+        return (None,) * 11
+    device = positions.device
+    wp_device = wp.device_from_torch(device)
+    dtype = positions.dtype
+    wp_scalar = get_wp_dtype(dtype)
+    wp_vec = get_wp_vec_dtype(dtype)
+    wp_mat = get_wp_mat_dtype(dtype)
+    n = positions.shape[0]
+    scale = torch.tensor(
+        [1.0 if ctx.half_neighbor_list else 0.5], dtype=torch.float64, device=device
+    )
+    grad_positions = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_charges = torch.zeros(n, dtype=dtype, device=device)
+    grad_dipoles = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_cells = torch.zeros_like(cells)
+    batch_multipole_real_space_dipole_csr_cell_grad_backward(
+        wp.from_torch(positions.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(dipoles.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(cells.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(idx_j.contiguous(), dtype=wp.int32),
+        wp.from_torch(neighbor_ptr.contiguous(), dtype=wp.int32),
+        wp.from_torch(batch_idx.contiguous(), dtype=wp.int32),
+        wp.from_torch(unit_shifts.contiguous(), dtype=wp.vec3i),
+        wp.from_torch(sigmas.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(alphas.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(scale, dtype=wp.float64),
+        wp.from_torch(g_cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(grad_positions, dtype=wp_vec),
+        wp.from_torch(grad_charges, dtype=wp_scalar),
+        wp.from_torch(grad_dipoles, dtype=wp_vec),
+        wp.from_torch(grad_cells, dtype=wp_mat),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return (
+        grad_positions if need[0] else None,
+        grad_charges if need[1] else None,
+        grad_dipoles if need[2] else None,
+        grad_cells if need[3] else None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+torch.library.register_autograd(
+    "nvalchemiops::batch_multipole_real_space_dipole_cell_grad",
+    _batch_rs_dipole_cell_grad_backward,
+    setup_context=_batch_rs_dipole_cell_grad_setup,
+)
+
+
 @torch.library.custom_op(
     "nvalchemiops::batch_multipole_real_space_dipole_fused", mutates_args=()
 )
@@ -3051,6 +3156,101 @@ def _batch_rs_monopole_cell_grad_op(
 @_batch_rs_monopole_cell_grad_op.register_fake
 def _(positions, charges, cells, sigmas, alphas, idx_j, nptr, shifts, batch_idx, half):
     return torch.empty_like(cells)
+
+
+def _batch_rs_monopole_cell_grad_setup(ctx, inputs, output):
+    """Save inputs for the batched l=0 cell-grad double-backward."""
+    (
+        positions,
+        charges,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+        half_neighbor_list,
+    ) = inputs
+    ctx.save_for_backward(
+        positions,
+        charges,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+    )
+    ctx.half_neighbor_list = half_neighbor_list
+
+
+def _batch_rs_monopole_cell_grad_backward(ctx, g_cell):
+    """Batched ∂/∂{positions, charges, cells} of ⟨g_cell, dE/dcell⟩."""
+    (
+        positions,
+        charges,
+        cells,
+        sigmas,
+        alphas,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+    ) = ctx.saved_tensors
+    need = ctx.needs_input_grad
+    if not (need[0] or need[1] or need[2]):
+        return (None,) * 10
+    device = positions.device
+    wp_device = wp.device_from_torch(device)
+    dtype = positions.dtype
+    wp_scalar = get_wp_dtype(dtype)
+    wp_vec = get_wp_vec_dtype(dtype)
+    wp_mat = get_wp_mat_dtype(dtype)
+    n = positions.shape[0]
+    scale_val = 1.0 if ctx.half_neighbor_list else 0.5
+    scale = torch.tensor([scale_val], dtype=torch.float64, device=device)
+    grad_positions = torch.zeros((n, 3), dtype=dtype, device=device)
+    grad_charges = torch.zeros(n, dtype=dtype, device=device)
+    grad_cells = torch.zeros_like(cells)
+    batch_multipole_real_space_monopole_csr_cell_grad_backward(
+        wp.from_torch(positions.detach().contiguous(), dtype=wp_vec),
+        wp.from_torch(charges.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(cells.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(idx_j.contiguous(), dtype=wp.int32),
+        wp.from_torch(neighbor_ptr.contiguous(), dtype=wp.int32),
+        wp.from_torch(batch_idx.contiguous(), dtype=wp.int32),
+        wp.from_torch(unit_shifts.contiguous(), dtype=wp.vec3i),
+        wp.from_torch(sigmas.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(alphas.detach().contiguous(), dtype=wp_scalar),
+        wp.from_torch(scale, dtype=wp.float64),
+        wp.from_torch(g_cell.detach().contiguous(), dtype=wp_mat),
+        wp.from_torch(grad_positions, dtype=wp_vec),
+        wp.from_torch(grad_charges, dtype=wp_scalar),
+        wp.from_torch(grad_cells, dtype=wp_mat),
+        wp_dtype=wp_scalar,
+        device=str(wp_device),
+    )
+    return (
+        grad_positions if need[0] else None,
+        grad_charges if need[1] else None,
+        grad_cells if need[2] else None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+torch.library.register_autograd(
+    "nvalchemiops::batch_multipole_real_space_monopole_cell_grad",
+    _batch_rs_monopole_cell_grad_backward,
+    setup_context=_batch_rs_monopole_cell_grad_setup,
+)
 
 
 @torch.library.custom_op(
