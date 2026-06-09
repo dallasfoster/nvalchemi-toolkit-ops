@@ -1127,19 +1127,21 @@ def wp_dtype(request):
 class TestFractionalize:
     """``pme_fractionalize`` keystone op (Tier-1 stress-loss, B-warp).
 
-    Forward maps Cartesian (positions, moments) to the unitless mesh frame
-    ``u = mesh ⊙ (M·r)``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` (M = cell_inv_t,
-    read per atom via ``batch_idx``). The backward is the adjoint of this
-    multilinear map. Validated forward-vs-numpy + FD-adjoint (float64).
+    Forward maps Cartesian (positions, moments) to the unitless cell-fractional
+    frame ``p = M·r``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` (M = cell_inv_t,
+    read per atom via ``batch_idx``). Feeding these to the spread kernel with an
+    identity ``cell_inv_t`` reproduces the cell-coupled spread bit-for-bit. The
+    backward is the adjoint of this multilinear map. Validated forward-vs-numpy
+    + FD-adjoint (float64).
     """
 
     @staticmethod
-    def _ref(pos, minv_t, bidx, mesh, dip, quad):
+    def _ref(pos, minv_t, bidx, dip, quad):
         m = minv_t[bidx]
-        u = np.einsum("nij,nj->ni", m, pos) * np.asarray(mesh, dtype=pos.dtype)
+        p = np.einsum("nij,nj->ni", m, pos)
         df = np.einsum("nij,nj->ni", m, dip)
         qf = np.einsum("nij,njk,nlk->nil", m, quad, m)
-        return u, df, qf
+        return p, df, qf
 
     def test_forward_matches_numpy(self, device, wp_dtype):
         from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
@@ -1151,32 +1153,30 @@ class TestFractionalize:
         mat = wp.mat33f if wp_dtype == wp.float32 else wp.mat33d
         rng = np.random.default_rng(0)
         n, b = 6, 2
-        mesh = (24, 20, 16)
         pos = rng.standard_normal((n, 3)).astype(np_dtype)
         dip = rng.standard_normal((n, 3)).astype(np_dtype)
         quad = rng.standard_normal((n, 3, 3)).astype(np_dtype)
         cells = (rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]).astype(np_dtype)
         minv_t = np.linalg.inv(cells.transpose(0, 2, 1)).astype(np_dtype)
         bidx = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
-        u = wp.zeros(n, dtype=vec, device=device)
+        p = wp.zeros(n, dtype=vec, device=device)
         df = wp.zeros(n, dtype=vec, device=device)
         qf = wp.zeros(n, dtype=mat, device=device)
         pme_fractionalize_launch(
             wp.array(pos, dtype=vec, device=device),
             wp.array(minv_t, dtype=mat, device=device),
             wp.array(bidx, dtype=wp.int32, device=device),
-            wp.vec3i(*mesh),
             wp.array(dip, dtype=vec, device=device),
             wp.array(quad, dtype=mat, device=device),
-            u,
+            p,
             df,
             qf,
             wp_dtype=wp_dtype,
             device=device,
         )
-        u_ref, df_ref, qf_ref = self._ref(pos, minv_t, bidx, mesh, dip, quad)
+        p_ref, df_ref, qf_ref = self._ref(pos, minv_t, bidx, dip, quad)
         tol = 1e-5 if wp_dtype == wp.float32 else 1e-12
-        assert np.allclose(u.numpy(), u_ref, atol=tol)
+        assert np.allclose(p.numpy(), p_ref, atol=tol)
         assert np.allclose(df.numpy(), df_ref, atol=tol)
         assert np.allclose(qf.numpy(), qf_ref, atol=tol)
 
@@ -1190,14 +1190,13 @@ class TestFractionalize:
         vec, mat = wp.vec3d, wp.mat33d
         rng = np.random.default_rng(1)
         n, b = 5, 2
-        mesh = (24, 20, 16)
         pos = rng.standard_normal((n, 3))
         dip = rng.standard_normal((n, 3))
         quad = rng.standard_normal((n, 3, 3))
         cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
         minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
         bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
-        gu = rng.standard_normal((n, 3))
+        gp_c = rng.standard_normal((n, 3))
         gdf = rng.standard_normal((n, 3))
         gqf = rng.standard_normal((n, 3, 3))
 
@@ -1209,7 +1208,6 @@ class TestFractionalize:
                 wp.array(p, dtype=vec, device=device),
                 wp.array(m, dtype=mat, device=device),
                 wp.array(bidx, dtype=wp.int32, device=device),
-                wp.vec3i(*mesh),
                 wp.array(d, dtype=vec, device=device),
                 wp.array(q, dtype=mat, device=device),
                 uo,
@@ -1228,10 +1226,9 @@ class TestFractionalize:
             wp.array(pos, dtype=vec, device=device),
             wp.array(minv_t, dtype=mat, device=device),
             wp.array(bidx, dtype=wp.int32, device=device),
-            wp.vec3i(*mesh),
             wp.array(dip, dtype=vec, device=device),
             wp.array(quad, dtype=mat, device=device),
-            wp.array(gu, dtype=vec, device=device),
+            wp.array(gp_c, dtype=vec, device=device),
             wp.array(gdf, dtype=vec, device=device),
             wp.array(gqf, dtype=mat, device=device),
             gp,
@@ -1261,8 +1258,8 @@ class TestFractionalize:
             minus[key] = base[key] - eps * v
             up, dp, qp = fwd(plus["p"], plus["m"], plus["d"], plus["q"])
             um, dm, qm = fwd(minus["p"], minus["m"], minus["d"], minus["q"])
-            lp = np.sum(up * gu) + np.sum(dp * gdf) + np.sum(qp * gqf)
-            lm = np.sum(um * gu) + np.sum(dm * gdf) + np.sum(qm * gqf)
+            lp = np.sum(up * gp_c) + np.sum(dp * gdf) + np.sum(qp * gqf)
+            lm = np.sum(um * gp_c) + np.sum(dm * gdf) + np.sum(qm * gqf)
             return (lp - lm) / (2 * eps)
 
         for name, shape in [
@@ -1295,14 +1292,13 @@ class TestFractionalize:
         vec, mat = wp.vec3d, wp.mat33d
         rng = np.random.default_rng(2)
         n, b = 5, 2
-        mesh = (24, 20, 16)
         pos = rng.standard_normal((n, 3))
         dip = rng.standard_normal((n, 3))
         quad = rng.standard_normal((n, 3, 3))
         cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
         minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
         bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
-        gu = rng.standard_normal((n, 3))
+        gp_c = rng.standard_normal((n, 3))
         gdf = rng.standard_normal((n, 3))
         gqf = rng.standard_normal((n, 3, 3))
         # Cotangents on the backward's outputs (grad_pos, grad_M, grad_dip,
@@ -1312,7 +1308,7 @@ class TestFractionalize:
         g_dip = rng.standard_normal((n, 3))
         g_quad = rng.standard_normal((n, 3, 3))
 
-        def bwd(gu_, gdf_, gqf_, pos_, m_, dip_, quad_):
+        def bwd(gp_, gdf_, gqf_, pos_, m_, dip_, quad_):
             gp = wp.zeros(n, dtype=vec, device=device)
             gm = wp.zeros(b, dtype=mat, device=device)
             gd = wp.zeros(n, dtype=vec, device=device)
@@ -1321,10 +1317,9 @@ class TestFractionalize:
                 wp.array(pos_, dtype=vec, device=device),
                 wp.array(m_, dtype=mat, device=device),
                 wp.array(bidx, dtype=wp.int32, device=device),
-                wp.vec3i(*mesh),
                 wp.array(dip_, dtype=vec, device=device),
                 wp.array(quad_, dtype=mat, device=device),
-                wp.array(gu_, dtype=vec, device=device),
+                wp.array(gp_, dtype=vec, device=device),
                 wp.array(gdf_, dtype=vec, device=device),
                 wp.array(gqf_, dtype=mat, device=device),
                 gp,
@@ -1336,7 +1331,7 @@ class TestFractionalize:
             )
             return gp.numpy(), gm.numpy(), gd.numpy(), gq.numpy()
 
-        ggu = wp.zeros(n, dtype=vec, device=device)
+        ggp = wp.zeros(n, dtype=vec, device=device)
         ggdf = wp.zeros(n, dtype=vec, device=device)
         ggqf = wp.zeros(n, dtype=mat, device=device)
         gpos = wp.zeros(n, dtype=vec, device=device)
@@ -1347,17 +1342,16 @@ class TestFractionalize:
             wp.array(pos, dtype=vec, device=device),
             wp.array(minv_t, dtype=mat, device=device),
             wp.array(bidx, dtype=wp.int32, device=device),
-            wp.vec3i(*mesh),
             wp.array(dip, dtype=vec, device=device),
             wp.array(quad, dtype=mat, device=device),
-            wp.array(gu, dtype=vec, device=device),
+            wp.array(gp_c, dtype=vec, device=device),
             wp.array(gdf, dtype=vec, device=device),
             wp.array(gqf, dtype=mat, device=device),
             wp.array(g_pos, dtype=vec, device=device),
             wp.array(g_cell, dtype=mat, device=device),
             wp.array(g_dip, dtype=vec, device=device),
             wp.array(g_quad, dtype=mat, device=device),
-            ggu,
+            ggp,
             ggdf,
             ggqf,
             gpos,
@@ -1368,7 +1362,7 @@ class TestFractionalize:
             device=device,
         )
         grads = {
-            "gu": ggu.numpy(),
+            "gp": ggp.numpy(),
             "gdf": ggdf.numpy(),
             "gQf": ggqf.numpy(),
             "pos": gpos.numpy(),
@@ -1378,7 +1372,7 @@ class TestFractionalize:
         }
         eps = 1e-6
         base = {
-            "gu": gu,
+            "gp": gp_c,
             "gdf": gdf,
             "gQf": gqf,
             "pos": pos,
@@ -1389,7 +1383,7 @@ class TestFractionalize:
 
         def scalar(args):
             gp, gm, gd, gq = bwd(
-                args["gu"],
+                args["gp"],
                 args["gdf"],
                 args["gQf"],
                 args["pos"],
@@ -1404,7 +1398,7 @@ class TestFractionalize:
                 + np.sum(gq * g_quad)
             )
 
-        for name in ("gu", "gdf", "gQf", "pos", "M", "dip", "quad"):
+        for name in ("gp", "gdf", "gQf", "pos", "M", "dip", "quad"):
             v = rng.standard_normal(base[name].shape)
             plus = dict(base)
             minus = dict(base)

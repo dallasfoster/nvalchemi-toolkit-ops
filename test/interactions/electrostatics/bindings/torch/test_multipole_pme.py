@@ -2886,11 +2886,11 @@ class TestQuadrupoleSelfEnergyFormula:
 class TestFractionalizeOp:
     """``multipole_pme_fractionalize`` torch op (Tier-1 stress-loss, B-warp).
 
-    The op maps Cartesian (positions, moments) to the unitless mesh frame
-    ``u = mesh ⊙ (M·r)``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` so all
-    ``cell_inv_t`` coupling is factored out of spread/gather. Full 2nd-order
-    autograd (forward/backward/double-backward chain) — the second order is the
-    genuine cell × {position, moment} cross term stress-loss needs.
+    The op maps Cartesian (positions, moments) to the cell-fractional frame
+    ``p = M·r``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` so all ``cell_inv_t``
+    coupling is factored out of spread (fed with an identity cell). Full
+    2nd-order autograd (forward/backward/double-backward chain) — the second
+    order is the genuine cell × {position, moment} cross term stress-loss needs.
     """
 
     def test_gradgradcheck(self):
@@ -2898,7 +2898,6 @@ class TestFractionalizeOp:
         torch.manual_seed(0)
         dt = torch.float64
         n, b = 5, 2
-        mesh = (24, 20, 16)
         pos = torch.randn(n, 3, dtype=dt, device=device, requires_grad=True)
         cells = torch.randn(b, 3, 3, dtype=dt, device=device) + 3 * torch.eye(
             3, dtype=dt, device=device
@@ -2912,7 +2911,7 @@ class TestFractionalizeOp:
         op = torch.ops.nvalchemiops.multipole_pme_fractionalize
 
         def fn(p, m, d, q):
-            return op(p, m, d, q, bidx, mesh[0], mesh[1], mesh[2])
+            return op(p, m, d, q, bidx)
 
         assert torch.autograd.gradcheck(
             fn, (pos, cell_inv_t, dip, quad), atol=1e-6, rtol=1e-4

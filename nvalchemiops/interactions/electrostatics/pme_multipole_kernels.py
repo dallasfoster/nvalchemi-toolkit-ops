@@ -5459,41 +5459,34 @@ def _pme_fractionalize_kernel(
     positions: wp.array(dtype=Any),  # (N,) vec3
     cell_inv_t: wp.array(dtype=Any),  # (B,) mat33  (M = inv(cell)ᵀ)
     batch_idx: wp.array(dtype=wp.int32),  # (N,) per-atom system index
-    mesh: wp.vec3i,  # mesh dims (Nx, Ny, Nz)
     dipoles: wp.array(dtype=Any),  # (N,) vec3
     quadrupoles: wp.array(dtype=Any),  # (N,) mat33
-    u_out: wp.array(dtype=Any),  # (N,) vec3 OUTPUT — scaled fractional coord
+    p_out: wp.array(dtype=Any),  # (N,) vec3 OUTPUT — cell-fractional coord
     df_out: wp.array(dtype=Any),  # (N,) vec3 OUTPUT — fractional dipole
     Qf_out: wp.array(dtype=Any),  # (N,) mat33 OUTPUT — fractional quadrupole
 ):
-    r"""Map Cartesian (positions, moments) to the unitless mesh/fractional frame.
+    r"""Map Cartesian (positions, moments) to the unitless cell-fractional frame.
 
-    Per atom, with :math:`M = \text{cell\_inv\_t}[b_i]` and mesh sizes
-    :math:`(N_x, N_y, N_z)`:
+    Per atom, with :math:`M = \text{cell\_inv\_t}[b_i]`:
 
     .. math::
 
-        u_i = (N_x, N_y, N_z) \odot (M\, r_i), \quad
+        p_i = M\, r_i, \quad
         d^{\text{frac}}_i = M\, \mu_i, \quad
         Q^{\text{frac}}_i = M\, Q_i\, M^{\mathsf T}.
 
     This factors ALL ``cell_inv_t`` coupling out of the spread/gather kernels:
-    once they consume ``u`` + fractional moments they are cell-free, so the
-    cell-stress 2nd-order composes through this multilinear map's autograd
-    (cheap, exact). One thread per atom; ``cell_inv_t[batch_idx[i]]`` is read
-    per atom so batched systems need no host-side per-atom cell gather.
+    feeding them ``p`` + fractional moments with an identity ``cell_inv_t``
+    reproduces the cell-coupled spread bit-for-bit (``compute_fractional_coords``
+    multiplies by the mesh internally; the moment rotations become no-ops), so
+    the cell-stress 2nd-order composes entirely through this multilinear map's
+    autograd (cheap, exact). One thread per atom; ``cell_inv_t[batch_idx[i]]``
+    is read per atom so batched systems need no host-side per-atom cell gather.
     """
     i = wp.tid()
     b = batch_idx[i]
     m_mat = cell_inv_t[b]
-    r = positions[i]
-    fr = m_mat * r
-    s = r[0]
-    u_out[i] = wp.vector(
-        fr[0] * type(s)(mesh[0]),
-        fr[1] * type(s)(mesh[1]),
-        fr[2] * type(s)(mesh[2]),
-    )
+    p_out[i] = m_mat * positions[i]
     df_out[i] = m_mat * dipoles[i]
     Qf_out[i] = m_mat * quadrupoles[i] * wp.transpose(m_mat)
 
@@ -5505,10 +5498,9 @@ def _pme_fractionalize_sig(v, t):
         wp.array(dtype=v),  # positions
         wp.array(dtype=mat),  # cell_inv_t
         wp.array(dtype=wp.int32),  # batch_idx
-        wp.vec3i,  # mesh
         wp.array(dtype=v),  # dipoles
         wp.array(dtype=mat),  # quadrupoles
-        wp.array(dtype=v),  # u_out
+        wp.array(dtype=v),  # p_out
         wp.array(dtype=v),  # df_out
         wp.array(dtype=mat),  # Qf_out
     ]
@@ -5523,10 +5515,9 @@ def pme_fractionalize_launch(
     positions,
     cell_inv_t,
     batch_idx,
-    mesh,
     dipoles,
     quadrupoles,
-    u_out,
+    p_out,
     df_out,
     Qf_out,
     wp_dtype,
@@ -5539,8 +5530,8 @@ def pme_fractionalize_launch(
     wp.launch(
         _pme_fractionalize_overloads[vec_dtype],
         dim=(positions.shape[0],),
-        inputs=[positions, cell_inv_t, batch_idx, mesh, dipoles, quadrupoles],
-        outputs=[u_out, df_out, Qf_out],
+        inputs=[positions, cell_inv_t, batch_idx, dipoles, quadrupoles],
+        outputs=[p_out, df_out, Qf_out],
         device=device,
     )
 
@@ -5550,10 +5541,9 @@ def _pme_fractionalize_backward_kernel(
     positions: wp.array(dtype=Any),  # (N,) vec3
     cell_inv_t: wp.array(dtype=Any),  # (B,) mat33
     batch_idx: wp.array(dtype=wp.int32),  # (N,)
-    mesh: wp.vec3i,
     dipoles: wp.array(dtype=Any),  # (N,) vec3
     quadrupoles: wp.array(dtype=Any),  # (N,) mat33
-    gu: wp.array(dtype=Any),  # (N,) vec3  — cotangent on u
+    gp: wp.array(dtype=Any),  # (N,) vec3  — cotangent on p
     gdf: wp.array(dtype=Any),  # (N,) vec3  — cotangent on d_frac
     gQf: wp.array(dtype=Any),  # (N,) mat33 — cotangent on Q_frac
     grad_positions: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
@@ -5563,29 +5553,23 @@ def _pme_fractionalize_backward_kernel(
 ):
     r"""Adjoint of :func:`_pme_fractionalize_kernel` (the map is multilinear).
 
-    With ``mgu = mesh ⊙ gu`` and ``M = cell_inv_t[b]``:
-    ``grad_r = Mᵀ·mgu``; ``grad_μ = Mᵀ·gdf``; ``grad_Q = Mᵀ·gQf·M``; and
-    ``grad_M = mgu⊗r + gdf⊗μ + gQf·M·Qᵀ + gQfᵀ·M·Q`` (atomic-added per system).
+    With ``M = cell_inv_t[b]``:
+    ``grad_r = Mᵀ·gp``; ``grad_μ = Mᵀ·gdf``; ``grad_Q = Mᵀ·gQf·M``; and
+    ``grad_M = gp⊗r + gdf⊗μ + gQf·M·Qᵀ + gQfᵀ·M·Q`` (atomic-added per system).
     """
     i = wp.tid()
     b = batch_idx[i]
     m_mat = cell_inv_t[b]
     r = positions[i]
-    s = r[0]
-    gu_i = gu[i]
-    mgu = wp.vector(
-        gu_i[0] * type(s)(mesh[0]),
-        gu_i[1] * type(s)(mesh[1]),
-        gu_i[2] * type(s)(mesh[2]),
-    )
+    gp_i = gp[i]
     m_t = wp.transpose(m_mat)
-    grad_positions[i] = m_t * mgu
+    grad_positions[i] = m_t * gp_i
     grad_dipoles[i] = m_t * gdf[i]
     gQf_i = gQf[i]
     grad_quadrupoles[i] = m_t * gQf_i * m_mat
     q_i = quadrupoles[i]
     grad_m = (
-        wp.outer(mgu, r)
+        wp.outer(gp_i, r)
         + wp.outer(gdf[i], dipoles[i])
         + gQf_i * m_mat * wp.transpose(q_i)
         + wp.transpose(gQf_i) * m_mat * q_i
@@ -5600,10 +5584,9 @@ def _pme_fractionalize_backward_sig(v, t):
         wp.array(dtype=v),  # positions
         wp.array(dtype=mat),  # cell_inv_t
         wp.array(dtype=wp.int32),  # batch_idx
-        wp.vec3i,  # mesh
         wp.array(dtype=v),  # dipoles
         wp.array(dtype=mat),  # quadrupoles
-        wp.array(dtype=v),  # gu
+        wp.array(dtype=v),  # gp
         wp.array(dtype=v),  # gdf
         wp.array(dtype=mat),  # gQf
         wp.array(dtype=v),  # grad_positions
@@ -5622,10 +5605,9 @@ def pme_fractionalize_backward_launch(
     positions,
     cell_inv_t,
     batch_idx,
-    mesh,
     dipoles,
     quadrupoles,
-    gu,
+    gp,
     gdf,
     gQf,
     grad_positions,
@@ -5646,10 +5628,9 @@ def pme_fractionalize_backward_launch(
             positions,
             cell_inv_t,
             batch_idx,
-            mesh,
             dipoles,
             quadrupoles,
-            gu,
+            gp,
             gdf,
             gQf,
         ],
@@ -5663,17 +5644,16 @@ def _pme_fractionalize_double_backward_kernel(
     positions: wp.array(dtype=Any),  # (N,) vec3
     cell_inv_t: wp.array(dtype=Any),  # (B,) mat33
     batch_idx: wp.array(dtype=wp.int32),  # (N,)
-    mesh: wp.vec3i,
     dipoles: wp.array(dtype=Any),  # (N,) vec3
     quadrupoles: wp.array(dtype=Any),  # (N,) mat33
-    gu: wp.array(dtype=Any),  # (N,) vec3  — cotangent on u
+    gp: wp.array(dtype=Any),  # (N,) vec3  — cotangent on p
     gdf: wp.array(dtype=Any),  # (N,) vec3  — cotangent on d_frac
     gQf: wp.array(dtype=Any),  # (N,) mat33 — cotangent on Q_frac
     g_pos: wp.array(dtype=Any),  # (N,) vec3  — cotangent on grad_positions
     g_cell: wp.array(dtype=Any),  # (B,) mat33 — cotangent on grad_cell_inv_t
     g_dip: wp.array(dtype=Any),  # (N,) vec3  — cotangent on grad_dipoles
     g_quad: wp.array(dtype=Any),  # (N,) mat33 — cotangent on grad_quadrupoles
-    grad_gu: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_gp: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
     grad_gdf: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
     grad_gQf: wp.array(dtype=Any),  # (N,) mat33 OUTPUT
     grad_positions: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
@@ -5684,18 +5664,18 @@ def _pme_fractionalize_double_backward_kernel(
     r"""Double-backward of :func:`_pme_fractionalize_kernel` (stress-loss).
 
     The forward map is multilinear, so the second-order is closed-form. With
-    ``M = cell_inv_t[b]``, ``mgu = mesh ⊙ gu``, and the four incoming cotangents
-    ``(Gr, GM, Gμ, GQ)`` on the backward outputs
+    ``M = cell_inv_t[b]`` and the four incoming cotangents ``(Gr, GM, Gμ, GQ)``
+    on the backward outputs
     ``(grad_positions, grad_cell_inv_t, grad_dipoles, grad_quadrupoles)``, the
     grads w.r.t. the backward inputs are:
 
-    - ``grad_gu = mesh ⊙ (M·Gr)``
+    - ``grad_gp = M·Gr + GM·r`` (gp enters BOTH grad_positions and grad_cell)
     - ``grad_gdf = GM·μ + M·Gμ``
     - ``grad_gQf = GM·Q·Mᵀ + M·Q·GMᵀ + M·GQ·Mᵀ``
-    - ``grad_r = GMᵀ·mgu``
+    - ``grad_r = GMᵀ·gp``
     - ``grad_μ = GMᵀ·gdf``
     - ``grad_Q = GMᵀ·gQf·M + Mᵀ·gQf·GM``
-    - ``grad_M = mgu⊗Gr + gdf⊗Gμ + gQfᵀ·GM·Q + gQf·GM·Qᵀ
+    - ``grad_M = gp⊗Gr + gdf⊗Gμ + gQfᵀ·GM·Q + gQf·GM·Qᵀ
       + gQf·M·GQᵀ + gQfᵀ·M·GQ`` (atomic per system).
     """
     i = wp.tid()
@@ -5703,10 +5683,9 @@ def _pme_fractionalize_double_backward_kernel(
     m_mat = cell_inv_t[b]
     m_t = wp.transpose(m_mat)
     r = positions[i]
-    s = r[0]
     mu = dipoles[i]
     q_i = quadrupoles[i]
-    gu_i = gu[i]
+    gp_i = gp[i]
     gdf_i = gdf[i]
     gQf_i = gQf[i]
     gr = g_pos[i]
@@ -5714,27 +5693,17 @@ def _pme_fractionalize_double_backward_kernel(
     gm_t = wp.transpose(gm)
     gmu = g_dip[i]
     gq = g_quad[i]
-    mgu = wp.vector(
-        gu_i[0] * type(s)(mesh[0]),
-        gu_i[1] * type(s)(mesh[1]),
-        gu_i[2] * type(s)(mesh[2]),
-    )
-    # ∂/∂(incoming cotangents). gu enters BOTH grad_positions (via gr=Mᵀ·mgu)
-    # AND grad_cell_inv_t (via the mgu⊗r term), so both feed grad_gu.
-    m_gr = m_mat * gr + gm * r
-    grad_gu[i] = wp.vector(
-        m_gr[0] * type(s)(mesh[0]),
-        m_gr[1] * type(s)(mesh[1]),
-        m_gr[2] * type(s)(mesh[2]),
-    )
+    # ∂/∂(incoming cotangents). gp enters BOTH grad_positions (via gr=Mᵀ·gp)
+    # AND grad_cell_inv_t (via the gp⊗r term), so both feed grad_gp.
+    grad_gp[i] = m_mat * gr + gm * r
     grad_gdf[i] = gm * mu + m_mat * gmu
     grad_gQf[i] = gm * q_i * m_t + m_mat * q_i * gm_t + m_mat * gq * m_t
     # ∂/∂(forward inputs) — the genuine cell×{pos,moment} cross terms.
-    grad_positions[i] = gm_t * mgu
+    grad_positions[i] = gm_t * gp_i
     grad_dipoles[i] = gm_t * gdf_i
     grad_quadrupoles[i] = gm_t * gQf_i * m_mat + m_t * gQf_i * gm
     grad_m = (
-        wp.outer(mgu, gr)
+        wp.outer(gp_i, gr)
         + wp.outer(gdf_i, gmu)
         + wp.transpose(gQf_i) * gm * q_i
         + gQf_i * gm * wp.transpose(q_i)
@@ -5751,17 +5720,16 @@ def _pme_fractionalize_double_backward_sig(v, t):
         wp.array(dtype=v),  # positions
         wp.array(dtype=mat),  # cell_inv_t
         wp.array(dtype=wp.int32),  # batch_idx
-        wp.vec3i,  # mesh
         wp.array(dtype=v),  # dipoles
         wp.array(dtype=mat),  # quadrupoles
-        wp.array(dtype=v),  # gu
+        wp.array(dtype=v),  # gp
         wp.array(dtype=v),  # gdf
         wp.array(dtype=mat),  # gQf
         wp.array(dtype=v),  # g_pos
         wp.array(dtype=mat),  # g_cell
         wp.array(dtype=v),  # g_dip
         wp.array(dtype=mat),  # g_quad
-        wp.array(dtype=v),  # grad_gu
+        wp.array(dtype=v),  # grad_gp
         wp.array(dtype=v),  # grad_gdf
         wp.array(dtype=mat),  # grad_gQf
         wp.array(dtype=v),  # grad_positions
@@ -5780,17 +5748,16 @@ def pme_fractionalize_double_backward_launch(
     positions,
     cell_inv_t,
     batch_idx,
-    mesh,
     dipoles,
     quadrupoles,
-    gu,
+    gp,
     gdf,
     gQf,
     g_pos,
     g_cell,
     g_dip,
     g_quad,
-    grad_gu,
+    grad_gp,
     grad_gdf,
     grad_gQf,
     grad_positions,
@@ -5811,10 +5778,9 @@ def pme_fractionalize_double_backward_launch(
             positions,
             cell_inv_t,
             batch_idx,
-            mesh,
             dipoles,
             quadrupoles,
-            gu,
+            gp,
             gdf,
             gQf,
             g_pos,
@@ -5823,7 +5789,7 @@ def pme_fractionalize_double_backward_launch(
             g_quad,
         ],
         outputs=[
-            grad_gu,
+            grad_gp,
             grad_gdf,
             grad_gQf,
             grad_positions,

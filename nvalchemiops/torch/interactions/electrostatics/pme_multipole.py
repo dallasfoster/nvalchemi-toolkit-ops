@@ -3804,16 +3804,14 @@ def _pme_fractionalize_forward(
     dipoles: torch.Tensor,
     quadrupoles: torch.Tensor,
     batch_idx: torch.Tensor,
-    mesh_nx: int,
-    mesh_ny: int,
-    mesh_nz: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Map Cartesian (positions, moments) to the unitless mesh frame.
+    r"""Map Cartesian (positions, moments) to the cell-fractional frame.
 
-    Returns ``(u, d_frac, Q_frac)`` with ``u = mesh ⊙ (M·r)``,
-    ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` (``M = cell_inv_t[batch_idx[i]]``).
-    Factors ALL ``cell_inv_t`` coupling out of the spread/gather kernels so the
-    cell-stress 2nd-order composes through this multilinear map's autograd.
+    Returns ``(p, d_frac, Q_frac)`` with ``p = M·r``, ``d_frac = M·μ``,
+    ``Q_frac = M·Q·Mᵀ`` (``M = cell_inv_t[batch_idx[i]]``). Feeding these to the
+    spread kernel with an identity ``cell_inv_t`` reproduces the cell-coupled
+    spread bit-for-bit, so the cell-stress 2nd-order composes through this
+    multilinear map's autograd.
     """
     device = positions.device
     dtype = positions.dtype
@@ -3821,7 +3819,7 @@ def _pme_fractionalize_forward(
     wp_vec = get_wp_vec_dtype(dtype)
     wp_mat = get_wp_mat_dtype(dtype)
     n = positions.shape[0]
-    u = torch.empty((n, 3), dtype=dtype, device=device)
+    p = torch.empty((n, 3), dtype=dtype, device=device)
     df = torch.empty((n, 3), dtype=dtype, device=device)
     qf = torch.empty((n, 3, 3), dtype=dtype, device=device)
     with _scoped_warp_stream(device):
@@ -3829,20 +3827,19 @@ def _pme_fractionalize_forward(
             _wp_from_torch(positions.contiguous(), dtype=wp_vec),
             _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
             _wp_from_torch(batch_idx.contiguous(), dtype=wp.int32),
-            wp.vec3i(int(mesh_nx), int(mesh_ny), int(mesh_nz)),
             _wp_from_torch(dipoles.contiguous(), dtype=wp_vec),
             _wp_from_torch(quadrupoles.contiguous(), dtype=wp_mat),
-            _wp_from_torch(u, dtype=wp_vec),
+            _wp_from_torch(p, dtype=wp_vec),
             _wp_from_torch(df, dtype=wp_vec),
             _wp_from_torch(qf, dtype=wp_mat),
             wp_dtype=wp_scalar,
             device=str(wp.device_from_torch(device)),
         )
-    return u, df, qf
+    return p, df, qf
 
 
 def _pme_fractionalize_backward(
-    grad_u: torch.Tensor,
+    grad_p: torch.Tensor,
     grad_df: torch.Tensor,
     grad_qf: torch.Tensor,
     positions: torch.Tensor,
@@ -3850,9 +3847,6 @@ def _pme_fractionalize_backward(
     dipoles: torch.Tensor,
     quadrupoles: torch.Tensor,
     batch_idx: torch.Tensor,
-    mesh_nx: int,
-    mesh_ny: int,
-    mesh_nz: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adjoint of the fractionalize map → (grad_pos, grad_cell, grad_dip, grad_quad)."""
     device = positions.device
@@ -3871,10 +3865,9 @@ def _pme_fractionalize_backward(
             _wp_from_torch(positions.contiguous(), dtype=wp_vec),
             _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
             _wp_from_torch(batch_idx.contiguous(), dtype=wp.int32),
-            wp.vec3i(int(mesh_nx), int(mesh_ny), int(mesh_nz)),
             _wp_from_torch(dipoles.contiguous(), dtype=wp_vec),
             _wp_from_torch(quadrupoles.contiguous(), dtype=wp_mat),
-            _wp_from_torch(grad_u.contiguous(), dtype=wp_vec),
+            _wp_from_torch(grad_p.contiguous(), dtype=wp_vec),
             _wp_from_torch(grad_df.contiguous(), dtype=wp_vec),
             _wp_from_torch(grad_qf.contiguous(), dtype=wp_mat),
             _wp_from_torch(grad_pos, dtype=wp_vec),
@@ -3892,7 +3885,7 @@ def _pme_fractionalize_double_backward(
     g_cell: torch.Tensor,
     g_dip: torch.Tensor,
     g_quad: torch.Tensor,
-    grad_u: torch.Tensor,
+    grad_p: torch.Tensor,
     grad_df: torch.Tensor,
     grad_qf: torch.Tensor,
     positions: torch.Tensor,
@@ -3900,9 +3893,6 @@ def _pme_fractionalize_double_backward(
     dipoles: torch.Tensor,
     quadrupoles: torch.Tensor,
     batch_idx: torch.Tensor,
-    mesh_nx: int,
-    mesh_ny: int,
-    mesh_nz: int,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -3914,8 +3904,8 @@ def _pme_fractionalize_double_backward(
 ]:
     r"""Second-order backward (stress-loss). Cotangents ``(g_pos, g_cell, g_dip,
     g_quad)`` on the backward outputs → grads w.r.t. backward inputs at
-    ``second_order_diff_positions = (0, 1, 2, 3, 4, 9, 10)`` =
-    ``(grad_u, grad_df, grad_qf, positions, cell_inv_t, dipoles, quadrupoles)``.
+    ``second_order_diff_positions = (0, 1, 2, 3, 4, 5, 6)`` =
+    ``(grad_p, grad_df, grad_qf, positions, cell_inv_t, dipoles, quadrupoles)``.
     """
     device = positions.device
     dtype = positions.dtype
@@ -3924,7 +3914,7 @@ def _pme_fractionalize_double_backward(
     wp_mat = get_wp_mat_dtype(dtype)
     n = positions.shape[0]
     b = cell_inv_t.shape[0]
-    d_gu = torch.empty((n, 3), dtype=dtype, device=device)
+    d_gp = torch.empty((n, 3), dtype=dtype, device=device)
     d_gdf = torch.empty((n, 3), dtype=dtype, device=device)
     d_gqf = torch.empty((n, 3, 3), dtype=dtype, device=device)
     d_pos = torch.empty((n, 3), dtype=dtype, device=device)
@@ -3936,17 +3926,16 @@ def _pme_fractionalize_double_backward(
             _wp_from_torch(positions.contiguous(), dtype=wp_vec),
             _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
             _wp_from_torch(batch_idx.contiguous(), dtype=wp.int32),
-            wp.vec3i(int(mesh_nx), int(mesh_ny), int(mesh_nz)),
             _wp_from_torch(dipoles.contiguous(), dtype=wp_vec),
             _wp_from_torch(quadrupoles.contiguous(), dtype=wp_mat),
-            _wp_from_torch(grad_u.contiguous(), dtype=wp_vec),
+            _wp_from_torch(grad_p.contiguous(), dtype=wp_vec),
             _wp_from_torch(grad_df.contiguous(), dtype=wp_vec),
             _wp_from_torch(grad_qf.contiguous(), dtype=wp_mat),
             _wp_from_torch(g_pos.contiguous(), dtype=wp_vec),
             _wp_from_torch(g_cell.contiguous(), dtype=wp_mat),
             _wp_from_torch(g_dip.contiguous(), dtype=wp_vec),
             _wp_from_torch(g_quad.contiguous(), dtype=wp_mat),
-            _wp_from_torch(d_gu, dtype=wp_vec),
+            _wp_from_torch(d_gp, dtype=wp_vec),
             _wp_from_torch(d_gdf, dtype=wp_vec),
             _wp_from_torch(d_gqf, dtype=wp_mat),
             _wp_from_torch(d_pos, dtype=wp_vec),
@@ -3956,13 +3945,13 @@ def _pme_fractionalize_double_backward(
             wp_dtype=wp_scalar,
             device=str(wp.device_from_torch(device)),
         )
-    return d_gu, d_gdf, d_gqf, d_pos, d_cell, d_dip, d_quad
+    return d_gp, d_gdf, d_gqf, d_pos, d_cell, d_dip, d_quad
 
 
 def _pme_fractionalize_forward_fake(
     positions, cell_inv_t, dipoles, quadrupoles, *_args
 ):
-    """Fake: ``(u, d_frac, Q_frac)`` shaped like the moment inputs."""
+    """Fake: ``(p, d_frac, Q_frac)`` shaped like the moment inputs."""
     return (
         torch.empty_like(positions),
         torch.empty_like(dipoles),
@@ -3971,7 +3960,7 @@ def _pme_fractionalize_forward_fake(
 
 
 def _pme_fractionalize_backward_fake(
-    grad_u, grad_df, grad_qf, positions, cell_inv_t, dipoles, quadrupoles, *_args
+    grad_p, grad_df, grad_qf, positions, cell_inv_t, dipoles, quadrupoles, *_args
 ):
     """Fake: grads of (positions, cell_inv_t, dipoles, quadrupoles)."""
     return (
@@ -3987,7 +3976,7 @@ def _pme_fractionalize_double_backward_fake(
     g_cell,
     g_dip,
     g_quad,
-    grad_u,
+    grad_p,
     grad_df,
     grad_qf,
     positions,
@@ -3996,9 +3985,9 @@ def _pme_fractionalize_double_backward_fake(
     quadrupoles,
     *_args,
 ):
-    """Fake: grads of (grad_u, grad_df, grad_qf, pos, cell_inv_t, dip, quad)."""
+    """Fake: grads of (grad_p, grad_df, grad_qf, pos, cell_inv_t, dip, quad)."""
     return (
-        torch.empty_like(grad_u),
+        torch.empty_like(grad_p),
         torch.empty_like(grad_df),
         torch.empty_like(grad_qf),
         torch.empty_like(positions),
@@ -4010,10 +3999,9 @@ def _pme_fractionalize_double_backward_fake(
 
 _FRACTIONALIZE_DBWD_SCHEMA = (
     "(Tensor g_pos, Tensor g_cell, Tensor g_dip, Tensor g_quad, "
-    "Tensor grad_u, Tensor grad_df, Tensor grad_qf, Tensor positions, "
-    "Tensor cell_inv_t, Tensor dipoles, Tensor quadrupoles, Tensor batch_idx, "
-    "int mesh_nx, int mesh_ny, int mesh_nz) -> "
-    "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    "Tensor grad_p, Tensor grad_df, Tensor grad_qf, Tensor positions, "
+    "Tensor cell_inv_t, Tensor dipoles, Tensor quadrupoles, Tensor batch_idx) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
 )
 
 
@@ -4025,16 +4013,16 @@ register_warp_op_chain(
     backward=_pme_fractionalize_backward,
     backward_fake=_pme_fractionalize_backward_fake,
     backward_return_arity=4,
-    # positions=0, cell_inv_t=1, dipoles=2, quadrupoles=3 (batch_idx + mesh int).
+    # positions=0, cell_inv_t=1, dipoles=2, quadrupoles=3 (batch_idx=4 const).
     diff_input_positions=(0, 1, 2, 3),
-    n_forward_inputs=8,
+    n_forward_inputs=5,
     double_backward=_pme_fractionalize_double_backward,
     double_backward_fake=_pme_fractionalize_double_backward_fake,
     double_backward_schema=_FRACTIONALIZE_DBWD_SCHEMA,
-    # Backward inputs: grad_u=0, grad_df=1, grad_qf=2, positions=3,
-    # cell_inv_t=4, dipoles=5, quadrupoles=6 (batch_idx=7, mesh=8,9,10 const).
+    # Backward inputs: grad_p=0, grad_df=1, grad_qf=2, positions=3,
+    # cell_inv_t=4, dipoles=5, quadrupoles=6 (batch_idx=7 const).
     second_order_diff_positions=(0, 1, 2, 3, 4, 5, 6),
-    n_backward_inputs=11,
+    n_backward_inputs=8,
     double_backward_return_arity=7,
 )
 
@@ -4230,12 +4218,31 @@ def multipole_pme_reciprocal_space(
                 device=positions.device,
             )
         )
-        rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
+        # B-warp stress-loss path: factor ALL cell_inv_t coupling into the
+        # ``fractionalize`` op (p=M·r, df=Mμ, Qf=MQMᵀ) so the spread runs
+        # cell-free with an identity cell — bit-identical forward, but the
+        # cell autograd (1st + 2nd order, i.e. stress + stress-loss) now flows
+        # through fractionalize's analytic multilinear-map backward instead of
+        # the spread's missing cell double-backward.
+        batch_idx_single = torch.zeros(
+            positions.shape[0], dtype=torch.int32, device=positions.device
+        )
+        p_frac, df_frac, qf_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
             positions,
-            charges,
+            cell_inv_t_resolved,
             dipoles_in,
             quadrupoles_in,
-            cell_inv_t_resolved,
+            batch_idx_single,
+        )
+        identity_cell = torch.eye(
+            3, dtype=positions.dtype, device=positions.device
+        ).unsqueeze(0)
+        rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
+            p_frac,
+            charges,
+            df_frac,
+            qf_frac,
+            identity_cell,
             nx,
             ny,
             nz,
