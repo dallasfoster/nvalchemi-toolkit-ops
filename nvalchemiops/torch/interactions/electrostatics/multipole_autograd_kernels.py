@@ -61,7 +61,9 @@ from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels im
     receiver_phi_hat_backward_dipole,
     receiver_phi_hat_backward_quadrupole,
     source_phi_hat_backward_dipole,
+    source_phi_hat_double_backward_dipole,
 )
+from nvalchemiops.torch._warp_op_helpers import register_warp_op_chain
 
 
 def _wp_scalar(dtype: torch.dtype):
@@ -101,13 +103,146 @@ def _wp_out(t: torch.Tensor, dtype=wp.float64):
 # =============================================================================
 
 
-class SourcePhiHatFunction(torch.autograd.Function):
-    r"""Autograd-registered :func:`eval_gto_fourier_dipole`.
+def _source_phi_hat_forward(
+    k_vectors: torch.Tensor,
+    k_norm2: torch.Tensor,
+    sigma: float,
+    icl0: float,
+    icl1: float,
+) -> torch.Tensor:
+    """Opaque forward: :func:`eval_gto_fourier_dipole` -> ``(N_k, 4, 2)``."""
+    device = k_vectors.device
+    out = torch.empty((k_vectors.shape[0], 4, 2), dtype=torch.float64, device=device)
+    eval_gto_fourier_dipole(
+        _wp_in(k_vectors, wp.vec3d),
+        _wp_in(k_norm2),
+        float(sigma),
+        float(icl0),
+        float(icl1),
+        _wp_out(out),
+        device=str(wp.device_from_torch(device)),
+    )
+    return out
 
-    Forward takes ``(k_vectors, k_norm2, sigma, icl0, icl1)`` and
-    returns ``source_phi_hat`` of shape ``(N_k, 4, 2)``. Backward
-    produces ``(grad_k_vectors, grad_k_norm2)``; the scalars
-    ``sigma, icl0, icl1`` are not differentiable.
+
+def _source_phi_hat_forward_fake(
+    k_vectors: torch.Tensor,
+    k_norm2: torch.Tensor,
+    sigma: float,
+    icl0: float,
+    icl1: float,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``(N_k, 4, 2)`` float64."""
+    return k_vectors.new_empty((k_vectors.shape[0], 4, 2), dtype=torch.float64)
+
+
+def _source_phi_hat_backward(
+    grad_output: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_norm2: torch.Tensor,
+    sigma: float,
+    icl0: float,
+    icl1: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """First-order backward via the Warp ``source_phi_hat_backward_dipole`` kernel."""
+    device = k_vectors.device
+    grad_k_vec = torch.empty_like(k_vectors, dtype=torch.float64)
+    grad_k_n2 = torch.empty_like(k_norm2, dtype=torch.float64)
+    source_phi_hat_backward_dipole(
+        _wp_in(grad_output),
+        _wp_in(k_vectors, wp.vec3d),
+        _wp_in(k_norm2),
+        float(sigma),
+        float(icl0),
+        float(icl1),
+        _wp_out(grad_k_vec, wp.vec3d),
+        _wp_out(grad_k_n2),
+        device=str(wp.device_from_torch(device)),
+    )
+    return grad_k_vec, grad_k_n2
+
+
+def _source_phi_hat_double_backward(
+    gg_k_vectors: torch.Tensor,
+    gg_k_norm2: torch.Tensor,
+    grad_output: torch.Tensor,
+    k_vectors: torch.Tensor,
+    k_norm2: torch.Tensor,
+    sigma: float,
+    icl0: float,
+    icl1: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward via the Warp double-backward kernel.
+
+    Propagates ``(gg_k_vectors, gg_k_norm2)`` to grads w.r.t. the backward's
+    differentiable inputs ``(grad_output, k_vectors, k_norm2)`` — enabling
+    reciprocal stress-loss (``∂²E/∂cell∂θ``) while staying fully on Warp.
+    """
+    device = k_vectors.device
+    grad_grad_output = torch.empty(
+        (k_vectors.shape[0], 4, 2), dtype=torch.float64, device=device
+    )
+    grad_k_vec = torch.empty_like(k_vectors, dtype=torch.float64)
+    grad_k_n2 = torch.empty_like(k_norm2, dtype=torch.float64)
+    source_phi_hat_double_backward_dipole(
+        _wp_in(gg_k_vectors, wp.vec3d),
+        _wp_in(gg_k_norm2),
+        _wp_in(grad_output),
+        _wp_in(k_vectors, wp.vec3d),
+        _wp_in(k_norm2),
+        float(sigma),
+        float(icl0),
+        float(icl1),
+        _wp_out(grad_grad_output),
+        _wp_out(grad_k_vec, wp.vec3d),
+        _wp_out(grad_k_n2),
+        device=str(wp.device_from_torch(device)),
+    )
+    return grad_grad_output, grad_k_vec, grad_k_n2
+
+
+_SOURCE_PHI_HAT_SCHEMA = (
+    "(Tensor k_vectors, Tensor k_norm2, float sigma, float icl0, float icl1) -> Tensor"
+)
+_SOURCE_PHI_HAT_BWD_SCHEMA = (
+    "(Tensor grad_output, Tensor k_vectors, Tensor k_norm2, float sigma, "
+    "float icl0, float icl1) -> (Tensor, Tensor)"
+)
+_SOURCE_PHI_HAT_DBWD_SCHEMA = (
+    "(Tensor gg_k_vectors, Tensor gg_k_norm2, Tensor grad_output, "
+    "Tensor k_vectors, Tensor k_norm2, float sigma, float icl0, float icl1) "
+    "-> (Tensor, Tensor, Tensor)"
+)
+register_warp_op_chain(
+    name="nvalchemiops::multipole_source_phi_hat",
+    forward=_source_phi_hat_forward,
+    forward_schema=_SOURCE_PHI_HAT_SCHEMA,
+    forward_fake=_source_phi_hat_forward_fake,
+    backward=_source_phi_hat_backward,
+    backward_schema=_SOURCE_PHI_HAT_BWD_SCHEMA,
+    backward_return_arity=2,
+    diff_input_positions=(0, 1),  # k_vectors, k_norm2
+    n_forward_inputs=5,
+    double_backward=_source_phi_hat_double_backward,
+    double_backward_schema=_SOURCE_PHI_HAT_DBWD_SCHEMA,
+    double_backward_return_arity=3,
+    # Backward-op inputs: grad_output(0), k_vectors(1), k_norm2(2) are the diff
+    # slots the double-backward returns grads for.
+    second_order_diff_positions=(0, 1, 2),
+    n_backward_inputs=6,
+)
+
+
+class SourcePhiHatFunction:
+    r"""Back-compat shim for the source :math:`\hat\phi(k)` GTO-Fourier eval.
+
+    The implementation is the fully-differentiable
+    ``torch.ops.nvalchemiops.multipole_source_phi_hat`` Warp op chain (opaque
+    forward :func:`eval_gto_fourier_dipole` + analytical first- and second-order
+    Warp backward), so the ``k_vectors`` / ``k_norm2`` -> ``source_phi_hat``
+    graph is twice differentiable (reciprocal stress-loss) and compile-clean.
+    This class only preserves the historical ``.apply(k_vectors, k_norm2,
+    sigma, icl0, icl1)`` signature; new code should call the op directly.
 
     Parameters
     ----------
@@ -128,60 +263,17 @@ class SourcePhiHatFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
-        ctx,
+    def apply(
         k_vectors: torch.Tensor,
         k_norm2: torch.Tensor,
         sigma: float,
         icl0: float,
         icl1: float,
     ) -> torch.Tensor:
-        """Run eval_gto_fourier_dipole and save tensors for backward."""
-        n_k = k_vectors.shape[0]
-        device = k_vectors.device
-        wp_device = wp.device_from_torch(device)
-
-        out = torch.empty((n_k, 4, 2), dtype=torch.float64, device=device)
-        eval_gto_fourier_dipole(
-            _wp_in(k_vectors, wp.vec3d),
-            _wp_in(k_norm2),
-            float(sigma),
-            float(icl0),
-            float(icl1),
-            _wp_out(out),
-            device=str(wp_device),
+        """Dispatch to ``torch.ops.nvalchemiops.multipole_source_phi_hat``."""
+        return torch.ops.nvalchemiops.multipole_source_phi_hat(
+            k_vectors, k_norm2, float(sigma), float(icl0), float(icl1)
         )
-
-        ctx.save_for_backward(k_vectors, k_norm2)
-        ctx.sigma = float(sigma)
-        ctx.icl0 = float(icl0)
-        ctx.icl1 = float(icl1)
-        return out
-
-    @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None]:
-        r""":math:`\partial/\partial`\ (k_vectors, k_norm2); sigma/icl scalars are non-differentiable."""
-        k_vectors, k_norm2 = ctx.saved_tensors
-        device = k_vectors.device
-        wp_device = wp.device_from_torch(device)
-
-        grad_k_vec = torch.empty_like(k_vectors)
-        grad_k_n2 = torch.empty_like(k_norm2)
-
-        source_phi_hat_backward_dipole(
-            _wp_in(grad_output),
-            _wp_in(k_vectors, wp.vec3d),
-            _wp_in(k_norm2),
-            ctx.sigma,
-            ctx.icl0,
-            ctx.icl1,
-            _wp_out(grad_k_vec, wp.vec3d),
-            _wp_out(grad_k_n2),
-            device=str(wp_device),
-        )
-        return grad_k_vec, grad_k_n2, None, None, None
 
 
 # =============================================================================

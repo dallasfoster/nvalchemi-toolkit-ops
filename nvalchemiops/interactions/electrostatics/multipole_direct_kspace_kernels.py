@@ -4321,6 +4321,128 @@ def source_phi_hat_backward_dipole(
     )
 
 
+@wp.kernel
+def _source_phi_hat_double_backward_dipole_kernel(
+    gg_k_vectors: wp.array(dtype=wp.vec3d),  # (N_k,) cotangent on grad_k_vectors
+    gg_k_norm2: wp.array(dtype=wp.float64),  # (N_k,) cotangent on grad_k_norm2
+    grad_output: wp.array3d(dtype=wp.float64),  # (N_k, 4, 2)
+    k_vectors: wp.array(dtype=wp.vec3d),  # (N_k,)
+    k_norm2: wp.array(dtype=wp.float64),  # (N_k,)
+    sigma: wp.float64,
+    inv_cl_l0: wp.float64,
+    inv_cl_l1: wp.float64,
+    grad_grad_output: wp.array3d(dtype=wp.float64),  # (N_k, 4, 2) OUTPUT
+    grad_k_vectors: wp.array(dtype=wp.vec3d),  # (N_k,) OUTPUT
+    grad_k_norm2: wp.array(dtype=wp.float64),  # (N_k,) OUTPUT
+):
+    r"""Second-order backward of :func:`eval_gto_fourier_dipole`.
+
+    The first-order backward (:func:`_source_phi_hat_backward_dipole_kernel`) is
+    linear in ``grad_output`` and depends on ``(k_vectors, k_norm2)`` through the
+    shared Gaussian ``g(k²) = C₀·e^{γ·k²}`` (``γ = -σ²/2``). With upstream
+    cotangents ``(gg_kv, gg_k2)`` on ``(grad_k_vectors, grad_k_norm2)`` the
+    closed-form second-order grads (per k) are, with ``a₀ = invcl₀·g·σ³·Y₀₀``,
+    ``c₁ = -invcl₁·g·σ⁵·Y₁``, ``S = Σ_α G_{1,α}·k_α``:
+
+    .. math::
+
+        \partial L_2/\partial G_{0,0} &= gg_{k²}\,\gamma\,a_0 \\
+        \partial L_2/\partial G_{1,\alpha} &= c_1(gg_{kv,\alpha} + gg_{k²}\,\gamma\,k_\alpha) \\
+        \partial L_2/\partial k_\alpha &= gg_{k²}\,\gamma\,c_1\,G_{1,\alpha} \\
+        \partial L_2/\partial k² &= \gamma\,c_1(gg_{kv}\!\cdot\!G_{1})
+            + gg_{k²}\,\gamma^2(a_0 G_{0,0} + c_1 S)
+
+    Launch Grid
+    -----------
+    dim = [N_k].
+    """
+    k_idx = wp.tid()
+    k_vec = k_vectors[k_idx]
+    k2 = k_norm2[k_idx]
+
+    sigma2 = sigma * sigma
+    sigma3 = sigma2 * sigma
+    sigma5 = sigma3 * sigma2
+    gamma = -wp.float64(0.5) * sigma2  # d(common)/dk2 = gamma * common
+
+    gauss = wp.exp(-wp.float64(0.5) * k2 * sigma2)
+    common_radial = _FOUR_PI_SQRT_PI_OVER_2 * gauss
+    a0_base = inv_cl_l0 * common_radial * sigma3 * Y00_COEFF
+    coeff_l1 = -inv_cl_l1 * common_radial * sigma5 * Y1_COEFF
+
+    # grad_output relevant entries (l=0 real, l=1 imag at rows 1/2/3 -> k_y/k_z/k_x).
+    g_l0_r = grad_output[k_idx, 0, 0]
+    g_ky = grad_output[k_idx, 1, 1]
+    g_kz = grad_output[k_idx, 2, 1]
+    g_kx = grad_output[k_idx, 3, 1]
+
+    ggkv = gg_k_vectors[k_idx]
+    ggkv_x = ggkv[0]
+    ggkv_y = ggkv[1]
+    ggkv_z = ggkv[2]
+    ggk2 = gg_k_norm2[k_idx]
+
+    # S = Σ_α G_{1,α} k_α with the (m=-1,0,+1) -> (k_y, k_z, k_x) layout.
+    s_dot = g_ky * k_vec[1] + g_kz * k_vec[2] + g_kx * k_vec[0]
+    ggkv_dot_g = ggkv_x * g_kx + ggkv_y * g_ky + ggkv_z * g_kz
+
+    # grad_grad_output: zero everywhere except the l=0 real + l=1 imag slots.
+    for lm in range(4):
+        grad_grad_output[k_idx, lm, 0] = wp.float64(0.0)
+        grad_grad_output[k_idx, lm, 1] = wp.float64(0.0)
+    grad_grad_output[k_idx, 0, 0] = ggk2 * gamma * a0_base
+    grad_grad_output[k_idx, 3, 1] = coeff_l1 * (ggkv_x + ggk2 * gamma * k_vec[0])
+    grad_grad_output[k_idx, 1, 1] = coeff_l1 * (ggkv_y + ggk2 * gamma * k_vec[1])
+    grad_grad_output[k_idx, 2, 1] = coeff_l1 * (ggkv_z + ggk2 * gamma * k_vec[2])
+
+    # grad w.r.t. k_vectors (k enters only the gg_k2 path via S).
+    sc_kv = ggk2 * gamma * coeff_l1
+    grad_k_vectors[k_idx] = wp.vec3d(sc_kv * g_kx, sc_kv * g_ky, sc_kv * g_kz)
+
+    # grad w.r.t. k_norm2 (common's k2-dependence, factor gamma on a0/coeff_l1).
+    grad_k_norm2[k_idx] = gamma * coeff_l1 * ggkv_dot_g + ggk2 * gamma * gamma * (
+        a0_base * g_l0_r + coeff_l1 * s_dot
+    )
+
+
+def source_phi_hat_double_backward_dipole(
+    gg_k_vectors: wp.array,
+    gg_k_norm2: wp.array,
+    grad_output: wp.array,
+    k_vectors: wp.array,
+    k_norm2: wp.array,
+    sigma: float,
+    inv_cl_l0: float,
+    inv_cl_l1: float,
+    grad_grad_output: wp.array,
+    grad_k_vectors: wp.array,
+    grad_k_norm2: wp.array,
+    device: str | None = None,
+) -> None:
+    """Launcher for :func:`_source_phi_hat_double_backward_dipole_kernel`."""
+    n_k = k_vectors.shape[0]
+    if device is None:
+        device = str(k_vectors.device)
+    wp.launch(
+        _source_phi_hat_double_backward_dipole_kernel,
+        dim=n_k,
+        inputs=[
+            gg_k_vectors,
+            gg_k_norm2,
+            grad_output,
+            k_vectors,
+            k_norm2,
+            wp.float64(sigma),
+            wp.float64(inv_cl_l0),
+            wp.float64(inv_cl_l1),
+            grad_grad_output,
+            grad_k_vectors,
+            grad_k_norm2,
+        ],
+        device=device,
+    )
+
+
 # -----------------------------------------------------------------------------
 # K2: backward of eval_receiver_gto_fourier_dipole w.r.t. (k_vectors, k_norm2)
 # -----------------------------------------------------------------------------

@@ -47,6 +47,7 @@ from nvalchemiops.torch.interactions.electrostatics.k_vectors import (
 from nvalchemiops.torch.interactions.electrostatics.multipole_autograd_kernels import (
     ReceiverPhiHatFunction,
     ReceiverPhiHatQuadrupoleFunction,
+    SourcePhiHatFunction,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_electrostatics import (
     _prepend_origin,
@@ -210,48 +211,6 @@ class MultipoleSCFCache:
         return self.k_vectors.device
 
 
-def _source_phi_hat_torch(
-    k_vectors: torch.Tensor,
-    k_norm2: torch.Tensor,
-    sigma: float,
-    icl0: float,
-    icl1: float,
-) -> torch.Tensor:
-    r"""Pure-torch twin of :func:`eval_gto_fourier_dipole` (source :math:`\hat\phi`, l<=1).
-
-    Bit-matches :class:`SourcePhiHatFunction` (verified) but is twice
-    differentiable in ``k_vectors`` / ``k_norm2`` (= cell), enabling reciprocal
-    stress-loss. Closed form:
-    ``φ̂_{0,0} = icl0·4π√(π/2)·σ³·e^{-k²σ²/2}·Y00``;
-    ``φ̂_{1,m} = -icl1·4π√(π/2)·σ⁵·e^{-k²σ²/2}·Y1·k_component·(-i)`` (purely
-    imaginary), with ``(m=-1,0,+1) -> (k_y, k_z, k_x)``.
-    """
-    import math as _math
-
-    from nvalchemiops.math.spherical_harmonics import Y00_COEFF as _Y00
-    from nvalchemiops.math.spherical_harmonics import Y1_COEFF as _Y1
-
-    four_pi_sqrt = 4.0 * _math.pi * _math.sqrt(_math.pi / 2.0)
-    s = float(sigma)
-    s3 = s**3
-    s5 = s**5
-    common = four_pi_sqrt * torch.exp(-0.5 * k_norm2 * s * s)  # (N_k,)
-    zero = torch.zeros_like(k_norm2)
-    phi00_r = float(icl0) * common * s3 * float(_Y00)  # (N_k,)
-    coeff_l1 = -float(icl1) * common * s5 * float(_Y1)  # (N_k,)
-    real = torch.stack([phi00_r, zero, zero, zero], dim=1)  # (N_k, 4)
-    imag = torch.stack(
-        [
-            zero,
-            coeff_l1 * k_vectors[:, 1],  # m=-1 -> k_y
-            coeff_l1 * k_vectors[:, 2],  # m= 0 -> k_z
-            coeff_l1 * k_vectors[:, 0],  # m=+1 -> k_x
-        ],
-        dim=1,
-    )  # (N_k, 4)
-    return torch.stack([real, imag], dim=-1)  # (N_k, 4, 2)
-
-
 def prepare_multipole_scf_cache(
     cell: torch.Tensor,
     *,
@@ -410,7 +369,7 @@ def prepare_multipole_scf_cache(
     # O(N_k) setup, so torch here costs nothing on the per-atom hot path.
     icl0_source = inv_cl(sigma, 0, density_mode)
     icl1_source = inv_cl(sigma, 1, density_mode) if l_max >= 1 else 1.0
-    source_phi_hat_t = _source_phi_hat_torch(
+    source_phi_hat_t = SourcePhiHatFunction.apply(
         k_vectors, k_norm2, sigma, icl0_source, icl1_source
     )
 
@@ -686,7 +645,7 @@ def _prepare_multipole_scf_cache_batch(
 
     source_phi_per_system: list[torch.Tensor] = []
     for b in range(batch_size):
-        phi_b_padded = _source_phi_hat_torch(
+        phi_b_padded = SourcePhiHatFunction.apply(
             k_vectors[b],
             k_norm2[b],
             sigma,
