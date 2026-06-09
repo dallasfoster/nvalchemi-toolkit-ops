@@ -28,6 +28,8 @@ Topics covered:
 - Stress tensor via the cell-gradient (full Ewald: real + reciprocal).
 - Force-loss-style training (l_max=2 ``create_graph=True`` through the
   **full composite**, real + reciprocal) — single-system AND batched.
+- Stress-loss-style training (``create_graph=True`` through ``dE/dcell``,
+  i.e. ∂²E/∂cell∂θ) — single-system AND batched.
 - Full-PBC Ewald with parameter auto-estimation.
 - Batched (multi-system) workflows, incl. batch-aware ``neighbor_list``.
 
@@ -398,6 +400,48 @@ print(f"l_max=2 force-loss = {force_loss.item():.4f}")
 print(f"l_max=2 ∂loss/∂positions max = {grad_pos_2nd.abs().max().item():.4f}")
 
 # %%
+# Stress-Loss Training (l_max=2 ``create_graph=True`` through ``dE/dcell``)
+# ------------------------------------------------------------------------
+# The cousin of force-loss: backprop a **stress**-error loss. The stress is
+# itself a first derivative ``∂E/∂cell``, so training it to a target requires
+# the *mixed* second derivative ``∂²E/∂cell∂θ`` (θ = positions / moments).
+# Take the stress with ``create_graph=True`` and backprop the loss — this runs
+# the full l_max=2 composite second-order backward through the **cell** on both
+# the real-space and the direct-k reciprocal halves (the reciprocal cell↔
+# {positions, moments} cross-terms are wired single-system AND batched).
+#
+# Pair this with the force-loss above and an energy term for the canonical
+# MLIP training objective (energy + forces + stress).
+
+pos_g = positions.clone().requires_grad_(True)
+cell_g = cell.clone().requires_grad_(True)
+E = multipole_ewald_summation(
+    pos_g,
+    moments_l2_static,
+    cell_g,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma=sigma,
+    alpha=alpha,
+    kspace_cutoff=kspace_cutoff,
+)
+# Virial stress with create_graph=True so it stays autograd-connected to the
+# inputs (full Ewald: real + reciprocal cell second-order).
+(grad_cell,) = torch.autograd.grad(E, cell_g, create_graph=True)
+stress = (cell.T @ grad_cell) / volume
+# Mock stress-error loss against a random symmetric target.
+stress_label = torch.randn_like(stress)
+stress_label = 0.5 * (stress_label + stress_label.T)
+stress_loss = ((stress - stress_label) ** 2).mean()
+# Backprop the stress-loss to positions (∂²E/∂cell∂positions).
+(grad_pos_stress,) = torch.autograd.grad(stress_loss, [pos_g])
+print(f"l_max=2 stress-loss = {stress_loss.item():.4f}")
+print(
+    f"l_max=2 ∂(stress-loss)/∂positions max = {grad_pos_stress.abs().max().item():.4f}"
+)
+
+# %%
 # Auto-Estimated Ewald Parameters
 # -------------------------------
 # ``multipole_ewald_summation`` accepts ``alpha=None`` and
@@ -590,6 +634,53 @@ for lmax_tag, moments_b in (
     )
 
 # %%
+# Batched Stress-Loss Training (``create_graph=True`` through ``dE/dcell``)
+# ------------------------------------------------------------------------
+# Stress-loss is batched too: a ``(B, 3, 3)`` ``cell`` carries grad, the
+# per-system virial is autograd-connected, and the batched composite
+# second-order backward (real-space + direct-k reciprocal cell cross-terms)
+# lets a stress-error loss backprop to positions. Matches the per-system
+# single-system result atom-for-atom.
+
+vols_batch = torch.det(cells_batch)  # (B,)
+for lmax_tag, moments_b in (
+    ("l_max=1", moments_l1_batch),
+    ("l_max=2", moments_l2_batch),
+):
+    pos_g_batch = positions_batch.clone().requires_grad_(True)
+    cells_g_batch = cells_batch.clone().requires_grad_(True)
+    E_sl = multipole_ewald_summation(
+        pos_g_batch,
+        moments_b,
+        cells_g_batch,
+        idx_j_batch,
+        ptr_batch,
+        sh_batch,
+        sigma=sigma,
+        alpha=alpha,
+        kspace_cutoff=kspace_cutoff,
+        batch_idx=batch_idx,
+    )
+    # Per-system virial stress (B, 3, 3), create_graph-connected.
+    (grad_cells_batch,) = torch.autograd.grad(
+        E_sl.sum(), cells_g_batch, create_graph=True
+    )
+    stress_batch = (
+        torch.einsum("bca,bcd->bad", cells_batch, grad_cells_batch)
+        / (vols_batch[:, None, None])
+    )
+    stress_labels_batch = torch.randn_like(stress_batch)
+    stress_labels_batch = 0.5 * (
+        stress_labels_batch + stress_labels_batch.transpose(-1, -2)
+    )
+    stress_loss_batch = ((stress_batch - stress_labels_batch) ** 2).mean()
+    (grad_pos_stress_batch,) = torch.autograd.grad(stress_loss_batch, [pos_g_batch])
+    print(
+        f"Batched (B=2) {lmax_tag} stress-loss = {stress_loss_batch.item():.4f}  "
+        f"∂loss/∂positions max = {grad_pos_stress_batch.abs().max().item():.4f}"
+    )
+
+# %%
 # Summary
 # -------
 # * ``multipole_ewald_summation`` is the composite Ewald entry point for
@@ -608,6 +699,11 @@ for lmax_tag, moments_b in (
 #   real-space second-order backward plus the direct-k reciprocal Q-channel
 #   double-backward. The reciprocal contribution to ``∂²E/∂x∂y`` is included
 #   (batched matches per-system atom-for-atom).
+# * **Stress-loss training** (``create_graph=True`` through ``dE/dcell``, i.e.
+#   the mixed ``∂²E/∂cell∂θ``) is likewise wired through the full composite at
+#   l_max=0/1/2, **single-system AND batched** — real-space + direct-k
+#   reciprocal cell cross-terms. Train energy + forces + stress together for
+#   the canonical MLIP objective.
 # * The unified real-space-only entry point is
 #   ``multipole_real_space_energy(positions, multipole_moments, ...)``,
 #   returning per-atom for all l_max.

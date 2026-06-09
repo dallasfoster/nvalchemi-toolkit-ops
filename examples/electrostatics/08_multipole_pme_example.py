@@ -30,6 +30,8 @@ Topics covered:
   real + reciprocal — for all l_max).
 - Force-loss-style training (l_max=2 ``create_graph=True``) through the
   full PME composite.
+- Stress-loss-style training (``create_graph=True`` through ``dE/dcell``,
+  i.e. ∂²E/∂cell∂θ) — single-system AND batched.
 - Auto-estimated parameters via ``estimate_multipole_pme_parameters``.
 - Batched (multi-system) workflows, including batched l_max=2.
 
@@ -392,6 +394,42 @@ print(f"l_max=2 ∂loss/∂positions max  = {grad_pos_2nd.abs().max().item():.4f
 
 
 # %%
+# Stress-Loss Training (l_max=2 ``create_graph=True`` through ``dE/dcell``)
+# ------------------------------------------------------------------------
+# The stress is ``∂E/∂cell``, so backprop a stress-error loss needs the mixed
+# second derivative ``∂²E/∂cell∂θ``. PME has the **cell** second-order wired
+# end-to-end at l_max=0/1/2 (single-system and batched): the reciprocal cell
+# coupling routes through ``fractionalize`` (cell autograd) feeding the spread
+# double-backward, plus the convolve k²/volume double-backward. Take the stress
+# with ``create_graph=True`` and backprop the loss to positions.
+
+pos_g = positions.clone().requires_grad_(True)
+cell_g = cell.clone().requires_grad_(True)
+E_sl = multipole_particle_mesh_ewald(
+    pos_g,
+    mm_l2,
+    cell_g,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma=sigma,
+    alpha=alpha,
+    mesh_dimensions=mesh,
+)
+# Virial stress with create_graph=True (real + reciprocal cell second-order).
+(grad_cell_sl,) = torch.autograd.grad(E_sl, cell_g, create_graph=True)
+stress_sl = (cell[0].T @ grad_cell_sl[0]) / volume
+stress_label = torch.randn_like(stress_sl)
+stress_label = 0.5 * (stress_label + stress_label.T)
+stress_loss = ((stress_sl - stress_label) ** 2).mean()
+(grad_pos_stress,) = torch.autograd.grad(stress_loss, [pos_g])
+print(f"l_max=2 PME stress-loss       = {stress_loss.item():.4f}")
+print(
+    f"l_max=2 ∂(stress-loss)/∂positions max = {grad_pos_stress.abs().max().item():.4f}"
+)
+
+
+# %%
 # Auto-Estimated PME Parameters
 # -----------------------------
 # ``multipole_particle_mesh_ewald`` accepts ``alpha=None`` and
@@ -570,6 +608,49 @@ for lmax_tag, mm_b in (("l_max=1", mm_l1_batch), ("l_max=2", mm_l2_batch)):
 
 
 # %%
+# Batched Stress-Loss Training (``create_graph=True`` through ``dE/dcell``)
+# ------------------------------------------------------------------------
+# Stress-loss is batched too: a ``(B, 3, 3)`` ``cell`` carries grad and the
+# batched PME composite second-order through the cell (fractionalize-fed spread
+# double-backward + convolve k²/volume double-backward) lets a per-system
+# stress-error loss backprop to positions. Matches the per-system single result.
+
+vols_batch = torch.det(cells_batch)  # (B,)
+for lmax_tag, mm_b in (("l_max=1", mm_l1_batch), ("l_max=2", mm_l2_batch)):
+    pos_g_batch = positions_batch.clone().requires_grad_(True)
+    cells_g_batch = cells_batch.clone().requires_grad_(True)
+    E_sl = multipole_particle_mesh_ewald(
+        pos_g_batch,
+        mm_b,
+        cells_g_batch,
+        idx_j_batch,
+        ptr_batch,
+        sh_batch,
+        sigma=sigma,
+        alpha=alpha,
+        batch_idx=batch_idx,
+    )
+    (grad_cells_batch,) = torch.autograd.grad(
+        E_sl.sum(), cells_g_batch, create_graph=True
+    )
+    stress_batch = (
+        torch.einsum("bca,bcd->bad", cells_batch, grad_cells_batch)
+        / (vols_batch[:, None, None])
+    )
+    stress_labels_batch = torch.randn_like(stress_batch)
+    stress_labels_batch = 0.5 * (
+        stress_labels_batch + stress_labels_batch.transpose(-1, -2)
+    )
+    stress_loss_batch = ((stress_batch - stress_labels_batch) ** 2).mean()
+    (grad_pos_stress_batch,) = torch.autograd.grad(stress_loss_batch, [pos_g_batch])
+    print(
+        f"Batched (B=2) {lmax_tag} PME stress-loss = "
+        f"{stress_loss_batch.item():.4f}  "
+        f"∂loss/∂positions max = {grad_pos_stress_batch.abs().max().item():.4f}"
+    )
+
+
+# %%
 # Summary
 # -------
 # * ``multipole_particle_mesh_ewald`` is the composite PME entry point for
@@ -584,5 +665,8 @@ for lmax_tag, mm_b in (("l_max=1", mm_l1_batch), ("l_max=2", mm_l2_batch)):
 #   ``multipole_moments``, for when you need just the short-range half.
 # * **Force-loss training (create_graph=True):** the full PME composite is
 #   twice-differentiable at l_max=0/1/2, **single-system and batched**.
+# * **Stress-loss training (create_graph=True through ``dE/dcell``):** the
+#   mixed ``∂²E/∂cell∂θ`` is wired through the full composite at l_max=0/1/2,
+#   **single-system and batched** — train energy + forces + stress together.
 # * PME's O(N log M) scaling makes it preferable to direct-k-space Ewald
 #   for N ≳ 1000 — see the ``benchmarks`` folder for wall-clock numbers.
