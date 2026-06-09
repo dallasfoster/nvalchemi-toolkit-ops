@@ -1036,3 +1036,95 @@ def test_monopole_dipole_half_vs_full_neighbor_list_match(lmax):
         f"LMAX={lmax}: half vs full disagree, rel={rel:.3e}\n"
         f"full={grad_full}\nhalf={grad_half}"
     )
+
+
+def _periodic_csr(pos_np, cell_np, cutoff, device):
+    """Full periodic CSR neighbor list with integer shifts in {-1,0,1}^3."""
+    n = pos_np.shape[0]
+    pi, pj, sh = [], [], []
+    for i in range(n):
+        for j in range(n):
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for c in (-1, 0, 1):
+                        if i == j and a == 0 and b == 0 and c == 0:
+                            continue
+                        shift = np.array([a, b, c])
+                        if (
+                            np.linalg.norm(pos_np[j] + shift @ cell_np - pos_np[i])
+                            < cutoff
+                        ):
+                            pi.append(i)
+                            pj.append(j)
+                            sh.append([a, b, c])
+    order = sorted(range(len(pi)), key=lambda k: (pi[k], pj[k]))
+    pi = [pi[k] for k in order]
+    pj = [pj[k] for k in order]
+    sh = [sh[k] for k in order]
+    idx_j = torch.tensor(
+        [pj[k] for k in range(len(pj))], dtype=torch.int32, device=device
+    )
+    nptr = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    for ii in pi:
+        nptr[ii + 1] += 1
+    nptr = torch.cumsum(nptr, 0).to(torch.int32)
+    return idx_j, nptr, torch.tensor(sh, dtype=torch.int32, device=device)
+
+
+class TestRealSpaceMonopoleStressLoss:
+    """l=0 real-space cell-grad double-backward (∂²E/∂cell∂θ) — Tier-1 S2.
+
+    The standalone l=0 entry uses the non-fused chain (no cell-grad), so this
+    exercises the fused op (used by ``multipole_ewald_summation``) directly:
+    ``create_graph`` through ``dE/dcell`` then backprop to positions/charges/
+    cell must be nonzero (silent-zero guard) and FD-match.
+    """
+
+    def test_stress_loss_fd(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dt = torch.float64
+        rng = np.random.default_rng(7)
+        n, lbox = 5, 4.0
+        cell_np = np.diag([lbox, lbox, lbox]) + rng.normal(scale=0.2, size=(3, 3))
+        pos_np = rng.uniform(0, lbox, size=(n, 3))
+        idx_j, nptr, shifts = _periodic_csr(pos_np, cell_np, 5.0, device)
+        assert int((shifts.abs().sum(1) > 0).sum()) > 0, "need image neighbors"
+        sigma = torch.tensor([0.5], dtype=dt, device=device)
+        alpha = torch.tensor([0.35], dtype=dt, device=device)
+        q0 = torch.tensor(rng.normal(size=n), dtype=dt, device=device)
+        q0 = q0 - q0.mean()
+        cell0 = torch.tensor(cell_np, dtype=dt, device=device).unsqueeze(0)
+        pos0 = torch.tensor(pos_np, dtype=dt, device=device)
+        w = torch.tensor(rng.normal(size=(1, 3, 3)), dtype=dt, device=device)
+        op = torch.ops.nvalchemiops.multipole_real_space_monopole_fused
+
+        def sloss(pos, cell, q):
+            e, _, _ = op(pos, q, cell, sigma, alpha, idx_j, nptr, shifts, False)
+            (stress,) = torch.autograd.grad(e, cell, create_graph=True)
+            return (stress * w).sum()
+
+        eps = 1e-6
+        # position channel
+        pos = pos0.clone().requires_grad_(True)
+        cell = cell0.clone().requires_grad_(True)
+        (gp,) = torch.autograd.grad(sloss(pos, cell, q0), pos)
+        assert gp.abs().max() > 1e-8, "silent zero (positions)"
+        vp = torch.tensor(rng.normal(size=(n, 3)), dtype=dt, device=device)
+
+        def sval_pos(p):
+            return sloss(p, cell0.clone().requires_grad_(True), q0).item()
+
+        fdp = (sval_pos(pos0 + eps * vp) - sval_pos(pos0 - eps * vp)) / (2 * eps)
+        assert abs((gp * vp).sum().item() - fdp) / (abs(fdp) + 1e-12) < 1e-5
+        # charge channel
+        qg = q0.clone().requires_grad_(True)
+        (gq,) = torch.autograd.grad(
+            sloss(pos0, cell0.clone().requires_grad_(True), qg), qg
+        )
+        vq = torch.tensor(rng.normal(size=n), dtype=dt, device=device)
+
+        def sval_q(qq):
+            return sloss(pos0, cell0.clone().requires_grad_(True), qq).item()
+
+        fdq = (sval_q(q0 + eps * vq) - sval_q(q0 - eps * vq)) / (2 * eps)
+        assert abs((gq * vq).sum().item() - fdq) / (abs(fdq) + 1e-12) < 1e-5

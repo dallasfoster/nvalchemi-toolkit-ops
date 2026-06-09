@@ -4153,6 +4153,213 @@ def multipole_real_space_monopole_csr_energy_2nd_backward(
     )
 
 
+@wp.kernel
+def _multipole_real_space_monopole_csr_cell_grad_backward_kernel(
+    positions: wp.array(dtype=Any),
+    charges: wp.array(dtype=Any),
+    cell: wp.array(dtype=Any),
+    idx_j: wp.array(dtype=wp.int32),
+    neighbor_ptr: wp.array(dtype=wp.int32),
+    unit_shifts: wp.array(dtype=wp.vec3i),
+    sigma: wp.array(dtype=Any),
+    alpha: wp.array(dtype=Any),
+    per_direction_scale: wp.array(dtype=wp.float64),
+    g_cell: wp.array(dtype=Any),  # (1,) mat33 — cotangent on grad_cell
+    grad_positions: wp.array(dtype=Any),  # (N,) OUT (pre-zeroed)
+    grad_charges: wp.array(dtype=Any),  # (N,) OUT (pre-zeroed)
+    grad_cell_out: wp.array(dtype=Any),  # (1,) mat33 OUT (pre-zeroed, atomic)
+):
+    r"""Double-backward of the l=0 real-space cell-grad (stress-loss).
+
+    The forward cell-grad is ``grad_cell[a,b] = Σ_pairs scale·n[a]·f[b]`` with
+    ``f = ∂E_pair/∂r_ij = -q_i q_j (A/r) r_vec`` and ``n = unit_shifts``. For a
+    cotangent ``g_cell`` on ``grad_cell``, ``S = ⟨g_cell, grad_cell⟩ =
+    Σ_pairs scale·(w·f)`` with the per-pair direction ``w = g_cellᵀ·n``. The
+    grads (same radial algebra as the force-loss 2nd-order kernel, with the
+    position-direction replaced by ``w``):
+
+    - ``G = q_i q_j (c_quad·(w·r_vec)·r_vec + (A/r)·w)``,
+      ``∂S/∂r_i = +scale·G``, ``∂S/∂r_j = -scale·G``;
+    - ``∂S/∂q_i = -scale·q_j·(A/r)·(w·r_vec)``, sym for ``q_j``;
+    - ``∂S/∂cell[a,b] = -scale·n[a]·G[b]`` (cell-cell / stress-stress block).
+    """
+    atom_i = wp.tid()
+    sigma_ = wp.float64(sigma[0])
+    alpha_ = wp.float64(alpha[0])
+    ab = _gto_ewald_ab(sigma_, alpha_)
+    a_coef = ab[0]
+    b_coef = ab[1]
+    scale = per_direction_scale[0]
+    cell_t = wp.transpose(cell[0])
+    gcell = g_cell[0]
+    g00 = wp.float64(gcell[0, 0])
+    g01 = wp.float64(gcell[0, 1])
+    g02 = wp.float64(gcell[0, 2])
+    g10 = wp.float64(gcell[1, 0])
+    g11 = wp.float64(gcell[1, 1])
+    g12 = wp.float64(gcell[1, 2])
+    g20 = wp.float64(gcell[2, 0])
+    g21 = wp.float64(gcell[2, 1])
+    g22 = wp.float64(gcell[2, 2])
+
+    pos_i = positions[atom_i]
+    qi = wp.float64(charges[atom_i])
+    k_start = neighbor_ptr[atom_i]
+    k_end = neighbor_ptr[atom_i + 1]
+    for k in range(k_start, k_end):
+        j = idx_j[k]
+        shift_vec = unit_shifts[k]
+        qj = wp.float64(charges[j])
+        pos_j = positions[j]
+        periodic_shift = cell_t * type(pos_i)(
+            type(pos_i[0])(shift_vec[0]),
+            type(pos_i[0])(shift_vec[1]),
+            type(pos_i[0])(shift_vec[2]),
+        )
+        sep = pos_j - pos_i + periodic_shift
+        distance = wp.float64(wp.length(sep))
+        if distance > wp.float64(1e-8):
+            r_vec = wp.vec3d(wp.float64(sep[0]), wp.float64(sep[1]), wp.float64(sep[2]))
+            inv_r = wp.float64(1.0) / distance
+            inv_r2 = inv_r * inv_r
+            inv_r3 = inv_r * inv_r2
+            ra = _gto_ewald_A_single(distance, a_coef)
+            rb = _gto_ewald_A_single(distance, b_coef)
+            a_scalar = ra[0] - rb[0]
+            a_prime = ra[1] - rb[1]
+            a_over_r = a_scalar * inv_r
+            c_quad = a_prime * inv_r2 - a_scalar * inv_r3
+
+            sh0 = wp.float64(shift_vec[0])
+            sh1 = wp.float64(shift_vec[1])
+            sh2 = wp.float64(shift_vec[2])
+            # w = g_cellᵀ · n  (per-pair "position direction").
+            w_x = g00 * sh0 + g10 * sh1 + g20 * sh2
+            w_y = g01 * sh0 + g11 * sh1 + g21 * sh2
+            w_z = g02 * sh0 + g12 * sh1 + g22 * sh2
+            w_dot_r = w_x * r_vec[0] + w_y * r_vec[1] + w_z * r_vec[2]
+
+            qq = qi * qj
+            gx = qq * (c_quad * w_dot_r * r_vec[0] + a_over_r * w_x)
+            gy = qq * (c_quad * w_dot_r * r_vec[1] + a_over_r * w_y)
+            gz = qq * (c_quad * w_dot_r * r_vec[2] + a_over_r * w_z)
+            sgx = scale * gx
+            sgy = scale * gy
+            sgz = scale * gz
+            # ∂S/∂r_i = +scale·G ; ∂S/∂r_j = -scale·G.
+            wp.atomic_add(
+                grad_positions,
+                atom_i,
+                type(pos_i)(
+                    type(pos_i[0])(sgx),
+                    type(pos_i[0])(sgy),
+                    type(pos_i[0])(sgz),
+                ),
+            )
+            wp.atomic_add(
+                grad_positions,
+                j,
+                type(pos_i)(
+                    type(pos_i[0])(-sgx),
+                    type(pos_i[0])(-sgy),
+                    type(pos_i[0])(-sgz),
+                ),
+            )
+            # ∂S/∂q_i = -scale·q_j·(A/r)·(w·r) ; sym for q_j.
+            base_c = -scale * a_over_r * w_dot_r
+            wp.atomic_add(grad_charges, atom_i, type(charges[atom_i])(base_c * qj))
+            wp.atomic_add(grad_charges, j, type(charges[atom_i])(base_c * qi))
+            # ∂S/∂cell[a,b] = -scale·n[a]·G[b]  (cell-cell block).
+            cgx = -sgx
+            cgy = -sgy
+            cgz = -sgz
+            wp.atomic_add(
+                grad_cell_out,
+                0,
+                type(gcell)(
+                    type(gcell[0, 0])(sh0 * cgx),
+                    type(gcell[0, 0])(sh0 * cgy),
+                    type(gcell[0, 0])(sh0 * cgz),
+                    type(gcell[0, 0])(sh1 * cgx),
+                    type(gcell[0, 0])(sh1 * cgy),
+                    type(gcell[0, 0])(sh1 * cgz),
+                    type(gcell[0, 0])(sh2 * cgx),
+                    type(gcell[0, 0])(sh2 * cgy),
+                    type(gcell[0, 0])(sh2 * cgz),
+                ),
+            )
+
+
+def _monopole_csr_cell_grad_backward_sig(v, t):
+    """Signature builder for the l=0 cell-grad double-backward kernel."""
+    m = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=t),  # charges
+        wp.array(dtype=m),  # cell
+        wp.array(dtype=wp.int32),  # idx_j
+        wp.array(dtype=wp.int32),  # neighbor_ptr
+        wp.array(dtype=wp.vec3i),  # unit_shifts
+        wp.array(dtype=t),  # sigma
+        wp.array(dtype=t),  # alpha
+        wp.array(dtype=wp.float64),  # per_direction_scale
+        wp.array(dtype=m),  # g_cell
+        wp.array(dtype=v),  # grad_positions (out)
+        wp.array(dtype=t),  # grad_charges (out)
+        wp.array(dtype=m),  # grad_cell_out (out)
+    ]
+
+
+_multipole_real_space_monopole_csr_cell_grad_backward_overloads = register_overloads(
+    _multipole_real_space_monopole_csr_cell_grad_backward_kernel,
+    _monopole_csr_cell_grad_backward_sig,
+)
+
+
+def multipole_real_space_monopole_csr_cell_grad_backward(
+    positions: wp.array,
+    charges: wp.array,
+    cell: wp.array,
+    idx_j: wp.array,
+    neighbor_ptr: wp.array,
+    unit_shifts: wp.array,
+    sigma: wp.array,
+    alpha: wp.array,
+    per_direction_scale: wp.array,
+    g_cell: wp.array,
+    grad_positions: wp.array,
+    grad_charges: wp.array,
+    grad_cell_out: wp.array,
+    wp_dtype: type,
+    device: str | None = None,
+) -> None:
+    r"""Launcher for the l=0 cell-grad double-backward (stress-loss).
+
+    Caller pre-zeroes ``grad_positions``, ``grad_charges``, ``grad_cell_out``.
+    """
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    if device is None:
+        device = str(positions.device)
+    wp.launch(
+        _multipole_real_space_monopole_csr_cell_grad_backward_overloads[vec_dtype],
+        dim=positions.shape[0],
+        inputs=[
+            positions,
+            charges,
+            cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigma,
+            alpha,
+            per_direction_scale,
+            g_cell,
+        ],
+        outputs=[grad_positions, grad_charges, grad_cell_out],
+        device=device,
+    )
+
+
 # =============================================================================
 # l_max = 1 analytical backward kernel — ∂/∂(positions, charges, dipoles)
 # =============================================================================
