@@ -1028,6 +1028,119 @@ torch.library.register_autograd(
 
 
 # =============================================================================
+# Spread-transpose gather: g = Sᵀ(grad_rho) — the per-atom reciprocal potential
+# =============================================================================
+#
+# The direct-k reciprocal energy ``E = scale·Σ_k |ρ(k)|²`` is the moment-weighted
+# sum of the rho-assembly transpose applied to ρ:
+#
+#   Σ_k |ρ|² = <S·m, ρ> = <m, Sᵀρ> = Σ_i m_i · (Sᵀρ)_i
+#
+# so ``E_i = scale·m_i·(Sᵀρ)_i`` is a genuine per-atom decomposition (parallels
+# the PME ``multipole_pme_gather_via_spread_t``). ``Sᵀ`` here is the rho
+# assembly's OWN transpose (``multipole_rho_moment_grad``), so ``Σ_i E_i`` is
+# bit-identical to the collective ``Σ_k|ρ|²``. The op is twice-differentiable
+# *for free*: its backward is composed from the already-twice-differentiable
+# ``multipole_rho`` op and the rho-backward sub-op chains (position/φ̂/k-vector
+# grads), so force-loss and stress-loss flow through ordinary autograd.
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_gather_t",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_rho, Tensor positions, Tensor source_phi_hat, "
+        "Tensor k_vectors, Tensor volume) -> Tensor"
+    ),
+)
+def _multipole_rho_gather_t_op(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Opaque forward: ``g = Sᵀ·grad_rho`` per-atom moment gradient ``(N, 4)``.
+
+    e3nn layout ``[q, μ_y, μ_z, μ_x]``; equals the rho-assembly's Jacobian
+    transpose (``multipole_rho_moment_grad``).
+    """
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return _rho_moment_grad_forward(grad_rho, cosines, sines, source_phi_hat, volume)
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_gather_t")
+def _multipole_rho_gather_t_fake(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``g`` is ``(N_atoms, 4)`` float64."""
+    return positions.new_empty((positions.shape[0], 4), dtype=torch.float64)
+
+
+def _multipole_rho_gather_t_setup_context(ctx, inputs, output) -> None:
+    """Save forward inputs for the analytical backward."""
+    grad_rho, positions, source_phi_hat, k_vectors, volume = inputs
+    ctx.save_for_backward(grad_rho, positions, source_phi_hat, k_vectors, volume)
+
+
+def _multipole_rho_gather_t_backward(ctx, g_cot: torch.Tensor):
+    r"""Adjoint of ``g = Sᵀ·grad_rho``.
+
+    With cotangent ``cg = g_cot`` (per-atom, e3nn layout) on ``g``,
+    ``<cg, Sᵀ grad_rho> = <S·cg, grad_rho>``:
+
+    * ``∂/∂grad_rho = S·cg = ρ(cg)`` (the rho FORWARD with moments ``= cg``)
+    * ``∂/∂{positions, source_phi_hat, k_vectors}`` are the rho-assembly
+      backward sub-ops evaluated with moments ``= cg`` and field ``= grad_rho``.
+
+    Every term is an autograd-registered op, so create_graph composes their
+    double-backwards automatically — no explicit second-order routine.
+    """
+    grad_rho, positions, source_phi_hat, k_vectors, volume = ctx.saved_tensors
+    cg_q = g_cot[:, 0].contiguous()
+    # e3nn -> Cartesian for the dipole channel: (μ_x, μ_y, μ_z) = lm(3, 1, 2).
+    cg_dip = g_cot[:, [3, 1, 2]].contiguous()
+    # cos/sin are detached constants (the position 2nd-order is carried by the
+    # position-grad kernel), mirroring ``_multipole_rho_backward``.
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    shim = types.SimpleNamespace(
+        source_phi_hat=source_phi_hat,
+        k_vectors=k_vectors,
+        volume=volume,
+        device=positions.device,
+        n_k=k_vectors.shape[0],
+    )
+    # ∂/∂grad_rho = ρ(cg): S applied to the cotangent-as-moments (= multipole_rho).
+    d_grad_rho = torch.ops.nvalchemiops.multipole_rho(
+        cg_q, cg_dip, positions, source_phi_hat, k_vectors, volume
+    )
+    d_positions = _rho_backward_to_positions(
+        grad_rho, cg_q, cg_dip, cosines, sines, shim, positions
+    ).to(positions.dtype)
+    d_phi = _rho_backward_to_phihat(
+        grad_rho, cg_q, cg_dip, positions, cosines, sines, shim
+    )
+    d_kvec = _rho_backward_to_kvec(
+        grad_rho, cg_q, cg_dip, positions, cosines, sines, shim
+    )
+    # Slots: (grad_rho, positions, source_phi_hat, k_vectors, volume).
+    return d_grad_rho, d_positions, d_phi, d_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_rho_gather_t",
+    _multipole_rho_gather_t_backward,
+    setup_context=_multipole_rho_gather_t_setup_context,
+)
+
+
+# =============================================================================
 # Cartesian-quadrupole (l=2) rho_Q(k) contribution
 # =============================================================================
 #

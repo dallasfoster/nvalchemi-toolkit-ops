@@ -1362,6 +1362,126 @@ def _recip_stress_dot(positions, mm, cell, g, *, batch_idx=None):
     return (stress * g).sum()
 
 
+class TestDirectKGatherPerAtom:
+    r"""Per-atom direct-k reciprocal energy via the spread-transpose gather.
+
+    ``multipole_rho_gather_t`` decomposes the collective ``E = scale·Σ_k 2 f_k
+    |ρ|²`` into ``E_i = scale·m_i·(Sᵀ·2 f_k ρ)_i`` (``Sᵀ`` = the rho-assembly's
+    own transpose). The decomposition is bit-identical to the collective energy
+    and carries the same first- and (force-loss / stress) second-order grads.
+    """
+
+    @pytest.fixture
+    def gpu_system(self):
+        if not torch.cuda.is_available():
+            pytest.skip("Path A reciprocal kernels are GPU-only")
+        positions, charges, dipoles, cell = _system(
+            n_atoms=8, box_len=5.0, device="cuda:0", seed=0xBEEF, with_dipoles=True
+        )
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+            prepare_multipole_scf_cache,
+        )
+
+        cache = prepare_multipole_scf_cache(
+            cell,
+            sigma=1.0,
+            receiver_sigmas=[1.0],
+            kspace_cutoff=3.0,
+            l_max=1,
+            alpha=0.5,
+            device="cuda:0",
+        )
+        return {
+            "positions": positions,
+            "charges": charges,
+            "dipoles": dipoles,
+            "cell": cell,
+            "cache": cache,
+        }
+
+    @staticmethod
+    def _peratom(cache, pos, q, dip):
+        import nvalchemiops.torch.interactions.electrostatics.multipole_autograd  # noqa: F401
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+            _TWO_PI_6,
+        )
+
+        rho = torch.ops.nvalchemiops.multipole_rho(
+            q, dip, pos, cache.source_phi_hat, cache.k_vectors, cache.volume
+        )
+        rho = rho * (cache.volume.detach() / cache.volume)
+        phi_hat = (2.0 * cache.per_k_factor).unsqueeze(-1) * rho
+        g = torch.ops.nvalchemiops.multipole_rho_gather_t(
+            phi_hat, pos, cache.source_phi_hat, cache.k_vectors, cache.volume
+        )
+        # Restore the moment-grad's detached 1/V so the volume cell-grad is exact.
+        g = g * (cache.volume.detach() / cache.volume)
+        scale = 0.5 * cache.volume / _TWO_PI_6
+        return scale * (q * g[:, 0] + (dip * g[:, [3, 1, 2]]).sum(-1))
+
+    @staticmethod
+    def _collective(cache, pos, q, dip):
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+            multipole_scf_step_energy,
+        )
+
+        return multipole_scf_step_energy(
+            cache, pos, pack_charges_dipoles(q, dip), include_self_interaction=True
+        )
+
+    def test_value_parity(self, gpu_system):
+        """Σ_i E_i bit-identical to the collective raw reciprocal energy."""
+        sd = gpu_system
+        e_i = self._peratom(sd["cache"], sd["positions"], sd["charges"], sd["dipoles"])
+        e_coll = self._collective(
+            sd["cache"], sd["positions"], sd["charges"], sd["dipoles"]
+        )
+        assert e_i.shape == (sd["positions"].shape[0],)
+        torch.testing.assert_close(e_i.sum(), e_coll, rtol=1e-12, atol=1e-12)
+
+    def test_force_loss_parity(self, gpu_system):
+        """Force-loss grads (∂²E/∂r∂θ) match the collective path bit-for-bit."""
+        sd = gpu_system
+        wf = torch.randn_like(sd["positions"])
+
+        def grads(efn):
+            p = sd["positions"].clone().requires_grad_(True)
+            q = sd["charges"].clone().requires_grad_(True)
+            mu = sd["dipoles"].clone().requires_grad_(True)
+            e = efn(sd["cache"], p, q, mu)
+            gp = torch.autograd.grad(e.sum(), p, create_graph=True)[0]
+            loss = (gp * wf).sum()
+            return torch.autograd.grad(loss, (q, mu, p))
+
+        for a, b in zip(grads(self._peratom), grads(self._collective)):
+            torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-10)
+
+    def test_stress_parity(self, gpu_system):
+        """∂E/∂cell matches the collective path bit-for-bit."""
+        sd = gpu_system
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+            prepare_multipole_scf_cache,
+        )
+
+        def stress(efn):
+            cell = sd["cell"].clone().requires_grad_(True)
+            cache = prepare_multipole_scf_cache(
+                cell,
+                sigma=1.0,
+                receiver_sigmas=[1.0],
+                kspace_cutoff=3.0,
+                l_max=1,
+                alpha=0.5,
+                device="cuda:0",
+            )
+            e = efn(cache, sd["positions"], sd["charges"], sd["dipoles"])
+            return torch.autograd.grad(e.sum(), cell)[0]
+
+        torch.testing.assert_close(
+            stress(self._peratom), stress(self._collective), rtol=1e-9, atol=1e-9
+        )
+
+
 class TestReciprocalStressLoss:
     """∂²E/∂cell∂pos on the direct-k reciprocal path matches a double-FD of E."""
 
