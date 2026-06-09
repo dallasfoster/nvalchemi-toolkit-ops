@@ -1122,3 +1122,159 @@ class TestPMEKernelsRegression:
 def wp_dtype(request):
     """Parameterized fixture for Warp dtypes."""
     return request.param
+
+
+class TestFractionalize:
+    """``pme_fractionalize`` keystone op (Tier-1 stress-loss, B-warp).
+
+    Forward maps Cartesian (positions, moments) to the unitless mesh frame
+    ``u = mesh ⊙ (M·r)``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` (M = cell_inv_t,
+    read per atom via ``batch_idx``). The backward is the adjoint of this
+    multilinear map. Validated forward-vs-numpy + FD-adjoint (float64).
+    """
+
+    @staticmethod
+    def _ref(pos, minv_t, bidx, mesh, dip, quad):
+        m = minv_t[bidx]
+        u = np.einsum("nij,nj->ni", m, pos) * np.asarray(mesh, dtype=pos.dtype)
+        df = np.einsum("nij,nj->ni", m, dip)
+        qf = np.einsum("nij,njk,nlk->nil", m, quad, m)
+        return u, df, qf
+
+    def test_forward_matches_numpy(self, device, wp_dtype):
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_launch,
+        )
+
+        np_dtype = np.float32 if wp_dtype == wp.float32 else np.float64
+        vec = wp.vec3f if wp_dtype == wp.float32 else wp.vec3d
+        mat = wp.mat33f if wp_dtype == wp.float32 else wp.mat33d
+        rng = np.random.default_rng(0)
+        n, b = 6, 2
+        mesh = (24, 20, 16)
+        pos = rng.standard_normal((n, 3)).astype(np_dtype)
+        dip = rng.standard_normal((n, 3)).astype(np_dtype)
+        quad = rng.standard_normal((n, 3, 3)).astype(np_dtype)
+        cells = (rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]).astype(np_dtype)
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1)).astype(np_dtype)
+        bidx = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
+        u = wp.zeros(n, dtype=vec, device=device)
+        df = wp.zeros(n, dtype=vec, device=device)
+        qf = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.vec3i(*mesh),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            u,
+            df,
+            qf,
+            wp_dtype=wp_dtype,
+            device=device,
+        )
+        u_ref, df_ref, qf_ref = self._ref(pos, minv_t, bidx, mesh, dip, quad)
+        tol = 1e-5 if wp_dtype == wp.float32 else 1e-12
+        assert np.allclose(u.numpy(), u_ref, atol=tol)
+        assert np.allclose(df.numpy(), df_ref, atol=tol)
+        assert np.allclose(qf.numpy(), qf_ref, atol=tol)
+
+    def test_backward_adjoint_fd(self, device):
+        """FD-validate the backward as the adjoint of the forward (float64)."""
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_backward_launch,
+            pme_fractionalize_launch,
+        )
+
+        vec, mat = wp.vec3d, wp.mat33d
+        rng = np.random.default_rng(1)
+        n, b = 5, 2
+        mesh = (24, 20, 16)
+        pos = rng.standard_normal((n, 3))
+        dip = rng.standard_normal((n, 3))
+        quad = rng.standard_normal((n, 3, 3))
+        cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
+        bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+        gu = rng.standard_normal((n, 3))
+        gdf = rng.standard_normal((n, 3))
+        gqf = rng.standard_normal((n, 3, 3))
+
+        def fwd(p, m, d, q):
+            uo = wp.zeros(n, dtype=vec, device=device)
+            do = wp.zeros(n, dtype=vec, device=device)
+            qo = wp.zeros(n, dtype=mat, device=device)
+            pme_fractionalize_launch(
+                wp.array(p, dtype=vec, device=device),
+                wp.array(m, dtype=mat, device=device),
+                wp.array(bidx, dtype=wp.int32, device=device),
+                wp.vec3i(*mesh),
+                wp.array(d, dtype=vec, device=device),
+                wp.array(q, dtype=mat, device=device),
+                uo,
+                do,
+                qo,
+                wp_dtype=wp.float64,
+                device=device,
+            )
+            return uo.numpy(), do.numpy(), qo.numpy()
+
+        gp = wp.zeros(n, dtype=vec, device=device)
+        gm = wp.zeros(b, dtype=mat, device=device)
+        gd = wp.zeros(n, dtype=vec, device=device)
+        gq = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_backward_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.vec3i(*mesh),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            wp.array(gu, dtype=vec, device=device),
+            wp.array(gdf, dtype=vec, device=device),
+            wp.array(gqf, dtype=mat, device=device),
+            gp,
+            gm,
+            gd,
+            gq,
+            wp_dtype=wp.float64,
+            device=device,
+        )
+        grads = {
+            "pos": gp.numpy(),
+            "M": gm.numpy(),
+            "dip": gd.numpy(),
+            "quad": gq.numpy(),
+        }
+        eps = 1e-6
+
+        def vjp_dot(grad, v):
+            return float(np.sum(grad * v))
+
+        def fd_dir(name, v):
+            base = {"p": pos, "m": minv_t, "d": dip, "q": quad}
+            plus = dict(base)
+            minus = dict(base)
+            key = {"pos": "p", "M": "m", "dip": "d", "quad": "q"}[name]
+            plus[key] = base[key] + eps * v
+            minus[key] = base[key] - eps * v
+            up, dp, qp = fwd(plus["p"], plus["m"], plus["d"], plus["q"])
+            um, dm, qm = fwd(minus["p"], minus["m"], minus["d"], minus["q"])
+            lp = np.sum(up * gu) + np.sum(dp * gdf) + np.sum(qp * gqf)
+            lm = np.sum(um * gu) + np.sum(dm * gdf) + np.sum(qm * gqf)
+            return (lp - lm) / (2 * eps)
+
+        for name, shape in [
+            ("pos", pos.shape),
+            ("M", minv_t.shape),
+            ("dip", dip.shape),
+            ("quad", quad.shape),
+        ]:
+            v = rng.standard_normal(shape)
+            analytic = vjp_dot(grads[name], v)
+            fd = fd_dir(name, v)
+            rel = abs(analytic - fd) / (abs(fd) + 1e-12)
+            assert rel < 1e-6, (
+                f"{name}: adjoint rel={rel:.2e} (analytic={analytic}, fd={fd})"
+            )

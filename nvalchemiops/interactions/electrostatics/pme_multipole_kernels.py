@@ -5455,6 +5455,210 @@ def pme_effective_moments_launch(
 
 
 @wp.kernel
+def _pme_fractionalize_kernel(
+    positions: wp.array(dtype=Any),  # (N,) vec3
+    cell_inv_t: wp.array(dtype=Any),  # (B,) mat33  (M = inv(cell)ᵀ)
+    batch_idx: wp.array(dtype=wp.int32),  # (N,) per-atom system index
+    mesh: wp.vec3i,  # mesh dims (Nx, Ny, Nz)
+    dipoles: wp.array(dtype=Any),  # (N,) vec3
+    quadrupoles: wp.array(dtype=Any),  # (N,) mat33
+    u_out: wp.array(dtype=Any),  # (N,) vec3 OUTPUT — scaled fractional coord
+    df_out: wp.array(dtype=Any),  # (N,) vec3 OUTPUT — fractional dipole
+    Qf_out: wp.array(dtype=Any),  # (N,) mat33 OUTPUT — fractional quadrupole
+):
+    r"""Map Cartesian (positions, moments) to the unitless mesh/fractional frame.
+
+    Per atom, with :math:`M = \text{cell\_inv\_t}[b_i]` and mesh sizes
+    :math:`(N_x, N_y, N_z)`:
+
+    .. math::
+
+        u_i = (N_x, N_y, N_z) \odot (M\, r_i), \quad
+        d^{\text{frac}}_i = M\, \mu_i, \quad
+        Q^{\text{frac}}_i = M\, Q_i\, M^{\mathsf T}.
+
+    This factors ALL ``cell_inv_t`` coupling out of the spread/gather kernels:
+    once they consume ``u`` + fractional moments they are cell-free, so the
+    cell-stress 2nd-order composes through this multilinear map's autograd
+    (cheap, exact). One thread per atom; ``cell_inv_t[batch_idx[i]]`` is read
+    per atom so batched systems need no host-side per-atom cell gather.
+    """
+    i = wp.tid()
+    b = batch_idx[i]
+    m_mat = cell_inv_t[b]
+    r = positions[i]
+    fr = m_mat * r
+    s = r[0]
+    u_out[i] = wp.vector(
+        fr[0] * type(s)(mesh[0]),
+        fr[1] * type(s)(mesh[1]),
+        fr[2] * type(s)(mesh[2]),
+    )
+    df_out[i] = m_mat * dipoles[i]
+    Qf_out[i] = m_mat * quadrupoles[i] * wp.transpose(m_mat)
+
+
+def _pme_fractionalize_sig(v, t):
+    """Signature builder for :func:`_pme_fractionalize_kernel`."""
+    mat = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=mat),  # cell_inv_t
+        wp.array(dtype=wp.int32),  # batch_idx
+        wp.vec3i,  # mesh
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=mat),  # quadrupoles
+        wp.array(dtype=v),  # u_out
+        wp.array(dtype=v),  # df_out
+        wp.array(dtype=mat),  # Qf_out
+    ]
+
+
+_pme_fractionalize_overloads = register_overloads(
+    _pme_fractionalize_kernel, _pme_fractionalize_sig
+)
+
+
+def pme_fractionalize_launch(
+    positions,
+    cell_inv_t,
+    batch_idx,
+    mesh,
+    dipoles,
+    quadrupoles,
+    u_out,
+    df_out,
+    Qf_out,
+    wp_dtype,
+    device=None,
+):
+    r"""Launch :func:`_pme_fractionalize_kernel` (one thread per atom)."""
+    if device is None:
+        device = str(positions.device)
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    wp.launch(
+        _pme_fractionalize_overloads[vec_dtype],
+        dim=(positions.shape[0],),
+        inputs=[positions, cell_inv_t, batch_idx, mesh, dipoles, quadrupoles],
+        outputs=[u_out, df_out, Qf_out],
+        device=device,
+    )
+
+
+@wp.kernel
+def _pme_fractionalize_backward_kernel(
+    positions: wp.array(dtype=Any),  # (N,) vec3
+    cell_inv_t: wp.array(dtype=Any),  # (B,) mat33
+    batch_idx: wp.array(dtype=wp.int32),  # (N,)
+    mesh: wp.vec3i,
+    dipoles: wp.array(dtype=Any),  # (N,) vec3
+    quadrupoles: wp.array(dtype=Any),  # (N,) mat33
+    gu: wp.array(dtype=Any),  # (N,) vec3  — cotangent on u
+    gdf: wp.array(dtype=Any),  # (N,) vec3  — cotangent on d_frac
+    gQf: wp.array(dtype=Any),  # (N,) mat33 — cotangent on Q_frac
+    grad_positions: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_cell_inv_t: wp.array(dtype=Any),  # (B,) mat33 OUTPUT (atomic accum)
+    grad_dipoles: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_quadrupoles: wp.array(dtype=Any),  # (N,) mat33 OUTPUT
+):
+    r"""Adjoint of :func:`_pme_fractionalize_kernel` (the map is multilinear).
+
+    With ``mgu = mesh ⊙ gu`` and ``M = cell_inv_t[b]``:
+    ``grad_r = Mᵀ·mgu``; ``grad_μ = Mᵀ·gdf``; ``grad_Q = Mᵀ·gQf·M``; and
+    ``grad_M = mgu⊗r + gdf⊗μ + gQf·M·Qᵀ + gQfᵀ·M·Q`` (atomic-added per system).
+    """
+    i = wp.tid()
+    b = batch_idx[i]
+    m_mat = cell_inv_t[b]
+    r = positions[i]
+    s = r[0]
+    gu_i = gu[i]
+    mgu = wp.vector(
+        gu_i[0] * type(s)(mesh[0]),
+        gu_i[1] * type(s)(mesh[1]),
+        gu_i[2] * type(s)(mesh[2]),
+    )
+    m_t = wp.transpose(m_mat)
+    grad_positions[i] = m_t * mgu
+    grad_dipoles[i] = m_t * gdf[i]
+    gQf_i = gQf[i]
+    grad_quadrupoles[i] = m_t * gQf_i * m_mat
+    q_i = quadrupoles[i]
+    grad_m = (
+        wp.outer(mgu, r)
+        + wp.outer(gdf[i], dipoles[i])
+        + gQf_i * m_mat * wp.transpose(q_i)
+        + wp.transpose(gQf_i) * m_mat * q_i
+    )
+    wp.atomic_add(grad_cell_inv_t, b, grad_m)
+
+
+def _pme_fractionalize_backward_sig(v, t):
+    """Signature builder for :func:`_pme_fractionalize_backward_kernel`."""
+    mat = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=mat),  # cell_inv_t
+        wp.array(dtype=wp.int32),  # batch_idx
+        wp.vec3i,  # mesh
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=mat),  # quadrupoles
+        wp.array(dtype=v),  # gu
+        wp.array(dtype=v),  # gdf
+        wp.array(dtype=mat),  # gQf
+        wp.array(dtype=v),  # grad_positions
+        wp.array(dtype=mat),  # grad_cell_inv_t
+        wp.array(dtype=v),  # grad_dipoles
+        wp.array(dtype=mat),  # grad_quadrupoles
+    ]
+
+
+_pme_fractionalize_backward_overloads = register_overloads(
+    _pme_fractionalize_backward_kernel, _pme_fractionalize_backward_sig
+)
+
+
+def pme_fractionalize_backward_launch(
+    positions,
+    cell_inv_t,
+    batch_idx,
+    mesh,
+    dipoles,
+    quadrupoles,
+    gu,
+    gdf,
+    gQf,
+    grad_positions,
+    grad_cell_inv_t,
+    grad_dipoles,
+    grad_quadrupoles,
+    wp_dtype,
+    device=None,
+):
+    r"""Launch :func:`_pme_fractionalize_backward_kernel` (one thread per atom)."""
+    if device is None:
+        device = str(positions.device)
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    wp.launch(
+        _pme_fractionalize_backward_overloads[vec_dtype],
+        dim=(positions.shape[0],),
+        inputs=[
+            positions,
+            cell_inv_t,
+            batch_idx,
+            mesh,
+            dipoles,
+            quadrupoles,
+            gu,
+            gdf,
+            gQf,
+        ],
+        outputs=[grad_positions, grad_cell_inv_t, grad_dipoles, grad_quadrupoles],
+        device=device,
+    )
+
+
+@wp.kernel
 def _pme_spread_dbwd_readout_kernel(
     gg_pos: wp.array(dtype=Any),  # (N,) vec3
     gd2: wp.array(dtype=Any),  # (N,) vec3
