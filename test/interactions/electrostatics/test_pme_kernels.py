@@ -1278,3 +1278,142 @@ class TestFractionalize:
             assert rel < 1e-6, (
                 f"{name}: adjoint rel={rel:.2e} (analytic={analytic}, fd={fd})"
             )
+
+    def test_double_backward_adjoint_fd(self, device):
+        """FD-validate the double-backward as the adjoint of the backward.
+
+        The double-backward computes grads w.r.t. the backward's inputs
+        (cotangents gu/gdf/gQf and forward inputs pos/M/dip/quad) given
+        cotangents (Gr, GM, Gμ, GQ) on the backward outputs. This is the
+        genuine cell×{pos,moment} second-order needed for stress-loss.
+        """
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_backward_launch,
+            pme_fractionalize_double_backward_launch,
+        )
+
+        vec, mat = wp.vec3d, wp.mat33d
+        rng = np.random.default_rng(2)
+        n, b = 5, 2
+        mesh = (24, 20, 16)
+        pos = rng.standard_normal((n, 3))
+        dip = rng.standard_normal((n, 3))
+        quad = rng.standard_normal((n, 3, 3))
+        cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
+        bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+        gu = rng.standard_normal((n, 3))
+        gdf = rng.standard_normal((n, 3))
+        gqf = rng.standard_normal((n, 3, 3))
+        # Cotangents on the backward's outputs (grad_pos, grad_M, grad_dip,
+        # grad_quad). grad_M / G_cell is per-system.
+        g_pos = rng.standard_normal((n, 3))
+        g_cell = rng.standard_normal((b, 3, 3))
+        g_dip = rng.standard_normal((n, 3))
+        g_quad = rng.standard_normal((n, 3, 3))
+
+        def bwd(gu_, gdf_, gqf_, pos_, m_, dip_, quad_):
+            gp = wp.zeros(n, dtype=vec, device=device)
+            gm = wp.zeros(b, dtype=mat, device=device)
+            gd = wp.zeros(n, dtype=vec, device=device)
+            gq = wp.zeros(n, dtype=mat, device=device)
+            pme_fractionalize_backward_launch(
+                wp.array(pos_, dtype=vec, device=device),
+                wp.array(m_, dtype=mat, device=device),
+                wp.array(bidx, dtype=wp.int32, device=device),
+                wp.vec3i(*mesh),
+                wp.array(dip_, dtype=vec, device=device),
+                wp.array(quad_, dtype=mat, device=device),
+                wp.array(gu_, dtype=vec, device=device),
+                wp.array(gdf_, dtype=vec, device=device),
+                wp.array(gqf_, dtype=mat, device=device),
+                gp,
+                gm,
+                gd,
+                gq,
+                wp_dtype=wp.float64,
+                device=device,
+            )
+            return gp.numpy(), gm.numpy(), gd.numpy(), gq.numpy()
+
+        ggu = wp.zeros(n, dtype=vec, device=device)
+        ggdf = wp.zeros(n, dtype=vec, device=device)
+        ggqf = wp.zeros(n, dtype=mat, device=device)
+        gpos = wp.zeros(n, dtype=vec, device=device)
+        gcell = wp.zeros(b, dtype=mat, device=device)
+        gdip = wp.zeros(n, dtype=vec, device=device)
+        gquad = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_double_backward_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.vec3i(*mesh),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            wp.array(gu, dtype=vec, device=device),
+            wp.array(gdf, dtype=vec, device=device),
+            wp.array(gqf, dtype=mat, device=device),
+            wp.array(g_pos, dtype=vec, device=device),
+            wp.array(g_cell, dtype=mat, device=device),
+            wp.array(g_dip, dtype=vec, device=device),
+            wp.array(g_quad, dtype=mat, device=device),
+            ggu,
+            ggdf,
+            ggqf,
+            gpos,
+            gcell,
+            gdip,
+            gquad,
+            wp_dtype=wp.float64,
+            device=device,
+        )
+        grads = {
+            "gu": ggu.numpy(),
+            "gdf": ggdf.numpy(),
+            "gQf": ggqf.numpy(),
+            "pos": gpos.numpy(),
+            "M": gcell.numpy(),
+            "dip": gdip.numpy(),
+            "quad": gquad.numpy(),
+        }
+        eps = 1e-6
+        base = {
+            "gu": gu,
+            "gdf": gdf,
+            "gQf": gqf,
+            "pos": pos,
+            "M": minv_t,
+            "dip": dip,
+            "quad": quad,
+        }
+
+        def scalar(args):
+            gp, gm, gd, gq = bwd(
+                args["gu"],
+                args["gdf"],
+                args["gQf"],
+                args["pos"],
+                args["M"],
+                args["dip"],
+                args["quad"],
+            )
+            return (
+                np.sum(gp * g_pos)
+                + np.sum(gm * g_cell)
+                + np.sum(gd * g_dip)
+                + np.sum(gq * g_quad)
+            )
+
+        for name in ("gu", "gdf", "gQf", "pos", "M", "dip", "quad"):
+            v = rng.standard_normal(base[name].shape)
+            plus = dict(base)
+            minus = dict(base)
+            plus[name] = base[name] + eps * v
+            minus[name] = base[name] - eps * v
+            fd = (scalar(plus) - scalar(minus)) / (2 * eps)
+            analytic = float(np.sum(grads[name] * v))
+            rel = abs(analytic - fd) / (abs(fd) + 1e-12)
+            assert rel < 1e-6, (
+                f"{name}: double-bwd adjoint rel={rel:.2e} "
+                f"(analytic={analytic}, fd={fd})"
+            )

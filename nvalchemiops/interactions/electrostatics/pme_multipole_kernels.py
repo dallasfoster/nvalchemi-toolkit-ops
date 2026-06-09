@@ -5659,6 +5659,183 @@ def pme_fractionalize_backward_launch(
 
 
 @wp.kernel
+def _pme_fractionalize_double_backward_kernel(
+    positions: wp.array(dtype=Any),  # (N,) vec3
+    cell_inv_t: wp.array(dtype=Any),  # (B,) mat33
+    batch_idx: wp.array(dtype=wp.int32),  # (N,)
+    mesh: wp.vec3i,
+    dipoles: wp.array(dtype=Any),  # (N,) vec3
+    quadrupoles: wp.array(dtype=Any),  # (N,) mat33
+    gu: wp.array(dtype=Any),  # (N,) vec3  — cotangent on u
+    gdf: wp.array(dtype=Any),  # (N,) vec3  — cotangent on d_frac
+    gQf: wp.array(dtype=Any),  # (N,) mat33 — cotangent on Q_frac
+    g_pos: wp.array(dtype=Any),  # (N,) vec3  — cotangent on grad_positions
+    g_cell: wp.array(dtype=Any),  # (B,) mat33 — cotangent on grad_cell_inv_t
+    g_dip: wp.array(dtype=Any),  # (N,) vec3  — cotangent on grad_dipoles
+    g_quad: wp.array(dtype=Any),  # (N,) mat33 — cotangent on grad_quadrupoles
+    grad_gu: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_gdf: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_gQf: wp.array(dtype=Any),  # (N,) mat33 OUTPUT
+    grad_positions: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_cell_inv_t: wp.array(dtype=Any),  # (B,) mat33 OUTPUT (atomic)
+    grad_dipoles: wp.array(dtype=Any),  # (N,) vec3 OUTPUT
+    grad_quadrupoles: wp.array(dtype=Any),  # (N,) mat33 OUTPUT
+):
+    r"""Double-backward of :func:`_pme_fractionalize_kernel` (stress-loss).
+
+    The forward map is multilinear, so the second-order is closed-form. With
+    ``M = cell_inv_t[b]``, ``mgu = mesh ⊙ gu``, and the four incoming cotangents
+    ``(Gr, GM, Gμ, GQ)`` on the backward outputs
+    ``(grad_positions, grad_cell_inv_t, grad_dipoles, grad_quadrupoles)``, the
+    grads w.r.t. the backward inputs are:
+
+    - ``grad_gu = mesh ⊙ (M·Gr)``
+    - ``grad_gdf = GM·μ + M·Gμ``
+    - ``grad_gQf = GM·Q·Mᵀ + M·Q·GMᵀ + M·GQ·Mᵀ``
+    - ``grad_r = GMᵀ·mgu``
+    - ``grad_μ = GMᵀ·gdf``
+    - ``grad_Q = GMᵀ·gQf·M + Mᵀ·gQf·GM``
+    - ``grad_M = mgu⊗Gr + gdf⊗Gμ + gQfᵀ·GM·Q + gQf·GM·Qᵀ
+      + gQf·M·GQᵀ + gQfᵀ·M·GQ`` (atomic per system).
+    """
+    i = wp.tid()
+    b = batch_idx[i]
+    m_mat = cell_inv_t[b]
+    m_t = wp.transpose(m_mat)
+    r = positions[i]
+    s = r[0]
+    mu = dipoles[i]
+    q_i = quadrupoles[i]
+    gu_i = gu[i]
+    gdf_i = gdf[i]
+    gQf_i = gQf[i]
+    gr = g_pos[i]
+    gm = g_cell[b]
+    gm_t = wp.transpose(gm)
+    gmu = g_dip[i]
+    gq = g_quad[i]
+    mgu = wp.vector(
+        gu_i[0] * type(s)(mesh[0]),
+        gu_i[1] * type(s)(mesh[1]),
+        gu_i[2] * type(s)(mesh[2]),
+    )
+    # ∂/∂(incoming cotangents). gu enters BOTH grad_positions (via gr=Mᵀ·mgu)
+    # AND grad_cell_inv_t (via the mgu⊗r term), so both feed grad_gu.
+    m_gr = m_mat * gr + gm * r
+    grad_gu[i] = wp.vector(
+        m_gr[0] * type(s)(mesh[0]),
+        m_gr[1] * type(s)(mesh[1]),
+        m_gr[2] * type(s)(mesh[2]),
+    )
+    grad_gdf[i] = gm * mu + m_mat * gmu
+    grad_gQf[i] = gm * q_i * m_t + m_mat * q_i * gm_t + m_mat * gq * m_t
+    # ∂/∂(forward inputs) — the genuine cell×{pos,moment} cross terms.
+    grad_positions[i] = gm_t * mgu
+    grad_dipoles[i] = gm_t * gdf_i
+    grad_quadrupoles[i] = gm_t * gQf_i * m_mat + m_t * gQf_i * gm
+    grad_m = (
+        wp.outer(mgu, gr)
+        + wp.outer(gdf_i, gmu)
+        + wp.transpose(gQf_i) * gm * q_i
+        + gQf_i * gm * wp.transpose(q_i)
+        + gQf_i * m_mat * wp.transpose(gq)
+        + wp.transpose(gQf_i) * m_mat * gq
+    )
+    wp.atomic_add(grad_cell_inv_t, b, grad_m)
+
+
+def _pme_fractionalize_double_backward_sig(v, t):
+    """Signature builder for :func:`_pme_fractionalize_double_backward_kernel`."""
+    mat = wp.mat33d if t == wp.float64 else wp.mat33f
+    return [
+        wp.array(dtype=v),  # positions
+        wp.array(dtype=mat),  # cell_inv_t
+        wp.array(dtype=wp.int32),  # batch_idx
+        wp.vec3i,  # mesh
+        wp.array(dtype=v),  # dipoles
+        wp.array(dtype=mat),  # quadrupoles
+        wp.array(dtype=v),  # gu
+        wp.array(dtype=v),  # gdf
+        wp.array(dtype=mat),  # gQf
+        wp.array(dtype=v),  # g_pos
+        wp.array(dtype=mat),  # g_cell
+        wp.array(dtype=v),  # g_dip
+        wp.array(dtype=mat),  # g_quad
+        wp.array(dtype=v),  # grad_gu
+        wp.array(dtype=v),  # grad_gdf
+        wp.array(dtype=mat),  # grad_gQf
+        wp.array(dtype=v),  # grad_positions
+        wp.array(dtype=mat),  # grad_cell_inv_t
+        wp.array(dtype=v),  # grad_dipoles
+        wp.array(dtype=mat),  # grad_quadrupoles
+    ]
+
+
+_pme_fractionalize_double_backward_overloads = register_overloads(
+    _pme_fractionalize_double_backward_kernel, _pme_fractionalize_double_backward_sig
+)
+
+
+def pme_fractionalize_double_backward_launch(
+    positions,
+    cell_inv_t,
+    batch_idx,
+    mesh,
+    dipoles,
+    quadrupoles,
+    gu,
+    gdf,
+    gQf,
+    g_pos,
+    g_cell,
+    g_dip,
+    g_quad,
+    grad_gu,
+    grad_gdf,
+    grad_gQf,
+    grad_positions,
+    grad_cell_inv_t,
+    grad_dipoles,
+    grad_quadrupoles,
+    wp_dtype,
+    device=None,
+):
+    r"""Launch :func:`_pme_fractionalize_double_backward_kernel` (one thread/atom)."""
+    if device is None:
+        device = str(positions.device)
+    vec_dtype = wp.vec3d if wp_dtype == wp.float64 else wp.vec3f
+    wp.launch(
+        _pme_fractionalize_double_backward_overloads[vec_dtype],
+        dim=(positions.shape[0],),
+        inputs=[
+            positions,
+            cell_inv_t,
+            batch_idx,
+            mesh,
+            dipoles,
+            quadrupoles,
+            gu,
+            gdf,
+            gQf,
+            g_pos,
+            g_cell,
+            g_dip,
+            g_quad,
+        ],
+        outputs=[
+            grad_gu,
+            grad_gdf,
+            grad_gQf,
+            grad_positions,
+            grad_cell_inv_t,
+            grad_dipoles,
+            grad_quadrupoles,
+        ],
+        device=device,
+    )
+
+
+@wp.kernel
 def _pme_spread_dbwd_readout_kernel(
     gg_pos: wp.array(dtype=Any),  # (N,) vec3
     gd2: wp.array(dtype=Any),  # (N,) vec3
