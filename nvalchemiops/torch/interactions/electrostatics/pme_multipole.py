@@ -2611,6 +2611,166 @@ def _gather_field_forward_fake(mesh, positions, *_args):
     )
 
 
+def _quad_gradpos(
+    positions: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+    mesh: torch.Tensor,
+) -> torch.Tensor:
+    r"""``Σ_{αβ} Q_i[α,β] Σ_g mesh[g] ∂³B/∂r_α∂r_β∂r_γ(r_i,g)`` per atom ``(N,3)``.
+
+    The ∂³B contraction of a per-atom Cartesian quadrupole against the mesh —
+    the position-derivative of the quadrupole spread. Computed via the unified
+    spread backward (``lmax=2``, ``quadrupoles=Q``, ``grad_mesh=mesh``); its
+    ``grad_positions`` output is exactly this third-derivative gather. Stencil
+    math stays in Warp.
+    """
+    device = positions.device
+    input_dtype = positions.dtype
+    wp_scalar = get_wp_dtype(input_dtype)
+    wp_vec = get_wp_vec_dtype(input_dtype)
+    wp_mat = get_wp_mat_dtype(input_dtype)
+    n_atoms = positions.shape[0]
+    grad_positions = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    zero_charges = torch.zeros(n_atoms, dtype=input_dtype, device=device)
+    zero_d = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    scratch_q = torch.zeros(n_atoms, dtype=input_dtype, device=device)
+    scratch_d = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    scratch_Q = torch.zeros((n_atoms, 3, 3), dtype=input_dtype, device=device)
+    scratch_M = torch.zeros((3, 3), dtype=input_dtype, device=device)
+    ok = multipole_pme_spread_backward_unified_launch(
+        _wp_from_torch(positions.contiguous(), dtype=wp_vec),
+        _wp_from_torch(zero_charges, dtype=wp_scalar),
+        _wp_from_torch(zero_d, dtype=wp_vec),
+        _wp_from_torch(quadrupoles.to(input_dtype).contiguous(), dtype=wp_mat),
+        _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
+        order=spline_order,
+        lmax=2,
+        grad_mesh=_wp_from_torch(mesh.contiguous(), dtype=wp_scalar),
+        grad_positions=_wp_from_torch(grad_positions, dtype=wp_vec),
+        grad_charges=_wp_from_torch(scratch_q, dtype=wp_scalar),
+        grad_dipoles=_wp_from_torch(scratch_d, dtype=wp_vec),
+        grad_quadrupoles=_wp_from_torch(scratch_Q, dtype=wp_mat),
+        grad_cell_inv_t=_wp_from_torch(scratch_M, dtype=wp_scalar),
+        wp_dtype=wp_scalar,
+        device=str(wp.device_from_torch(device)),
+    )
+    if not ok:
+        raise NotImplementedError(
+            f"gather_field double-backward needs unified spread backward "
+            f"for (order={spline_order}, lmax=2, dtype={input_dtype})."
+        )
+    return grad_positions
+
+
+def _quad_spread(
+    positions: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+    mesh_shape: tuple[int, ...],
+    device: torch.device,
+    input_dtype: torch.dtype,
+) -> torch.Tensor:
+    r"""``Σ_i Σ_{αβ} Q_i[α,β] ∂²B/∂r_α∂r_β(r_i,g)`` on the mesh ``(quad-spread)``.
+
+    The ∂²B (quadrupole) channel of the unified spread (``lmax=2``, ``charges=0``,
+    ``dipoles=0``) — the mesh-side adjoint of the Hessian gather.
+    """
+    wp_scalar = get_wp_dtype(input_dtype)
+    wp_vec = get_wp_vec_dtype(input_dtype)
+    wp_mat = get_wp_mat_dtype(input_dtype)
+    n_atoms = positions.shape[0]
+    out = torch.zeros(mesh_shape, dtype=input_dtype, device=device)
+    ok = multipole_pme_spread_unified_launch(
+        _wp_from_torch(positions.contiguous(), dtype=wp_vec),
+        _wp_from_torch(
+            torch.zeros(n_atoms, dtype=input_dtype, device=device), dtype=wp_scalar
+        ),
+        _wp_from_torch(
+            torch.zeros((n_atoms, 3), dtype=input_dtype, device=device), dtype=wp_vec
+        ),
+        _wp_from_torch(quadrupoles.to(input_dtype).contiguous(), dtype=wp_mat),
+        _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
+        order=spline_order,
+        lmax=2,
+        mesh=_wp_from_torch(out, dtype=wp_scalar),
+        wp_dtype=wp_scalar,
+        device=str(wp.device_from_torch(device)),
+    )
+    if not ok:
+        raise NotImplementedError(
+            f"gather_field double-backward needs unified spread (quad) for "
+            f"(order={spline_order}, lmax=2, dtype={input_dtype})."
+        )
+    return out
+
+
+def _multipole_pme_gather_field_double_backward(
+    gg_grad_mesh: torch.Tensor,
+    gg_grad_positions: torch.Tensor,
+    grad_field: torch.Tensor,
+    mesh: torch.Tensor,
+    positions: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Second-order backward of :func:`_multipole_pme_gather_field_backward`.
+
+    Forward ``field_i = Σ_g ∇B(r_i,g) mesh[g]`` (N,3). Backward (cotangent
+    ``gf``): ``grad_mesh = dipole-spread(gf)``, ``grad_pos_i = H^m_i·gf_i``
+    (``H^m = Σ_g ∇²B·mesh``). With cotangents ``gg_m`` (grad_mesh), ``gg_p``
+    (grad_pos), and ``Q_i = gf_i ⊗ gg_p_i``:
+
+    .. math::
+
+        \partial/\partial gf_i &= \text{gatherGrad}(gg_m)_i + H^m_i \cdot gg_{p,i} \\
+        \partial/\partial mesh[g] &= \text{quadSpread}(Q)[g]
+            \quad (\sum_i Q_i : \nabla^2 B(r_i,g)) \\
+        \partial/\partial r_i &= H^{gg_m}_i \cdot gf_i
+            + \text{quadGradPos}(Q, mesh)_i \quad (\nabla^3 B\ \text{term})
+
+    All stencil sums run in Warp launchers; only O(N) per-atom combines + the
+    ``gf ⊗ gg_p`` outer product are torch. Returns grads for the backward's diff
+    inputs ``(grad_field, mesh, positions)``.
+    """
+    device = positions.device
+    input_dtype = positions.dtype
+    n_atoms = positions.shape[0]
+    gf = grad_field.to(input_dtype)
+    gg_m = gg_grad_mesh.to(input_dtype)
+    gg_p = gg_grad_positions.to(input_dtype)
+    # Q_fake_i = gf_i⊗gg_p_i + gg_p_i⊗gf_i  (= 2·sym(gf⊗gg_p)). The unified-spread
+    # Q-channel carries a ½ factor AND reads only the symmetric storage (see
+    # gather_hessian backward: it uses Q = 2·grad_H), so the bare contraction
+    # ``Σ_αβ gf_α gg_p_β ∂²B_αβ`` needs the symmetrized, doubled tensor.
+    quad = gf.unsqueeze(-1) * gg_p.unsqueeze(-2) + gg_p.unsqueeze(-1) * gf.unsqueeze(-2)
+
+    with _scoped_warp_stream(device):
+        ones = torch.ones(n_atoms, dtype=input_dtype, device=device)
+        ggrad_ggm = _gather_grad_field(positions, ones, cell_inv_t, spline_order, gg_m)
+        hm_ggp = _hessian_contract(positions, gg_p, cell_inv_t, spline_order, mesh)
+        hggm_gf = _hessian_contract(positions, gf, cell_inv_t, spline_order, gg_m)
+        quad_gp = _quad_gradpos(positions, quad, cell_inv_t, spline_order, mesh)
+
+    # ∂/∂grad_field (N,3): gatherGrad(gg_m) + H^m·gg_p.
+    d_grad_field = (ggrad_ggm + hm_ggp).to(grad_field.dtype)
+    # ∂/∂mesh: quad-spread of Q = gf ⊗ gg_p.
+    d_mesh = _quad_spread(
+        positions,
+        quad,
+        cell_inv_t,
+        spline_order,
+        tuple(mesh.shape),
+        device,
+        input_dtype,
+    )
+    # ∂/∂positions (N,3): H^{gg_m}·gf + ∇³B contraction.
+    d_positions = (hggm_gf + quad_gp).to(input_dtype)
+    return d_grad_field, d_mesh, d_positions
+
+
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_gather_field",
     forward=_multipole_pme_gather_field_forward,
@@ -2619,6 +2779,11 @@ register_warp_op_chain(
     backward_return_arity=2,
     diff_input_positions=(0, 1),  # mesh + positions
     n_forward_inputs=4,
+    double_backward=_multipole_pme_gather_field_double_backward,
+    # backward inputs: (grad_field, mesh, positions, cell_inv_t, spline_order)
+    second_order_diff_positions=(0, 1, 2),
+    n_backward_inputs=5,
+    double_backward_return_arity=3,
 )
 
 
@@ -2724,6 +2889,144 @@ def _batch_multipole_pme_gather_field_backward(
     return grad_mesh, grad_positions
 
 
+def _batch_quad_gradpos(
+    positions: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+    mesh: torch.Tensor,
+) -> torch.Tensor:
+    """Batched companion of :func:`_quad_gradpos` (∇³B contraction, ``(N,3)``)."""
+    device = positions.device
+    input_dtype = positions.dtype
+    wp_scalar = get_wp_dtype(input_dtype)
+    wp_vec = get_wp_vec_dtype(input_dtype)
+    wp_mat = get_wp_mat_dtype(input_dtype)
+    n_atoms = positions.shape[0]
+    grad_positions = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    zero_charges = torch.zeros(n_atoms, dtype=input_dtype, device=device)
+    zero_d = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    scratch_q = torch.zeros(n_atoms, dtype=input_dtype, device=device)
+    scratch_d = torch.zeros((n_atoms, 3), dtype=input_dtype, device=device)
+    scratch_Q = torch.zeros((n_atoms, 3, 3), dtype=input_dtype, device=device)
+    scratch_M = torch.zeros((mesh.shape[0], 3, 3), dtype=input_dtype, device=device)
+    ok = batch_multipole_pme_spread_backward_unified_launch(
+        _wp_from_torch(positions.contiguous(), dtype=wp_vec),
+        _wp_from_torch(zero_charges, dtype=wp_scalar),
+        _wp_from_torch(zero_d, dtype=wp_vec),
+        _wp_from_torch(quadrupoles.to(input_dtype).contiguous(), dtype=wp_mat),
+        _wp_from_torch(batch_idx.contiguous(), dtype=wp.int32),
+        _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
+        order=spline_order,
+        lmax=2,
+        grad_mesh=_wp_from_torch(mesh.contiguous(), dtype=wp_scalar),
+        grad_positions=_wp_from_torch(grad_positions, dtype=wp_vec),
+        grad_charges=_wp_from_torch(scratch_q, dtype=wp_scalar),
+        grad_dipoles=_wp_from_torch(scratch_d, dtype=wp_vec),
+        grad_quadrupoles=_wp_from_torch(scratch_Q, dtype=wp_mat),
+        grad_cell_inv_t=_wp_from_torch(scratch_M, dtype=wp_scalar),
+        wp_dtype=wp_scalar,
+        device=str(wp.device_from_torch(device)),
+    )
+    if not ok:
+        raise NotImplementedError(
+            f"batched gather_field double-backward needs unified spread backward "
+            f"for (order={spline_order}, lmax=2, dtype={input_dtype})."
+        )
+    return grad_positions
+
+
+def _batch_quad_spread(
+    positions: torch.Tensor,
+    quadrupoles: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+    mesh_shape: tuple[int, ...],
+    device: torch.device,
+    input_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Batched companion of :func:`_quad_spread` (∂²B quad channel → mesh)."""
+    wp_scalar = get_wp_dtype(input_dtype)
+    wp_vec = get_wp_vec_dtype(input_dtype)
+    wp_mat = get_wp_mat_dtype(input_dtype)
+    n_atoms = positions.shape[0]
+    out = torch.zeros(mesh_shape, dtype=input_dtype, device=device)
+    ok = batch_multipole_pme_spread_unified_launch(
+        _wp_from_torch(positions.contiguous(), dtype=wp_vec),
+        _wp_from_torch(
+            torch.zeros(n_atoms, dtype=input_dtype, device=device), dtype=wp_scalar
+        ),
+        _wp_from_torch(
+            torch.zeros((n_atoms, 3), dtype=input_dtype, device=device), dtype=wp_vec
+        ),
+        _wp_from_torch(quadrupoles.to(input_dtype).contiguous(), dtype=wp_mat),
+        _wp_from_torch(batch_idx.contiguous(), dtype=wp.int32),
+        _wp_from_torch(cell_inv_t.contiguous(), dtype=wp_mat),
+        order=spline_order,
+        lmax=2,
+        mesh=_wp_from_torch(out, dtype=wp_scalar),
+        wp_dtype=wp_scalar,
+        device=str(wp.device_from_torch(device)),
+    )
+    if not ok:
+        raise NotImplementedError(
+            f"batched gather_field double-backward needs unified spread (quad) "
+            f"for (order={spline_order}, lmax=2, dtype={input_dtype})."
+        )
+    return out
+
+
+def _batch_multipole_pme_gather_field_double_backward(
+    gg_grad_mesh: torch.Tensor,
+    gg_grad_positions: torch.Tensor,
+    grad_field: torch.Tensor,
+    mesh: torch.Tensor,
+    positions: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched second-order backward — mirrors :func:`_multipole_pme_gather_field_double_backward`."""
+    device = positions.device
+    input_dtype = positions.dtype
+    n_atoms = positions.shape[0]
+    gf = grad_field.to(input_dtype)
+    gg_m = gg_grad_mesh.to(input_dtype)
+    gg_p = gg_grad_positions.to(input_dtype)
+    quad = gf.unsqueeze(-1) * gg_p.unsqueeze(-2) + gg_p.unsqueeze(-1) * gf.unsqueeze(-2)
+
+    with _scoped_warp_stream(device):
+        ones = torch.ones(n_atoms, dtype=input_dtype, device=device)
+        ggrad_ggm = _batch_gather_grad_field(
+            positions, ones, batch_idx, cell_inv_t, spline_order, gg_m
+        )
+        hm_ggp = _batch_hessian_contract(
+            positions, gg_p, batch_idx, cell_inv_t, spline_order, mesh
+        )
+        hggm_gf = _batch_hessian_contract(
+            positions, gf, batch_idx, cell_inv_t, spline_order, gg_m
+        )
+        quad_gp = _batch_quad_gradpos(
+            positions, quad, batch_idx, cell_inv_t, spline_order, mesh
+        )
+
+    d_grad_field = (ggrad_ggm + hm_ggp).to(grad_field.dtype)
+    d_mesh = _batch_quad_spread(
+        positions,
+        quad,
+        batch_idx,
+        cell_inv_t,
+        spline_order,
+        tuple(mesh.shape),
+        device,
+        input_dtype,
+    )
+    d_positions = (hggm_gf + quad_gp).to(input_dtype)
+    return d_grad_field, d_mesh, d_positions
+
+
 register_warp_op_chain(
     name="nvalchemiops::multipole_pme_gather_field_batch",
     forward=_batch_multipole_pme_gather_field_forward,
@@ -2732,6 +3035,11 @@ register_warp_op_chain(
     backward_return_arity=2,
     diff_input_positions=(0, 1),  # mesh + positions
     n_forward_inputs=5,
+    double_backward=_batch_multipole_pme_gather_field_double_backward,
+    # backward inputs: (grad_field, mesh, positions, batch_idx, cell_inv_t, spline_order)
+    second_order_diff_positions=(0, 1, 2),
+    n_backward_inputs=6,
+    double_backward_return_arity=3,
 )
 
 
