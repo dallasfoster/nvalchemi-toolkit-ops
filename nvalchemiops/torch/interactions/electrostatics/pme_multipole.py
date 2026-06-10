@@ -4424,6 +4424,91 @@ def multipole_pme_energy_corrections(
     )
 
 
+def multipole_pme_energy_corrections_per_atom(
+    charges: torch.Tensor,
+    dipoles: torch.Tensor | None,
+    sigma: float,
+    alpha: float,
+    volume: torch.Tensor,
+    *,
+    batch_idx: torch.Tensor | None = None,
+    quadrupoles: torch.Tensor | None = None,
+    n_systems: int | None = None,
+) -> torch.Tensor:
+    r"""Per-atom GTO-Ewald multipole self + background corrections.
+
+    Per-atom ``(N,)`` (single) / ``(N_total,)`` (batched) counterpart of
+    :func:`multipole_pme_energy_corrections`. The reduced wrapper returns
+    ``Σ_i correction_i`` (scalar / ``(B,)``); this returns the per-atom
+    ``correction_i`` so the per-atom-energy composite can assemble
+    ``E_i = E_real_i + E_recip_i − correction_i`` and let the caller own the
+    reduction (the PR #96 energy-autograd contract — ``Σ_i`` matches the reduced
+    op bit-for-bit, and ``grad(Σ_i, ·)`` matches the reduced op's gradients).
+
+    Closed forms (all per-atom, ``F = FIELD_CONSTANT``,
+    ``σ_c = sqrt(σ² + 1/(4α²))``):
+
+    .. math::
+
+        \text{self}_i &= \frac{F q_i^2}{8\pi^{3/2}\sigma_c}
+          + \frac{F |\mu_i|^2}{48\pi^{3/2}\sigma_c^3}
+          + \frac{F |Q_i|_F^2}{320\pi^{3/2}\sigma_c^5}, \\
+        \text{bg}_i &= \frac{F\pi}{2\alpha^2 V}\, q_i\, Q_\text{total}, \\
+        \text{correction}_i &= \text{self}_i - \text{bg}_i.
+
+    The background is split per atom as ``q_i · Q_total`` so the per-atom sum
+    recovers the collective ``(F\pi/2\alpha^2 V) Q_\text{total}^2``. Pure-torch
+    elementwise (twice-differentiable for free) — matches the
+    ``multipole_pme_corrections`` Warp op's reduced value/grads to machine eps.
+
+    Parameters mirror :func:`multipole_pme_energy_corrections`. Returns a
+    ``float64`` tensor of shape ``(N,)`` (single) or ``(N_total,)`` (batched).
+    """
+    if dipoles is not None and dipoles.shape != (charges.shape[0], 3):
+        raise ValueError(
+            f"dipoles must have shape (N, 3) = ({charges.shape[0]}, 3); "
+            f"got {tuple(dipoles.shape)}"
+        )
+
+    sigma_c = math.sqrt(sigma**2 + 1.0 / (4.0 * alpha**2))
+    pi32 = math.pi**1.5
+    F = FIELD_CONSTANT
+    c_self_q = F / (8.0 * pi32 * sigma_c)
+    c_self_mu = F / (48.0 * pi32 * sigma_c**3)
+    c_self_q2 = F / (320.0 * pi32 * sigma_c**5)
+    c_bg_no_v = F * math.pi / (2.0 * alpha**2)
+
+    charges_f64 = charges.to(torch.float64)
+    self_e = c_self_q * charges_f64.square()
+    if dipoles is not None:
+        self_e = self_e + c_self_mu * dipoles.to(torch.float64).square().sum(-1)
+    if quadrupoles is not None:
+        self_e = self_e + c_self_q2 * quadrupoles.to(torch.float64).square().sum(
+            (-1, -2)
+        )
+
+    # Background: per-atom share q_i · Q_total / V so Σ_i = Q_total² / V (× c_bg).
+    if batch_idx is None:
+        total_charge = charges_f64.sum()
+        inv_v = (c_bg_no_v / volume.to(torch.float64).reshape(())).reshape(())
+        bg = inv_v * charges_f64 * total_charge
+    else:
+        if n_systems is None:
+            n_systems = int(batch_idx.max().item()) + 1
+        total_charge = torch.zeros(
+            n_systems, dtype=torch.float64, device=charges.device
+        )
+        total_charge = total_charge.scatter_add(0, batch_idx, charges_f64)
+        vol_ps = volume.to(torch.float64).reshape(-1)
+        if vol_ps.numel() == 1 and n_systems > 1:
+            vol_ps = vol_ps.expand(n_systems)
+        per_atom_v = vol_ps.index_select(0, batch_idx)
+        per_atom_qtot = total_charge.index_select(0, batch_idx)
+        bg = c_bg_no_v * charges_f64 * per_atom_qtot / per_atom_v
+
+    return self_e + bg
+
+
 # =============================================================================
 # Reciprocal-space per-k energy from rho (shared by direct k-space + Ewald reciprocal)
 # =============================================================================

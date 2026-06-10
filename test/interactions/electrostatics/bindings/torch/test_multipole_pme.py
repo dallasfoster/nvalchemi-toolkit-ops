@@ -51,6 +51,7 @@ from nvalchemiops.torch.interactions.electrostatics.pme import (
 from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (  # noqa: E402
     multipole_particle_mesh_ewald,
     multipole_pme_energy_corrections,
+    multipole_pme_energy_corrections_per_atom,
     multipole_pme_gather_field,
     multipole_pme_gather_hessian,
     multipole_pme_gather_potential,
@@ -893,6 +894,105 @@ class TestEnergyCorrections:
             sf_b = _path_a_pack_source_feats(charges[mask], dipoles[mask])
             expected_b = _multipole_ewald_self_energy_per_atom(sf_b, sigma, alpha).sum()
             torch.testing.assert_close(per_sys[b], expected_b, rtol=1e-15, atol=1e-15)
+
+
+class TestEnergyCorrectionsPerAtom:
+    """Per-atom corrections (Phase 4 component): ``Σ_i`` + ``grad`` match the
+    reduced :func:`multipole_pme_energy_corrections` op bit-for-bit."""
+
+    @pytest.mark.parametrize("l_max", [0, 1, 2])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_sum_and_grad_match_reduced(self, l_max, batched):
+        td = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        rng = np.random.default_rng(0x9E + l_max + (10 if batched else 0))
+        sigma, alpha = 0.9, 0.37
+
+        if batched:
+            batch_idx = torch.tensor(
+                [0, 0, 0, 0, 1, 1, 1, 2, 2, 2], dtype=torch.int32, device=td
+            )
+            N = batch_idx.numel()
+            volume = torch.tensor([700.0, 800.0, 900.0], dtype=torch.float64, device=td)
+        else:
+            batch_idx = None
+            N = 8
+            volume = torch.tensor(729.0, dtype=torch.float64, device=td)
+
+        # Non-neutral so the background term is exercised.
+        charges = torch.from_numpy(rng.uniform(-1.0, 1.0, N)).to(td, torch.float64)
+        dipoles = (
+            torch.from_numpy(rng.standard_normal((N, 3)) * 0.4).to(td, torch.float64)
+            if l_max >= 1
+            else None
+        )
+        if l_max >= 2:
+            q_full = torch.from_numpy(rng.standard_normal((N, 3, 3)) * 0.3).to(
+                td, torch.float64
+            )
+            quadrupoles = 0.5 * (q_full + q_full.mT)
+        else:
+            quadrupoles = None
+
+        def _reduce(per_atom):
+            if batch_idx is None:
+                return per_atom.sum()
+            out = torch.zeros(3, dtype=torch.float64, device=td)
+            return out.scatter_add(0, batch_idx, per_atom)
+
+        # Value: Σ per-atom == reduced.
+        per_atom = multipole_pme_energy_corrections_per_atom(
+            charges,
+            dipoles,
+            sigma,
+            alpha,
+            volume,
+            batch_idx=batch_idx,
+            quadrupoles=quadrupoles,
+        )
+        assert per_atom.shape == (N,)
+        reduced = multipole_pme_energy_corrections(
+            charges,
+            dipoles,
+            sigma=sigma,
+            alpha=alpha,
+            volume=volume,
+            batch_idx=batch_idx,
+            quadrupoles=quadrupoles,
+        )
+        torch.testing.assert_close(_reduce(per_atom), reduced, rtol=1e-13, atol=1e-13)
+
+        # Gradient: grad(Σ per-atom, charges) == grad(reduced, charges).
+        q1 = charges.clone().requires_grad_(True)
+        g_pa = torch.autograd.grad(
+            _reduce(
+                multipole_pme_energy_corrections_per_atom(
+                    q1,
+                    dipoles,
+                    sigma,
+                    alpha,
+                    volume,
+                    batch_idx=batch_idx,
+                    quadrupoles=quadrupoles,
+                )
+            ).sum(),
+            q1,
+        )[0]
+        q2 = charges.clone().requires_grad_(True)
+        g_red = torch.autograd.grad(
+            multipole_pme_energy_corrections(
+                q2,
+                dipoles,
+                sigma=sigma,
+                alpha=alpha,
+                volume=volume,
+                batch_idx=batch_idx,
+                quadrupoles=quadrupoles,
+            ).sum(),
+            q2,
+        )[0]
+        torch.testing.assert_close(g_pa, g_red, rtol=1e-12, atol=1e-12)
 
 
 class TestReciprocalSpace:
