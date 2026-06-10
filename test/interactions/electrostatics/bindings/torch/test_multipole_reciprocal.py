@@ -31,6 +31,7 @@ from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     cartesian_quadrupole_to_e3nn,
     dipole_cartesian_to_spherical,
     pack_charges_dipoles,
+    pack_multipole_moments,
 )
 from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
     FIELD_CONSTANT,
@@ -1475,6 +1476,137 @@ class TestDirectKGatherPerAtom:
                 device="cuda:0",
             )
             e = efn(cache, sd["positions"], sd["charges"], sd["dipoles"])
+            return torch.autograd.grad(e.sum(), cell)[0]
+
+        torch.testing.assert_close(
+            stress(self._peratom), stress(self._collective), rtol=1e-9, atol=1e-9
+        )
+
+
+class TestDirectKGatherPerAtomLmax2:
+    r"""Per-atom direct-k reciprocal energy at l=2 via the Q-channel gather.
+
+    Adds the Cartesian-quadrupole channel ``multipole_rho_q_gather_t`` to the
+    l<=1 ``multipole_rho_gather_t`` decomposition; ``Σ_i E_i`` and its
+    force-loss / stress grads must match the collective
+    ``multipole_scf_step_energy(..., quadrupoles=Q)`` bit-for-bit.
+    """
+
+    @pytest.fixture
+    def gpu_system(self):
+        if not torch.cuda.is_available():
+            pytest.skip("Path A reciprocal kernels are GPU-only")
+        positions, charges, dipoles, cell = _system(
+            n_atoms=8, box_len=5.0, device="cuda:0", seed=0xC0DE, with_dipoles=True
+        )
+        rng = torch.Generator(device="cuda:0").manual_seed(0xC0DE)
+        qf = torch.randn(8, 3, 3, dtype=torch.float64, device="cuda:0", generator=rng)
+        quadrupoles = 0.5 * (qf + qf.mT)
+        return {
+            "positions": positions,
+            "charges": charges,
+            "dipoles": dipoles,
+            "quadrupoles": quadrupoles,
+            "cell": cell,
+        }
+
+    @staticmethod
+    def _mkcache(cell):
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+            prepare_multipole_scf_cache,
+        )
+
+        return prepare_multipole_scf_cache(
+            cell,
+            sigma=1.0,
+            receiver_sigmas=[1.0],
+            kspace_cutoff=3.0,
+            l_max=2,
+            alpha=0.5,
+            device="cuda:0",
+        )
+
+    @staticmethod
+    def _peratom(cache, pos, q, dip, quad):
+        import nvalchemiops.torch.interactions.electrostatics.multipole_autograd  # noqa: F401
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+            _TWO_PI_6,
+        )
+
+        rho = torch.ops.nvalchemiops.multipole_rho(
+            q, dip, pos, cache.source_phi_hat, cache.k_vectors, cache.volume
+        )
+        rho = rho + torch.ops.nvalchemiops.multipole_rho_q(
+            quad, pos, cache.source_coeff2, cache.k_vectors, cache.volume
+        )
+        rho = rho * (cache.volume.detach() / cache.volume)
+        phi_hat = (2.0 * cache.per_k_factor).unsqueeze(-1) * rho
+        g = torch.ops.nvalchemiops.multipole_rho_gather_t(
+            phi_hat, pos, cache.source_phi_hat, cache.k_vectors, cache.volume
+        )
+        g_q = torch.ops.nvalchemiops.multipole_rho_q_gather_t(
+            phi_hat, pos, cache.source_coeff2, cache.k_vectors, cache.volume
+        )
+        g = g * (cache.volume.detach() / cache.volume)
+        g_q = g_q * (cache.volume.detach() / cache.volume)
+        scale = 0.5 * cache.volume / _TWO_PI_6
+        return scale * (
+            q * g[:, 0] + (dip * g[:, [3, 1, 2]]).sum(-1) + (quad * g_q).sum((-1, -2))
+        )
+
+    @staticmethod
+    def _collective(cache, pos, q, dip, quad):
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
+            multipole_scf_step_energy,
+        )
+
+        return multipole_scf_step_energy(
+            cache,
+            pos,
+            pack_multipole_moments(q, dip),
+            quadrupoles=quad,
+            include_self_interaction=True,
+        )
+
+    def test_value_parity(self, gpu_system):
+        sd = gpu_system
+        cache = self._mkcache(sd["cell"])
+        e_i = self._peratom(
+            cache, sd["positions"], sd["charges"], sd["dipoles"], sd["quadrupoles"]
+        )
+        e_coll = self._collective(
+            cache, sd["positions"], sd["charges"], sd["dipoles"], sd["quadrupoles"]
+        )
+        assert e_i.shape == (sd["positions"].shape[0],)
+        torch.testing.assert_close(e_i.sum(), e_coll, rtol=1e-12, atol=1e-12)
+
+    def test_force_loss_parity(self, gpu_system):
+        sd = gpu_system
+        cache = self._mkcache(sd["cell"])
+        wf = torch.randn_like(sd["positions"])
+
+        def grads(efn):
+            p = sd["positions"].clone().requires_grad_(True)
+            q = sd["charges"].clone().requires_grad_(True)
+            mu = sd["dipoles"].clone().requires_grad_(True)
+            quad = sd["quadrupoles"].clone().requires_grad_(True)
+            e = efn(cache, p, q, mu, quad)
+            gp = torch.autograd.grad(e.sum(), p, create_graph=True)[0]
+            loss = (gp * wf).sum()
+            return torch.autograd.grad(loss, (q, mu, quad, p))
+
+        for a, b in zip(grads(self._peratom), grads(self._collective)):
+            torch.testing.assert_close(a, b, rtol=1e-10, atol=1e-10)
+
+    def test_stress_parity(self, gpu_system):
+        sd = gpu_system
+
+        def stress(efn):
+            cell = sd["cell"].clone().requires_grad_(True)
+            cache = self._mkcache(cell)
+            e = efn(
+                cache, sd["positions"], sd["charges"], sd["dipoles"], sd["quadrupoles"]
+            )
             return torch.autograd.grad(e.sum(), cell)[0]
 
         torch.testing.assert_close(

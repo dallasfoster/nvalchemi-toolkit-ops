@@ -1141,6 +1141,103 @@ torch.library.register_autograd(
 
 
 # =============================================================================
+# Direct-k l=2 Cartesian-quadrupole gather: g_Q = Sᵀ_Q · grad_rho  (per-atom).
+# The l=2 analog of ``multipole_rho_gather_t``: ``g_Q`` is the Q-assembly's
+# Jacobian transpose (``multipole_rho_q_moment_grad``), so for the per-atom
+# direct-k reciprocal energy ``E_i = scale·Q_i : g_Q_i`` (with
+# ``grad_rho = φ̂ = 2 f_k ρ``), ``Σ_i Q_i:g_Q_i == <ρ_Q, φ̂>`` bit-for-bit.
+# Twice-differentiable for free: the backward composes the autograd-registered
+# ``multipole_rho_q`` forward and the rho_q backward sub-ops.
+# =============================================================================
+
+
+@torch.library.custom_op(
+    "nvalchemiops::multipole_rho_q_gather_t",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_rho, Tensor positions, Tensor source_coeff2, "
+        "Tensor k_vectors, Tensor volume) -> Tensor"
+    ),
+)
+def _multipole_rho_q_gather_t_op(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    r"""Opaque forward: ``g_Q = Sᵀ_Q · grad_rho`` per-atom quadrupole gradient.
+
+    Returns ``(N, 3, 3)`` Cartesian symmetric; equals the Q-assembly's Jacobian
+    transpose (``multipole_rho_q_moment_grad``).
+    """
+    cosines, sines = _structure_factor_table_launch(positions, k_vectors)
+    return torch.ops.nvalchemiops.multipole_rho_q_moment_grad(
+        grad_rho, positions, cosines, sines, k_vectors, source_coeff2, volume
+    )
+
+
+@torch.library.register_fake("nvalchemiops::multipole_rho_q_gather_t")
+def _multipole_rho_q_gather_t_fake(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``g_Q`` is ``(N_atoms, 3, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3, 3), dtype=torch.float64)
+
+
+def _multipole_rho_q_gather_t_setup_context(ctx, inputs, output) -> None:
+    """Save forward inputs for the analytical backward."""
+    grad_rho, positions, source_coeff2, k_vectors, volume = inputs
+    ctx.save_for_backward(grad_rho, positions, source_coeff2, k_vectors, volume)
+
+
+def _multipole_rho_q_gather_t_backward(ctx, g_cot: torch.Tensor):
+    r"""Adjoint of ``g_Q = Sᵀ_Q · grad_rho``.
+
+    With cotangent ``cg_Q = g_cot`` (per-atom ``(N, 3, 3)``) on ``g_Q``,
+    ``<cg_Q, Sᵀ_Q grad_rho> = <S_Q·cg_Q, grad_rho>``:
+
+    * ``∂/∂grad_rho = S_Q·cg_Q = ρ_Q(cg_Q)`` (the ``multipole_rho_q`` FORWARD).
+    * ``∂/∂{positions, source_coeff2, k_vectors}`` are the rho_q backward
+      sub-ops with quadrupoles ``= cg_Q`` and field ``= grad_rho``.
+
+    Every term is an autograd-registered op, so create_graph composes their
+    double-backwards automatically.
+    """
+    grad_rho, positions, source_coeff2, k_vectors, volume = ctx.saved_tensors
+    cg_q = g_cot.contiguous()
+    cosines, sines = torch.ops.nvalchemiops.multipole_structure_factor(
+        positions.detach(), k_vectors.detach()
+    )
+    # ∂/∂grad_rho = ρ_Q(cg_Q): S_Q applied to the cotangent-as-quadrupoles.
+    d_grad_rho = torch.ops.nvalchemiops.multipole_rho_q(
+        cg_q, positions, source_coeff2, k_vectors, volume
+    )
+    d_positions = torch.ops.nvalchemiops.multipole_rho_q_position_grad(
+        grad_rho, cg_q, positions, cosines, sines, k_vectors, source_coeff2, volume
+    ).to(positions.dtype)
+    d_coeff2 = torch.ops.nvalchemiops.multipole_rho_q_coeff2_grad(
+        grad_rho, cg_q, positions, cosines, sines, k_vectors, volume
+    )
+    d_kvec = torch.ops.nvalchemiops.multipole_rho_q_kvec_grad(
+        grad_rho, cg_q, positions, cosines, sines, k_vectors, source_coeff2, volume
+    )
+    # Slots: (grad_rho, positions, source_coeff2, k_vectors, volume).
+    return d_grad_rho, d_positions, d_coeff2, d_kvec, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::multipole_rho_q_gather_t",
+    _multipole_rho_q_gather_t_backward,
+    setup_context=_multipole_rho_q_gather_t_setup_context,
+)
+
+
+# =============================================================================
 # Cartesian-quadrupole (l=2) rho_Q(k) contribution
 # =============================================================================
 #
