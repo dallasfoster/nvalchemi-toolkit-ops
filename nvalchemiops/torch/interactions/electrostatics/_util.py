@@ -23,9 +23,114 @@ __all__ = [
     "_InjectChargeGrad",
     "_build_electrostatic_result",
     "_combine_electrostatic_outputs",
+    "_energy_cotangents",
+    "_is_per_system_uniform_cotangent",
+    "_is_sync_free_uniform_cotangent",
     "_sum_charge_gradients",
     "_unpack_electrostatic_outputs",
 ]
+
+
+def _is_sync_free_uniform_cotangent(grad_energy: torch.Tensor) -> bool:
+    """Return whether ``grad_energy`` is known uniform without reading values.
+
+    A scalar, or a tensor broadcast from one element (every non-trivial axis
+    has stride 0), is uniform by construction — detectable without a device
+    sync. Used to fast-path the common ``energy.sum()`` cotangent.
+    """
+    if grad_energy.numel() <= 1:
+        return True
+    return all(
+        size <= 1 or stride == 0
+        for size, stride in zip(grad_energy.shape, grad_energy.stride(), strict=True)
+    )
+
+
+def _energy_cotangents(
+    grad_energy: torch.Tensor,
+    batch_idx: torch.Tensor | None,
+    num_atoms: int,
+    num_systems: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a per-atom energy cotangent into per-system + per-atom parts.
+
+    Ported from the PR #96 energy-derivative contract. The returned
+    ``grad_system`` ``(num_systems,)`` weights collective per-system quantities
+    (cell-grad / reciprocal), and ``atom_grad`` ``(num_atoms,)`` weights
+    per-atom quantities. Accepts ``grad_energy`` shaped per-system
+    ``(num_systems,)``, per-atom ``(num_atoms,)``, or scalar; under the
+    sum-reduction contract (``energy.sum()``) the cotangent is uniform so both
+    reduce to the (broadcast) loss scale.
+    """
+    grad = grad_energy.reshape(-1)
+    if batch_idx is None:
+        if num_systems > 1 and grad.numel() == num_systems:
+            grad_system = grad
+        elif num_systems > 1 and grad.numel() == 1:
+            grad_system = grad.expand(num_systems)
+        elif grad.numel() == num_atoms and num_atoms > 0:
+            grad_system = grad.mean().reshape(1)
+        elif grad.numel() == 0:
+            grad_system = grad.new_zeros((1,))
+        else:
+            grad_system = grad.reshape(-1)[:1]
+        atom_grad = grad_system[0].expand(num_atoms)
+        return grad_system, atom_grad
+
+    if grad.numel() == num_systems:
+        grad_system = grad
+    elif grad.numel() == num_atoms:
+        sums = grad.new_zeros((num_systems,)).index_add(0, batch_idx, grad)
+        counts = grad.new_zeros((num_systems,)).index_add(
+            0, batch_idx, torch.ones_like(grad)
+        )
+        grad_system = sums / counts.clamp_min(1)
+    elif grad.numel() == 1:
+        grad_system = grad.expand(num_systems)
+    else:
+        raise RuntimeError(
+            "Energy cotangent must be per-system, per-atom, or scalar; got "
+            f"{tuple(grad_energy.shape)} for {num_atoms} atoms / {num_systems} systems"
+        )
+    atom_grad = grad_system.index_select(0, batch_idx)
+    return grad_system, atom_grad
+
+
+def _is_per_system_uniform_cotangent(
+    grad_energy: torch.Tensor,
+    batch_idx: torch.Tensor | None,
+    num_systems: int,
+) -> bool:
+    """Return whether an atom-major cotangent is uniform within each system.
+
+    The PR #96 energy-derivative contract supports per-system-uniform energy
+    cotangents (e.g. ``energy.sum()``). Returns ``True`` cheaply when uniformity
+    is provable without reading values; otherwise reads (a device sync on CUDA).
+    """
+    if _is_sync_free_uniform_cotangent(grad_energy):
+        return True
+    grad = grad_energy.reshape(-1)
+    if grad.numel() == 0:
+        return True
+    if grad.numel() == 1 or grad.numel() == num_systems:
+        return True
+    if grad.is_cuda:
+        return False
+    if batch_idx is None:
+        return bool(torch.all(grad == grad[0]).item())
+    if grad.numel() != batch_idx.numel():
+        return False
+    idx = batch_idx.to(device=grad.device, dtype=torch.long)
+    grad64 = grad.to(torch.float64)
+    sys_min = torch.full(
+        (num_systems,), float("inf"), dtype=torch.float64, device=grad.device
+    ).scatter_reduce(0, idx, grad64, reduce="amin", include_self=False)
+    sys_max = torch.full(
+        (num_systems,), float("-inf"), dtype=torch.float64, device=grad.device
+    ).scatter_reduce(0, idx, grad64, reduce="amax", include_self=False)
+    return bool(
+        torch.all(sys_min.index_select(0, idx) == sys_max.index_select(0, idx)).item()
+    )
 
 
 @torch.compiler.disable

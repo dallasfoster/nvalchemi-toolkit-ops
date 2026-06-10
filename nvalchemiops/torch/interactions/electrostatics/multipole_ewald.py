@@ -81,6 +81,9 @@ from nvalchemiops.torch._warp_op_helpers import (
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     split_multipole_moments,
 )
+from nvalchemiops.torch.interactions.electrostatics._util import (
+    _energy_cotangents,
+)
 from nvalchemiops.torch.math import FIELD_CONSTANT
 from nvalchemiops.torch.types import get_wp_dtype, get_wp_mat_dtype, get_wp_vec_dtype
 
@@ -1599,6 +1602,256 @@ torch.library.register_autograd(
     _rs_dipole_fused_backward,
     setup_context=_rs_dipole_fused_setup,
 )
+
+
+class _AttachRealSpaceCellGradLmax1(torch.autograd.Function):
+    """Attach the per-system-reduced cell gradient to a per-atom l<=1
+    real-space energy.
+
+    The per-atom :func:`multipole_real_space_energy` op (l=0/1) does not
+    differentiate ``cell`` (it is detached in the kernel); the collective stress
+    comes from the separate, twice-differentiable
+    ``multipole_real_space_{monopole,dipole}_cell_grad`` op, which computes the
+    UNWEIGHTED total ``dE/dcell``. This identity-forward Function injects that
+    cell gradient into the per-atom energy's graph so that
+    ``grad(E.sum(), cell)`` reproduces the collective stress (PR #96
+    energy-autograd contract: the energy cotangent is per-system uniform under
+    sum-reduction). ``grad_cell = grad_system * total_cell_grad`` where
+    ``grad_system`` is the per-system-reduced energy cotangent
+    (:func:`_energy_cotangents`). The cell-grad op is re-evaluated inside
+    ``backward`` so its registered double-backward carries stress-loss
+    (``d^2E/dcell d theta``). l=2 already routes cell-grad through its own
+    per-atom-weighted op, so this covers l=0/1 only.
+
+    Forward inputs: ``per_atom`` (the energy, slot 0, carries the
+    position/charge/dipole graph) and ``cell`` (slot 1, the only slot this
+    Function contributes a gradient to). The remaining tensors are saved for the
+    backward cell-grad re-evaluation; this Function returns ``None`` for them at
+    first order (their first-order grads flow through ``per_atom``).
+    """
+
+    @staticmethod
+    def forward(
+        per_atom,
+        cell,
+        positions,
+        charges,
+        dipoles,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+        num_systems,
+        l_max,
+        half_neighbor_list,
+    ):
+        """Identity over ``per_atom``."""
+        return per_atom
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        """Save the inputs the backward re-evaluates the cell-grad op from."""
+        (
+            _per_atom,
+            cell,
+            positions,
+            charges,
+            dipoles,
+            sigma,
+            alpha,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            batch_idx,
+            num_systems,
+            l_max,
+            half_neighbor_list,
+        ) = inputs
+        ctx.save_for_backward(
+            cell,
+            positions,
+            charges,
+            dipoles,
+            sigma,
+            alpha,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            batch_idx if batch_idx is not None else cell.new_zeros(0),
+        )
+        ctx.has_batch = batch_idx is not None
+        ctx.num_systems = num_systems
+        ctx.num_atoms = output.shape[0]
+        ctx.l_max = l_max
+        ctx.half_neighbor_list = half_neighbor_list
+
+    @staticmethod
+    def backward(ctx, grad_energy):
+        """Pass ``grad_energy`` through to ``per_atom``; inject ``grad_cell``."""
+        (
+            cell,
+            positions,
+            charges,
+            dipoles,
+            sigma,
+            alpha,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            batch_idx_saved,
+        ) = ctx.saved_tensors
+        grad_cell = None
+        if ctx.needs_input_grad[1]:
+            batch_idx = batch_idx_saved if ctx.has_batch else None
+            grad_system, _ = _energy_cotangents(
+                grad_energy, batch_idx, ctx.num_atoms, ctx.num_systems
+            )
+            if ctx.has_batch:
+                if ctx.l_max == 1:
+                    cg = torch.ops.nvalchemiops.batch_multipole_real_space_dipole_cell_grad(
+                        positions,
+                        charges,
+                        dipoles,
+                        cell,
+                        sigma,
+                        alpha,
+                        idx_j,
+                        neighbor_ptr,
+                        unit_shifts,
+                        batch_idx,
+                        ctx.half_neighbor_list,
+                    )
+                else:
+                    cg = torch.ops.nvalchemiops.batch_multipole_real_space_monopole_cell_grad(
+                        positions,
+                        charges,
+                        cell,
+                        sigma,
+                        alpha,
+                        idx_j,
+                        neighbor_ptr,
+                        unit_shifts,
+                        batch_idx,
+                        ctx.half_neighbor_list,
+                    )
+                grad_cell = grad_system.view(-1, 1, 1) * cg
+            else:
+                if ctx.l_max == 1:
+                    cg = torch.ops.nvalchemiops.multipole_real_space_dipole_cell_grad(
+                        positions,
+                        charges,
+                        dipoles,
+                        cell,
+                        sigma,
+                        alpha,
+                        idx_j,
+                        neighbor_ptr,
+                        unit_shifts,
+                        ctx.half_neighbor_list,
+                    )
+                else:
+                    cg = torch.ops.nvalchemiops.multipole_real_space_monopole_cell_grad(
+                        positions,
+                        charges,
+                        cell,
+                        sigma,
+                        alpha,
+                        idx_j,
+                        neighbor_ptr,
+                        unit_shifts,
+                        ctx.half_neighbor_list,
+                    )
+                grad_cell = grad_system.reshape(()) * cg
+        return (
+            grad_energy,
+            grad_cell,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def multipole_real_space_energy_with_stress(
+    positions: torch.Tensor,
+    multipole_moments: torch.Tensor,
+    cell: torch.Tensor,
+    idx_j: torch.Tensor,
+    neighbor_ptr: torch.Tensor,
+    unit_shifts: torch.Tensor,
+    sigma: torch.Tensor,
+    alpha: torch.Tensor,
+    *,
+    batch_idx: torch.Tensor | None = None,
+    half_neighbor_list: bool = False,
+) -> torch.Tensor:
+    r"""Per-atom real-space energy that also carries the cell gradient (stress).
+
+    Same per-atom :math:`(N,)` / :math:`(N_\text{total},)` value and
+    position/charge/dipole/quadrupole gradients as
+    :func:`multipole_real_space_energy`, but additionally differentiable w.r.t.
+    ``cell``: ``grad(E.sum(), cell)`` equals the collective stress (and
+    ``d^2E/dcell d theta`` flows for stress-loss). This is the per-atom-energy
+    composite's real-space half under the PR #96 energy-autograd contract,
+    replacing the per-system-scalar ``*FusedScalarFunction`` path (which carried
+    cell-grad only on a scalar). l=2 already routes cell-grad per-atom; for
+    l<=1 the cell gradient is injected via :class:`_AttachRealSpaceCellGradLmax1`
+    (the energy cotangent is per-system uniform under sum-reduction).
+    """
+    per_atom = multipole_real_space_energy(
+        positions,
+        multipole_moments,
+        cell,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        sigma,
+        alpha,
+        batch_idx=batch_idx,
+        half_neighbor_list=half_neighbor_list,
+    )
+    charges, dipoles_cart, _quadrupoles, l_max = split_multipole_moments(
+        multipole_moments
+    )
+    if l_max == 2:
+        # l=2 already differentiates cell through its per-atom-weighted cell-grad op.
+        return per_atom
+    num_systems = (
+        int(cell.shape[0]) if (batch_idx is not None and cell.dim() == 3) else 1
+    )
+    dipoles_in = (
+        dipoles_cart
+        if dipoles_cart is not None
+        else torch.zeros(
+            (positions.shape[0], 3), dtype=positions.dtype, device=positions.device
+        )
+    )
+    return _AttachRealSpaceCellGradLmax1.apply(
+        per_atom,
+        cell,
+        positions,
+        charges,
+        dipoles_in,
+        sigma,
+        alpha,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        batch_idx,
+        num_systems,
+        l_max,
+        half_neighbor_list,
+    )
 
 
 @torch.library.custom_op(

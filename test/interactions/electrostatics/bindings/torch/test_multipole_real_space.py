@@ -1363,3 +1363,159 @@ class TestRealSpaceBatchedStressLoss:
         # large-magnitude stress whose 2nd-order central difference floors near
         # ~3e-5 (analytic matches to that); still catches sign flips/silent zeros.
         assert abs((gp * v).sum().item() - fd) / (abs(fd) + 1e-12) < 1e-4
+
+
+class TestRealSpaceEnergyWithStress:
+    """Per-atom real-space energy that also carries cell-grad (Phase 4 component).
+
+    ``multipole_real_space_energy_with_stress`` must match the per-atom
+    :func:`multipole_real_space_energy` on value + position/charge gradients,
+    and reproduce the collective stress (``grad(E.sum(), cell)``) of the
+    per-system-scalar ``*FusedScalarFunction`` oracle, with a correct
+    stress-loss (``d(stress)/d theta``) under the sum-reduction contract.
+    """
+
+    @pytest.mark.parametrize("l_max", [0, 1])
+    def test_value_forces_match_plain_per_atom(self, l_max):
+        from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
+            pack_multipole_moments,
+        )
+        from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
+            multipole_real_space_energy,
+            multipole_real_space_energy_with_stress,
+        )
+
+        td = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        rng = np.random.default_rng(0xA1 + l_max)
+        n, ell = 6, 8.0
+        cell = torch.eye(3, dtype=torch.float64, device=td) * ell
+        pos = torch.from_numpy(rng.uniform(0, ell, (n, 3))).to(td)
+        q = torch.from_numpy(rng.uniform(-1, 1, n)).to(td)
+        q = q - q.mean()
+        mu = (
+            torch.from_numpy(rng.standard_normal((n, 3)) * 0.3).to(td)
+            if l_max
+            else None
+        )
+        idx_j, nptr, ush = _csr_neighbors_for_n_atoms(pos, 4.5)
+        sig = torch.tensor([1.0], dtype=torch.float64, device=td)
+        alp = torch.tensor([0.4], dtype=torch.float64, device=td)
+        mm = pack_multipole_moments(q, mu) if l_max else pack_multipole_moments(q)
+
+        plain = multipole_real_space_energy(pos, mm, cell, idx_j, nptr, ush, sig, alp)
+        withs = multipole_real_space_energy_with_stress(
+            pos, mm, cell, idx_j, nptr, ush, sig, alp
+        )
+        torch.testing.assert_close(withs, plain, rtol=0, atol=0)
+
+        # Forces (grad wrt positions) must be identical.
+        p1 = pos.clone().requires_grad_(True)
+        f_plain = torch.autograd.grad(
+            multipole_real_space_energy(p1, mm, cell, idx_j, nptr, ush, sig, alp).sum(),
+            p1,
+        )[0]
+        p2 = pos.clone().requires_grad_(True)
+        f_with = torch.autograd.grad(
+            multipole_real_space_energy_with_stress(
+                p2, mm, cell, idx_j, nptr, ush, sig, alp
+            ).sum(),
+            p2,
+        )[0]
+        torch.testing.assert_close(f_with, f_plain, rtol=1e-12, atol=1e-12)
+
+    @pytest.mark.parametrize("l_max", [0, 1])
+    def test_stress_matches_fused_scalar_oracle(self, l_max):
+        from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
+            pack_multipole_moments,
+        )
+        from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
+            MultipoleRealSpaceDipoleFusedScalarFunction,
+            MultipoleRealSpaceMonopoleFusedScalarFunction,
+            multipole_real_space_energy_with_stress,
+        )
+
+        td = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        rng = np.random.default_rng(0xB2 + l_max)
+        n, ell = 6, 8.0
+        cell = torch.eye(3, dtype=torch.float64, device=td) * ell
+        pos = torch.from_numpy(rng.uniform(0, ell, (n, 3))).to(td)
+        q = torch.from_numpy(rng.uniform(-1, 1, n)).to(td)
+        q = q - q.mean()
+        mu = (
+            torch.from_numpy(rng.standard_normal((n, 3)) * 0.3).to(td)
+            if l_max
+            else None
+        )
+        idx_j, nptr, ush = _csr_neighbors_for_n_atoms(pos, 4.5)
+        sig = torch.tensor([1.0], dtype=torch.float64, device=td)
+        alp = torch.tensor([0.4], dtype=torch.float64, device=td)
+        mm = pack_multipole_moments(q, mu) if l_max else pack_multipole_moments(q)
+
+        c_or = cell.clone().requires_grad_(True)
+        if l_max:
+            e_or = MultipoleRealSpaceDipoleFusedScalarFunction.apply(
+                pos, q, mu, c_or, sig, alp, idx_j, nptr, ush
+            )
+        else:
+            e_or = MultipoleRealSpaceMonopoleFusedScalarFunction.apply(
+                pos, q, c_or, sig, alp, idx_j, nptr, ush
+            )
+        s_or = torch.autograd.grad(e_or, c_or)[0]
+
+        c2 = cell.clone().requires_grad_(True)
+        e2 = multipole_real_space_energy_with_stress(
+            pos, mm, c2, idx_j, nptr, ush, sig, alp
+        )
+        s_ours = torch.autograd.grad(e2.sum(), c2)[0]
+        torch.testing.assert_close(s_ours, s_or, rtol=1e-10, atol=1e-10)
+
+    @pytest.mark.parametrize("l_max", [0, 1])
+    def test_stress_loss_finite_difference(self, l_max):
+        from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
+            pack_multipole_moments,
+        )
+        from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
+            multipole_real_space_energy_with_stress,
+        )
+
+        td = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        rng = np.random.default_rng(0xC3 + l_max)
+        n, ell = 5, 8.0
+        cell = torch.eye(3, dtype=torch.float64, device=td) * ell
+        pos = torch.from_numpy(rng.uniform(0, ell, (n, 3))).to(td)
+        q0 = torch.from_numpy(rng.uniform(-1, 1, n)).to(td)
+        q0 = q0 - q0.mean()
+        mu = (
+            torch.from_numpy(rng.standard_normal((n, 3)) * 0.3).to(td)
+            if l_max
+            else None
+        )
+        idx_j, nptr, ush = _csr_neighbors_for_n_atoms(pos, 4.5)
+        sig = torch.tensor([1.0], dtype=torch.float64, device=td)
+        alp = torch.tensor([0.4], dtype=torch.float64, device=td)
+
+        def stress(qv):
+            c = cell.clone().requires_grad_(True)
+            mm = pack_multipole_moments(qv, mu) if l_max else pack_multipole_moments(qv)
+            e = multipole_real_space_energy_with_stress(
+                pos, mm, c, idx_j, nptr, ush, sig, alp
+            )
+            return torch.autograd.grad(e.sum(), c, create_graph=True)[0]
+
+        q1 = q0.clone().requires_grad_(True)
+        analytic = torch.autograd.grad(stress(q1).sum(), q1)[0]
+        h = 1e-6
+        fd = torch.zeros_like(q0)
+        for k in range(n):
+            qp = q0.clone()
+            qp[k] += h
+            qm = q0.clone()
+            qm[k] -= h
+            fd[k] = (stress(qp).sum() - stress(qm).sum()) / (2 * h)
+        assert (analytic - fd).norm().item() / (fd.norm().item() + 1e-12) < 1e-6
