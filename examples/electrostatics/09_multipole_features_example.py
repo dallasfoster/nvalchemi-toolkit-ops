@@ -351,11 +351,12 @@ pos_g = positions.clone().requires_grad_(True)
 q_g = charges.clone().requires_grad_(True)
 mu_g = dipoles_cart.clone().requires_grad_(True)
 moments_g = pack_multipole_moments(q_g, mu_g)
+cell_g = cell.clone().requires_grad_(True)
 
 feats = multipole_electrostatic_features(
     pos_g,
     moments_g,
-    cell,
+    cell_g,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
     kspace_cutoff=kspace_cutoff,
@@ -368,6 +369,7 @@ print(f"scalar readout = {scalar.item():.6f}")
 print(f"‖∂scalar/∂positions‖ = {pos_g.grad.norm().item():.4f}")
 print(f"‖∂scalar/∂charges‖   = {q_g.grad.norm().item():.4f}")
 print(f"‖∂scalar/∂dipoles‖   = {mu_g.grad.norm().item():.4f}")
+print(f"‖∂scalar/∂cell‖   = {cell_g.grad.norm().item():.4f}")
 
 # %%
 # Batched (Multi-System) Features
