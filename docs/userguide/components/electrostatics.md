@@ -1589,6 +1589,334 @@ and its parameters.
   summation." *J. Chem. Phys.* 110, 8254.
   [DOI: 10.1063/1.478738](https://doi.org/10.1063/1.478738)
 
+## Multipole Electrostatics
+
+The methods above treat every atom as a point charge. ALCHEMI Toolkit-Ops also
+provides **multipole** electrostatics, where each atom additionally carries a
+dipole (and optionally a quadrupole). The charge density is modelled as a sum of
+Gaussian-type-orbital (GTO) smeared multipoles, so the lattice sum is handled by
+the same GTO-Ewald split used for point charges. Both an $O(N^2)$ Ewald path and
+an $O(N \log N)$ PME path are available, along with atom-centered feature
+extractors and an amortized SCF cache for repeated evaluations at fixed cell.
+
+```{tip}
+For an end-to-end walkthrough (energy, forces, stress, and force-loss training at
+$l_{\max}=0/1/2$), see the gallery examples
+{ref}`sphx_glr_examples_electrostatics_07_multipole_ewald_summation_example.py`
+(Ewald) and
+{ref}`sphx_glr_examples_electrostatics_08_multipole_pme_example.py` (PME).
+```
+
+### Packed Multipole Moments
+
+All multipole entry points consume a single packed `multipole_moments` tensor
+rather than separate charge/dipole/quadrupole arguments. Build it with
+{func}`~nvalchemiops.torch.interactions.electrostatics.pack_multipole_moments`,
+which accepts the moments in their natural physical Cartesian layout:
+
+- **charges** — shape $(N,)$, required.
+- **dipoles** — Cartesian, shape $(N, 3)$, optional.
+- **quadrupoles** — Cartesian symmetric, shape $(N, 3, 3)$, optional.
+
+The returned tensor has shape $(N, (l_{\max}+1)^2)$, i.e. $(N, 1)$ for charges
+only ($l_{\max}=0$), $(N, 4)$ with dipoles ($l_{\max}=1$), and $(N, 9)$ with
+quadrupoles ($l_{\max}=2$). Internally the moments are stored in the e3nn
+spherical layout; the $l=2$ block is the **traceless** quadrupole (5 independent
+degrees of freedom), so a supplied Cartesian quadrupole must be symmetric and is
+validated to be (near-)traceless.
+
+```python
+import torch
+from nvalchemiops.torch.interactions.electrostatics import pack_multipole_moments
+
+charges = torch.randn(N)
+dipoles = torch.randn(N, 3)                     # Cartesian (N, 3)
+
+# A clean physical axial (linear) quadrupole: diag(-1, -1, 2) is symmetric and
+# traceless by construction, scaled per atom. pack_multipole_moments accepts any
+# symmetric Cartesian (N, 3, 3) and drops a residual trace, so no manual
+# symmetrize/detrace is required.
+axial = torch.diag(torch.tensor([-1.0, -1.0, 2.0]))
+quadrupoles = torch.randn(N)[:, None, None] * axial          # (N, 3, 3)
+
+moments_l0 = pack_multipole_moments(charges)                            # (N, 1)
+moments_l1 = pack_multipole_moments(charges, dipoles)                   # (N, 4)
+moments_l2 = pack_multipole_moments(charges, dipoles, quadrupoles)      # (N, 9)
+```
+
+### Ewald Multipole
+
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_ewald_summation`
+computes the full periodic multipole energy as a single composite call. It uses
+the GTO-Ewald split
+
+$$
+E = E_{\text{real}} + E_{\text{recip}} - E_{\text{self}},
+$$
+
+where the real-space term is a short-ranged pair sum over a neighbor list, the
+reciprocal term is a direct $k$-space sum, and the self term removes the
+spurious self-interaction of each smeared multipole. It supports $l_{\max}=0/1/2$
+energy, forces, stress, and force-loss ($\texttt{create\_graph=True}$) training,
+for both single systems and batches (via `batch_idx`).
+
+The real-space term requires a CSR-style neighbor list: a flat `idx_j` (target
+atoms), a `neighbor_ptr` row pointer of shape $(N+1,)$, and per-pair PBC
+`unit_shifts`. The general
+{func}`~nvalchemiops.torch.neighbors.neighbor_list` returns the list as a
+$(2, n_{\text{pairs}})$ COO tensor; take the second row as `idx_j`.
+
+```python
+from nvalchemiops.torch.interactions.electrostatics import multipole_ewald_summation
+from nvalchemiops.torch.neighbors import neighbor_list
+
+nl_2d, neighbor_ptr, unit_shifts = neighbor_list(
+    positions, cell, cutoff=cutoff, return_neighbor_list=True
+)
+idx_j = nl_2d[1].contiguous()
+
+energy = multipole_ewald_summation(
+    positions,
+    moments_l1,       # packed (N, 4) charges + dipoles
+    cell,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma=1.0,        # GTO width of the source multipoles
+)
+forces = -torch.autograd.grad(energy, positions)[0]
+```
+
+```{note}
+`sigma` is the GTO smearing width of the source multipoles and is **required**.
+The Ewald splitting parameter `alpha` and the reciprocal-space `k_cutoff`
+are estimated automatically from the requested `accuracy` when left as `None`.
+```
+
+### PME Multipole
+
+For large periodic systems, prefer the Particle Mesh Ewald path
+{func}`~nvalchemiops.torch.interactions.electrostatics.pme_multipole.multipole_particle_mesh_ewald`.
+It replaces the direct $k$-space sum with B-spline charge spreading plus an FFT
+convolution, reducing the reciprocal cost to $O(N \log N)$ while supporting the
+same $l_{\max}=0/1/2$ energy/forces/stress/force-loss coverage (single and
+batched). It is imported from the `pme_multipole` submodule:
+
+```python
+from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
+    multipole_particle_mesh_ewald,
+)
+
+energy = multipole_particle_mesh_ewald(
+    positions,
+    moments_l1,
+    cell,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma=1.0,
+    mesh_dimensions=(32, 32, 32),  # estimated from accuracy if None
+    spline_order=4,                # B-spline order (4 = cubic)
+)
+```
+
+As with point-charge PME, `alpha` and `mesh_dimensions` are estimated from the
+requested `accuracy` when omitted. Unlike point-charge PME, batched multipole
+PME requires a **single shared `alpha`** across the batch: when `alpha` is
+auto-estimated and the per-system estimates differ,
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_particle_mesh_ewald`
+raises a `ValueError` — pass an explicit `alpha` (and `mesh_dimensions`) for
+heterogeneous batches.
+
+### Atom-Centered Features
+
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_electrostatic_features`
+produces per-atom electrostatic features by projecting the GTO-smeared multipole
+density onto a set of receiver GTOs centered on each atom. It needs **no**
+neighbor list — the interaction is captured entirely through the reciprocal-space
+projection — making it convenient as an equivariant descriptor for MLIPs.
+
+```python
+from nvalchemiops.torch.interactions.electrostatics import (
+    multipole_electrostatic_features,
+)
+
+features = multipole_electrostatic_features(
+    positions,
+    moments_l1,
+    cell,
+    sigma=1.0,
+    receiver_sigmas=[0.5, 1.0, 2.0],  # one GTO width per receiver channel
+    feature_max_l=1,                  # max angular order of the output features
+)
+```
+
+`receiver_sigmas` is a list (or tensor) of receiver GTO widths — one per radial
+channel — and `feature_max_l` sets the maximum angular order of the returned
+features (decoupled from the source `l_max`). Here $l$ is the
+**angular-momentum order** of the spherical-harmonic channel: $l=0$ is a scalar
+(1 component), $l=1$ a vector (3 components), and $l=2$ a rank-2 tensor (5
+components). `feature_max_l` is the receiver cap on $l$, so the output has width
+`len(receiver_sigmas) * (feature_max_l + 1)**2`.
+
+### SCF Cache (Amortized Workflow)
+
+When evaluating many configurations at a **fixed cell** (MD steps or
+self-consistent-field iterations), the position-independent reciprocal-space
+state — $k$-vectors, receiver $\hat\phi$, per-$k$ factors, overlap constants —
+can be built once and reused. Use
+{func}`~nvalchemiops.torch.interactions.electrostatics.prepare_multipole_scf_cache`
+to build a
+{class}`~nvalchemiops.torch.interactions.electrostatics.MultipoleSCFCache`, then
+feed it to the per-step functions
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_scf_step_energy`
+and
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_scf_step_features`:
+
+```python
+from nvalchemiops.torch.interactions.electrostatics import (
+    prepare_multipole_scf_cache,
+    multipole_scf_step_energy,
+    multipole_scf_step_features,
+)
+
+cache = prepare_multipole_scf_cache(
+    cell,
+    sigma=1.0,
+    receiver_sigmas=[1.0],
+    l_max=1,           # source moment order held by the cache
+    feature_max_l=1,
+)
+
+for positions in trajectory:               # fixed cell, varying positions
+    energy = multipole_scf_step_energy(cache, positions, source_feats)
+    feats = multipole_scf_step_features(cache, positions, source_feats)
+```
+
+```{note}
+The step functions take `source_feats` in the **e3nn-packed** spherical layout of
+shape $(N, (l_{\max}+1)^2)$ — $(N, 1)$ for `l_max=0`, $(N, 4)$ for `l_max=1`
+ordered `[q, mu_y, mu_z, mu_x]` — which must match `cache.l_max`. For $l_{\max}=2$,
+pass the Cartesian source quadrupole through the optional `quadrupoles=` argument
+(shape $(N, 3, 3)$); the cache must have been built with `l_max>=2`.
+```
+
+### Batched Multipole Calculations
+
+Every multipole entry point batches through a **single unified pattern** that
+mirrors
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_ewald_summation`:
+pass a batched `cell` of shape $(B, 3, 3)$ together with a `batch_idx` tensor
+(`int32`, one entry per atom giving its system index, **sorted** so atoms group
+contiguously by system). Every per-atom tensor — `positions`,
+`multipole_moments`, and the neighbor-list arrays — stays **flat** with the
+leading dimension $N_{\text{total}} = \sum_b N_b$ over all systems. There are no
+separate `batch_*` multipole functions; the same call serves single systems
+(`batch_idx=None`) and batches.
+
+This applies to
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_ewald_summation`,
+{func}`~nvalchemiops.torch.interactions.electrostatics.pme_multipole.multipole_particle_mesh_ewald`,
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_electrostatic_energy`,
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_electrostatic_features`,
+and the SCF cache pair
+{func}`~nvalchemiops.torch.interactions.electrostatics.prepare_multipole_scf_cache`
++
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_scf_step_energy` /
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_scf_step_features`.
+For the cache, build it from a $(B, 3, 3)$ cell stack and pass `batch_idx` to the
+per-step calls.
+
+```python
+import torch
+from nvalchemiops.torch.interactions.electrostatics import (
+    multipole_ewald_summation,
+    pack_multipole_moments,
+)
+from nvalchemiops.torch.neighbors import neighbor_list
+
+# Two small systems concatenated into one flat batch.
+pos_a, cell_a = positions_a, cell_a  # (Na, 3), (3, 3)
+pos_b, cell_b = positions_b, cell_b  # (Nb, 3), (3, 3)
+
+positions = torch.cat([pos_a, pos_b], dim=0)          # (Na + Nb, 3)
+moments = torch.cat([moments_a, moments_b], dim=0)    # (Na + Nb, 4)
+cell = torch.stack([cell_a, cell_b], dim=0)           # (B, 3, 3)
+batch_idx = torch.cat([                                # int32, sorted by system
+    torch.zeros(pos_a.shape[0], dtype=torch.int32),
+    torch.ones(pos_b.shape[0], dtype=torch.int32),
+])
+
+nl_2d, neighbor_ptr, unit_shifts = neighbor_list(
+    positions, cell, cutoff=cutoff, batch_idx=batch_idx, return_neighbor_list=True
+)
+idx_j = nl_2d[1].contiguous()
+
+energy = multipole_ewald_summation(
+    positions,
+    moments,
+    cell,
+    idx_j,
+    neighbor_ptr,
+    unit_shifts,
+    sigma=1.0,
+    batch_idx=batch_idx,
+)   # (B,) — one energy per system
+```
+
+:::{note}
+The real-space smearing/splitting parameters `sigma` and `alpha` may be supplied
+as per-system $(B,)$ tensors when systems differ in scale, or as plain Python
+floats when shared across the batch.
+:::
+
+For end-to-end batched walkthroughs (energy, forces, stress, force-loss), see the
+gallery examples
+{ref}`sphx_glr_examples_electrostatics_07_multipole_ewald_summation_example.py`,
+{ref}`sphx_glr_examples_electrostatics_08_multipole_pme_example.py`,
+{ref}`sphx_glr_examples_electrostatics_09_multipole_features_example.py`, and
+{ref}`sphx_glr_examples_electrostatics_10_multipole_scf_cache_example.py`.
+
+### Autograd: Forces, Stress, and Force-Loss
+
+The multipole energy is differentiable with respect to three inputs:
+
+- **`positions`** — the gradient is the negative force, $F = -\partial E /
+  \partial r$.
+- **`multipole_moments`** — per-moment gradients flow back to the packed charges,
+  dipoles, and quadrupoles, so the moments can be predicted and trained by an ML
+  model (e.g. learned partial charges or polarizabilities).
+- **`cell`** — the cell gradient yields the stress/virial,
+  $\sigma = V^{-1}\, \partial E / \partial \mathbf{h}$.
+
+All three derivatives are supported at $l_{\max}=0/1/2$ for both the Ewald and PME
+paths, single and batched. Second-order autograd via `create_graph=True` (used for
+force-loss / force-matching training) is likewise supported across all of these
+combinations. The feature extractor
+{func}`~nvalchemiops.torch.interactions.electrostatics.multipole_electrostatic_features`
+is autograd-connected to both `positions` and `multipole_moments` as well.
+
+```python
+import torch
+from nvalchemiops.torch.interactions.electrostatics import multipole_ewald_summation
+
+positions = positions.requires_grad_(True)
+moments = moments.requires_grad_(True)
+
+energy = multipole_ewald_summation(
+    positions, moments, cell, idx_j, neighbor_ptr, unit_shifts, sigma=1.0
+)
+energy.backward()
+
+forces = -positions.grad        # (-dE/dr)
+moment_grads = moments.grad     # dE/d(charge, dipole, quadrupole)
+```
+
+To obtain the stress/virial, make the `cell` require gradients and read
+`cell.grad` after `backward()` (scale by $V^{-1}$ for the stress tensor). For
+force-loss training, differentiate the forces again with
+`torch.autograd.grad(energy, positions, create_graph=True)`.
+
 ## Batched Calculations
 
 All electrostatics functions support batched calculations for evaluating multiple

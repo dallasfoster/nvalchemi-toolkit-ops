@@ -54,6 +54,7 @@ import argparse
 import csv
 import hashlib
 import importlib
+import math
 import sys
 import traceback
 import warnings
@@ -135,6 +136,11 @@ try:
     )
     _torch_neighbors = importlib.import_module("nvalchemiops.torch.neighbors")
     _neighbor_utils = importlib.import_module("nvalchemiops.neighbors.neighbor_utils")
+    # ``multipole_particle_mesh_ewald`` / ``multipole_pme_reciprocal_space`` live
+    # in the pme_multipole submodule (not re-exported by the package root).
+    _torch_pme_multipole = importlib.import_module(
+        "nvalchemiops.torch.interactions.electrostatics.pme_multipole"
+    )
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -143,6 +149,7 @@ except ImportError:
     _torch_electrostatics = None
     _torch_neighbors = None
     _neighbor_utils = None
+    _torch_pme_multipole = None
 
 # -- JAX backend --------------------------------------------------------------
 try:
@@ -166,8 +173,17 @@ SLAB_AXIS = 2
 SLAB_VACUUM_FACTOR = 3.0
 SLAB_METHODS = ("ewald_slab", "pme_slab")
 EWALD_METHODS = ("ewald", "ewald_slab")
+MULTIPOLE_METHODS = ("multipole_ewald", "multipole_pme")
 DEFAULT_METHODS = ["ewald", "pme"]
-ALL_METHODS = ["ewald", "ewald_slab", "pme", "pme_slab", "dsf"]
+ALL_METHODS = [
+    "ewald",
+    "ewald_slab",
+    "pme",
+    "pme_slab",
+    "dsf",
+    "multipole_ewald",
+    "multipole_pme",
+]
 CUSTOM_EWALD_PME_BACKENDS = ("torch", "jax")
 
 
@@ -182,6 +198,8 @@ def _electrostatic_method_family(method: str) -> Literal["ewald", "pme"]:
 
 def _system_cache_key(method: str) -> str:
     """Return the prepared-system cache key for an electrostatics method."""
+    if method in MULTIPOLE_METHODS:
+        return "multipole"
     family = _electrostatic_method_family(method)
     suffix = "_slab" if method in SLAB_METHODS else ""
     return f"{family}{suffix}"
@@ -1686,6 +1704,482 @@ def run_nvalchemiops_pme(
             )
 
 
+# ==============================================================================
+# Multipole (charges + dipoles + quadrupoles) benchmark methods (torch-only)
+# ==============================================================================
+
+
+# GTO density-basis width shared across the multipole sweep; only affects
+# the energy value, not the timing signal.
+_MULTIPOLE_SIGMA = 1.0
+# Ewald splitting parameter. Fixed so the real-space cutoff used to build
+# the neighbor list matches what the entry points integrate against.
+_MULTIPOLE_ALPHA = 0.3
+# Deterministic RNG seed for the random dipoles/quadrupoles.
+_MULTIPOLE_SEED = 7919
+
+
+def _multipole_real_cutoff(sigma: float, alpha: float) -> float:
+    """Real-space cutoff covering the GTO-Ewald tail to machine epsilon.
+
+    ``10·σ_c`` with ``σ_c = sqrt(σ² + 1/(4α²))`` — the same heuristic the
+    standalone multipole benchmarks used.
+    """
+    sigma_c = math.sqrt(sigma**2 + 1.0 / (4.0 * alpha**2))
+    return 10.0 * sigma_c
+
+
+def _attach_multipole_moments(
+    system_data: dict,
+    l_max: int,
+    device: str,
+    dtype: torch.dtype,
+) -> None:
+    """Generate random dipoles/quadrupoles and pack ``multipole_moments`` in-place.
+
+    Dipoles (l_max>=1) and symmetric-traceless quadrupoles (l_max>=2) are
+    drawn from a fixed-seed Gaussian; magnitudes only affect the reported
+    energy, not the timing.
+    """
+    pack_multipole_moments = _torch_electrostatics.pack_multipole_moments
+    charges = system_data["charges"]
+    n = charges.shape[0]
+    gen = torch.Generator(device="cpu").manual_seed(_MULTIPOLE_SEED)
+
+    dipoles = None
+    quadrupoles = None
+    if l_max >= 1:
+        dipoles = torch.randn(n, 3, generator=gen, dtype=torch.float64)
+        dipoles = dipoles.to(device=device, dtype=dtype).contiguous()
+    if l_max >= 2:
+        raw = torch.randn(n, 3, 3, generator=gen, dtype=torch.float64)
+        # Symmetrize, then remove the trace so the l=2 channel is traceless.
+        sym = 0.5 * (raw + raw.transpose(-1, -2))
+        trace = sym.diagonal(dim1=-2, dim2=-1).sum(-1)
+        eye = torch.eye(3, dtype=torch.float64)
+        sym = sym - (trace / 3.0)[:, None, None] * eye
+        quadrupoles = sym.to(device=device, dtype=dtype).contiguous()
+
+    system_data["multipole_moments"] = pack_multipole_moments(
+        charges, dipoles, quadrupoles
+    )
+    system_data["sigma"] = _MULTIPOLE_SIGMA
+    system_data["l_max"] = l_max
+
+
+def _attach_multipole_csr(system_data: dict, sigma: float, alpha: float) -> None:
+    """Build a CSR neighbor list at the GTO-Ewald real cutoff, in-place.
+
+    Stores ``idx_j`` / ``neighbor_ptr`` / ``unit_shifts`` (flat CSR) — the
+    format the multipole entry points consume. Reuses the production on-GPU
+    neighbor-list builder rather than the O(N²) host loop the old scripts had.
+    """
+    positions = system_data["positions"]
+    cell = system_data["cell"]
+    pbc = system_data["pbc"]
+    batch_idx = system_data.get("batch_idx")
+    cutoff = _multipole_real_cutoff(sigma, alpha)
+
+    nl_kwargs: dict = dict(cell=cell, pbc=pbc, return_neighbor_list=True)
+    if batch_idx is not None:
+        nl_kwargs["batch_idx"] = batch_idx
+        nl_kwargs["method"] = "batch_naive"
+
+    neighbor_pairs, neighbor_ptr, unit_shifts = _torch_neighbors.neighbor_list(
+        positions, cutoff, **nl_kwargs
+    )
+    # ``neighbor_list`` returns a (2, E) COO ``(idx_i, idx_j)`` stack with a
+    # CSR row pointer over the source axis; the multipole entry points want
+    # the flat (E,) ``idx_j`` column.
+    idx_j = neighbor_pairs[1] if neighbor_pairs.dim() == 2 else neighbor_pairs
+    system_data["idx_j"] = idx_j.to(torch.int32).contiguous()
+    system_data["neighbor_ptr"] = neighbor_ptr.to(torch.int32).contiguous()
+    system_data["unit_shifts"] = unit_shifts.to(torch.int32).contiguous()
+    system_data["cutoff"] = cutoff
+
+
+def _attach_multipole_reciprocal_caches(system_data: dict, l_max: int) -> None:
+    """Precompute the position-independent reciprocal state, in-place.
+
+    So the *timed* call excludes reciprocal setup (the fair-benchmark fix):
+
+    * Ewald: a prebuilt ``MultipoleSCFCache`` (k-grid + GTO-Fourier ``phi_hat``
+      + per-k-factor tables), passed via ``multipole_ewald_summation(cache=)``.
+      ``k_cutoff`` comes from the Ewald parameter estimator (done once).
+    * PME: ``cell_inv_t`` / ``volume`` / ``k_squared`` / ``moduli``, passed to
+      ``multipole_particle_mesh_ewald`` (which reuses them as-is).
+
+    These are all functions of (cell, sigma, alpha, mesh) only — independent of
+    positions — so building them once here is correct and excludes the rebuild
+    from the per-step timing.
+    """
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        prepare_multipole_scf_cache,
+    )
+    from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
+        _resolve_batch_cell_inv_t,
+        _resolve_batch_pme_k_squared,
+        _resolve_cell_inv_t,
+        _resolve_pme_k_squared,
+        _resolve_pme_moduli,
+    )
+    from nvalchemiops.torch.math.gto import NormMode
+
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    mesh = system_data["mesh_dimensions"]
+    spline_order = system_data.get("spline_order", 4)
+    dtype = system_data["positions"].dtype
+    sigma, alpha = _MULTIPOLE_SIGMA, _MULTIPOLE_ALPHA
+
+    # --- Ewald reciprocal cache (k_cutoff from the estimator, once) ------
+    ew = _torch_electrostatics.estimate_multipole_ewald_parameters(
+        system_data["positions"], cell, sigma=sigma, batch_idx=batch_idx
+    )
+    k_cutoff = float(ew.reciprocal_space_cutoff.max().item())
+    system_data["ewald_cache"] = prepare_multipole_scf_cache(
+        cell,
+        sigma=sigma,
+        receiver_sigmas=[sigma],
+        k_cutoff=k_cutoff,
+        l_max=l_max,
+        density_normalize=NormMode.MULTIPOLES,
+        feature_normalize=NormMode.MULTIPOLES,
+        alpha=alpha,
+        device=cell.device,
+    )
+
+    # --- PME reusables (cell_inv_t / volume / k_squared / moduli) -------------
+    if batch_idx is None:
+        cell_2d = cell if cell.dim() == 2 else cell.squeeze(0)
+        system_data["pme_cell_inv_t"] = _resolve_cell_inv_t(cell, None)
+        system_data["pme_volume"] = torch.abs(torch.det(cell_2d.to(torch.float64)))
+        system_data["pme_k_squared"] = _resolve_pme_k_squared(
+            cell_2d, mesh, dtype, None
+        )
+    else:
+        system_data["pme_cell_inv_t"] = _resolve_batch_cell_inv_t(cell, None)
+        system_data["pme_volume"] = torch.abs(torch.det(cell.to(torch.float64)))
+        system_data["pme_k_squared"] = _resolve_batch_pme_k_squared(
+            cell, mesh, dtype, None
+        )
+    system_data["pme_moduli"] = _resolve_pme_moduli(
+        mesh, spline_order, dtype, cell.device, None
+    )
+
+
+def prepare_multipole_single_system(
+    supercell_size: int,
+    device: str,
+    dtype: torch.dtype,
+    l_max: int = 1,
+) -> dict:
+    """Prepare a single system for multipole Ewald/PME benchmarking.
+
+    Builds a neutral BCC supercell, attaches random multipole moments up to
+    ``l_max``, and builds the CSR neighbor list. The PME mesh is left to the
+    entry point's auto-estimator (driven by ``sigma``/``alpha``).
+    """
+    target_atoms = 2 * supercell_size**3
+    system = create_crystal_system(
+        target_atoms,
+        lattice_type="bcc",
+        lattice_constant=4.14,
+        device=device,
+        dtype=dtype,
+    )
+    pbc = system["pbc"]
+    if pbc.dim() == 2 and pbc.shape[0] == 1:
+        pbc = pbc.squeeze(0)
+    cell = system["cell"]
+    # Single-system multipole Ewald expects a bare (3, 3) cell, not (1, 3, 3).
+    if cell.dim() == 3 and cell.shape[0] == 1:
+        cell = cell.squeeze(0)
+    system_data = {
+        "positions": system["positions"],
+        "charges": system["atomic_charges"],
+        "cell": cell,
+        "pbc": pbc,
+        "total_atoms": system["num_atoms"],
+        "batch_idx": None,
+        "alpha": _MULTIPOLE_ALPHA,
+        "spline_order": 4,
+    }
+    _attach_multipole_moments(system_data, l_max, device, dtype)
+    _attach_multipole_csr(system_data, _MULTIPOLE_SIGMA, _MULTIPOLE_ALPHA)
+    # Precompute the PME mesh before timing so the timed call excludes
+    # auto-estimation (matches the monopole PME path; fair single-call timing).
+    pme_params = _torch_electrostatics.estimate_multipole_pme_parameters(
+        system_data["positions"], cell, sigma=_MULTIPOLE_SIGMA
+    )
+    system_data["mesh_dimensions"] = pme_params.mesh_dimensions
+    # Precompute the reciprocal caches so the timed call excludes their rebuild.
+    _attach_multipole_reciprocal_caches(system_data, l_max)
+    # Hand back a positions leaf that already requires grad (set OUTSIDE any
+    # timed/compiled region). The runner then computes forces via autograd
+    # without an in-place ``requires_grad_()`` call, which Dynamo cannot trace
+    # under ``fullgraph=True`` (keeps the --torch-compile path working).
+    system_data["positions"] = system_data["positions"].detach().requires_grad_(True)
+    return system_data
+
+
+def prepare_multipole_batch_system(
+    supercell_size: int,
+    batch_size: int,
+    device: str,
+    dtype: torch.dtype,
+    l_max: int = 1,
+) -> dict:
+    """Prepare a batched system for multipole Ewald/PME benchmarking.
+
+    Same as :func:`prepare_multipole_single_system` but stacks ``batch_size``
+    BCC supercells into flat per-atom tensors with a ``batch_idx`` map. The
+    CSR neighbor list is built per-system via the batched neighbor builder.
+    """
+    target_atoms_per_system = 2 * supercell_size**3
+
+    all_positions = []
+    all_charges = []
+    all_cells = []
+    all_pbc = []
+    batch_idx_list = []
+
+    for i in range(batch_size):
+        system = create_crystal_system(
+            target_atoms_per_system,
+            lattice_type="bcc",
+            lattice_constant=4.14,
+            device=device,
+            dtype=dtype,
+        )
+        n_atoms = system["num_atoms"]
+        all_positions.append(system["positions"])
+        all_charges.append(system["atomic_charges"])
+        all_cells.append(system["cell"])
+        all_pbc.append(system["pbc"])
+        batch_idx_list.extend([i] * n_atoms)
+
+    positions = torch.cat(all_positions, dim=0)
+    charges = torch.cat(all_charges, dim=0)
+    cells = torch.cat(all_cells, dim=0)
+    pbc = torch.stack(all_pbc, dim=0)
+    batch_idx = torch.tensor(batch_idx_list, dtype=torch.int32, device=device)
+
+    system_data = {
+        "positions": positions,
+        "charges": charges,
+        "cell": cells,
+        "pbc": pbc,
+        "total_atoms": positions.shape[0],
+        "batch_idx": batch_idx,
+        "batch_size": batch_size,
+        "alpha": _MULTIPOLE_ALPHA,
+        "spline_order": 4,
+    }
+    _attach_multipole_moments(system_data, l_max, device, dtype)
+    _attach_multipole_csr(system_data, _MULTIPOLE_SIGMA, _MULTIPOLE_ALPHA)
+    # Precompute the shared PME mesh before timing so the timed call excludes
+    # auto-estimation (matches the monopole PME path; fair single-call timing).
+    pme_params = _torch_electrostatics.estimate_multipole_pme_parameters(
+        positions, cells, sigma=_MULTIPOLE_SIGMA, batch_idx=batch_idx
+    )
+    system_data["mesh_dimensions"] = pme_params.mesh_dimensions
+    # Precompute the reciprocal caches so the timed call excludes their rebuild.
+    _attach_multipole_reciprocal_caches(system_data, l_max)
+    # Hand back a positions leaf that already requires grad (set OUTSIDE any
+    # timed/compiled region). The runner then computes forces via autograd
+    # without an in-place ``requires_grad_()`` call, which Dynamo cannot trace
+    # under ``fullgraph=True`` (keeps the --torch-compile path working).
+    system_data["positions"] = system_data["positions"].detach().requires_grad_(True)
+    return system_data
+
+
+def _real_space_sigma_alpha_tensors(
+    system_data: dict, sigma: float, alpha: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-system ``(sigma, alpha)`` tensors for the real-space-only component.
+
+    ``multipole_real_space_energy`` takes per-system tensors (length 1 single,
+    length ``B`` batched); the benchmark uses one uniform ``sigma``/``alpha``.
+    """
+    pos = system_data["positions"]
+    batch_idx = system_data.get("batch_idx")
+    n = 1 if batch_idx is None else int(batch_idx.max().item()) + 1
+    sigma_t = torch.full((n,), float(sigma), dtype=pos.dtype, device=pos.device)
+    alpha_t = torch.full((n,), float(alpha), dtype=pos.dtype, device=pos.device)
+    return sigma_t, alpha_t
+
+
+def _multipole_energy_fn(method: str, component: str, system_data: dict):
+    """Return a closure ``positions -> per-atom energy`` for one method/component.
+
+    Only ``positions`` varies (the autograd leaf); every other input is captured
+    from ``system_data``. This is the unit we hand to ``torch.compile``: the
+    energy-only forward is compile-clean for all multipole combos (single +
+    batched, l=0/1/2, full + reciprocal), whereas compiling energy **and** the
+    autograd-grad force pass together hits Inductor backward-codegen limits. So
+    the caller compiles *this* and takes ``torch.autograd.grad`` outside it.
+    """
+    multipole_moments = system_data["multipole_moments"]
+    cell = system_data["cell"]
+    idx_j = system_data["idx_j"]
+    neighbor_ptr = system_data["neighbor_ptr"]
+    unit_shifts = system_data["unit_shifts"]
+    batch_idx = system_data.get("batch_idx")
+    sigma = system_data["sigma"]
+    alpha = system_data.get("alpha")
+    mesh_dimensions = system_data.get("mesh_dimensions")
+    spline_order = system_data.get("spline_order", 4)
+
+    if component == "real":
+        # Real-space is the same erfc-damped pair sum for Ewald and PME.
+        sigma_t, alpha_t = _real_space_sigma_alpha_tensors(system_data, sigma, alpha)
+
+        def energy_fn(pos):
+            return _torch_electrostatics.multipole_real_space_energy(
+                pos,
+                multipole_moments,
+                cell,
+                idx_j,
+                neighbor_ptr,
+                unit_shifts,
+                sigma_t,
+                alpha_t,
+                batch_idx=batch_idx,
+            )
+
+        return energy_fn
+
+    if method == "multipole_ewald":
+        if component == "reciprocal":
+            # Direct-k GTO-Ewald reciprocal sum (prebuilt cache excludes setup).
+            def energy_fn(pos):
+                return _torch_electrostatics.multipole_reciprocal_space_energy(
+                    pos,
+                    multipole_moments,
+                    cell,
+                    batch_idx=batch_idx,
+                    sigma=sigma,
+                    alpha=alpha,
+                    cache=system_data.get("ewald_cache"),
+                )
+        else:  # "full"
+
+            def energy_fn(pos):
+                return _torch_electrostatics.multipole_ewald_summation(
+                    pos,
+                    multipole_moments,
+                    cell,
+                    idx_j,
+                    neighbor_ptr,
+                    unit_shifts,
+                    sigma=sigma,
+                    alpha=alpha,
+                    batch_idx=batch_idx,
+                    # Prebuilt reciprocal cache so the timed call excludes the
+                    # per-step cache rebuild + parameter estimation.
+                    cache=system_data.get("ewald_cache"),
+                )
+
+        return energy_fn
+
+    # multipole_pme
+    if component == "reciprocal":
+        # PME mesh reciprocal sum (prebuilt k_squared / moduli exclude setup).
+        def energy_fn(pos):
+            return _torch_pme_multipole.multipole_pme_reciprocal_space(
+                pos,
+                multipole_moments,
+                cell,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                cell_inv_t=system_data.get("pme_cell_inv_t"),
+                volume=system_data.get("pme_volume"),
+                moduli=system_data.get("pme_moduli"),
+                k_squared=system_data.get("pme_k_squared"),
+            )
+    else:  # "full"
+
+        def energy_fn(pos):
+            return _torch_pme_multipole.multipole_particle_mesh_ewald(
+                pos,
+                multipole_moments,
+                cell,
+                idx_j,
+                neighbor_ptr,
+                unit_shifts,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                # Prebuilt reusables so the timed call excludes k-grid / modulus rebuild.
+                cell_inv_t=system_data.get("pme_cell_inv_t"),
+                volume=system_data.get("pme_volume"),
+                k_squared=system_data.get("pme_k_squared"),
+                moduli=system_data.get("pme_moduli"),
+            )
+
+    return energy_fn
+
+
+def _run_multipole(
+    method: str,
+    system_data: dict,
+    compute_forces: bool,
+    component: str,
+    energy_fn=None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run one multipole method/component: energy via ``energy_fn`` (eager or
+    pre-``torch.compile``-d), forces via autograd taken **outside** ``energy_fn``.
+
+    ``energy_fn`` defaults to the eager closure; ``run_benchmark`` passes the
+    compiled closure under ``--torch-compile``. Returns ``(energy, forces)``.
+    """
+    pos = system_data["positions"]
+    if compute_forces and not pos.requires_grad:
+        pos = pos.detach().requires_grad_(True)
+    if energy_fn is None:
+        energy_fn = _multipole_energy_fn(method, component, system_data)
+
+    energy = energy_fn(pos)
+    forces = None
+    if compute_forces:
+        # Autograd is deliberately OUTSIDE energy_fn (the compiled unit) — the
+        # backward of the full composite is not Inductor-codegen-clean.
+        (grad,) = torch.autograd.grad(energy.sum(), pos)
+        forces = -grad.detach()
+        energy = energy.detach()
+    return energy, forces
+
+
+def run_nvalchemiops_multipole_ewald(
+    system_data: dict,
+    compute_forces: bool,
+    compile_model: bool = False,
+    component: str = "full",
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run multipole Ewald summation (eager). ``component`` selects ``"full"``,
+    ``"reciprocal"``, or ``"real"``. Compile is handled by ``run_benchmark`` via
+    :func:`_multipole_energy_fn`. Returns ``(energy, forces)``."""
+    return _run_multipole("multipole_ewald", system_data, compute_forces, component)
+
+
+def run_nvalchemiops_multipole_pme(
+    system_data: dict,
+    compute_forces: bool,
+    compile_model: bool = False,
+    component: str = "full",
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run multipole PME (eager). ``component`` selects ``"full"``,
+    ``"reciprocal"``, or ``"real"``. Compile is handled by ``run_benchmark`` via
+    :func:`_multipole_energy_fn`. Returns ``(energy, forces)``."""
+    return _run_multipole("multipole_pme", system_data, compute_forces, component)
+
+
 def _first_tensor(result):
     """Return the first tensor from a backend result tuple or the tensor itself."""
     return result[0] if isinstance(result, tuple) else result
@@ -2914,6 +3408,25 @@ def run_benchmark(
                     error=f"Backend '{backend}' not applicable for DSF",
                     error_type="NotApplicable",
                 )
+        elif method in MULTIPOLE_METHODS:
+            # Multipole methods are torch-only. Under --torch-compile we compile
+            # the ENERGY closure only and take autograd.grad OUTSIDE it (see
+            # _multipole_energy_fn): the energy-only forward is Inductor-clean
+            # for every combo, whereas compiling energy+force-backward together
+            # is not. So we bypass the shared full-bench torch.compile block
+            # below (which would re-wrap energy+autograd and fail).
+            multipole_energy_fn = _multipole_energy_fn(method, component, system_data)
+            if torch_compile:
+                multipole_energy_fn = torch.compile(multipole_energy_fn, fullgraph=True)
+
+            def bench_fn():
+                return _run_multipole(
+                    method,
+                    system_data,
+                    compute_forces,
+                    component,
+                    energy_fn=multipole_energy_fn,
+                )
         elif backend == "torch":
             if method in ("ewald", "ewald_slab"):
 
@@ -3073,7 +3586,14 @@ def run_benchmark(
         framework_compile_ms: float | None = None
         framework: str = "none"
         warp_compile_ms: float | None = None
-        if backend in ("torch", "torchpme", "torch_dsf") and torch_compile:
+        if (
+            backend in ("torch", "torchpme", "torch_dsf")
+            and torch_compile
+            and method not in MULTIPOLE_METHODS
+        ):
+            # Multipole compiles its ENERGY closure inside bench_fn (above) and
+            # keeps autograd eager — it must NOT be re-wrapped here, which would
+            # try to compile energy+force-backward together and fail.
             try:
                 # 1) Raw pre-warm — pays warp NVRTC + any cuFFT plan creation.
                 import time as _time
@@ -3083,6 +3603,15 @@ def run_benchmark(
                 bench_fn()
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 warp_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                # The energy-autograd bench_fn calls torch.autograd.grad to get
+                # forces; under fullgraph=True that needs compiled-autograd
+                # tracing enabled (default-off on some torch builds), else
+                # Dynamo raises "Unsupported: using torch.autograd.grad with
+                # trace_autograd_ops=False". Enabling it lets the full fwd+bwd
+                # compile (first-order forces). Second-order (create_graph) is
+                # still not compilable and is excluded from these workloads.
+                if hasattr(torch._dynamo.config, "trace_autograd_ops"):
+                    torch._dynamo.config.trace_autograd_ops = True
                 # Use the default torch.compile mode. CUDA-graph capture modes
                 # clash with warp's stream binding in this benchmark.
                 compiled_fn = torch.compile(bench_fn, fullgraph=True)
@@ -3248,13 +3777,37 @@ def main():
     parser.add_argument(
         "--method",
         type=str,
-        choices=["ewald", "ewald_slab", "pme", "pme_slab", "dsf", "both", "all"],
+        choices=[
+            "ewald",
+            "ewald_slab",
+            "pme",
+            "pme_slab",
+            "dsf",
+            "multipole_ewald",
+            "multipole_pme",
+            "both",
+            "all",
+        ],
         default=None,
         help=(
             "Method to benchmark. When omitted, the YAML ``methods:`` list "
             "controls; if that is also empty, defaults to ewald + pme. "
             "'both' = ewald + pme. "
-            "'all' = ewald + ewald_slab + pme + pme_slab + dsf."
+            "'all' = ewald + ewald_slab + pme + pme_slab + dsf + "
+            "multipole_ewald + multipole_pme. The multipole methods are "
+            "torch-only and take an extra --l-max flag."
+        ),
+    )
+    parser.add_argument(
+        "--l-max",
+        type=int,
+        choices=[0, 1, 2],
+        default=None,
+        help=(
+            "Maximum multipole order for the multipole_* methods. When "
+            "omitted, falls back to the config 'l_max:' value, else 1. "
+            "0 = charges, 1 = +dipoles, 2 = +quadrupoles. Ignored by the "
+            "point-charge methods."
         ),
     )
     parser.add_argument(
@@ -3402,6 +3955,8 @@ def main():
         args.derivative_contract,
         config.get("derivative_contract"),
     )
+    # Max multipole order for the multipole_* methods: --l-max > config > 1.
+    l_max = args.l_max if args.l_max is not None else int(config.get("l_max", 1))
 
     # Optional PME real-space cutoff (CLI overrides config)
     if args.real_space_cutoff is not None:
@@ -3510,6 +4065,22 @@ def main():
                                 )
                             except Exception as e:
                                 print(f"    Failed to prepare DSF system: {e}")
+                                traceback.print_exc()
+                                system_data_cache[cache_key] = None
+                            continue
+
+                        if method in MULTIPOLE_METHODS:
+                            cache_key = ("multipole", "torch")
+                            if cache_key in system_data_cache:
+                                continue
+                            try:
+                                system_data_cache[cache_key] = (
+                                    prepare_multipole_single_system(
+                                        size, device, dtype, l_max
+                                    )
+                                )
+                            except Exception as e:
+                                print(f"    Failed to prepare multipole system: {e}")
                                 traceback.print_exc()
                                 system_data_cache[cache_key] = None
                             continue
@@ -3700,6 +4271,22 @@ def main():
                                 )
                             except Exception as e:
                                 print(f"    Failed to prepare DSF batch: {e}")
+                                traceback.print_exc()
+                                system_data_cache[cache_key] = None
+                            continue
+
+                        if method in MULTIPOLE_METHODS:
+                            cache_key = ("multipole", "torch")
+                            if cache_key in system_data_cache:
+                                continue
+                            try:
+                                system_data_cache[cache_key] = (
+                                    prepare_multipole_batch_system(
+                                        base_size, batch_size, device, dtype, l_max
+                                    )
+                                )
+                            except Exception as e:
+                                print(f"    Failed to prepare multipole batch: {e}")
                                 traceback.print_exc()
                                 system_data_cache[cache_key] = None
                             continue

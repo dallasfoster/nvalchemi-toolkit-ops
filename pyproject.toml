@@ -86,6 +86,7 @@ dev = [
     "pytest-testmon>=2.2.0",
     {include-group="docs"},
 ]
+
 docs = [
     "sphinx>=6.0.0",
     "sphinx-design",
@@ -209,6 +210,9 @@ exclude_also = [
     "@wp.kernel",
     "@wp.func",
     "@torch.jit.script",
+    # register_fake stubs run only under fake-tensor / meta tracing, never in
+    # eager execution, so coverage never sees them — exclude like @wp.kernel.
+    "\\.register_fake",
 ]
 omit = [
     "test/*",

@@ -94,3 +94,61 @@ Functions for automatic parameter estimation based on desired accuracy tolerance
 
 .. autoclass:: PMEParameters
    :members:
+
+Multipole Electrostatics
+------------------------
+
+GTO-smeared multipole electrostatics for systems carrying per-atom charges,
+dipoles, and quadrupoles (``l_max`` 0/1/2). Moments are passed as a single
+packed ``multipole_moments`` tensor built with :func:`pack_multipole_moments`.
+
+High-Level Interface
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: multipole_ewald_summation
+
+.. autofunction:: nvalchemiops.torch.interactions.electrostatics.pme_multipole.multipole_particle_mesh_ewald
+
+.. currentmodule:: nvalchemiops.torch.interactions.electrostatics
+
+Energy Components
+~~~~~~~~~~~~~~~~~
+
+.. autofunction:: multipole_electrostatic_energy
+.. autofunction:: multipole_real_space_energy
+.. autofunction:: multipole_reciprocal_space_energy
+
+Atom-Centered Features
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: multipole_electrostatic_features
+
+Moment Packing
+~~~~~~~~~~~~~~
+
+.. autofunction:: pack_multipole_moments
+
+SCF Cache (Amortized Workflow)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Reuse the position-independent reciprocal-space state across many
+evaluations at fixed cell (MD steps / SCF iterations).
+
+.. autofunction:: prepare_multipole_scf_cache
+.. autofunction:: multipole_scf_step_energy
+.. autofunction:: multipole_scf_step_features
+
+.. autoclass:: MultipoleSCFCache
+   :members:
+
+Parameter Estimation
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. autofunction:: estimate_multipole_ewald_parameters
+.. autofunction:: estimate_multipole_pme_parameters
+
+.. autoclass:: MultipoleEwaldParameters
+   :members:
+
+.. autoclass:: MultipolePMEParameters
+   :members:

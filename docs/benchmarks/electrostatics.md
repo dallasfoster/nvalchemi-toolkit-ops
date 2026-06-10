@@ -425,10 +425,17 @@ python benchmark_electrostatics.py \
   `torch` + `torchpme` for Ewald/PME, `torch` for Ewald/PME slab
   methods, and `torch` + `torch_dsf` for DSF.
 
-`--method {ewald,ewald_slab,pme,pme_slab,dsf,both,all}`
+`--method {ewald,ewald_slab,pme,pme_slab,dsf,multipole_ewald,multipole_pme,both,all}`
 : Electrostatics method. When omitted, the YAML `methods:` list controls; if
   that is empty, the script defaults to Ewald + PME. `both` = Ewald + PME.
-  `all` = Ewald + Ewald slab + PME + PME slab + DSF.
+  `all` = Ewald + Ewald slab + PME + PME slab + DSF + multipole Ewald +
+  multipole PME. The `multipole_ewald` / `multipole_pme` methods are torch-only
+  and take an extra `--l-max` flag.
+
+`--l-max {0,1,2}`
+: Maximum multipole order for the `multipole_*` methods (default: `1`):
+  `0` = charges, `1` = + dipoles, `2` = + quadrupoles. Ignored by the
+  point-charge methods.
 
 `--neighbor-format {list,matrix,both}`
 : Neighbor format for DSF benchmarks (default: `list`). Ewald/PME always use matrix.

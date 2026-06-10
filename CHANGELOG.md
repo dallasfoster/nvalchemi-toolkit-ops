@@ -108,6 +108,17 @@
   (Note: `nvalchemiops.neighbors.naive` and `nvalchemiops.neighbors.cell_list`
   are now the canonical subpackages, not deprecated shims.)
 
+### Added (electrostatics)
+
+- Higher-order (multipole) electrostatics for charges, dipoles, and quadrupoles
+  (l = 0, 1, 2): direct-k Ewald (`multipole_ewald_summation`), particle-mesh
+  Ewald (`multipole_particle_mesh_ewald`), reciprocal- and real-space entry
+  points, electrostatic feature extraction (`multipole_electrostatic_features`),
+  and an SCF cache/step API for repeated evaluations on a fixed cell. Provided as
+  Warp kernels and `nvalchemiops.torch` bindings, single-system and batched, with
+  energies, forces, moment gradients, stress, and force-loss (`create_graph`)
+  training; the forward and first-order backward are `torch.compile`-compatible.
+
 ## 0.3.0 - 2026-XX-XX
 
 ### Breaking Changes

@@ -106,6 +106,22 @@ from nvalchemiops.interactions.electrostatics.ewald_kernels import (
     ewald_subtract_self_energy,
 )
 
+# Multipole direct k-space - Warp launchers (framework-agnostic). Re-exported
+# here because the batched multipole torch autograd wrappers import them from
+# the package root.
+from nvalchemiops.interactions.electrostatics.multipole_direct_kspace_kernels import (
+    batch_apply_per_k_factor,
+    batch_assemble_rho_k_dipole,
+    batch_build_structure_factor_table,
+    batch_compute_energy_product_per_k,
+    batch_eval_gto_fourier_dipole,
+    batch_eval_receiver_gto_fourier_dipole,
+    batch_position_gradient_from_feature_grad,
+    batch_position_gradient_from_rhok,
+    batch_project_features_dipole,
+    batch_v_gradient_from_feature_grad,
+)
+
 # PME - Warp launchers (framework-agnostic)
 from nvalchemiops.interactions.electrostatics.pme_kernels import (
     batch_pme_energy_corrections,

@@ -1312,3 +1312,292 @@ class TestPMEKernelsRegression:
 def wp_dtype(request):
     """Parameterized fixture for Warp dtypes."""
     return request.param
+
+
+class TestFractionalize:
+    """``pme_fractionalize`` keystone op (Tier-1 stress-loss, B-warp).
+
+    Forward maps Cartesian (positions, moments) to the unitless cell-fractional
+    frame ``p = M·r``, ``d_frac = M·μ``, ``Q_frac = M·Q·Mᵀ`` (M = cell_inv_t,
+    read per atom via ``batch_idx``). Feeding these to the spread kernel with an
+    identity ``cell_inv_t`` reproduces the cell-coupled spread bit-for-bit. The
+    backward is the adjoint of this multilinear map. Validated forward-vs-numpy
+    + FD-adjoint (float64).
+    """
+
+    @staticmethod
+    def _ref(pos, minv_t, bidx, dip, quad):
+        m = minv_t[bidx]
+        p = np.einsum("nij,nj->ni", m, pos)
+        df = np.einsum("nij,nj->ni", m, dip)
+        qf = np.einsum("nij,njk,nlk->nil", m, quad, m)
+        return p, df, qf
+
+    def test_forward_matches_numpy(self, device, wp_dtype):
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_launch,
+        )
+
+        np_dtype = np.float32 if wp_dtype == wp.float32 else np.float64
+        vec = wp.vec3f if wp_dtype == wp.float32 else wp.vec3d
+        mat = wp.mat33f if wp_dtype == wp.float32 else wp.mat33d
+        rng = np.random.default_rng(0)
+        n, b = 6, 2
+        pos = rng.standard_normal((n, 3)).astype(np_dtype)
+        dip = rng.standard_normal((n, 3)).astype(np_dtype)
+        quad = rng.standard_normal((n, 3, 3)).astype(np_dtype)
+        cells = (rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]).astype(np_dtype)
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1)).astype(np_dtype)
+        bidx = np.array([0, 0, 0, 1, 1, 1], dtype=np.int32)
+        p = wp.zeros(n, dtype=vec, device=device)
+        df = wp.zeros(n, dtype=vec, device=device)
+        qf = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            p,
+            df,
+            qf,
+            wp_dtype=wp_dtype,
+            device=device,
+        )
+        p_ref, df_ref, qf_ref = self._ref(pos, minv_t, bidx, dip, quad)
+        tol = 1e-5 if wp_dtype == wp.float32 else 1e-12
+        assert np.allclose(p.numpy(), p_ref, atol=tol)
+        assert np.allclose(df.numpy(), df_ref, atol=tol)
+        assert np.allclose(qf.numpy(), qf_ref, atol=tol)
+
+    def test_backward_adjoint_fd(self, device):
+        """FD-validate the backward as the adjoint of the forward (float64)."""
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_backward_launch,
+            pme_fractionalize_launch,
+        )
+
+        vec, mat = wp.vec3d, wp.mat33d
+        rng = np.random.default_rng(1)
+        n, b = 5, 2
+        pos = rng.standard_normal((n, 3))
+        dip = rng.standard_normal((n, 3))
+        quad = rng.standard_normal((n, 3, 3))
+        cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
+        bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+        gp_c = rng.standard_normal((n, 3))
+        gdf = rng.standard_normal((n, 3))
+        gqf = rng.standard_normal((n, 3, 3))
+
+        def fwd(p, m, d, q):
+            uo = wp.zeros(n, dtype=vec, device=device)
+            do = wp.zeros(n, dtype=vec, device=device)
+            qo = wp.zeros(n, dtype=mat, device=device)
+            pme_fractionalize_launch(
+                wp.array(p, dtype=vec, device=device),
+                wp.array(m, dtype=mat, device=device),
+                wp.array(bidx, dtype=wp.int32, device=device),
+                wp.array(d, dtype=vec, device=device),
+                wp.array(q, dtype=mat, device=device),
+                uo,
+                do,
+                qo,
+                wp_dtype=wp.float64,
+                device=device,
+            )
+            return uo.numpy(), do.numpy(), qo.numpy()
+
+        gp = wp.zeros(n, dtype=vec, device=device)
+        gm = wp.zeros(b, dtype=mat, device=device)
+        gd = wp.zeros(n, dtype=vec, device=device)
+        gq = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_backward_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            wp.array(gp_c, dtype=vec, device=device),
+            wp.array(gdf, dtype=vec, device=device),
+            wp.array(gqf, dtype=mat, device=device),
+            gp,
+            gm,
+            gd,
+            gq,
+            wp_dtype=wp.float64,
+            device=device,
+        )
+        grads = {
+            "pos": gp.numpy(),
+            "M": gm.numpy(),
+            "dip": gd.numpy(),
+            "quad": gq.numpy(),
+        }
+        eps = 1e-6
+
+        def vjp_dot(grad, v):
+            return float(np.sum(grad * v))
+
+        def fd_dir(name, v):
+            base = {"p": pos, "m": minv_t, "d": dip, "q": quad}
+            plus = dict(base)
+            minus = dict(base)
+            key = {"pos": "p", "M": "m", "dip": "d", "quad": "q"}[name]
+            plus[key] = base[key] + eps * v
+            minus[key] = base[key] - eps * v
+            up, dp, qp = fwd(plus["p"], plus["m"], plus["d"], plus["q"])
+            um, dm, qm = fwd(minus["p"], minus["m"], minus["d"], minus["q"])
+            lp = np.sum(up * gp_c) + np.sum(dp * gdf) + np.sum(qp * gqf)
+            lm = np.sum(um * gp_c) + np.sum(dm * gdf) + np.sum(qm * gqf)
+            return (lp - lm) / (2 * eps)
+
+        for name, shape in [
+            ("pos", pos.shape),
+            ("M", minv_t.shape),
+            ("dip", dip.shape),
+            ("quad", quad.shape),
+        ]:
+            v = rng.standard_normal(shape)
+            analytic = vjp_dot(grads[name], v)
+            fd = fd_dir(name, v)
+            rel = abs(analytic - fd) / (abs(fd) + 1e-12)
+            assert rel < 1e-6, (
+                f"{name}: adjoint rel={rel:.2e} (analytic={analytic}, fd={fd})"
+            )
+
+    def test_double_backward_adjoint_fd(self, device):
+        """FD-validate the double-backward as the adjoint of the backward.
+
+        The double-backward computes grads w.r.t. the backward's inputs
+        (cotangents gu/gdf/gQf and forward inputs pos/M/dip/quad) given
+        cotangents (Gr, GM, Gμ, GQ) on the backward outputs. This is the
+        genuine cell×{pos,moment} second-order needed for stress-loss.
+        """
+        from nvalchemiops.interactions.electrostatics.pme_multipole_kernels import (
+            pme_fractionalize_backward_launch,
+            pme_fractionalize_double_backward_launch,
+        )
+
+        vec, mat = wp.vec3d, wp.mat33d
+        rng = np.random.default_rng(2)
+        n, b = 5, 2
+        pos = rng.standard_normal((n, 3))
+        dip = rng.standard_normal((n, 3))
+        quad = rng.standard_normal((n, 3, 3))
+        cells = rng.standard_normal((b, 3, 3)) + 3 * np.eye(3)[None]
+        minv_t = np.linalg.inv(cells.transpose(0, 2, 1))
+        bidx = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+        gp_c = rng.standard_normal((n, 3))
+        gdf = rng.standard_normal((n, 3))
+        gqf = rng.standard_normal((n, 3, 3))
+        # Cotangents on the backward's outputs (grad_pos, grad_M, grad_dip,
+        # grad_quad). grad_M / G_cell is per-system.
+        g_pos = rng.standard_normal((n, 3))
+        g_cell = rng.standard_normal((b, 3, 3))
+        g_dip = rng.standard_normal((n, 3))
+        g_quad = rng.standard_normal((n, 3, 3))
+
+        def bwd(gp_, gdf_, gqf_, pos_, m_, dip_, quad_):
+            gp = wp.zeros(n, dtype=vec, device=device)
+            gm = wp.zeros(b, dtype=mat, device=device)
+            gd = wp.zeros(n, dtype=vec, device=device)
+            gq = wp.zeros(n, dtype=mat, device=device)
+            pme_fractionalize_backward_launch(
+                wp.array(pos_, dtype=vec, device=device),
+                wp.array(m_, dtype=mat, device=device),
+                wp.array(bidx, dtype=wp.int32, device=device),
+                wp.array(dip_, dtype=vec, device=device),
+                wp.array(quad_, dtype=mat, device=device),
+                wp.array(gp_, dtype=vec, device=device),
+                wp.array(gdf_, dtype=vec, device=device),
+                wp.array(gqf_, dtype=mat, device=device),
+                gp,
+                gm,
+                gd,
+                gq,
+                wp_dtype=wp.float64,
+                device=device,
+            )
+            return gp.numpy(), gm.numpy(), gd.numpy(), gq.numpy()
+
+        ggp = wp.zeros(n, dtype=vec, device=device)
+        ggdf = wp.zeros(n, dtype=vec, device=device)
+        ggqf = wp.zeros(n, dtype=mat, device=device)
+        gpos = wp.zeros(n, dtype=vec, device=device)
+        gcell = wp.zeros(b, dtype=mat, device=device)
+        gdip = wp.zeros(n, dtype=vec, device=device)
+        gquad = wp.zeros(n, dtype=mat, device=device)
+        pme_fractionalize_double_backward_launch(
+            wp.array(pos, dtype=vec, device=device),
+            wp.array(minv_t, dtype=mat, device=device),
+            wp.array(bidx, dtype=wp.int32, device=device),
+            wp.array(dip, dtype=vec, device=device),
+            wp.array(quad, dtype=mat, device=device),
+            wp.array(gp_c, dtype=vec, device=device),
+            wp.array(gdf, dtype=vec, device=device),
+            wp.array(gqf, dtype=mat, device=device),
+            wp.array(g_pos, dtype=vec, device=device),
+            wp.array(g_cell, dtype=mat, device=device),
+            wp.array(g_dip, dtype=vec, device=device),
+            wp.array(g_quad, dtype=mat, device=device),
+            ggp,
+            ggdf,
+            ggqf,
+            gpos,
+            gcell,
+            gdip,
+            gquad,
+            wp_dtype=wp.float64,
+            device=device,
+        )
+        grads = {
+            "gp": ggp.numpy(),
+            "gdf": ggdf.numpy(),
+            "gQf": ggqf.numpy(),
+            "pos": gpos.numpy(),
+            "M": gcell.numpy(),
+            "dip": gdip.numpy(),
+            "quad": gquad.numpy(),
+        }
+        eps = 1e-6
+        base = {
+            "gp": gp_c,
+            "gdf": gdf,
+            "gQf": gqf,
+            "pos": pos,
+            "M": minv_t,
+            "dip": dip,
+            "quad": quad,
+        }
+
+        def scalar(args):
+            gp, gm, gd, gq = bwd(
+                args["gp"],
+                args["gdf"],
+                args["gQf"],
+                args["pos"],
+                args["M"],
+                args["dip"],
+                args["quad"],
+            )
+            return (
+                np.sum(gp * g_pos)
+                + np.sum(gm * g_cell)
+                + np.sum(gd * g_dip)
+                + np.sum(gq * g_quad)
+            )
+
+        for name in ("gp", "gdf", "gQf", "pos", "M", "dip", "quad"):
+            v = rng.standard_normal(base[name].shape)
+            plus = dict(base)
+            minus = dict(base)
+            plus[name] = base[name] + eps * v
+            minus[name] = base[name] - eps * v
+            fd = (scalar(plus) - scalar(minus)) / (2 * eps)
+            analytic = float(np.sum(grads[name] * v))
+            rel = abs(analytic - fd) / (abs(fd) + 1e-12)
+            assert rel < 1e-6, (
+                f"{name}: double-bwd adjoint rel={rel:.2e} "
+                f"(analytic={analytic}, fd={fd})"
+            )

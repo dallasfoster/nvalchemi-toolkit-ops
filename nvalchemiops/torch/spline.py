@@ -805,7 +805,7 @@ def _spline_gather(
     if cell.dim() == 2:
         cell = cell.unsqueeze(0)
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
     return torch.ops.nvalchemiops.spline_gather(
         positions,
@@ -853,7 +853,7 @@ def _spline_gather_vec3(
         cell = cell.unsqueeze(0)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -1126,7 +1126,7 @@ def _spline_gather_with_force(
     if cell.dim() == 2:
         cell = cell.unsqueeze(0)
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
     return torch.ops.nvalchemiops.spline_gather_with_force(
         positions,
@@ -1718,7 +1718,7 @@ def _batch_spline_spread(
 ) -> torch.Tensor:
     """Internal: batch spline spread (registered custom op)."""
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
     return torch.ops.nvalchemiops.batch_spline_spread(
         positions,
@@ -1741,7 +1741,7 @@ def _batch_spline_gather(
 ) -> torch.Tensor:
     """Internal: batch spline gather (registered custom op)."""
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
     return torch.ops.nvalchemiops.batch_spline_gather(
         positions,
@@ -1788,7 +1788,7 @@ def _batch_spline_gather_vec3(
     needs_grad_flag = needs_grad(positions, mesh, cell)
 
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -2067,7 +2067,7 @@ def _batch_spline_gather_with_force(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Internal: batched fused gather + gather-gradient (registered custom op)."""
     if cell_inv_t is None:
-        cell_inv = torch.linalg.inv(cell)
+        cell_inv = torch.linalg.inv_ex(cell)[0]
         cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
     return torch.ops.nvalchemiops.batch_spline_gather_with_force(
         positions,
@@ -2217,7 +2217,7 @@ def _spline_gather_channels(
     if cell.dim() == 2:
         cell = cell.unsqueeze(0)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -2317,7 +2317,7 @@ def _batch_spline_spread_channels(
     num_points = spline_order**3
     needs_grad_flag = needs_grad(positions, values, cell)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(
@@ -2409,7 +2409,7 @@ def _batch_spline_gather_channels(
     num_points = spline_order**3
     needs_grad_flag = needs_grad(positions, mesh, cell)
 
-    cell_inv = torch.linalg.inv(cell)
+    cell_inv = torch.linalg.inv_ex(cell)[0]
     cell_inv_t = cell_inv.transpose(-1, -2).contiguous()
 
     wp_positions = warp_from_torch(

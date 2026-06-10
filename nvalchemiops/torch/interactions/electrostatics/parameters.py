@@ -308,6 +308,295 @@ def estimate_pme_parameters(
     )
 
 
+@dataclass
+class MultipoleEwaldParameters:
+    """Container for GTO-Ewald multipole parameters.
+
+    Like :class:`EwaldParameters` but with the GTO basis width ``sigma``
+    propagated through. The Kolafa-Perram balance for the multipole case
+    has the same ``rcut`` / ``kcut`` formulas as the monopole case, but
+    ``alpha`` differs because the effective Ewald split width is
+    ``sigma_c = sqrt(sigma**2 + 1/(4 alpha**2))`` rather than ``1/(alpha
+    sqrt(2))``.
+
+    Attributes
+    ----------
+    alpha : torch.Tensor, shape (B,)
+        Ewald splitting parameter (inverse length units).
+    sigma : torch.Tensor, shape (B,)
+        GTO basis width (passed through; physics).
+    real_space_cutoff : torch.Tensor, shape (B,)
+        Real-space cutoff distance.
+    reciprocal_space_cutoff : torch.Tensor, shape (B,)
+        Reciprocal-space cutoff (``|k|`` in inverse length units).
+    """
+
+    alpha: torch.Tensor
+    sigma: torch.Tensor
+    real_space_cutoff: torch.Tensor
+    reciprocal_space_cutoff: torch.Tensor
+
+
+@dataclass
+class MultipolePMEParameters:
+    """Container for GTO-Ewald multipole PME parameters.
+
+    Attributes
+    ----------
+    alpha : torch.Tensor, shape (B,)
+        Ewald splitting parameter.
+    sigma : torch.Tensor, shape (B,)
+        GTO basis width (passed through; physics).
+    mesh_dimensions : tuple[int, int, int]
+        Mesh dimensions ``(nx, ny, nz)`` (max across batch).
+    mesh_spacing : torch.Tensor, shape (B, 3)
+        Actual mesh spacing per direction.
+    real_space_cutoff : torch.Tensor, shape (B,)
+        Real-space cutoff distance.
+    """
+
+    alpha: torch.Tensor
+    sigma: torch.Tensor
+    mesh_dimensions: tuple[int, int, int]
+    mesh_spacing: torch.Tensor
+    real_space_cutoff: torch.Tensor
+
+
+def _kp_eta(volume: torch.Tensor, num_atoms: torch.Tensor) -> torch.Tensor:
+    """Kolafa-Perram cost-balance length scale ``η = (V**2/N)**(1/6) / sqrt(2π)``.
+
+    Common to both the monopole and multipole estimators — captures the
+    geometric balance between real-space-pair count and reciprocal-space
+    k-vector count at fixed accuracy.
+    """
+    return (volume**2 / num_atoms) ** (1.0 / 6.0) / math.sqrt(2.0 * math.pi)
+
+
+def _prepare_sigma(
+    sigma: float | torch.Tensor,
+    num_systems: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Broadcast a scalar or per-system ``sigma`` into shape ``(B,)``."""
+    if isinstance(sigma, torch.Tensor):
+        sig = sigma.to(dtype=dtype, device=device)
+        if sig.ndim == 0:
+            sig = sig.expand(num_systems).clone()
+        elif sig.shape != (num_systems,):
+            raise ValueError(
+                f"sigma must be scalar or shape ({num_systems},); "
+                f"got {tuple(sig.shape)}"
+            )
+        return sig
+    return torch.full((num_systems,), float(sigma), dtype=dtype, device=device)
+
+
+def estimate_multipole_ewald_parameters(
+    positions: torch.Tensor,
+    cell: torch.Tensor,
+    sigma: float | torch.Tensor,
+    batch_idx: torch.Tensor | None = None,
+    accuracy: float = 1e-6,
+    cost_ratio: float = 1.0,
+) -> MultipoleEwaldParameters:
+    """Estimate GTO-Ewald multipole parameters at a given target accuracy.
+
+    Mirrors :func:`estimate_ewald_parameters` semantics ("relative
+    energy-error" accuracy via the Kolafa-Perram envelope), adjusted for
+    the multipole case where the effective Ewald-split width is
+    ``sigma_c = sqrt(sigma**2 + 1/(4 alpha**2))`` rather than
+    ``1/(alpha sqrt(2))``.
+
+    Derivation
+    ----------
+    Both the real-space tail (``erfc(r/(2 sigma_c))``) and the
+    reciprocal-space envelope (``exp(-k**2 sigma_c**2)``) decay with the
+    same effective width ``sigma_c sqrt(2)``. Substituting that for the
+    monopole's ``eta = 1/(alpha sqrt(2))`` in Kolafa-Perram gives
+    ``rcut = error_factor * eta``, ``kcut = error_factor / eta``, and
+    ``alpha = 1 / (sqrt(2) sqrt(eta**2 - 2 sigma**2))``. The
+    ``sigma -> 0`` limit recovers the monopole formula.
+
+    Cost-ratio correction
+    ---------------------
+    The textbook Kolafa-Perram balance assumes the per-real-space-pair
+    cost equals the per-k-vector cost. On real hardware (and especially
+    for the lmax=1 multipole tile kernels) those costs differ — measured
+    ``C_r / C_k`` is in the 20-40x range for our cluster-pair tile
+    kernels at fp64. The cost-balanced optimum scales as
+    ``eta_eff = eta_KP / cost_ratio**(1/6)``: a 30x cost ratio shrinks
+    rcut by ~1.76x (and grows kcut by the same factor), which can cut
+    the real-space pair count by ~5x at the same target accuracy.
+
+    The math: with cost ratio ``R = C_r / C_k``, the cost-balanced
+    formula becomes ``eta_eff = (V^2 / (N * R))^(1/6) / sqrt(2 pi)``.
+    Setting ``R = 1`` (default) reproduces the canonical KP estimator.
+
+    Parameters
+    ----------
+    positions : torch.Tensor, shape (N, 3) or (N_total, 3)
+        Atomic coordinates.
+    cell : torch.Tensor, shape (3, 3) or (B, 3, 3)
+        Unit cell matrix (matches the multipole-Ewald convention).
+    sigma : float or torch.Tensor
+        GTO basis width — same value used by the multipole-Ewald kernel.
+        Scalar or shape ``(B,)``.
+    batch_idx : torch.Tensor, shape (N_total,), int32, optional
+        System index per atom. ``None`` selects single-system mode.
+    accuracy : float, default 1e-6
+        Target relative accuracy (matches monopole convention).
+    cost_ratio : float, default 1.0
+        Empirical ``C_r / C_k`` ratio — per-pair real-space cost divided
+        by per-k-vector reciprocal cost on the target hardware. ``1.0``
+        (default) reproduces canonical Kolafa-Perram. Higher values
+        shift the optimum toward smaller rcut (fewer pairs) + larger
+        kcut (more k-vectors), which wins when the per-pair cluster-pair
+        tile kernel dominates. For the lmax=1 multipole kernels on a
+        GB10-class GPU, ``cost_ratio`` ~ 30 is a reasonable starting
+        point — measure on your own hardware via the per-pair / per-k
+        timing probe (see ``docs/learnings/`` if archived). Setting
+        below 1 is allowed but rarely useful (the formula is
+        symmetric).
+
+    Returns
+    -------
+    MultipoleEwaldParameters
+        ``(alpha, sigma, real_space_cutoff, reciprocal_space_cutoff)``.
+
+    Raises
+    ------
+    ValueError
+        If any system has ``eta_eff <= sigma * sqrt(2)`` — meaning the
+        cost-balanced Ewald split is degenerate at this size + sigma
+        combination. Note: the validity threshold scales as
+        ``cost_ratio**(-1/6)`` — large ``cost_ratio`` makes the split
+        more likely to be invalid for small/dense systems.
+    """
+    if cost_ratio <= 0.0:
+        raise ValueError(f"cost_ratio must be positive, got {cost_ratio}")
+
+    if cell.ndim == 2:
+        cell = cell.unsqueeze(0)
+    num_systems = cell.shape[0]
+    dtype = positions.dtype
+    device = positions.device
+
+    volume = torch.abs(torch.linalg.det(cell)).squeeze(-1)
+    num_atoms = _count_atoms_per_system(positions, num_systems, batch_idx).to(dtype)
+
+    eta_kp = _kp_eta(volume, num_atoms)
+    eta = eta_kp / (cost_ratio ** (1.0 / 6.0))
+    error_factor = math.sqrt(-2.0 * math.log(accuracy))
+
+    real_space_cutoff = error_factor * eta
+    reciprocal_space_cutoff = error_factor / eta
+
+    sigma_t = _prepare_sigma(sigma, num_systems, dtype, device)
+
+    # alpha = 1 / (sqrt(2) * sqrt(eta**2 - 2 sigma**2)). The validity
+    # check uses the cost-corrected eta — large cost_ratio shrinks eta,
+    # which can push borderline systems into the invalid regime.
+    discriminant = eta * eta - 2.0 * sigma_t * sigma_t
+    if torch.any(discriminant <= 0.0):
+        bad = (discriminant <= 0.0).nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(
+            "Multipole Ewald parameter estimation: GTO sigma is too large "
+            f"relative to the system size for systems {bad} at cost_ratio="
+            f"{cost_ratio}. The cost-balanced eta={eta.tolist()} satisfies "
+            f"eta**2 <= 2 sigma**2 (sigma={sigma_t.tolist()}). Either reduce "
+            "sigma, increase the system, drop cost_ratio toward 1.0, or use "
+            "direct k-space (multipole_electrostatic_energy)."
+        )
+    alpha = 1.0 / (math.sqrt(2.0) * torch.sqrt(discriminant))
+
+    return MultipoleEwaldParameters(
+        alpha=alpha,
+        sigma=sigma_t,
+        real_space_cutoff=real_space_cutoff,
+        reciprocal_space_cutoff=reciprocal_space_cutoff,
+    )
+
+
+def estimate_multipole_pme_parameters(
+    positions: torch.Tensor,
+    cell: torch.Tensor,
+    sigma: float | torch.Tensor,
+    batch_idx: torch.Tensor | None = None,
+    accuracy: float = 1e-6,
+    cost_ratio: float = 1.0,
+) -> MultipolePMEParameters:
+    """Estimate GTO-Ewald multipole PME parameters at a given target accuracy.
+
+    Same Kolafa-Perram backbone as
+    :func:`estimate_multipole_ewald_parameters`. Mesh dimensions follow
+    the standard B-spline-error formula
+    ``n_per_dim = 2 alpha_eff L / (3 accuracy**0.2)`` with
+    ``alpha_eff = 1 / (sqrt(2) eta)`` — the monopole-equivalent alpha at
+    the same eta.
+
+    The ``cost_ratio`` knob has the same meaning as in
+    :func:`estimate_multipole_ewald_parameters` (per-pair vs per-k cost
+    asymmetry), and shifts the rcut/kcut/mesh balance the same way:
+    ``eta_eff = eta_KP / cost_ratio**(1/6)``. A larger ``cost_ratio``
+    grows the FFT mesh and shrinks the real-space cutoff. Note that
+    PME's true reciprocal cost is FFT (``M log M``) plus
+    spread/gather (``N p**3``), which is not the same shape as the
+    Ewald per-k-vector cost — so the optimal ``cost_ratio`` for PME may
+    differ from the Ewald optimum even on the same hardware. Default
+    ``1.0`` (canonical KP) is a safe starting point.
+
+    Returns
+    -------
+    MultipolePMEParameters
+        ``(alpha, sigma, mesh_dimensions, mesh_spacing, real_space_cutoff)``.
+    """
+    if cost_ratio <= 0.0:
+        raise ValueError(f"cost_ratio must be positive, got {cost_ratio}")
+
+    if cell.ndim == 2:
+        cell = cell.unsqueeze(0)
+    num_systems = cell.shape[0]
+    dtype = positions.dtype
+    device = positions.device
+
+    volume = torch.abs(torch.linalg.det(cell)).squeeze(-1)
+    num_atoms = _count_atoms_per_system(positions, num_systems, batch_idx).to(dtype)
+
+    eta_kp = _kp_eta(volume, num_atoms)
+    eta = eta_kp / (cost_ratio ** (1.0 / 6.0))
+    error_factor = math.sqrt(-2.0 * math.log(accuracy))
+    real_space_cutoff = error_factor * eta
+
+    sigma_t = _prepare_sigma(sigma, num_systems, dtype, device)
+    discriminant = eta * eta - 2.0 * sigma_t * sigma_t
+    if torch.any(discriminant <= 0.0):
+        bad = (discriminant <= 0.0).nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(
+            "Multipole PME parameter estimation: GTO sigma too large for "
+            f"systems {bad} at cost_ratio={cost_ratio} (eta**2 <= 2 sigma**2). "
+            "Reduce sigma, drop cost_ratio toward 1.0, or use direct k-space."
+        )
+    alpha = 1.0 / (math.sqrt(2.0) * torch.sqrt(discriminant))
+
+    # Mesh resolution from the reciprocal-space B-spline error envelope.
+    # Width is set by eta; alpha_eff = 1/(sqrt(2) eta) (monopole-equivalent).
+    alpha_eff = torch.full_like(eta, 1.0 / math.sqrt(2.0)) / eta
+    mesh_dims = estimate_pme_mesh_dimensions(cell, alpha_eff, accuracy)
+
+    cell_lengths = torch.norm(cell, dim=2)  # (B, 3)
+    mesh_dims_tensor = torch.tensor(mesh_dims, dtype=cell_lengths.dtype, device=device)
+    mesh_spacing = cell_lengths / mesh_dims_tensor
+
+    return MultipolePMEParameters(
+        alpha=alpha,
+        sigma=sigma_t,
+        mesh_dimensions=mesh_dims,
+        mesh_spacing=mesh_spacing,
+        real_space_cutoff=real_space_cutoff,
+    )
+
+
 def mesh_spacing_to_dimensions(
     cell: torch.Tensor,
     mesh_spacing: float | torch.Tensor,
