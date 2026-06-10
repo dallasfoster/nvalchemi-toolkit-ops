@@ -1915,6 +1915,11 @@ def prepare_multipole_single_system(
     system_data["mesh_dimensions"] = pme_params.mesh_dimensions
     # Precompute the reciprocal caches so the timed call excludes their rebuild.
     _attach_multipole_reciprocal_caches(system_data, l_max)
+    # Hand back a positions leaf that already requires grad (set OUTSIDE any
+    # timed/compiled region). The runner then computes forces via autograd
+    # without an in-place ``requires_grad_()`` call, which Dynamo cannot trace
+    # under ``fullgraph=True`` (keeps the --torch-compile path working).
+    system_data["positions"] = system_data["positions"].detach().requires_grad_(True)
     return system_data
 
 
@@ -1981,6 +1986,11 @@ def prepare_multipole_batch_system(
     system_data["mesh_dimensions"] = pme_params.mesh_dimensions
     # Precompute the reciprocal caches so the timed call excludes their rebuild.
     _attach_multipole_reciprocal_caches(system_data, l_max)
+    # Hand back a positions leaf that already requires grad (set OUTSIDE any
+    # timed/compiled region). The runner then computes forces via autograd
+    # without an in-place ``requires_grad_()`` call, which Dynamo cannot trace
+    # under ``fullgraph=True`` (keeps the --torch-compile path working).
+    system_data["positions"] = system_data["positions"].detach().requires_grad_(True)
     return system_data
 
 
@@ -3609,6 +3619,15 @@ def run_benchmark(
                 bench_fn()
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 warp_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                # The energy-autograd bench_fn calls torch.autograd.grad to get
+                # forces; under fullgraph=True that needs compiled-autograd
+                # tracing enabled (default-off on some torch builds), else
+                # Dynamo raises "Unsupported: using torch.autograd.grad with
+                # trace_autograd_ops=False". Enabling it lets the full fwd+bwd
+                # compile (first-order forces). Second-order (create_graph) is
+                # still not compilable and is excluded from these workloads.
+                if hasattr(torch._dynamo.config, "trace_autograd_ops"):
+                    torch._dynamo.config.trace_autograd_ops = True
                 # Use the default torch.compile mode. CUDA-graph capture modes
                 # clash with warp's stream binding in this benchmark.
                 compiled_fn = torch.compile(bench_fn, fullgraph=True)
