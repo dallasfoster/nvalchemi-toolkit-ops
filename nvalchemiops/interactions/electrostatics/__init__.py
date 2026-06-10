@@ -54,7 +54,8 @@ Available Methods
 5. **Slab Correction** (`slab_kernels`)
    - Yeh-Berkowitz / Ballenegger correction for 2D-periodic slabs
    - Supports orthogonal and triclinic cells via projected slab normals
-   - Warp launchers: ``slab_reduce_moments()``, ``slab_correction()``
+   - Warp launchers: ``slab_reduce_moments()``, ``slab_precompute_geometry()``,
+     ``slab_correction()``
    - PyTorch API: ``compute_slab_correction()`` and
      ``ewald_summation(..., slab_correction=True)``
 
@@ -118,6 +119,7 @@ from nvalchemiops.interactions.electrostatics.pme_kernels import (
 # Slab correction - Warp launchers (framework-agnostic)
 from nvalchemiops.interactions.electrostatics.slab_kernels import (
     slab_correction,
+    slab_precompute_geometry,
     slab_reduce_moments,
 )
 
@@ -166,6 +168,7 @@ __all__ = [
     "batch_ewald_reciprocal_space_energy_forces_charge_grad",
     # Slab correction - Warp launchers
     "slab_reduce_moments",
+    "slab_precompute_geometry",
     "slab_correction",
     # PME - Warp launchers
     "pme_green_structure_factor",
