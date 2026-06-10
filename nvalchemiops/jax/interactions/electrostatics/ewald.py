@@ -30,7 +30,6 @@ import warnings
 
 import jax
 import jax.numpy as jnp
-from jax.custom_transpose import custom_transpose
 from jax.interpreters import ad as jax_ad
 from jax.scipy.special import erfc
 
@@ -1819,48 +1818,6 @@ def _ewald_real_hvp(
 ) -> tuple[jax.Array, jax.Array]:
     """Linear real-space HVP with an explicit transpose rule."""
 
-    @custom_transpose
-    def _linear_hvp(res_arg, lin_arg):
-        lin_pos, lin_charge = lin_arg
-        res_positions, res_charges, *_rest = res_arg
-        _primal, tangent = _ewald_real_energy_derivatives_jvp_impl(
-            mask_value,
-            use_matrix,
-            res_arg,
-            (
-                lin_pos,
-                lin_charge,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            deriv_state,
-        )
-        return (
-            tangent[0].astype(res_positions.dtype),
-            tangent[1].astype(res_charges.dtype),
-        )
-
-    @_linear_hvp.def_transpose
-    def _linear_hvp_transpose(res_arg, ct_out):
-        ct_pos, ct_charge = ct_out
-        return _linear_hvp(
-            (
-                jax.core.ShapedArray(positions.shape, positions.dtype),
-                jax.core.ShapedArray(charges.shape, charges.dtype),
-            ),
-            res_arg,
-            (
-                _tangent_or_zeros(ct_pos, positions, dtype=positions.dtype),
-                _tangent_or_zeros(ct_charge, charges, dtype=charges.dtype),
-            ),
-        )
-
     residuals = (
         positions,
         charges,
@@ -1873,14 +1830,36 @@ def _ewald_real_hvp(
         neighbor_matrix,
         neighbor_matrix_shifts,
     )
-    return _linear_hvp(
-        (
-            jax.core.ShapedArray(positions.shape, positions.dtype),
-            jax.core.ShapedArray(charges.shape, charges.dtype),
-        ),
-        residuals,
-        (v_pos, v_charge),
-    )
+
+    # The HVP is a symmetric linear map in (v_pos, v_charge); custom_vjp supplies
+    # its transpose (== itself) so reverse-mode over this JVP yields the Hessian.
+    @jax.custom_vjp
+    def _linear_hvp(lin_pos, lin_charge):
+        _primal, tangent = _ewald_real_energy_derivatives_jvp_impl(
+            mask_value,
+            use_matrix,
+            residuals,
+            (lin_pos, lin_charge, None, None, None, None, None, None, None, None),
+            deriv_state,
+        )
+        return (
+            tangent[0].astype(positions.dtype),
+            tangent[1].astype(charges.dtype),
+        )
+
+    def _linear_hvp_fwd(lin_pos, lin_charge):
+        return _linear_hvp(lin_pos, lin_charge), None
+
+    def _linear_hvp_bwd(_res, ct_out):
+        ct_pos, ct_charge = ct_out
+        return _linear_hvp(
+            _tangent_or_zeros(ct_pos, positions, dtype=positions.dtype),
+            _tangent_or_zeros(ct_charge, charges, dtype=charges.dtype),
+        )
+
+    _linear_hvp.defvjp(_linear_hvp_fwd, _linear_hvp_bwd)
+
+    return _linear_hvp(v_pos, v_charge)
 
 
 def _ewald_reciprocal_hvp(
@@ -1896,45 +1875,35 @@ def _ewald_reciprocal_hvp(
 ) -> tuple[jax.Array, jax.Array]:
     """Linear reciprocal HVP with an explicit transpose rule."""
 
-    @custom_transpose
-    def _linear_hvp(res_arg, lin_arg):
-        lin_pos, lin_charge = lin_arg
-        res_positions, res_charges, *_rest = res_arg
+    residuals = (positions, charges, cell, k_vectors, alpha, batch_idx)
+
+    # The HVP is a symmetric linear map in (v_pos, v_charge); custom_vjp supplies
+    # its transpose (== itself) so reverse-mode over this JVP yields the Hessian.
+    @jax.custom_vjp
+    def _linear_hvp(lin_pos, lin_charge):
         _primal, tangent = _ewald_reciprocal_energy_derivatives_jvp_raw(
             max_atoms_per_system,
-            res_arg,
+            residuals,
             (lin_pos, lin_charge, None, None, None, None),
         )
         return (
-            tangent[0].astype(res_positions.dtype),
-            tangent[1].astype(res_charges.dtype),
+            tangent[0].astype(positions.dtype),
+            tangent[1].astype(charges.dtype),
         )
 
-    @_linear_hvp.def_transpose
-    def _linear_hvp_transpose(res_arg, ct_out):
-        res_positions, res_charges, *_rest = res_arg
+    def _linear_hvp_fwd(lin_pos, lin_charge):
+        return _linear_hvp(lin_pos, lin_charge), None
+
+    def _linear_hvp_bwd(_res, ct_out):
         ct_pos, ct_charge = ct_out
         return _linear_hvp(
-            (
-                jax.core.ShapedArray(res_positions.shape, res_positions.dtype),
-                jax.core.ShapedArray(res_charges.shape, res_charges.dtype),
-            ),
-            res_arg,
-            (
-                _tangent_or_zeros(ct_pos, res_positions, dtype=res_positions.dtype),
-                _tangent_or_zeros(ct_charge, res_charges, dtype=res_charges.dtype),
-            ),
+            _tangent_or_zeros(ct_pos, positions, dtype=positions.dtype),
+            _tangent_or_zeros(ct_charge, charges, dtype=charges.dtype),
         )
 
-    residuals = (positions, charges, cell, k_vectors, alpha, batch_idx)
-    return _linear_hvp(
-        (
-            jax.core.ShapedArray(positions.shape, positions.dtype),
-            jax.core.ShapedArray(charges.shape, charges.dtype),
-        ),
-        residuals,
-        (v_pos, v_charge),
-    )
+    _linear_hvp.defvjp(_linear_hvp_fwd, _linear_hvp_bwd)
+
+    return _linear_hvp(v_pos, v_charge)
 
 
 def _ewald_real_energy_derivatives_jvp_wrapped(

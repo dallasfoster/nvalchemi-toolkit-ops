@@ -33,6 +33,11 @@
 
 - Fixed Torch Ewald gradients for non-uniform per-atom energy cotangents
   (`torch.autograd.grad(..., grad_outputs=w)`).
+- JAX electrostatics no longer import the removed `jax.custom_transpose`. The
+  Ewald/PME real- and reciprocal-space and slab HVP transpose rules are
+  migrated to `jax.custom_vjp` (a stable API), restoring importability on
+  current JAX (0.10+) while preserving the second-order (force/stress-loss)
+  derivatives.
 - Coupled the FIRE2 variable-cell updates so positions and cell degrees of
   freedom advance consistently during constrained/variable-cell relaxation.
 - Neighbor-list launchers now reject unbatched methods when batch metadata is
