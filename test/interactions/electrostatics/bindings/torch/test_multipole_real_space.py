@@ -192,7 +192,7 @@ def test_quadrupole_backward_matches_fd_at_loose_tol():
             )
 
 
-def test_batch_quadrupole_forward_returns_per_system_energies():
+def test_batch_quadrupole_forward_returns_per_atom_energies():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = "cuda"
@@ -239,8 +239,14 @@ def test_batch_quadrupole_forward_returns_per_system_energies():
         alphas_b,
         batch_idx=batch_idx,
     )
-    assert E_b.shape == (2,), f"expected (2,); got {tuple(E_b.shape)}"
+    # Per-atom return (N_total,) for all l_max (uniform with l<=1); the caller
+    # scatter_adds to per-system.
+    assert E_b.shape == (n0 + n1,), f"expected ({n0 + n1},); got {tuple(E_b.shape)}"
     assert torch.isfinite(E_b).all(), f"non-finite energy: {E_b}"
+    per_system = torch.zeros(2, dtype=torch.float64, device=device).scatter_add(
+        0, batch_idx.to(torch.int64), E_b
+    )
+    assert torch.isfinite(per_system).all()
 
     E_b.sum().backward()
     for name, t in [("pos_b", pos_b), ("q_b", q_b), ("mu_b", mu_b), ("Q_b", Q_b)]:

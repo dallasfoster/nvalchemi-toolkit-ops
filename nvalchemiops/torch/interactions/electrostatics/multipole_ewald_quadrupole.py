@@ -1050,8 +1050,8 @@ def multipole_real_space_quadrupole_energy(
     Pass ``cell`` of shape ``(3, 3)`` / ``(1, 3, 3)`` (single) or
     ``(B, 3, 3)`` (batched) and set ``batch_idx`` to select the batched path.
     In batched mode ``sigma``/``alpha`` are per-system ``(B,)`` tensors and the
-    return shape is per-system ``(B,)`` (the underlying Function scatter-adds
-    per atom via ``batch_idx``).
+    return is per-atom ``(N_total,)`` (uniform with the single-system path; the
+    caller ``scatter_add``s for per-system totals).
 
     Parameters
     ----------
@@ -1076,7 +1076,7 @@ def multipole_real_space_quadrupole_energy(
     Returns
     -------
     torch.Tensor, ``float64``
-        Per-atom real-space energy ``(N,)`` (single) or per-system ``(B,)``
+        Per-atom real-space energy ``(N,)`` (single) or ``(N_total,)``
         (batched), before the :math:`F/(4\\pi)` Coulomb scale applied by the
         caller.
     """
@@ -1555,9 +1555,9 @@ def _batch_rs_quadrupole_op(
         wp_dtype=wp_scalar,
         device=str(wp_device),
     )
-    per_system = torch.zeros(cells.shape[0], dtype=torch.float64, device=device)
-    per_system.scatter_add_(0, batch_idx.to(torch.int64), energies)
-    return per_system
+    # Per-atom return (the caller owns the atom-global reduction / scatter_add);
+    # uniform with the l<=1 paths.
+    return energies
 
 
 @_batch_rs_quadrupole_op.register_fake
@@ -1575,7 +1575,7 @@ def _(
     unit_shifts,
     half_neighbor_list,
 ):
-    return cells.new_empty((cells.shape[0],), dtype=torch.float64)
+    return positions.new_empty((positions.shape[0],), dtype=torch.float64)
 
 
 @torch.library.custom_op(
@@ -2069,8 +2069,8 @@ def _batch_rs_quadrupole_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _batch_rs_quadrupole_backward(ctx, grad_per_system):
-    """Expand per-system grad to per-atom, then moment-grad + gated cell-grad."""
+def _batch_rs_quadrupole_backward(ctx, grad_per_atom):
+    """Per-atom grad → moment-grad + gated cell-grad (forward is now per-atom)."""
     (
         positions,
         charges,
@@ -2085,7 +2085,7 @@ def _batch_rs_quadrupole_backward(ctx, grad_per_system):
         unit_shifts,
     ) = ctx.saved_tensors
     need = ctx.needs_input_grad
-    ge_per_atom = grad_per_system[batch_idx.to(torch.int64)]
+    ge_per_atom = grad_per_atom.contiguous()
     grad_pos, grad_q, grad_mu, grad_Q = (
         torch.ops.nvalchemiops.batch_multipole_real_space_quadrupole_backward(
             ge_per_atom,
@@ -2167,12 +2167,13 @@ def _batch_multipole_real_space_quadrupole_energy(
     *,
     half_neighbor_list: bool = False,
 ) -> torch.Tensor:
-    """Per-system GTO-Ewald real-space LMAX=2 energy, batched (internal).
+    """Per-atom GTO-Ewald real-space LMAX=2 energy, batched (internal).
 
     Internal dispatch target reached via
     :func:`multipole_real_space_quadrupole_energy` with ``batch_idx=`` set.
-    Returns ``(B,)`` per-system total energies (sum of per-atom contributions
-    for each system). Same conventions as
+    Returns per-atom :math:`(N_\\text{total},)` energies (uniform with the
+    :math:`l_{max} \\le 1` paths; the caller ``scatter_add``s for per-system
+    totals). Same conventions as
     :func:`multipole_real_space_quadrupole_energy`, with per-system
     ``cells (B, 3, 3)``, ``sigmas (B,)``, ``alphas (B,)``, and per-atom
     ``batch_idx (N_total,)``.
@@ -2200,9 +2201,10 @@ def _batch_multipole_real_space_quadrupole_energy(
 
     Returns
     -------
-    torch.Tensor, shape ``(B,)``, ``float64``
-        Per-system total real-space energy, before the :math:`F/(4\\pi)`
-        Coulomb scale applied by the caller.
+    torch.Tensor, shape ``(N_total,)``, ``float64``
+        Per-atom real-space energy, before the :math:`F/(4\\pi)`
+        Coulomb scale applied by the caller (which ``scatter_add``s for
+        per-system totals).
     """
     if positions.ndim != 2 or positions.shape[-1] != 3:
         raise ValueError(f"positions must be (N, 3), got {tuple(positions.shape)}")

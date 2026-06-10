@@ -875,14 +875,11 @@ def multipole_ewald_scf_step_energy(
             alphas,
             batch_idx=batch_idx,
         )
-        # multipole_real_space_energy returns per-atom for l<=1 (reduce per
-        # system) but per-system (B,) for l=2.
-        if l_max == 2:
-            e_real = coulomb_scale * real
-        else:
-            e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-                0, batch_idx, coulomb_scale * real
-            )
+        # multipole_real_space_energy returns per-atom (N_total,) for ALL l_max;
+        # reduce to per-system here.
+        e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
+            0, batch_idx, coulomb_scale * real
+        )
     else:
         sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
         alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)

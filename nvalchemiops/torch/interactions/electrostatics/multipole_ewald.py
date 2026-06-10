@@ -1921,9 +1921,8 @@ def multipole_real_space_energy(
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` / ``(1, 3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use
     ``batch_idx`` to select the batched path. In batched mode ``sigma`` and
-    ``alpha`` are per-system ``(B,)`` tensors and the return shape is the
-    batched analog (per-atom :math:`(N_\text{total},)` for :math:`l_{max} \le
-    1`; per-system :math:`(B,)` for :math:`l_{max} = 2`).
+    ``alpha`` are per-system ``(B,)`` tensors and the return is per-atom
+    :math:`(N_\text{total},)` for all :math:`l_{max}`.
 
     Parameters
     ----------
@@ -1951,9 +1950,8 @@ def multipole_real_space_energy(
     Returns
     -------
     torch.Tensor, shape (N,), float64
-        Per-atom real-space energy (single). Batched: per-atom
-        :math:`(N_\text{total},)` for :math:`l_{max} \le 1`; per-system
-        :math:`(B,)` for :math:`l_{max} = 2`.
+        Per-atom real-space energy (single), or per-atom
+        :math:`(N_\text{total},)` batched — for all :math:`l_{max}`.
     """
     if batch_idx is not None:
         return _batch_multipole_real_space_energy(
@@ -3439,10 +3437,8 @@ def _batch_multipole_real_space_energy(
 
     Return shape:
 
-    * :math:`l_{max} \le 1` → per-atom :math:`(N_\text{total},)` float64; caller
-      does ``scatter_add`` via ``batch_idx`` for per-system totals.
-    * :math:`l_{max} = 2` → per-system :math:`(B,)` float64 (the underlying
-      Function scatter-adds per atom via ``batch_idx``).
+    Per-atom :math:`(N_\text{total},)` float64 for all :math:`l_{max}`; the
+    caller does ``scatter_add`` via ``batch_idx`` for per-system totals.
 
     Non-uniform per-atom backward weights are supported on all paths.
 
@@ -3466,8 +3462,7 @@ def _batch_multipole_real_space_energy(
     Returns
     -------
     torch.Tensor
-        Per-atom :math:`(N_\text{total},)` float64 for :math:`l_{max} \le 1`;
-        per-system :math:`(B,)` float64 for :math:`l_{max} = 2`.
+        Per-atom :math:`(N_\text{total},)` float64 for all :math:`l_{max}`.
     """
     if positions.ndim != 2 or positions.shape[-1] != 3:
         raise ValueError(
@@ -4257,7 +4252,9 @@ def multipole_ewald_summation(
             B = cell.shape[0]
             sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
             alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
-            e_real_b = coulomb_scale * multipole_real_space_quadrupole_energy(
+            # Real-space now returns per-atom (N_total,) for l=2 too; reduce to
+            # per-system to match the per-system reciprocal + self terms.
+            e_real_atom = coulomb_scale * multipole_real_space_quadrupole_energy(
                 positions,
                 charges_l2,
                 dipoles_cart_l2,
@@ -4269,6 +4266,9 @@ def multipole_ewald_summation(
                 sigmas,
                 alphas,
                 batch_idx=batch_idx,
+            )
+            e_real_b = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
+                0, batch_idx, e_real_atom
             )
             e_recip_b = multipole_reciprocal_space_energy(
                 positions,

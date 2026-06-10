@@ -5956,8 +5956,8 @@ def multipole_particle_mesh_ewald(
                 )
             e_real = coulomb_scale * per_system_real_raw
         else:
-            # l=2: batched real-space already returns per-system (B,) and is
-            # cell-grad aware.
+            # l=2: batched real-space now returns per-atom (N_total,) and is
+            # cell-grad aware; reduce to per-system here.
             real_out = multipole_real_space_energy(
                 positions,
                 multipole_moments,
@@ -5969,7 +5969,9 @@ def multipole_particle_mesh_ewald(
                 alphas,
                 batch_idx=batch_idx,
             )
-            e_real = coulomb_scale * real_out
+            e_real = torch.zeros(
+                B, dtype=torch.float64, device=positions.device
+            ).scatter_add(0, batch_idx, coulomb_scale * real_out)
 
         e_recip_minus_corr = multipole_pme_reciprocal_space(
             positions,
