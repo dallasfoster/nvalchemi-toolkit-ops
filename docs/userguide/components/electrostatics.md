@@ -1500,7 +1500,7 @@ forces = -torch.autograd.grad(energy, positions)[0]
 
 ```{note}
 `sigma` is the GTO smearing width of the source multipoles and is **required**.
-The Ewald splitting parameter `alpha` and the reciprocal-space `kspace_cutoff`
+The Ewald splitting parameter `alpha` and the reciprocal-space `k_cutoff`
 are estimated automatically from the requested `accuracy` when left as `None`.
 ```
 

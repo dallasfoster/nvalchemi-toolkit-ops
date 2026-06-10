@@ -87,7 +87,7 @@ class TestMultipoleReciprocalSpaceLimit:
             source_feats,
             cell,
             sigma=sigma,
-            kspace_cutoff=k_cutoff,
+            k_cutoff=k_cutoff,
             include_self_interaction=True,
         )
         e_recip = multipole_reciprocal_space_energy(
@@ -96,7 +96,7 @@ class TestMultipoleReciprocalSpaceLimit:
             cell,
             sigma=sigma,
             alpha=100.0,
-            kspace_cutoff=k_cutoff,
+            k_cutoff=k_cutoff,
         )
         # The residual is O((k_max/α)²) from the exp series; with
         # k_cutoff=3 and α=100 it's ~(3/100)² ≈ 1e-3 magnitude.
@@ -113,7 +113,7 @@ class TestMultipoleReciprocalSpaceLimit:
             cell,
             sigma=1.0,
             alpha=0.05,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         assert abs(e.sum().item()) < 1e-10
 
@@ -129,7 +129,7 @@ class TestMultipoleReciprocalSpaceShapes:
             cell,
             sigma=1.0,
             alpha=0.4,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         assert e.shape == (5,)
         assert e.dtype == torch.float64
@@ -152,7 +152,7 @@ class TestMultipoleReciprocalSpaceAutograd:
             cell,
             sigma=1.0,
             alpha=0.4,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         e.sum().backward()
         for t in (positions, source_feats):
@@ -175,7 +175,7 @@ class TestMultipoleReciprocalSpaceAutograd:
             cell,
             sigma=1.0,
             alpha=0.4,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         (forces_neg,) = torch.autograd.grad(e.sum(), positions, create_graph=True)
         loss = (forces_neg**2).sum()
@@ -216,7 +216,7 @@ class TestBatchMultipoleReciprocalSpace:
                     cell,
                     sigma=sigma,
                     alpha=alpha,
-                    kspace_cutoff=kcut,
+                    k_cutoff=kcut,
                 ).sum()
                 for (p, c, m, cell) in systems
             ]
@@ -235,7 +235,7 @@ class TestBatchMultipoleReciprocalSpace:
             batch_idx=bi,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         B = 3
         e_batch_per_sys = torch.zeros(
@@ -273,7 +273,7 @@ class TestBatchMultipoleReciprocalSpace:
             batch_idx=bi,
             sigma=1.0,
             alpha=0.4,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         assert e.shape == (B * n_per,)
         e.sum().backward()
@@ -295,14 +295,14 @@ class TestMultipoleReciprocalSpaceValidation:
                 cell,
                 sigma=1.0,
                 alpha=-0.1,
-                kspace_cutoff=3.0,
+                k_cutoff=3.0,
             )
 
     def test_requires_k_grid_info(self, device):
         positions, charges, _, cell = _system(
             n_atoms=4, box_len=5.0, device=device, seed=0, with_dipoles=False
         )
-        with pytest.raises(ValueError, match="k_vectors"):
+        with pytest.raises(ValueError, match="k_cutoff"):
             multipole_reciprocal_space_energy(
                 positions,
                 pack_charges_dipoles(charges, None),
@@ -337,7 +337,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             cell,
             sigma=sigma,
             receiver_sigmas=[sigma],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=1,
             alpha=alpha,
             device="cuda:0",
@@ -513,7 +513,7 @@ class TestBatchMultipoleReciprocalSpaceDipoleFusedScalar:
             cells,
             sigma=sigma,
             receiver_sigmas=[sigma],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=1,
             alpha=alpha,
             device=td,
@@ -712,13 +712,27 @@ def test_reciprocal_quadrupole_parity_vs_reference(sigma):
     ks_prod = np.vstack([np.zeros((1, 3)), half])
     ks_full = np.vstack([half, -half])
 
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        prepare_multipole_scf_cache,
+    )
+
+    # Pin the kernel to the exact reference k-grid by pre-building a cache from
+    # it (custom k-grids now live on the cache, not a k_vectors kwarg).
+    cache = prepare_multipole_scf_cache(
+        torch.tensor(cell_np),
+        sigma=sigma,
+        receiver_sigmas=[sigma],
+        k_vectors=torch.tensor(ks_prod, dtype=torch.float64),
+        l_max=2,
+        alpha=alpha,
+    )
     E = multipole_reciprocal_space_energy(
         torch.tensor(pos),
         _mm(q, mu, Q),
         torch.tensor(cell_np),
         sigma=sigma,
         alpha=alpha,
-        k_vectors=torch.tensor(ks_prod, dtype=torch.float64),
+        cache=cache,
     )
     # Reference uses the SAME traceless Q the converter feeds the kernel.
     Q_tl = Q - np.eye(3)[None] * (np.trace(Q, axis1=1, axis2=2)[:, None, None] / 3.0)
@@ -734,6 +748,20 @@ def test_reciprocal_quadrupole_grads_match_fd():
     kvec = torch.tensor(
         np.vstack([np.zeros((1, 3)), _half_kgrid(cell_np, kcut)]), dtype=torch.float64
     )
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        prepare_multipole_scf_cache,
+    )
+
+    # Position-independent cache built once from the fixed k-grid; reused across
+    # every FD energy evaluation (positions enter per call via autograd).
+    cache = prepare_multipole_scf_cache(
+        cell,
+        sigma=sigma,
+        receiver_sigmas=[sigma],
+        k_vectors=kvec,
+        l_max=2,
+        alpha=alpha,
+    )
 
     def energy(pos_, q_, mu_, Q_):
         sf_ = torch.cat([q_[:, None], dipole_cartesian_to_spherical(mu_)], dim=1)
@@ -744,7 +772,7 @@ def test_reciprocal_quadrupole_grads_match_fd():
             cell,
             sigma=sigma,
             alpha=alpha,
-            k_vectors=kvec,
+            cache=cache,
         )
 
     pos_t = torch.tensor(pos, requires_grad=True)
@@ -792,7 +820,20 @@ def test_reciprocal_quadrupole_none_unchanged():
     kvec = torch.tensor(
         np.vstack([np.zeros((1, 3)), _half_kgrid(cell_np, kcut)]), dtype=torch.float64
     )
-    args = dict(sigma=sigma, alpha=alpha, k_vectors=kvec)
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        prepare_multipole_scf_cache,
+    )
+
+    # One l=2 cache off the shared grid serves both the l<=1 and Q=0 calls.
+    cache = prepare_multipole_scf_cache(
+        torch.tensor(cell_np),
+        sigma=sigma,
+        receiver_sigmas=[sigma],
+        k_vectors=kvec,
+        l_max=2,
+        alpha=alpha,
+    )
+    args = dict(sigma=sigma, alpha=alpha, cache=cache)
     E_none = multipole_reciprocal_space_energy(
         torch.tensor(pos), _sf(q, mu), torch.tensor(cell_np), **args
     )
@@ -864,7 +905,7 @@ def test_composite_quadrupole_matches_pme_composite():
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         ).sum()
     )
 
@@ -917,7 +958,7 @@ def test_composite_quadrupole_batched_matches_per_system():
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         E_single.append(float(E.sum()))
 
@@ -962,7 +1003,7 @@ def test_composite_quadrupole_batched_matches_per_system():
         sh,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kcut,
+        k_cutoff=kcut,
         batch_idx=bidx,
     )
     assert Eb.shape == (off,)
@@ -1003,7 +1044,7 @@ def test_pme_composite_quadrupole_matches_directk_and_batched():
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         ).sum()
     )
     E_pme = multipole_particle_mesh_ewald(
@@ -1067,7 +1108,7 @@ def test_composite_quadrupole_autograd_connected():
         sh,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=12.0,
+        k_cutoff=12.0,
     )
     assert torch.isfinite(E).all()
     gpos, gsf, gQ = torch.autograd.grad(E.sum(), [pos_t, sf, Q_t])
@@ -1098,7 +1139,7 @@ def test_composite_stress_matches_fd(with_quad):
     cell_np, pos, q, mu, Q, L = _fixture(7)
     idx_j, ptr, sh = _build_csr(pos, cell_np, real_cut)
     mm = _mm(q, mu, Q if with_quad else None)
-    kw = dict(sigma=sigma, alpha=alpha, kspace_cutoff=kcut)
+    kw = dict(sigma=sigma, alpha=alpha, k_cutoff=kcut)
 
     def energy(cell_t):
         return multipole_ewald_summation(
@@ -1123,7 +1164,7 @@ def test_batched_stress_matches_per_system(with_quad):
     single_g = []
     for cell_np, pos, q, mu, Q, L in systems:
         idx_j, ptr, sh = _build_csr(pos, cell_np, real_cut)
-        kw = dict(sigma=sigma, alpha=alpha, kspace_cutoff=kcut)
+        kw = dict(sigma=sigma, alpha=alpha, k_cutoff=kcut)
         ct = torch.tensor(cell_np, requires_grad=True)
         mm = _mm(q, mu, Q if with_quad else None)
         E = multipole_ewald_summation(torch.tensor(pos), mm, ct, idx_j, ptr, sh, **kw)
@@ -1155,7 +1196,7 @@ def test_batched_stress_matches_per_system(with_quad):
     kw = dict(
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kcut,
+        k_cutoff=kcut,
         batch_idx=torch.tensor(bidx, dtype=torch.int32),
     )
     Eb = multipole_ewald_summation(
@@ -1188,13 +1229,13 @@ def test_reciprocal_quadrupole_pos_hvp_matches_fd():
     def grad_pos(p, create):
         pt = torch.tensor(p, requires_grad=True)
         E = multipole_reciprocal_space_energy(
-            pt, mm, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kcut
+            pt, mm, cell, sigma=sigma, alpha=alpha, k_cutoff=kcut
         )
         return torch.autograd.grad(E.sum(), [pt], create_graph=create)[0]
 
     pt = torch.tensor(pos, requires_grad=True)
     E = multipole_reciprocal_space_energy(
-        pt, mm, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kcut
+        pt, mm, cell, sigma=sigma, alpha=alpha, k_cutoff=kcut
     )
     gp = torch.autograd.grad(E.sum(), [pt], create_graph=True)[0]
     hvp = torch.autograd.grad((gp * v).sum(), [pt])[0]
@@ -1233,7 +1274,7 @@ def test_reciprocal_quadrupole_q_hvp_matches_fd():
             cell,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         return torch.autograd.grad(E.sum(), [Qt], create_graph=True)[0]
 
@@ -1244,7 +1285,7 @@ def test_reciprocal_quadrupole_q_hvp_matches_fd():
         cell,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kcut,
+        k_cutoff=kcut,
     )
     gQ = torch.autograd.grad(E.sum(), [Qt], create_graph=True)[0]
     qhvp = torch.autograd.grad((gQ * vQ).sum(), [Qt])[0]
@@ -1302,7 +1343,7 @@ def test_reciprocal_quadrupole_batched_hvp_matches_per_system():
         torch.tensor(np.stack([cell_np] * len(Ns))),
         sigma=sigma,
         receiver_sigmas=rs,
-        kspace_cutoff=kcut,
+        k_cutoff=kcut,
         l_max=2,
         alpha=alpha,
     )
@@ -1332,7 +1373,7 @@ def test_reciprocal_quadrupole_batched_hvp_matches_per_system():
             torch.tensor(cell_np),
             sigma=sigma,
             receiver_sigmas=rs,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             l_max=2,
             alpha=alpha,
         )
@@ -1369,7 +1410,7 @@ def _recip_stress_dot(positions, mm, cell, g, *, batch_idx=None):
         batch_idx=batch_idx,
         sigma=0.5,
         alpha=0.45,
-        kspace_cutoff=9.0,
+        k_cutoff=9.0,
     )
     (stress,) = torch.autograd.grad(e.sum(), cell, create_graph=True)
     return (stress * g).sum()
@@ -1399,7 +1440,7 @@ class TestDirectKGatherPerAtom:
             cell,
             sigma=1.0,
             receiver_sigmas=[1.0],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=1,
             alpha=0.5,
             device="cuda:0",
@@ -1483,7 +1524,7 @@ class TestDirectKGatherPerAtom:
                 cell,
                 sigma=1.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=3.0,
+                k_cutoff=3.0,
                 l_max=1,
                 alpha=0.5,
                 device="cuda:0",
@@ -1533,7 +1574,7 @@ class TestDirectKGatherPerAtomLmax2:
             cell,
             sigma=1.0,
             receiver_sigmas=[1.0],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=2,
             alpha=0.5,
             device="cuda:0",
@@ -1689,7 +1730,7 @@ class TestDirectKGatherPerAtomBatched:
             cells,
             sigma=sd["sigma"],
             receiver_sigmas=sd["rs"],
-            kspace_cutoff=sd["kcut"],
+            k_cutoff=sd["kcut"],
             l_max=2,
             alpha=sd["alpha"],
             device=cells.device,
@@ -1822,10 +1863,10 @@ class TestReciprocalStressLoss:
                     cm = cell0.clone()
                     cm[i, j] -= ec
                     ep = multipole_reciprocal_space_energy(
-                        p_, mm, cp, sigma=0.5, alpha=0.45, kspace_cutoff=9.0
+                        p_, mm, cp, sigma=0.5, alpha=0.45, k_cutoff=9.0
                     )
                     em = multipole_reciprocal_space_energy(
-                        p_, mm, cm, sigma=0.5, alpha=0.45, kspace_cutoff=9.0
+                        p_, mm, cm, sigma=0.5, alpha=0.45, k_cutoff=9.0
                     )
                     acc += (
                         float(g[i, j]) * (float(ep.sum()) - float(em.sum())) / (2 * ec)
@@ -1884,7 +1925,7 @@ class TestReciprocalStressLoss:
                             batch_idx=batch_idx,
                             sigma=0.5,
                             alpha=0.45,
-                            kspace_cutoff=9.0,
+                            k_cutoff=9.0,
                         ).sum()
                         em = multipole_reciprocal_space_energy(
                             p_,
@@ -1893,7 +1934,7 @@ class TestReciprocalStressLoss:
                             batch_idx=batch_idx,
                             sigma=0.5,
                             alpha=0.45,
-                            kspace_cutoff=9.0,
+                            k_cutoff=9.0,
                         ).sum()
                         acc += float(g[b, i, j]) * (float(ep) - float(em)) / (2 * ec)
             return acc
@@ -1940,7 +1981,7 @@ class TestEwaldCompositeStressLoss:
                 shifts,
                 sigma=0.5,
                 alpha=0.45,
-                kspace_cutoff=9.0,
+                k_cutoff=9.0,
             )
 
         def stress_dot(p_):

@@ -2164,7 +2164,7 @@ def _path_a_vs_b(
 
     E_B = float(
         multipole_electrostatic_energy(
-            pos, source_feats, cell, sigma=sigma, kspace_cutoff=kcut
+            pos, source_feats, cell, sigma=sigma, k_cutoff=kcut
         ).sum()
     )
     E_A = float(
@@ -2177,7 +2177,7 @@ def _path_a_vs_b(
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         ).sum()
     )
     return E_A - E_B
@@ -2221,7 +2221,7 @@ class TestPathAEquivPathB:
         kcut = 6.0 / sigma_c
         E_B = float(
             multipole_electrostatic_energy(
-                pos, sf, cell, sigma=sigma, kspace_cutoff=kcut
+                pos, sf, cell, sigma=sigma, k_cutoff=kcut
             ).sum()
         )
         E_A = float(
@@ -2234,7 +2234,7 @@ class TestPathAEquivPathB:
                 sh,
                 sigma=sigma,
                 alpha=alpha,
-                kspace_cutoff=kcut,
+                k_cutoff=kcut,
             ).sum()
         )
         assert abs(E_A - E_B) < 1e-4, (
@@ -2304,7 +2304,7 @@ class TestBatchedEwaldSummation:
                     sh,
                     sigma=sigma,
                     alpha=alpha,
-                    kspace_cutoff=kcut,
+                    k_cutoff=kcut,
                 ).sum()
             )
             per_system_e.append(e)
@@ -2349,7 +2349,7 @@ class TestBatchedEwaldSummation:
             sh_flat,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             batch_idx=batch_idx,
         )
         assert e_batch.shape == (pos_all.shape[0],)
@@ -2382,7 +2382,7 @@ class TestBatchedEwaldSummation:
             per_b.append(
                 float(
                     multipole_electrostatic_energy(
-                        pos, sf, cell, sigma=sigma, kspace_cutoff=kcut
+                        pos, sf, cell, sigma=sigma, k_cutoff=kcut
                     ).sum()
                 )
             )
@@ -2428,7 +2428,7 @@ class TestBatchedEwaldSummation:
             sh_flat,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             batch_idx=batch_idx,
         )
         B_sys = len(per_b)
@@ -2445,7 +2445,7 @@ class TestBatchedEwaldSummation:
 class TestEwaldSCFStepEnergy:
     """Cache-aware ``multipole_ewald_scf_step_energy`` must match the
     one-shot ``multipole_ewald_summation`` bit-for-bit when the cache is
-    built with matching (σ, α, kspace_cutoff)."""
+    built with matching (σ, α, k_cutoff)."""
 
     @pytest.mark.parametrize("alpha", [0.4, 0.9])
     @pytest.mark.parametrize("l_max", [0, 1, 2])
@@ -2475,7 +2475,7 @@ class TestEwaldSCFStepEnergy:
                 sh,
                 sigma=sigma,
                 alpha=alpha,
-                kspace_cutoff=kcut,
+                k_cutoff=kcut,
             ).sum()
         )
 
@@ -2484,7 +2484,7 @@ class TestEwaldSCFStepEnergy:
             sigma=sigma,
             alpha=alpha,
             receiver_sigmas=[sigma],
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             l_max=l_max,
             device=pos.device,
         )
@@ -2550,7 +2550,7 @@ class TestEwaldSCFStepEnergy:
             sh_flat,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             batch_idx=batch_idx,
         )
 
@@ -2559,7 +2559,7 @@ class TestEwaldSCFStepEnergy:
             sigma=sigma,
             alpha=alpha,
             receiver_sigmas=[sigma],
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
             l_max=l_max,
             device=pos_all.device,
         )
@@ -2587,7 +2587,7 @@ class TestEwaldSCFStepEnergy:
             cell.squeeze(0) if cell.ndim == 3 else cell,
             sigma=1.0,
             receiver_sigmas=[1.0],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=0,
             device=pos.device,
         )
@@ -2631,7 +2631,7 @@ class TestCudaCpuTileRouting:
                     sh,
                     sigma=sigma,
                     alpha=alpha,
-                    kspace_cutoff=kcut,
+                    k_cutoff=kcut,
                 ).sum()
             )
         assert abs(out["cpu"] - out["gpu"]) / max(abs(out["cpu"]), 1e-300) < 1e-10, (
@@ -2670,7 +2670,7 @@ class TestCudaCpuTileRouting:
                 sh,
                 sigma=sigma,
                 alpha=alpha,
-                kspace_cutoff=kcut,
+                k_cutoff=kcut,
             )
             energy.sum().backward()
             grads[f"{device}_pos"] = pos.grad.detach().cpu().clone()
@@ -2851,7 +2851,7 @@ def test_quadrupole_total_is_alpha_independent():
                 sh,
                 sigma=sigma,
                 alpha=alpha,
-                kspace_cutoff=7.0 / sc,
+                k_cutoff=7.0 / sc,
             ).sum()
         )
         totals.append(E)
@@ -2876,7 +2876,7 @@ def test_multipole_ewald_summation_quadrupole_computes():
         p["unit_shifts"],
         sigma=0.5,
         alpha=0.35,
-        kspace_cutoff=6.0,
+        k_cutoff=6.0,
     )
     assert E.shape == (p["positions"].shape[0],) and torch.isfinite(E).all()
     gpos, gmm = torch.autograd.grad(E.sum(), [pos, mm])
@@ -2903,7 +2903,7 @@ def test_multipole_ewald_summation_quadrupole_batched_matches_single():
         p["unit_shifts"],
         sigma=0.5,
         alpha=0.35,
-        kspace_cutoff=6.0,
+        k_cutoff=6.0,
     )
     E_batch = multipole_ewald_summation(
         p["positions"],
@@ -2914,7 +2914,7 @@ def test_multipole_ewald_summation_quadrupole_batched_matches_single():
         p["unit_shifts"],
         sigma=0.5,
         alpha=0.35,
-        kspace_cutoff=6.0,
+        k_cutoff=6.0,
         batch_idx=batch_idx,
     )
     n = p["positions"].shape[0]
@@ -2941,7 +2941,7 @@ def test_multipole_ewald_summation_validates_packed_shape():
             p["unit_shifts"],
             sigma=0.5,
             alpha=0.35,
-            kspace_cutoff=2.0,
+            k_cutoff=2.0,
         )
 
 

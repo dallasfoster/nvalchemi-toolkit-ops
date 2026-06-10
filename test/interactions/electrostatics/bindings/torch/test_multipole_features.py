@@ -94,7 +94,7 @@ class TestBasics:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=[0.5, 1.0, 1.5],
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert feats.shape == (4, 3 * 4)
         assert feats.dtype == torch.float64
@@ -109,7 +109,7 @@ class TestBasics:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=[0.5, 1.0],
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert feats.shape == (4, 2 * 4)
 
@@ -122,7 +122,7 @@ class TestBasics:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=[0.8, 1.2],
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert feats.shape == (5, 2 * 4)
 
@@ -136,7 +136,7 @@ class TestValidation:
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
                 receiver_sigmas=[],
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
     def test_rejects_non_positive_receiver_sigma(self):
@@ -147,10 +147,10 @@ class TestValidation:
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
                 receiver_sigmas=[0.5, -0.1],
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
-    def test_missing_both_kspace_cutoff_and_k_vectors(self):
+    def test_missing_both_k_cutoff_and_k_vectors(self):
         with pytest.raises(ValueError, match="k_vectors"):
             multipole_electrostatic_features(
                 torch.zeros((4, 3), dtype=torch.float64),
@@ -176,7 +176,7 @@ class TestPhysicalInvariants:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         f_after = multipole_electrostatic_features(
             sys["positions"] + shift,
@@ -184,7 +184,7 @@ class TestPhysicalInvariants:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         # Columns [0, n_sigma) are the translation-invariant l=0 channels.
         np.testing.assert_allclose(
@@ -205,7 +205,7 @@ class TestPhysicalInvariants:
             sys["cell"],
             sigma=1.0,
             receiver_sigmas=[0.7, 1.3],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         np.testing.assert_array_equal(
             feats.detach().cpu().numpy(), np.zeros((4, 2 * 4))
@@ -256,7 +256,7 @@ def _features(pos, mm, cell, *, feature_max_l):
         cell,
         sigma=_SIGMA,
         receiver_sigmas=_RSIG,
-        kspace_cutoff=_KCUT,
+        k_cutoff=_KCUT,
         feature_max_l=feature_max_l,
     )
 
@@ -301,7 +301,7 @@ class TestFeaturesQuadrupole:
             cell,
             sigma=_SIGMA,
             receiver_sigmas=_RSIG,
-            kspace_cutoff=_KCUT,
+            k_cutoff=_KCUT,
             l_max=2,
             feature_max_l=2,
         )
@@ -402,7 +402,7 @@ class TestFeaturesQuadrupole:
             batch_idx=bidx,
             sigma=_SIGMA,
             receiver_sigmas=_RSIG,
-            kspace_cutoff=_KCUT,
+            k_cutoff=_KCUT,
             feature_max_l=2,
         )
         f0 = _features(pos0, mm0, cell, feature_max_l=2)
@@ -466,7 +466,7 @@ class TestFeaturesQuadrupole:
                 batch_idx=bidx,
                 sigma=_SIGMA,
                 receiver_sigmas=_RSIG,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 feature_max_l=2,
             )
             (forces,) = torch.autograd.grad((f * w).sum(), p, create_graph=True)
@@ -507,7 +507,7 @@ class TestCacheShapes:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.6, 1.0, 1.4],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         assert isinstance(cache, MultipoleSCFCache)
         assert cache.n_sigma == 3
@@ -545,7 +545,7 @@ class TestCacheShapes:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.8],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
             l_max=0,
         )
         np.testing.assert_array_equal(
@@ -561,7 +561,7 @@ class TestCacheShapes:
             cell,
             sigma=1.0,
             receiver_sigmas=[1.0],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         np.testing.assert_array_equal(
             cache.k_vectors[0].detach().cpu().numpy(), np.zeros(3)
@@ -575,7 +575,7 @@ class TestCacheContents:
         td = _torch_device(device)
         cell = _cell(box_len=5.0, device=td)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.0
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.0
         )
         k_norm2 = cache.k_norm2.detach().cpu().numpy()
         expected = np.zeros_like(k_norm2)
@@ -592,7 +592,7 @@ class TestCacheContents:
         td = _torch_device(device)
         cell = _cell(box_len=5.0, device=td)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.0
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.0
         )
         kfp = cache.k_factor_proj.detach().cpu().numpy()
         assert kfp[0] == 0.5
@@ -607,7 +607,7 @@ class TestCacheContents:
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         oc_np = compute_overlap_constants(
             max_L=1,
@@ -631,7 +631,7 @@ class TestCacheContents:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.8, 1.2],
-            kspace_cutoff=3.0,
+            k_cutoff=3.0,
         )
         phi_origin_l1 = cache.receiver_phi_hat[0, :, 1:4, :].detach().cpu().numpy()
         np.testing.assert_array_equal(phi_origin_l1, np.zeros_like(phi_origin_l1))
@@ -641,7 +641,7 @@ class TestCacheContents:
         cell = _cell(box_len=5.0, device=td)
         sigma = 1.0
         cache = prepare_multipole_scf_cache(
-            cell, sigma=sigma, receiver_sigmas=[1.0], kspace_cutoff=3.0
+            cell, sigma=sigma, receiver_sigmas=[1.0], k_cutoff=3.0
         )
         expected = (
             inv_cl(sigma, 0, NormMode.MULTIPOLES)
@@ -662,8 +662,8 @@ class TestCacheReuse:
         """Supplying pre-built k_vectors produces a cache using exactly those."""
         td = _torch_device(device)
         cell = _cell(box_len=5.0, device=td)
-        kspace_cutoff = 3.5
-        k_half = generate_k_vectors_ewald_summation(cell, kspace_cutoff)
+        k_cutoff = 3.5
+        k_half = generate_k_vectors_ewald_summation(cell, k_cutoff)
         k = torch.cat([k_half.new_zeros((1, 3)), k_half], dim=0).to(torch.float64)
 
         cache = prepare_multipole_scf_cache(
@@ -684,10 +684,10 @@ class TestSCFCacheValidation:
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
                 receiver_sigmas=[],
-                kspace_cutoff=3.0,
+                k_cutoff=3.0,
             )
 
-    def test_rejects_missing_kspace_cutoff_and_k_vectors(self):
+    def test_rejects_missing_k_cutoff_and_k_vectors(self):
         with pytest.raises(ValueError, match="k_vectors"):
             prepare_multipole_scf_cache(
                 torch.eye(3, dtype=torch.float64) * 5.0,
@@ -702,7 +702,7 @@ class TestSCFCacheValidation:
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=3.0,
+                k_cutoff=3.0,
                 l_max=3,
             )
 
@@ -712,7 +712,7 @@ class TestSCFCacheValidation:
                 torch.eye(4, dtype=torch.float64),
                 sigma=1.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=3.0,
+                k_cutoff=3.0,
             )
 
 
@@ -742,7 +742,7 @@ class TestEnergyStep:
             seed=0, n_atoms=5, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e = multipole_scf_step_energy(cache, positions, source_feats)
         assert e.shape == (5,)
@@ -758,12 +758,12 @@ class TestEnergyStep:
             seed=seed, n_atoms=6, box_len=5.0, device=td, with_dipoles=with_dipoles
         )
         sigma = 1.0
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
         cache = prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=[1.0],
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             l_max=1 if with_dipoles else 0,
         )
         e_scf = multipole_scf_step_energy(cache, positions, source_feats)
@@ -772,7 +772,7 @@ class TestEnergyStep:
             source_feats,
             cell,
             sigma=sigma,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
         np.testing.assert_allclose(
             float(e_scf.sum()), float(e_one_shot.sum()), rtol=1e-14, atol=1e-14
@@ -786,7 +786,7 @@ class TestEnergyStep:
         zero_d = torch.zeros((5, 3), dtype=torch.float64, device=td)
         source_feats_zero = pack_charges_dipoles(charges, zero_d)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e_none = multipole_scf_step_energy(cache, positions, source_feats_none)
         e_zero = multipole_scf_step_energy(cache, positions, source_feats_zero)
@@ -802,7 +802,7 @@ class TestEnergyStep:
             seed=31, n_atoms=5, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e_a_scf = multipole_scf_step_energy(cache, positions, source_feats_a)
         e_b_scf = multipole_scf_step_energy(cache, positions, source_feats_b)
@@ -813,14 +813,14 @@ class TestEnergyStep:
             source_feats_a,
             cell,
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         e_b_one = multipole_electrostatic_energy(
             positions,
             source_feats_b,
             cell,
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         np.testing.assert_allclose(
             float(e_a_scf.sum()), float(e_a_one.sum()), rtol=1e-14, atol=1e-14
@@ -835,7 +835,7 @@ class TestEnergyStep:
             seed=0, n_atoms=4, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         wrong_source = torch.zeros((3, 1), dtype=torch.float64, device=td)
         with pytest.raises(ValueError):
@@ -852,7 +852,7 @@ class TestFeatureStep:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.7, 1.3],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         feats = multipole_scf_step_features(cache, positions, source_feats)
         assert feats.shape == (5, 2 * 4)
@@ -867,7 +867,7 @@ class TestFeatureStep:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.8, 1.2],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         feats = multipole_scf_step_features(cache, positions, source_feats)
         assert feats.shape == (4, 2 * 4)
@@ -882,12 +882,12 @@ class TestFeatureStep:
         )
         sigma = 1.0
         receiver_sigmas = [0.6, 1.0, 1.4]
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
         cache = prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             l_max=1 if with_dipoles else 0,
         )
         f_scf = multipole_scf_step_features(cache, positions, source_feats)
@@ -897,7 +897,7 @@ class TestFeatureStep:
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
         np.testing.assert_allclose(
             f_scf.detach().cpu().numpy(),
@@ -914,13 +914,13 @@ class TestFeatureStep:
         )
         sigma = 1.0
         receiver_sigmas = [0.8, 1.2]
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
         mode = NormMode[mode_name.upper()]
         cache = prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             feature_normalize=mode,
         )
         f_scf = multipole_scf_step_features(cache, positions, source_feats)
@@ -930,7 +930,7 @@ class TestFeatureStep:
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             feature_normalize=mode,
         )
         np.testing.assert_allclose(
@@ -947,12 +947,12 @@ class TestFeatureStep:
         )
         sigma = 1.0
         receiver_sigmas = [1.0]
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
         cache = prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
         f_scf = multipole_scf_step_features(
             cache, positions, source_feats, include_self_interaction=True
@@ -963,7 +963,7 @@ class TestFeatureStep:
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             include_self_interaction=True,
         )
         np.testing.assert_allclose(
@@ -985,7 +985,7 @@ class TestFeatureStep:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.9, 1.1],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         f_a = multipole_scf_step_features(cache, positions, source_feats_a)
         f_b = multipole_scf_step_features(cache, positions, source_feats_b)
@@ -996,7 +996,7 @@ class TestFeatureStep:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.9, 1.1],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         np.testing.assert_allclose(
             f_a.detach().cpu().numpy(),

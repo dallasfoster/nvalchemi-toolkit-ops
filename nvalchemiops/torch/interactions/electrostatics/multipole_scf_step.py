@@ -840,7 +840,7 @@ def multipole_ewald_scf_step_energy(
     ``cache`` must have been built with ``alpha`` (non-None):
 
         cache = prepare_multipole_scf_cache(
-            cell, sigma=sigma, alpha=alpha, kspace_cutoff=kcut
+            cell, sigma=sigma, alpha=alpha, k_cutoff=kcut
         )
 
     A direct-k-space cache (``alpha=None``) would give the wrong reciprocal

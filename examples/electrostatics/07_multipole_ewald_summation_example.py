@@ -185,7 +185,7 @@ print(f"neighbor list: {idx_j.shape[0]} pairs, cutoff = {cutoff} Å")
 
 sigma = 0.5
 alpha = 0.35
-kspace_cutoff = 2.0
+k_cutoff = 2.0
 
 moments_l0 = pack_multipole_moments(charges)  # (N, 1) — charges only
 pos_g = positions.clone().requires_grad_(True)
@@ -198,7 +198,7 @@ E_l0 = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 # ``multipole_ewald_summation`` returns PER-ATOM energies, shape ``(N,)``.
 # Call ``.sum()`` for the system total; use ``scatter_add`` for per-system
@@ -255,7 +255,7 @@ E_l1 = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 grad_pos, grad_mu = torch.autograd.grad(E_l1.sum(), [pos_g, mu_cart_g])
 print(f"l_max=1  E (total) = {E_l1.sum().item():.6f}")
@@ -305,7 +305,7 @@ E_l2 = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 grads = torch.autograd.grad(E_l2.sum(), [pos_g, q_g, mu_g_cart, Q_g])
 print(f"l_max=2  E (full Ewald, total) = {E_l2.sum().item():.6f}")
@@ -342,7 +342,7 @@ E_for_stress = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 (grad_cell,) = torch.autograd.grad(E_for_stress.sum(), [cell_g])
 volume = float(torch.det(cell))
@@ -362,7 +362,7 @@ E_l2_for_stress = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 (grad_cell_l2,) = torch.autograd.grad(E_l2_for_stress.sum(), [cell_g])
 stress_l2 = (cell.T @ grad_cell_l2) / volume
@@ -390,7 +390,7 @@ E = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 # Forces — autograd-connected with create_graph=True (full Ewald: the
 # graph runs both the real-space and reciprocal 2nd-order kernels).
@@ -430,7 +430,7 @@ E = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
 )
 # Virial stress with create_graph=True so it stays autograd-connected to the
 # inputs (full Ewald: real + reciprocal cell second-order).
@@ -451,7 +451,7 @@ print(
 # Auto-Estimated Ewald Parameters
 # -------------------------------
 # ``multipole_ewald_summation`` accepts ``alpha=None`` and
-# ``kspace_cutoff=None``; the Kolafa-Perram balance auto-estimates them
+# ``k_cutoff=None``; the Kolafa-Perram balance auto-estimates them
 # from ``sigma`` and the system geometry at the requested accuracy
 # (relative energy error). You can also call the estimator yourself
 # first when you want to log / log-scan / cache the values — that's
@@ -481,7 +481,7 @@ E_auto = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=alpha_auto,
-    kspace_cutoff=kcut_auto,
+    k_cutoff=kcut_auto,
 )
 print(f"auto-parameters Ewald (l_max=1): E = {E_auto.sum().item():.6f}")
 # Equivalent shortcut — pass None and let the wrapper estimate internally:
@@ -494,12 +494,10 @@ E_auto_via_none = multipole_ewald_summation(
     unit_shifts,
     sigma=sigma,
     alpha=None,
-    kspace_cutoff=None,
+    k_cutoff=None,
     accuracy=1e-6,
 )
-print(
-    f"  (matches alpha/kspace_cutoff=None shortcut: {E_auto_via_none.sum().item():.6f})"
-)
+print(f"  (matches alpha/k_cutoff=None shortcut: {E_auto_via_none.sum().item():.6f})")
 
 # %%
 # Batched Workflow (Multi-System)
@@ -552,7 +550,7 @@ E_batch = multipole_ewald_summation(
     sh_batch,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     batch_idx=batch_idx,
 )
 # E_batch is per-atom (N_total,). Reduce to per-system (B,) with scatter_add.
@@ -583,7 +581,7 @@ E_batch_l1 = multipole_ewald_summation(
     sh_batch,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     batch_idx=batch_idx,
 )
 E_batch_l1_sys = torch.zeros(
@@ -602,7 +600,7 @@ E_batch_l2 = multipole_ewald_summation(
     sh_batch,
     sigma=sigma,
     alpha=alpha,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     batch_idx=batch_idx,
 )
 E_batch_l2_sys = torch.zeros(
@@ -643,7 +641,7 @@ for lmax_tag, moments_b in (
         sh_batch,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kspace_cutoff,
+        k_cutoff=k_cutoff,
         batch_idx=batch_idx,
     )
     # Forces for the whole batch (autograd-connected). ``E_fl`` is per-atom
@@ -681,7 +679,7 @@ for lmax_tag, moments_b in (
         sh_batch,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kspace_cutoff,
+        k_cutoff=k_cutoff,
         batch_idx=batch_idx,
     )
     # Per-system virial stress (B, 3, 3), create_graph-connected.

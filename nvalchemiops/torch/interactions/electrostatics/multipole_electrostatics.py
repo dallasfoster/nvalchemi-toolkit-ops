@@ -33,12 +33,19 @@ autograd-connected to ``positions`` and ``multipole_moments``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from nvalchemiops.torch.interactions.electrostatics._multipole_moments import (
     split_packed_for_kernels,
 )
 from nvalchemiops.torch.math.gto import NormMode
+
+if TYPE_CHECKING:
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        MultipoleSCFCache,
+    )
 
 
 def _resolve_norm_mode(mode: NormMode | int | str) -> NormMode:
@@ -66,7 +73,7 @@ def multipole_electrostatic_energy(
     *,
     batch_idx: torch.Tensor | None = None,
     sigma: float,
-    kspace_cutoff: float | None = None,
+    k_cutoff: float | None = None,
     k_vectors: torch.Tensor | None = None,
     normalize: NormMode | int | str = NormMode.MULTIPOLES,
     include_self_interaction: bool = False,
@@ -92,7 +99,7 @@ def multipole_electrostatic_energy(
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use ``batch_idx`` to
     select the batched path (returns per-atom :math:`(N_\text{total},)`).
-    Batched mode requires ``kspace_cutoff`` (a pre-generated ``k_vectors`` is
+    Batched mode requires ``k_cutoff`` (a pre-generated ``k_vectors`` is
     single-system only).
 
     Parameters
@@ -115,7 +122,7 @@ def multipole_electrostatic_energy(
     sigma : float
         Density-basis Gaussian width. Used for both the source GTO basis and
         the self-interaction overlap (matches ``GTOElectrostaticEnergy``).
-    kspace_cutoff : float, optional
+    k_cutoff : float, optional
         Maximum ``|k|`` to include in the reciprocal-space sum. Required when
         ``k_vectors`` is not supplied; ignored when it is.
     k_vectors : torch.Tensor, optional
@@ -126,7 +133,7 @@ def multipole_electrostatic_energy(
         across many energy evaluations for the same geometry (MD steps at
         fixed cell, SCF iterations, benchmark loops). Must live on
         ``positions.device``. When omitted, the function generates k-vectors
-        internally via ``generate_k_vectors_ewald_summation(cell, kspace_cutoff)``
+        internally via ``generate_k_vectors_ewald_summation(cell, k_cutoff)``
         and prepends the origin.
     normalize : NormMode | int | str
         Normalization convention for the density basis. Defaults to
@@ -154,8 +161,7 @@ def multipole_electrostatic_energy(
             raise ValueError(f"batched cell must be (B, 3, 3), got {tuple(cell.shape)}")
         if k_vectors is not None:
             raise ValueError(
-                "k_vectors is not supported for batched energy; pass "
-                "kspace_cutoff instead."
+                "k_vectors is not supported for batched energy; pass k_cutoff instead."
             )
     elif cell.shape != (3, 3):
         raise ValueError(f"cell must be (3, 3) or (B, 3, 3), got {tuple(cell.shape)}")
@@ -173,10 +179,10 @@ def multipole_electrostatic_energy(
         )
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}")
-    if k_vectors is None and (kspace_cutoff is None or kspace_cutoff <= 0.0):
+    if k_vectors is None and (k_cutoff is None or k_cutoff <= 0.0):
         raise ValueError(
-            "Either k_vectors must be supplied, or kspace_cutoff must be a "
-            f"positive float (got kspace_cutoff={kspace_cutoff})."
+            "Either k_vectors must be supplied, or k_cutoff must be a "
+            f"positive float (got k_cutoff={k_cutoff})."
         )
 
     # Split into the l<=1 e3nn block + the Cartesian quadrupole (None for l<2).
@@ -195,7 +201,7 @@ def multipole_electrostatic_energy(
         cell,
         sigma=sigma,
         receiver_sigmas=[sigma],
-        kspace_cutoff=kspace_cutoff,
+        k_cutoff=k_cutoff,
         k_vectors=None if is_batch else k_vectors,
         l_max=l_max,
         density_normalize=norm_mode,
@@ -220,9 +226,9 @@ def multipole_reciprocal_space_energy(
     batch_idx: torch.Tensor | None = None,
     sigma: float,
     alpha: float,
-    kspace_cutoff: float | None = None,
-    k_vectors: torch.Tensor | None = None,
+    k_cutoff: float | None = None,
     normalize: NormMode | int | str = NormMode.MULTIPOLES,
+    cache: MultipoleSCFCache | None = None,
 ) -> torch.Tensor:
     r"""Reciprocal-space half of an Ewald-split multipole electrostatic energy.
 
@@ -244,12 +250,12 @@ def multipole_reciprocal_space_energy(
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use ``batch_idx`` to
     select the batched path (returns per-atom :math:`(N_\text{total},)`).
-    Batched mode requires ``kspace_cutoff`` (a pre-generated ``k_vectors``
-    is single-system only).
+    Both single and batched modes build their k-grid from ``k_cutoff`` (or
+    reuse a pre-built ``cache``).
 
     Parameters
     ----------
-    positions, multipole_moments, cell, sigma, kspace_cutoff, k_vectors, normalize
+    positions, multipole_moments, cell, sigma, k_cutoff, normalize
         Same as :func:`multipole_electrostatic_energy`.
     batch_idx : torch.Tensor, optional, shape (N_total,), int32
         Per-atom system index (expected sorted). Required when ``cell`` is
@@ -257,6 +263,20 @@ def multipole_reciprocal_space_energy(
     alpha : float
         Ewald splitting parameter (must be positive). The caller's
         real-space kernel should use the same ``alpha``.
+    cache : MultipoleSCFCache, optional
+        Pre-built reciprocal cache (from :func:`prepare_multipole_scf_cache`)
+        holding the position-independent k-grid / GTO-Fourier (``phi_hat``) /
+        per-k-factor tables. When given, the per-call cache rebuild is skipped
+        (MD / inference steady state) — the analog of passing precomputed
+        ``k_squared`` to PME. ``cell``/``sigma``/``alpha``/``k_cutoff`` are then
+        ignored for the reciprocal (the cache already encodes them); the caller
+        owns matching the cache to the system.
+
+        .. warning::
+            A pre-built cache holds a fixed (detached) k-grid and volume, so
+            ``grad(E, cell)`` (stress) does **not** flow through it — pass
+            ``cache=None`` for stress / cell-gradient training. Forces
+            (``grad(E, positions)``) are unaffected (positions enter per call).
 
     Returns
     -------
@@ -273,11 +293,6 @@ def multipole_reciprocal_space_energy(
     if is_batch:
         if cell.ndim != 3 or cell.shape[-2:] != (3, 3):
             raise ValueError(f"batched cell must be (B, 3, 3), got {tuple(cell.shape)}")
-        if k_vectors is not None:
-            raise ValueError(
-                "k_vectors is not supported for batched energy; pass "
-                "kspace_cutoff instead."
-            )
     elif cell.shape != (3, 3):
         raise ValueError(f"cell must be (3, 3) or (B, 3, 3), got {tuple(cell.shape)}")
     if positions.ndim != 2 or positions.shape[-1] != 3:
@@ -296,35 +311,51 @@ def multipole_reciprocal_space_energy(
         raise ValueError(f"sigma must be positive, got {sigma}")
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
-    if k_vectors is None and (kspace_cutoff is None or kspace_cutoff <= 0.0):
+    if cache is None and (k_cutoff is None or k_cutoff <= 0.0):
         raise ValueError(
-            "Either k_vectors must be supplied, or kspace_cutoff must be a "
-            f"positive float (got kspace_cutoff={kspace_cutoff})."
+            "Either a pre-built cache or a positive k_cutoff "
+            f"must be supplied (got k_cutoff={k_cutoff})."
         )
 
     norm_mode = _resolve_norm_mode(normalize)
     # Packed e3nn moments -> l<=1 SCF-step block + Cartesian l=2 channel.
     source_feats, quadrupoles, l_max = split_packed_for_kernels(multipole_moments)
 
-    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
-        prepare_multipole_scf_cache,
-    )
     from nvalchemiops.torch.interactions.electrostatics.multipole_scf_step import (
         multipole_scf_step_energy,
     )
 
-    cache = prepare_multipole_scf_cache(
-        cell,
-        sigma=sigma,
-        receiver_sigmas=[sigma],
-        kspace_cutoff=kspace_cutoff,
-        k_vectors=None if is_batch else k_vectors,
-        l_max=l_max,
-        density_normalize=norm_mode,
-        feature_normalize=norm_mode,
-        alpha=alpha,
-        device=positions.device,
-    )
+    if cache is None:
+        from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+            prepare_multipole_scf_cache,
+        )
+
+        cache = prepare_multipole_scf_cache(
+            cell,
+            sigma=sigma,
+            receiver_sigmas=[sigma],
+            k_cutoff=k_cutoff,
+            l_max=l_max,
+            density_normalize=norm_mode,
+            feature_normalize=norm_mode,
+            alpha=alpha,
+            device=positions.device,
+        )
+    else:
+        # Caller-supplied cache: cheap structural checks (the caller owns
+        # matching cell/sigma/alpha; see the cache= warning in the docstring).
+        if cache.is_batched != is_batch:
+            raise ValueError(
+                f"cache.is_batched={cache.is_batched} does not match the call "
+                f"(batch_idx {'set' if is_batch else 'None'}); build the cache "
+                "from a (B, 3, 3) cell for batched runs and a (3, 3) cell "
+                "otherwise."
+            )
+        if cache.l_max < l_max:
+            raise ValueError(
+                f"cache.l_max={cache.l_max} is below the moment order l_max="
+                f"{l_max}; rebuild the cache with l_max>={l_max}."
+            )
     # Return the raw reciprocal-space sum; the caller subtracts the Ewald
     # self-term alongside their real-space erfc contribution.
     return multipole_scf_step_energy(

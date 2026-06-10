@@ -936,7 +936,7 @@ class TestMultipoleEwaldSummationAutoEstimate:
             shifts,
             sigma=sigma,
             alpha=float(params.alpha.item()),
-            kspace_cutoff=float(params.reciprocal_space_cutoff.item()),
+            k_cutoff=float(params.reciprocal_space_cutoff.item()),
         )
         e_auto = multipole_ewald_summation(
             positions,

@@ -107,7 +107,7 @@ class TestBasics:
             pack_charges_dipoles(sys["charges"], sys["dipoles"]),
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert energy.shape == (4,)
         assert energy.dtype == torch.float64
@@ -121,7 +121,7 @@ class TestBasics:
             pack_charges_dipoles(sys["charges"], sys["dipoles"]),
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert energy.sum().dtype == torch.float64
 
@@ -136,14 +136,14 @@ class TestBasics:
             pack_charges_dipoles(sys["charges"], None),
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         e_zero = multipole_electrostatic_energy(
             sys["positions"],
             pack_charges_dipoles(sys["charges"], zero_dipoles),
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
         )
         assert torch.allclose(e_none.sum(), e_zero.sum(), rtol=1e-14, atol=1e-14)
 
@@ -157,7 +157,7 @@ class TestBasics:
             source_feats,
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
             include_self_interaction=True,
         )
         e_without = multipole_electrostatic_energy(
@@ -165,7 +165,7 @@ class TestBasics:
             source_feats,
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=4.0,
+            k_cutoff=4.0,
             include_self_interaction=False,
         )
         # E_self is positive, so include_self=False gives the smaller energy.
@@ -183,7 +183,7 @@ class TestValidation:
                 torch.zeros((5, 1), dtype=torch.float64),
                 torch.eye(3, dtype=torch.float64),
                 sigma=1.0,
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
     def test_source_feats_wrong_length(self):
@@ -193,7 +193,7 @@ class TestValidation:
                 torch.zeros((3, 1), dtype=torch.float64),
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
     def test_source_feats_wrong_last_dim(self):
@@ -203,7 +203,7 @@ class TestValidation:
                 torch.zeros((4, 5), dtype=torch.float64),
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
     def test_bad_cell_shape(self):
@@ -213,7 +213,7 @@ class TestValidation:
                 torch.zeros((4, 1), dtype=torch.float64),
                 torch.eye(4, dtype=torch.float64),
                 sigma=1.0,
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
     def test_non_positive_sigma(self):
@@ -223,21 +223,21 @@ class TestValidation:
                 torch.zeros((4, 1), dtype=torch.float64),
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=0.0,
-                kspace_cutoff=4.0,
+                k_cutoff=4.0,
             )
 
-    def test_non_positive_kspace_cutoff(self):
-        with pytest.raises(ValueError, match="kspace_cutoff"):
+    def test_non_positive_k_cutoff(self):
+        with pytest.raises(ValueError, match="k_cutoff"):
             multipole_electrostatic_energy(
                 torch.zeros((4, 3), dtype=torch.float64),
                 torch.zeros((4, 1), dtype=torch.float64),
                 torch.eye(3, dtype=torch.float64) * 5.0,
                 sigma=1.0,
-                kspace_cutoff=-1.0,
+                k_cutoff=-1.0,
             )
 
-    def test_missing_both_kspace_cutoff_and_k_vectors(self):
-        """At least one of ``kspace_cutoff`` / ``k_vectors`` must be supplied."""
+    def test_missing_both_k_cutoff_and_k_vectors(self):
+        """At least one of ``k_cutoff`` / ``k_vectors`` must be supplied."""
         with pytest.raises(ValueError, match="k_vectors"):
             multipole_electrostatic_energy(
                 torch.zeros((4, 3), dtype=torch.float64),
@@ -264,7 +264,7 @@ class TestNormalizationAndKVectors:
         """Pre-supplying the same k-grid the binding would build internally gives the same energy."""
         td = _es_torch_device(device)
         sys = _random_system(seed=13, n_atoms=6, box_len=5.0, device=td)
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
 
         source_feats = pack_charges_dipoles(sys["charges"], sys["dipoles"])
         e_internal = multipole_electrostatic_energy(
@@ -272,11 +272,11 @@ class TestNormalizationAndKVectors:
             source_feats,
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
 
         # Same k-grid, fed in explicitly.
-        k_half = generate_k_vectors_ewald_summation(sys["cell"], kspace_cutoff)
+        k_half = generate_k_vectors_ewald_summation(sys["cell"], k_cutoff)
         k_vecs = torch.cat([k_half.new_zeros((1, 3)), k_half], dim=0).to(
             dtype=torch.float64
         )
@@ -298,7 +298,7 @@ class TestNormalizationAndKVectors:
             multipole_moments=pack_charges_dipoles(sys["charges"], sys["dipoles"]),
             cell=sys["cell"],
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         e_enum = multipole_electrostatic_energy(**kwargs, normalize=NormMode.RECEIVER)
         e_int = multipole_electrostatic_energy(
@@ -328,14 +328,14 @@ class TestPhysicalInvariants:
             source_feats,
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         e_after = multipole_electrostatic_energy(
             sys["positions"] + shift,
             source_feats,
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         # |ρ(k)|² is phase-invariant, so the energy agrees to float64 noise.
         np.testing.assert_allclose(
@@ -353,7 +353,7 @@ class TestPhysicalInvariants:
             pack_charges_dipoles(zero_q, zero_d),
             sys["cell"],
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         assert float(e.sum()) == 0.0
 
@@ -428,7 +428,7 @@ class TestQuadrupole:
             mm,
             torch.tensor(cell, device=td),
             sigma=sigma,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         E_ref = _pathb_reference_quadrupole(pos, q, mu, Q, cell, sigma, kcut)
         assert abs(float(E.sum()) - E_ref) / abs(E_ref) < 1e-8
@@ -440,7 +440,7 @@ class TestQuadrupole:
         pos_t = torch.tensor(pos, device=td)
         cell_t = torch.tensor(cell, device=td)
         Qz = torch.zeros((pos.shape[0], 3, 3), dtype=torch.float64, device=td)
-        kw = dict(sigma=0.5, kspace_cutoff=12.0)
+        kw = dict(sigma=0.5, k_cutoff=12.0)
         e_l1 = multipole_electrostatic_energy(
             pos_t,
             pack_multipole_moments(
@@ -471,7 +471,7 @@ class TestQuadrupole:
         def energy(pos_, q_, mu_, Q_):
             mm = pack_multipole_moments(q_, mu_, Q_)
             return multipole_electrostatic_energy(
-                pos_, mm, cell_t, sigma=sigma, kspace_cutoff=kcut
+                pos_, mm, cell_t, sigma=sigma, k_cutoff=kcut
             ).sum()
 
         pos_t = torch.tensor(pos, device=td, requires_grad=True)
@@ -662,13 +662,13 @@ def _make_value_fn(entry, mode, l_max, sys):
 
             def value(pos, mm, cell):
                 return multipole_electrostatic_energy(
-                    pos, mm, cell, sigma=_SIGMA, kspace_cutoff=_KCUT
+                    pos, mm, cell, sigma=_SIGMA, k_cutoff=_KCUT
                 ).sum()
         else:
 
             def value(pos, mm, cell):
                 return multipole_electrostatic_energy(
-                    pos, mm, cell, batch_idx=bidx, sigma=_SIGMA, kspace_cutoff=_KCUT
+                    pos, mm, cell, batch_idx=bidx, sigma=_SIGMA, k_cutoff=_KCUT
                 ).sum()
     elif entry == "features":
         if mode == "single":
@@ -680,7 +680,7 @@ def _make_value_fn(entry, mode, l_max, sys):
                     cell,
                     sigma=_SIGMA,
                     receiver_sigmas=list(_RSIG),
-                    kspace_cutoff=_KCUT,
+                    k_cutoff=_KCUT,
                     feature_max_l=fml,
                 )
                 return _feat_weights(f)
@@ -694,7 +694,7 @@ def _make_value_fn(entry, mode, l_max, sys):
                     batch_idx=bidx,
                     sigma=_SIGMA,
                     receiver_sigmas=list(_RSIG),
-                    kspace_cutoff=_KCUT,
+                    k_cutoff=_KCUT,
                     feature_max_l=fml,
                 )
                 return _feat_weights(f)
@@ -710,7 +710,7 @@ def _make_value_fn(entry, mode, l_max, sys):
                 sh,
                 sigma=_SIGMA,
                 alpha=_ALPHA,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 batch_idx=bidx,
             ).sum()
     elif entry == "pme":
@@ -851,7 +851,7 @@ class TestCrossMethodPhysics:
                         torch.tensor(sh, dtype=torch.int32, device=td).reshape(-1, 3),
                         sigma=_SIGMA,
                         alpha=alpha,
-                        kspace_cutoff=7.0 / sc,
+                        k_cutoff=7.0 / sc,
                     ).sum()
                 )
             )
@@ -875,7 +875,7 @@ class TestCrossMethodPhysics:
 
         e_b = float(
             multipole_electrostatic_energy(
-                pos, mm, cell, sigma=_SIGMA, kspace_cutoff=_KCUT
+                pos, mm, cell, sigma=_SIGMA, k_cutoff=_KCUT
             ).sum()
         )
         e_ewald = float(
@@ -888,7 +888,7 @@ class TestCrossMethodPhysics:
                 st,
                 sigma=_SIGMA,
                 alpha=_ALPHA,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             ).sum()
         )
         e_pme = float(
@@ -943,7 +943,7 @@ class TestTorchCompile:
             seed=0, n_atoms=5, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
 
         def step(sf):
@@ -967,7 +967,7 @@ class TestTorchCompile:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.7, 1.3],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
 
         def step(sf):
@@ -1003,7 +1003,7 @@ class TestTorchCompile:
                 sf,
                 cell,
                 sigma=1.0,
-                kspace_cutoff=3.5,
+                k_cutoff=3.5,
             ).sum()
 
         e_eager = fn(source_feats)
@@ -1026,7 +1026,7 @@ class TestTorchCompile:
                 cell,
                 sigma=1.0,
                 receiver_sigmas=[0.8, 1.2],
-                kspace_cutoff=3.5,
+                k_cutoff=3.5,
             )
 
         f_eager = fn(source_feats)
@@ -1055,7 +1055,7 @@ class TestAutogradEnergy:
         )
         sf = source_feats.clone().requires_grad_(True)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e = multipole_scf_step_energy(cache, positions, sf)
         # requires_grad: the self-interaction torch subtract combines the
@@ -1074,7 +1074,7 @@ class TestAutogradEnergy:
             seed=seed, n_atoms=4, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
 
         def fn(sf):
@@ -1096,7 +1096,7 @@ class TestAutogradEnergy:
             seed=seed, n_atoms=4, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
 
         def fn(p):
@@ -1118,7 +1118,7 @@ class TestAutogradEnergy:
             seed=seed, n_atoms=4, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
 
         def fn(p, sf):
@@ -1136,7 +1136,7 @@ class TestAutogradEnergy:
         )
         p = positions.clone().requires_grad_(True)
         e = multipole_electrostatic_energy(
-            p, source_feats, cell, sigma=1.0, kspace_cutoff=3.5
+            p, source_feats, cell, sigma=1.0, k_cutoff=3.5
         )
         e.sum().backward()
         assert p.grad is not None
@@ -1155,7 +1155,7 @@ class TestAutogradEnergy:
         )
         sf = source_feats.clone().requires_grad_(True)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e = multipole_scf_step_energy(cache, positions, sf)
         e.sum().backward()
@@ -1192,7 +1192,7 @@ class TestAutogradEnergy:
         )
         sf = source_feats.clone().requires_grad_(True)
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e = multipole_scf_step_energy(
             cache, positions, sf, include_self_interaction=True
@@ -1224,7 +1224,7 @@ class TestAutogradFeatures:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.8, 1.2],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         f = multipole_scf_step_features(cache, positions, sf)
         assert f.requires_grad
@@ -1242,7 +1242,7 @@ class TestAutogradFeatures:
             cell,
             sigma=1.0,
             receiver_sigmas=[0.8, 1.2],
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         assert f.requires_grad
 
@@ -1259,7 +1259,7 @@ class TestAutogradFeatures:
             seed=seed, n_atoms=3, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[0.8, 1.2], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[0.8, 1.2], k_cutoff=3.5
         )
 
         def fn(p, sf):
@@ -1277,12 +1277,12 @@ class TestAutogradFeatures:
         )
         sigma = 1.0
         receiver_sigmas = [0.8, 1.2]
-        kspace_cutoff = 3.5
+        k_cutoff = 3.5
         cache = prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
 
         p_step = positions.clone().requires_grad_(True)
@@ -1298,7 +1298,7 @@ class TestAutogradFeatures:
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
         )
         f_one.sum().backward()
 
@@ -1332,10 +1332,10 @@ class TestAutogradOneShotEnergy:
             sf_one,
             cell,
             sigma=1.0,
-            kspace_cutoff=3.5,
+            k_cutoff=3.5,
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
         e_step = multipole_scf_step_energy(cache, positions, sf_step)
         e_one.sum().backward()
@@ -1367,7 +1367,7 @@ class TestCompileAutograd:
             seed=7, n_atoms=5, box_len=5.0, device=td
         )
         cache = prepare_multipole_scf_cache(
-            cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
+            cell, sigma=1.0, receiver_sigmas=[1.0], k_cutoff=3.5
         )
 
         def step(p, sf):
@@ -1425,7 +1425,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         pos = positions.clone()  # detached — not the variable we differentiate here
@@ -1446,7 +1446,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         sf = source_feats.clone()
@@ -1470,7 +1470,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         sf = source_feats.clone().requires_grad_(True)
@@ -1497,7 +1497,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         sf = source_feats.clone()
@@ -1528,7 +1528,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         energy = multipole_scf_step_energy(cache, positions, source_feats).sum()
@@ -1545,7 +1545,7 @@ class TestDoubleBackward:
             cell,
             sigma=1.5,
             receiver_sigmas=[1.5],
-            kspace_cutoff=1.5,
+            k_cutoff=1.5,
             l_max=1,
         )
         sf = source_feats.clone().requires_grad_(True)
@@ -1591,7 +1591,7 @@ class TestReciprocalValidation:
                 _cell(),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_moments(self):
@@ -1602,7 +1602,7 @@ class TestReciprocalValidation:
                 _cell(),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_cell(self):
@@ -1613,7 +1613,7 @@ class TestReciprocalValidation:
                 torch.zeros(2, 2, device=_TD),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_nonpositive_sigma(self):
@@ -1624,7 +1624,7 @@ class TestReciprocalValidation:
                 _cell(),
                 sigma=0.0,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_nonpositive_alpha(self):
@@ -1635,11 +1635,11 @@ class TestReciprocalValidation:
                 _cell(),
                 sigma=0.5,
                 alpha=0.0,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
-    def test_missing_kspace_cutoff_and_kvectors(self):
-        with pytest.raises(ValueError, match="k_vectors|kspace_cutoff"):
+    def test_missing_k_cutoff_and_kvectors(self):
+        with pytest.raises(ValueError, match="k_vectors|k_cutoff"):
             multipole_reciprocal_space_energy(
                 _pos(),
                 _charges(),
@@ -1661,7 +1661,7 @@ class TestBatchedValidation:
                 _cell().unsqueeze(0),
                 batch_idx=self._bidx(),
                 sigma=0.5,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_energy_bad_moments(self):
@@ -1672,7 +1672,7 @@ class TestBatchedValidation:
                 _cell().unsqueeze(0),
                 batch_idx=self._bidx(),
                 sigma=0.5,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_energy_bad_cells(self):
@@ -1683,7 +1683,7 @@ class TestBatchedValidation:
                 _cell(),
                 batch_idx=self._bidx(),
                 sigma=0.5,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_energy_bad_batch_idx(self):
@@ -1694,7 +1694,7 @@ class TestBatchedValidation:
                 _cell().unsqueeze(0),
                 batch_idx=self._bidx(5),
                 sigma=0.5,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_reciprocal_bad_cells(self):
@@ -1706,7 +1706,7 @@ class TestBatchedValidation:
                 batch_idx=self._bidx(),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_reciprocal_bad_batch_idx(self):
@@ -1718,7 +1718,7 @@ class TestBatchedValidation:
                 batch_idx=self._bidx(5),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_reciprocal_nonpositive_alpha(self):
@@ -1730,7 +1730,7 @@ class TestBatchedValidation:
                 batch_idx=self._bidx(),
                 sigma=0.5,
                 alpha=0.0,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_reciprocal_bad_positions(self):
@@ -1742,7 +1742,7 @@ class TestBatchedValidation:
                 batch_idx=self._bidx(),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_reciprocal_bad_moments(self):
@@ -1754,7 +1754,7 @@ class TestBatchedValidation:
                 batch_idx=self._bidx(),
                 sigma=0.5,
                 alpha=0.6,
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
 
@@ -1767,7 +1767,7 @@ class TestFeaturesValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_cell(self):
@@ -1778,7 +1778,7 @@ class TestFeaturesValidation:
                 torch.zeros(2, 2, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_nonpositive_sigma(self):
@@ -1789,7 +1789,7 @@ class TestFeaturesValidation:
                 _cell(),
                 sigma=-1.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_moments(self):
@@ -1800,7 +1800,7 @@ class TestFeaturesValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_feature_max_l(self):
@@ -1811,7 +1811,7 @@ class TestFeaturesValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 feature_max_l=3,
             )
 
@@ -1824,7 +1824,7 @@ class TestFeaturesValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=torch.tensor([], dtype=torch.float64),
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_receiver_sigmas_tensor_valid(self):
@@ -1836,7 +1836,7 @@ class TestFeaturesValidation:
             _cell(),
             sigma=0.5,
             receiver_sigmas=torch.tensor([1.0, 1.5], dtype=torch.float64),
-            kspace_cutoff=_KCUT,
+            k_cutoff=_KCUT,
         )
         assert torch.isfinite(f).all()
 
@@ -1849,7 +1849,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(3, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_bad_moments(self):
@@ -1861,7 +1861,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(3, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_bad_cells(self):
@@ -1873,7 +1873,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(3, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_bad_batch_idx(self):
@@ -1885,7 +1885,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(5, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_receiver_sigmas_tensor_empty(self):
@@ -1897,7 +1897,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(3, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=torch.tensor([], dtype=torch.float64),
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_bad_feature_max_l(self):
@@ -1909,7 +1909,7 @@ class TestFeaturesValidation:
                 batch_idx=torch.zeros(3, dtype=torch.int32, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 feature_max_l=5,
             )
 
@@ -1921,7 +1921,7 @@ class TestScfCacheValidation:
                 _cell(),
                 sigma=0.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_bad_feature_max_l(self):
@@ -1930,7 +1930,7 @@ class TestScfCacheValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 feature_max_l=7,
             )
 
@@ -1940,7 +1940,7 @@ class TestScfCacheValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 alpha=-1.0,
             )
 
@@ -1951,7 +1951,7 @@ class TestScfCacheValidation:
                 _cell(),
                 sigma=0.5,
                 receiver_sigmas=torch.tensor([-1.0], dtype=torch.float64),
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_empty_cells(self):
@@ -1960,7 +1960,7 @@ class TestScfCacheValidation:
                 torch.zeros(0, 3, 3, device=_TD),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_receiver_sigmas_empty(self):
@@ -1969,7 +1969,7 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=[],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_nonpositive_sigma(self):
@@ -1978,7 +1978,7 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.0,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_bad_l_max(self):
@@ -1987,7 +1987,7 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 l_max=4,
             )
 
@@ -1997,17 +1997,17 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 feature_max_l=9,
             )
 
-    def test_batch_bad_kspace_cutoff(self):
-        with pytest.raises(ValueError, match="kspace_cutoff must be"):
+    def test_batch_bad_k_cutoff(self):
+        with pytest.raises(ValueError, match="k_cutoff must be"):
             prepare_multipole_scf_cache(
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=-1.0,
+                k_cutoff=-1.0,
             )
 
     def test_batch_receiver_sigmas_negative(self):
@@ -2016,7 +2016,7 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=torch.tensor([-2.0], dtype=torch.float64),
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
             )
 
     def test_batch_alpha_nonpositive(self):
@@ -2025,7 +2025,7 @@ class TestScfCacheValidation:
                 _cell().unsqueeze(0),
                 sigma=0.5,
                 receiver_sigmas=[1.0],
-                kspace_cutoff=_KCUT,
+                k_cutoff=_KCUT,
                 alpha=-0.5,
             )
 
@@ -2046,7 +2046,7 @@ def _halflist(n):
 
 
 class TestEwaldAutoParameters:
-    """``multipole_ewald_summation`` with ``alpha``/``kspace_cutoff`` left None
+    """``multipole_ewald_summation`` with ``alpha``/``k_cutoff`` left None
     triggers ``estimate_multipole_ewald_parameters`` (the auto-param path)."""
 
     def test_single_system_auto_alpha_and_cutoff(self):
@@ -2060,7 +2060,7 @@ class TestEwaldAutoParameters:
             ptr,
             sh,
             sigma=0.5,
-        )  # alpha=None, kspace_cutoff=None → auto-estimate
+        )  # alpha=None, k_cutoff=None → auto-estimate
         assert torch.isfinite(e).all()
 
     def test_batched_auto_alpha_identical_cells(self):
@@ -2084,7 +2084,7 @@ class TestEwaldAutoParameters:
             sh,
             sigma=0.5,
             batch_idx=bidx,
-            kspace_cutoff=8.0,  # provide kcut; let alpha auto-estimate
+            k_cutoff=8.0,  # provide kcut; let alpha auto-estimate
         )
         assert torch.isfinite(e).all() and e.shape == (4,)
 
@@ -2277,7 +2277,7 @@ class TestBatchCache:
             dim=0,
         )
         cache = prepare_multipole_scf_cache(
-            cells, sigma=0.5, receiver_sigmas=[0.7], kspace_cutoff=3.5, l_max=1
+            cells, sigma=0.5, receiver_sigmas=[0.7], k_cutoff=3.5, l_max=1
         )
         assert cache.is_batched
         assert cache.batch_size == 3
@@ -2308,7 +2308,7 @@ def _per_system_energies_features(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=k_cut,
+            k_cutoff=k_cut,
             l_max=1,
         )
         source_feats = pack_charges_dipoles(charges, dipoles)
@@ -2331,7 +2331,7 @@ class TestBatchStepParity:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         e_b = multipole_scf_step_energy(
@@ -2361,7 +2361,7 @@ class TestBatchStepParity:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         f_b = multipole_scf_step_features(
@@ -2396,14 +2396,14 @@ class TestBatchStepParity:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=0,
         )
         cache_l1 = prepare_multipole_scf_cache(
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         e_l0 = multipole_scf_step_energy(
@@ -2443,7 +2443,7 @@ class TestBatchBackwardParity:
                 cell,
                 sigma=self.sigma,
                 receiver_sigmas=self.receiver_sigmas,
-                kspace_cutoff=self.k_cut,
+                k_cutoff=self.k_cut,
                 l_max=1,
             )
             e = multipole_scf_step_energy(cache, p, sf)
@@ -2461,7 +2461,7 @@ class TestBatchBackwardParity:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         e_vec = multipole_scf_step_energy(
@@ -2493,7 +2493,7 @@ class TestBatchBackwardParity:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         f = multipole_scf_step_features(cache_b, p, sf, batch_idx=batch["batch_idx"])
@@ -2522,7 +2522,7 @@ class TestBatchDoubleBackward:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         e_vec = multipole_scf_step_energy(cache_b, p, sf, batch_idx=batch["batch_idx"])
@@ -2548,7 +2548,7 @@ class TestBatchDoubleBackward:
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         f = multipole_scf_step_features(cache_b, p, sf, batch_idx=batch["batch_idx"])
@@ -2573,13 +2573,13 @@ class TestBatchOneShot:
             batch["cells"],
             batch_idx=batch["batch_idx"],
             sigma=self.sigma,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
         )
         cache_b = prepare_multipole_scf_cache(
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=[self.sigma],  # one-shot uses sigma as the only receiver σ
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         e_step = multipole_scf_step_energy(
@@ -2600,13 +2600,13 @@ class TestBatchOneShot:
             batch_idx=batch["batch_idx"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
         )
         cache_b = prepare_multipole_scf_cache(
             batch["cells"],
             sigma=self.sigma,
             receiver_sigmas=self.receiver_sigmas,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
             l_max=1,
         )
         f_step = multipole_scf_step_features(
@@ -2624,7 +2624,7 @@ class TestBatchValidation:
         cells = torch.zeros((4,), dtype=torch.float64, device=td)  # not (3,3)/(B,3,3)
         with pytest.raises(ValueError, match="cell must be"):
             prepare_multipole_scf_cache(
-                cells, sigma=0.5, receiver_sigmas=[0.7], kspace_cutoff=3.0
+                cells, sigma=0.5, receiver_sigmas=[0.7], k_cutoff=3.0
             )
 
     def test_batch_idx_length_mismatch(self, device):
@@ -2634,7 +2634,7 @@ class TestBatchValidation:
             dim=0,
         )
         cache_b = prepare_multipole_scf_cache(
-            cells, sigma=0.5, receiver_sigmas=[0.7], kspace_cutoff=3.0, l_max=1
+            cells, sigma=0.5, receiver_sigmas=[0.7], k_cutoff=3.0, l_max=1
         )
         pos = torch.zeros((5, 3), dtype=torch.float64, device=td)
         source_feats = torch.zeros((5, 4), dtype=torch.float64, device=td)
@@ -2698,7 +2698,7 @@ class TestBatchQuadrupole:
             cells,
             batch_idx=batch_idx,
             sigma=self.sigma,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
         )
         N_total = sum(n for n, _ in sizes)
         B = len(sizes)
@@ -2712,7 +2712,7 @@ class TestBatchQuadrupole:
                 pack_multipole_moments(q, mu, Q),
                 cell,
                 sigma=self.sigma,
-                kspace_cutoff=self.k_cut,
+                k_cutoff=self.k_cut,
             )
             torch.testing.assert_close(
                 e_b_per_sys[b], e_single.sum(), rtol=1e-9, atol=1e-9
@@ -2739,7 +2739,7 @@ class TestBatchQuadrupole:
             cells,
             batch_idx=batch_idx,
             sigma=self.sigma,
-            kspace_cutoff=self.k_cut,
+            k_cutoff=self.k_cut,
         )
         (g_b,) = torch.autograd.grad(e_b.sum(), pos)
         off = 0
@@ -2751,7 +2751,7 @@ class TestBatchQuadrupole:
                 pack_multipole_moments(q, mu, Q),
                 cell,
                 sigma=self.sigma,
-                kspace_cutoff=self.k_cut,
+                k_cutoff=self.k_cut,
             )
             (g_s,) = torch.autograd.grad(e_single.sum(), p_g)
             torch.testing.assert_close(g_b[off : off + n], g_s, rtol=1e-7, atol=1e-7)
@@ -2783,7 +2783,7 @@ class TestStepGraphBreaks:
             sys["cell"],
             sigma=_SIGMA,
             receiver_sigmas=list(_RSIG),
-            kspace_cutoff=_KCUT,
+            k_cutoff=_KCUT,
             l_max=l_max,
         )
         pos, bidx = sys["pos"], sys["batch_idx"]

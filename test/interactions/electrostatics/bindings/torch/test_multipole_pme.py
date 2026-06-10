@@ -1001,7 +1001,7 @@ class TestReciprocalSpace:
     Each call returns ``E_recip_pme - E_self - E_bg`` in Path A's
     ``FIELD_CONSTANT``-scaled units. The oracle is the raw reciprocal sum
     minus the self correction. Convergence floor is set by mesh density
-    (``mesh=(60, 60, 60)`` on ``L = 10``) and ``kspace_cutoff = 12``,
+    (``mesh=(60, 60, 60)`` on ``L = 10``) and ``k_cutoff = 12``,
     pushing the residual below ``rtol = 1e-4``.
     """
 
@@ -1030,7 +1030,7 @@ class TestReciprocalSpace:
         cell: torch.Tensor,
         sigma: float,
         alpha: float,
-        kspace_cutoff: float,
+        k_cutoff: float,
     ) -> torch.Tensor:
         """Path A reciprocal piece minus the self correction.
 
@@ -1044,7 +1044,7 @@ class TestReciprocalSpace:
         sf[:, 2] = dipoles[:, 2]  # μ_z
         sf[:, 3] = dipoles[:, 0]  # μ_x
         recip = multipole_reciprocal_space_energy(
-            positions, sf, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kspace_cutoff
+            positions, sf, cell, sigma=sigma, alpha=alpha, k_cutoff=k_cutoff
         )
         e_self = _multipole_ewald_self_energy_per_atom(sf, sigma, alpha).sum()
         return recip.sum() - e_self
@@ -1075,7 +1075,7 @@ class TestReciprocalSpace:
             spline_order=spline_order,
         )
         target = self._path_a_oracle(
-            positions, charges, dipoles, cell, sigma, alpha, kspace_cutoff=12.0
+            positions, charges, dipoles, cell, sigma, alpha, k_cutoff=12.0
         )
         torch.testing.assert_close(ours.sum(), target, rtol=1e-4, atol=1e-4)
 
@@ -1100,7 +1100,7 @@ class TestReciprocalSpace:
             spline_order=spline_order,
         )
         target = self._path_a_oracle(
-            positions, charges, dipoles, cell, sigma, alpha, kspace_cutoff=12.0
+            positions, charges, dipoles, cell, sigma, alpha, k_cutoff=12.0
         )
         torch.testing.assert_close(ours.sum(), target, rtol=1e-4, atol=1e-4)
 
@@ -1255,7 +1255,7 @@ class TestParticleMeshEwald:
         idx_j = torch.from_numpy(idx_j_np).to(td)
         nptr = torch.from_numpy(nptr_np).to(td)
         sh = torch.from_numpy(sh_np).to(td)
-        kspace_cutoff = 6.0 / sigma_c
+        k_cutoff = 6.0 / sigma_c
         return (
             td,
             positions,
@@ -1265,7 +1265,7 @@ class TestParticleMeshEwald:
             idx_j,
             nptr,
             sh,
-            kspace_cutoff,
+            k_cutoff,
         )
 
     @pytest.mark.parametrize("alpha", [0.4, 0.6])
@@ -1291,7 +1291,7 @@ class TestParticleMeshEwald:
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         e_pme = multipole_particle_mesh_ewald(
             positions,
@@ -1330,7 +1330,7 @@ class TestParticleMeshEwald:
             sh,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kcut,
+            k_cutoff=kcut,
         )
         e_pme = multipole_particle_mesh_ewald(
             positions,

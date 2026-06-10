@@ -222,7 +222,7 @@ def prepare_multipole_scf_cache(
     *,
     sigma: float,
     receiver_sigmas: list[float] | tuple[float, ...] | torch.Tensor,
-    kspace_cutoff: float | None = None,
+    k_cutoff: float | None = None,
     k_vectors: torch.Tensor | None = None,
     l_max: int = 1,
     feature_max_l: int = 1,
@@ -249,7 +249,7 @@ def prepare_multipole_scf_cache(
     ``cell`` of shape ``(3, 3)`` builds a single-system cache. ``cell`` of
     shape ``(B, 3, 3)`` builds a batched cache (``n_systems == B``) whose
     per-k tensors carry a leading-``B`` zero-padded layout; in that case
-    ``kspace_cutoff`` is required (a pre-generated ``k_vectors`` is not
+    ``k_cutoff`` is required (a pre-generated ``k_vectors`` is not
     supported for the batched build).
 
     Parameters
@@ -260,12 +260,12 @@ def prepare_multipole_scf_cache(
         Density-basis Gaussian width.
     receiver_sigmas : list / tuple / 1-D tensor of floats
         Multi-σ receiver widths. Must be non-empty.
-    kspace_cutoff, k_vectors
+    k_cutoff, k_vectors
         Same semantics as the step functions: either pass
-        ``kspace_cutoff`` to generate the k-grid internally (with origin
+        ``k_cutoff`` to generate the k-grid internally (with origin
         prepended), or pass a pre-generated ``k_vectors`` tensor
         (``(N_k, 3)`` float64 with origin at row 0). The batched build
-        (``cell`` ``(B, 3, 3)``) requires ``kspace_cutoff``.
+        (``cell`` ``(B, 3, 3)``) requires ``k_cutoff``.
     l_max : int
         Source multipole order the cache is being built for. ``0`` or
         ``1``. Only affects the ``feature_overlap_constants`` layout
@@ -301,7 +301,7 @@ def prepare_multipole_scf_cache(
             cell,
             sigma=sigma,
             receiver_sigmas=receiver_sigmas,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
             l_max=l_max,
             feature_max_l=feature_max_l,
             density_normalize=density_normalize,
@@ -321,10 +321,10 @@ def prepare_multipole_scf_cache(
         raise ValueError(f"feature_max_l must be 0, 1, or 2, got {feature_max_l}")
     if alpha is not None and alpha <= 0.0:
         raise ValueError(f"alpha, when given, must be positive, got {alpha}")
-    if k_vectors is None and (kspace_cutoff is None or kspace_cutoff <= 0.0):
+    if k_vectors is None and (k_cutoff is None or k_cutoff <= 0.0):
         raise ValueError(
-            "Either k_vectors must be supplied, or kspace_cutoff must be a "
-            f"positive float (got kspace_cutoff={kspace_cutoff})."
+            "Either k_vectors must be supplied, or k_cutoff must be a "
+            f"positive float (got k_cutoff={k_cutoff})."
         )
 
     if isinstance(receiver_sigmas, torch.Tensor):
@@ -348,7 +348,7 @@ def prepare_multipole_scf_cache(
     if k_vectors is None:
         cell_on_device = cell.to(device)
         k_vectors_half = generate_k_vectors_ewald_summation(
-            cell_on_device, float(kspace_cutoff)
+            cell_on_device, float(k_cutoff)
         )
         if k_vectors_half.ndim != 2:
             raise ValueError(
@@ -541,7 +541,7 @@ def _prepare_multipole_scf_cache_batch(
     *,
     sigma: float,
     receiver_sigmas: list[float] | tuple[float, ...] | torch.Tensor,
-    kspace_cutoff: float,
+    k_cutoff: float,
     l_max: int = 1,
     feature_max_l: int = 1,
     density_normalize: NormMode | int | str = NormMode.MULTIPOLES,
@@ -554,7 +554,7 @@ def _prepare_multipole_scf_cache_batch(
     Internal batched branch of :func:`prepare_multipole_scf_cache`. Every
     system in the batch gets its own k-vector grid generated via
     :func:`generate_k_vectors_ewald_summation` at the shared
-    ``kspace_cutoff``. The per-system grids are padded to the max-K
+    ``k_cutoff``. The per-system grids are padded to the max-K
     across the batch; padding is zero-filled in ``k_vectors``, and all
     dependent per-k tensors (``per_k_factor``, ``k_factor_proj``,
     ``source_phi_hat``, ``receiver_phi_hat``) have their pad rows
@@ -570,7 +570,7 @@ def _prepare_multipole_scf_cache_batch(
     ----------
     cells : torch.Tensor, shape (B, 3, 3)
         Per-system unit cells.
-    sigma, receiver_sigmas, kspace_cutoff, l_max, feature_max_l,
+    sigma, receiver_sigmas, k_cutoff, l_max, feature_max_l,
     density_normalize, feature_normalize, alpha
         Same semantics as :func:`prepare_multipole_scf_cache`; the
         values apply uniformly to every system in the batch. ``alpha``
@@ -597,8 +597,8 @@ def _prepare_multipole_scf_cache_batch(
         raise ValueError(f"l_max must be 0, 1, or 2, got {l_max}")
     if feature_max_l not in (0, 1, 2):
         raise ValueError(f"feature_max_l must be 0, 1, or 2, got {feature_max_l}")
-    if kspace_cutoff is None or kspace_cutoff <= 0.0:
-        raise ValueError(f"kspace_cutoff must be a positive float, got {kspace_cutoff}")
+    if k_cutoff is None or k_cutoff <= 0.0:
+        raise ValueError(f"k_cutoff must be a positive float, got {k_cutoff}")
 
     if isinstance(receiver_sigmas, torch.Tensor):
         sigmas_list = receiver_sigmas.detach().cpu().to(torch.float64).tolist()
@@ -622,9 +622,7 @@ def _prepare_multipole_scf_cache_batch(
     # Each system has its own valid-k count K_b; pad to K_max for uniform shapes.
     per_system_k: list[torch.Tensor] = []
     for b in range(batch_size):
-        k_half_b = generate_k_vectors_ewald_summation(
-            cells_dev[b], float(kspace_cutoff)
-        )
+        k_half_b = generate_k_vectors_ewald_summation(cells_dev[b], float(k_cutoff))
         if k_half_b.ndim != 2:
             raise ValueError(
                 f"generate_k_vectors_ewald_summation returned rank-{k_half_b.ndim} "

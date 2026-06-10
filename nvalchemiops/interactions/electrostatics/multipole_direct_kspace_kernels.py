@@ -1249,7 +1249,7 @@ def _launch_cossin_native_matmul(cosines, sines, m_cos, m_sin, contribs, device)
 # against the *next* kernel — confusing but characteristic.
 #
 # Repro: in the multipole Ewald backward at N≈4400 atoms, BCC layout,
-# kspace_cutoff=3.0, the tile-matmul over the (cos, sin) structure-factor
+# k_cutoff=3.0, the tile-matmul over the (cos, sin) structure-factor
 # table ((4400, 74464) float64) crosses the 2 GB threshold; the next
 # launch (``_project_features_postprocess_kernel``) is what surfaces the
 # error.

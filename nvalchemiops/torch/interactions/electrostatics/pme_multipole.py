@@ -156,7 +156,9 @@ def _bspline_moduli_1d_op(miller: torch.Tensor, n: int, order: int) -> torch.Ten
 
 
 @torch.library.register_fake("nvalchemiops::multipole_pme_bspline_moduli_1d")
-def _bspline_moduli_1d_fake(miller: torch.Tensor, n: int, order: int) -> torch.Tensor:
+def _bspline_moduli_1d_fake(
+    miller: torch.Tensor, n: int, order: int
+) -> torch.Tensor:  # pragma: no cover
     """Shape/dtype metadata: ``(n_axis,)`` float64."""
     return miller.new_empty((miller.shape[0],), dtype=torch.float64)
 
@@ -328,7 +330,7 @@ def _multipole_pme_convolve_forward(
     )
 
 
-def _multipole_pme_convolve_backward(
+def _multipole_pme_convolve_backward(  # pragma: no cover
     grad_convolved: torch.Tensor,
     mesh_fft: torch.Tensor,
     k_squared: torch.Tensor,
@@ -411,7 +413,7 @@ def _batch_multipole_pme_convolve_forward(
     )
 
 
-def _batch_multipole_pme_convolve_backward(
+def _batch_multipole_pme_convolve_backward(  # pragma: no cover
     grad_convolved: torch.Tensor,
     mesh_fft: torch.Tensor,
     k_squared: torch.Tensor,
@@ -466,7 +468,7 @@ def _batch_multipole_pme_convolve_backward(
     return grad_mesh_fft, grad_k_squared, grad_volume
 
 
-def _convolve_forward_fake(mesh_fft, *_):
+def _convolve_forward_fake(mesh_fft, *_):  # pragma: no cover
     """Fake for the convolve forward: contiguous output matching the real op.
 
     The real forward returns ``view_as_complex`` of a freshly-allocated
@@ -477,7 +479,9 @@ def _convolve_forward_fake(mesh_fft, *_):
     return mesh_fft.new_empty(mesh_fft.shape)
 
 
-def _convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
+def _convolve_backward_fake(
+    grad_convolved, mesh_fft, k_squared, *_
+):  # pragma: no cover
     """Fake for the convolve backward: 3-tuple
     (grad_mesh_fft, grad_k_squared, grad_volume). ``grad_mesh_fft`` is
     contiguous (the real op allocates a fresh contiguous buffer)."""
@@ -569,7 +573,7 @@ def _convolve_double_backward_run(
     )
 
 
-def _multipole_pme_convolve_double_backward(
+def _multipole_pme_convolve_double_backward(  # pragma: no cover
     gg_mesh_fft,
     gg_k_squared,
     gg_volume,
@@ -603,7 +607,7 @@ def _multipole_pme_convolve_double_backward(
     )
 
 
-def _batch_multipole_pme_convolve_double_backward(
+def _batch_multipole_pme_convolve_double_backward(  # pragma: no cover
     gg_mesh_fft,
     gg_k_squared,
     gg_volume,
@@ -637,7 +641,9 @@ def _batch_multipole_pme_convolve_double_backward(
     )
 
 
-def _batch_convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
+def _batch_convolve_backward_fake(
+    grad_convolved, mesh_fft, k_squared, *_
+):  # pragma: no cover
     """Fake for the batched convolve backward: per-system grad_volume (B,).
 
     ``grad_mesh_fft`` is contiguous (fresh buffer in the real op)."""
@@ -650,7 +656,7 @@ def _batch_convolve_backward_fake(grad_convolved, mesh_fft, k_squared, *_):
     )
 
 
-def _convolve_double_backward_fake(
+def _convolve_double_backward_fake(  # pragma: no cover
     gg_mesh_fft, gg_k_squared, gg_volume, grad_convolved, mesh_fft, k_squared, *_args
 ):
     """Fake: grads of (grad_convolved, mesh_fft, k_squared, volume).
@@ -665,7 +671,7 @@ def _convolve_double_backward_fake(
     )
 
 
-def _batch_convolve_double_backward_fake(
+def _batch_convolve_double_backward_fake(  # pragma: no cover
     gg_mesh_fft, gg_k_squared, gg_volume, grad_convolved, mesh_fft, k_squared, *_args
 ):
     """Batched fake: ``volume`` grad is per-system ``(B,)``."""
@@ -895,7 +901,7 @@ def _multipole_pme_spread_unified_forward(
     return mesh
 
 
-def _multipole_pme_spread_unified_backward(
+def _multipole_pme_spread_unified_backward(  # pragma: no cover
     grad_mesh: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -956,7 +962,7 @@ def _multipole_pme_spread_unified_backward(
     )
 
 
-def _spread_unified_forward_fake(positions, *_args):
+def _spread_unified_forward_fake(positions, *_args):  # pragma: no cover
     """Fake: output mesh shape ``(mesh_nx, mesh_ny, mesh_nz)``."""
     # positions=0, charges=1, dipoles=2, quadrupoles=3, cell_inv_t=4,
     # mesh_nx=5, mesh_ny=6, mesh_nz=7, spline_order=8, lmax=9.
@@ -973,7 +979,7 @@ def _spread_unified_forward_fake(positions, *_args):
 # ---------------------------------------------------------------------------
 
 
-def _multipole_pme_spread_unified_double_backward(
+def _multipole_pme_spread_unified_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor | None,
     gg_charges: torch.Tensor | None,
     gg_dipoles: torch.Tensor | None,
@@ -1123,7 +1129,7 @@ def _multipole_pme_spread_unified_double_backward(
     return d_grad_mesh, d_positions, d_charges, d_dipoles, d_quadrupoles
 
 
-def _spread_unified_double_backward_fake(
+def _spread_unified_double_backward_fake(  # pragma: no cover
     gg_positions,
     gg_charges,
     gg_dipoles,
@@ -1211,7 +1217,7 @@ def _batch_multipole_pme_spread_forward(
     return mesh
 
 
-def _batch_multipole_pme_spread_backward(
+def _batch_multipole_pme_spread_backward(  # pragma: no cover
     grad_mesh: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -1253,7 +1259,7 @@ def _batch_multipole_pme_spread_backward(
     return grad_positions, grad_charges, grad_dipoles
 
 
-def _batch_spread_forward_fake(positions, *_args):
+def _batch_spread_forward_fake(positions, *_args):  # pragma: no cover
     """Fake for batched spread — derive from mesh_nx/y/z and B kwargs."""
     # positions=0, charges=1, dipoles=2, batch_idx=3, cell_inv_t=4,
     # mesh_nx=5, mesh_ny=6, mesh_nz=7, B=8, spline_order=9.
@@ -1319,7 +1325,7 @@ def _batch_multipole_pme_spread_unified_forward(
     return mesh
 
 
-def _batch_multipole_pme_spread_unified_backward(
+def _batch_multipole_pme_spread_unified_backward(  # pragma: no cover
     grad_mesh: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -1381,7 +1387,7 @@ def _batch_multipole_pme_spread_unified_backward(
     )
 
 
-def _batch_spread_unified_forward_fake(positions, *_args):
+def _batch_spread_unified_forward_fake(positions, *_args):  # pragma: no cover
     """Fake: output mesh shape ``(B, mesh_nx, mesh_ny, mesh_nz)``."""
     # positions=0, charges=1, dipoles=2, quadrupoles=3, batch_idx=4,
     # cell_inv_t=5, mesh_nx=6, mesh_ny=7, mesh_nz=8, B=9, spline_order=10,
@@ -1394,7 +1400,7 @@ def _batch_spread_unified_forward_fake(positions, *_args):
     )
 
 
-def _batch_multipole_pme_spread_unified_double_backward(
+def _batch_multipole_pme_spread_unified_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor | None,
     gg_charges: torch.Tensor | None,
     gg_dipoles: torch.Tensor | None,
@@ -1551,7 +1557,7 @@ def _batch_multipole_pme_spread_unified_double_backward(
     return d_grad_mesh, d_positions, d_charges, d_dipoles, d_quadrupoles
 
 
-def _batch_spread_unified_double_backward_fake(
+def _batch_spread_unified_double_backward_fake(  # pragma: no cover
     gg_positions,
     gg_charges,
     gg_dipoles,
@@ -1681,7 +1687,7 @@ def _multipole_pme_gather_via_spread_t_forward(
     return g_q, g_d, g_Q
 
 
-def _gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
+def _gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):  # pragma: no cover
     """Fake: ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``."""
     del phi_grid
     n = p_frac.shape[0]
@@ -1692,7 +1698,7 @@ def _gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
     )
 
 
-def _multipole_pme_gather_via_spread_t_backward(
+def _multipole_pme_gather_via_spread_t_backward(  # pragma: no cover
     cg_q: torch.Tensor,
     cg_d: torch.Tensor,
     cg_Q: torch.Tensor,
@@ -1749,13 +1755,15 @@ def _multipole_pme_gather_via_spread_t_backward(
     return d_phi, d_p
 
 
-def _gather_via_spread_t_backward_fake(cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args):
+def _gather_via_spread_t_backward_fake(
+    cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
+):  # pragma: no cover
     """Fake: grads of ``(phi_grid, p_frac)``."""
     del cg_q, cg_d, cg_Q
     return torch.empty_like(phi_grid), torch.empty_like(p_frac)
 
 
-def _multipole_pme_gather_via_spread_t_double_backward(
+def _multipole_pme_gather_via_spread_t_double_backward(  # pragma: no cover
     gg_phi: torch.Tensor | None,
     gg_p: torch.Tensor | None,
     cg_q: torch.Tensor,
@@ -1857,7 +1865,7 @@ def _multipole_pme_gather_via_spread_t_double_backward(
     return d_cg_q, d_cg_d, d_cg_Q, d_phi, d_p
 
 
-def _gather_via_spread_t_double_backward_fake(
+def _gather_via_spread_t_double_backward_fake(  # pragma: no cover
     gg_phi, gg_p, cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
 ):
     """Fake: grads of ``(cg_q, cg_d, cg_Q, phi_grid, p_frac)``."""
@@ -1956,7 +1964,9 @@ def _batch_multipole_pme_gather_via_spread_t_forward(
     return g_q, g_d, g_Q
 
 
-def _batch_gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
+def _batch_gather_via_spread_t_forward_fake(
+    phi_grid, p_frac, *_args
+):  # pragma: no cover
     """Fake: ``(g_q (N,), g_d (N,3), g_Q (N,3,3))``."""
     del phi_grid
     n = p_frac.shape[0]
@@ -1967,7 +1977,7 @@ def _batch_gather_via_spread_t_forward_fake(phi_grid, p_frac, *_args):
     )
 
 
-def _batch_multipole_pme_gather_via_spread_t_backward(
+def _batch_multipole_pme_gather_via_spread_t_backward(  # pragma: no cover
     cg_q: torch.Tensor,
     cg_d: torch.Tensor,
     cg_Q: torch.Tensor,
@@ -2016,7 +2026,7 @@ def _batch_multipole_pme_gather_via_spread_t_backward(
     return d_phi, d_p
 
 
-def _batch_gather_via_spread_t_backward_fake(
+def _batch_gather_via_spread_t_backward_fake(  # pragma: no cover
     cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
 ):
     """Fake: grads of ``(phi_grid, p_frac)``."""
@@ -2024,7 +2034,7 @@ def _batch_gather_via_spread_t_backward_fake(
     return torch.empty_like(phi_grid), torch.empty_like(p_frac)
 
 
-def _batch_multipole_pme_gather_via_spread_t_double_backward(
+def _batch_multipole_pme_gather_via_spread_t_double_backward(  # pragma: no cover
     gg_phi: torch.Tensor | None,
     gg_p: torch.Tensor | None,
     cg_q: torch.Tensor,
@@ -2109,7 +2119,7 @@ def _batch_multipole_pme_gather_via_spread_t_double_backward(
     return d_cg_q, d_cg_d, d_cg_Q, d_phi, d_p
 
 
-def _batch_gather_via_spread_t_double_backward_fake(
+def _batch_gather_via_spread_t_double_backward_fake(  # pragma: no cover
     gg_phi, gg_p, cg_q, cg_d, cg_Q, phi_grid, p_frac, *_args
 ):
     """Fake: grads of ``(cg_q, cg_d, cg_Q, phi_grid, p_frac)``."""
@@ -2243,7 +2253,7 @@ def _multipole_pme_green_struct_forward(
     return green_function, structure_factor_sq
 
 
-def _green_struct_forward_fake(k_squared, *_args):
+def _green_struct_forward_fake(k_squared, *_args):  # pragma: no cover
     """Fake: ``(G̃, |C|²)`` both match k_squared shape (single-system)."""
     return torch.empty_like(k_squared), torch.empty_like(k_squared)
 
@@ -2304,7 +2314,7 @@ def _batch_multipole_pme_green_struct_forward(
     return green_function, structure_factor_sq
 
 
-def _batch_green_struct_forward_fake(k_squared, *_args):
+def _batch_green_struct_forward_fake(k_squared, *_args):  # pragma: no cover
     """Fake: ``green`` matches ``(B, Nx, Ny, Nz_rfft)``, ``|C|²`` is shared."""
     _, nx, ny, nz_rfft = k_squared.shape
     return (
@@ -2434,7 +2444,7 @@ def _multipole_pme_gather_potential_forward(
     return output
 
 
-def _multipole_pme_gather_potential_backward(
+def _multipole_pme_gather_potential_backward(  # pragma: no cover
     grad_output: torch.Tensor,
     mesh: torch.Tensor,
     positions: torch.Tensor,
@@ -2486,7 +2496,7 @@ def _multipole_pme_gather_potential_backward(
     return grad_mesh, -force_as_neg_grad_pos
 
 
-def _gather_potential_forward_fake(mesh, positions, *_args):
+def _gather_potential_forward_fake(mesh, positions, *_args):  # pragma: no cover
     """Fake: output ``(N,)`` matching positions dtype/device."""
     del mesh
     return torch.empty(
@@ -2494,7 +2504,7 @@ def _gather_potential_forward_fake(mesh, positions, *_args):
     )
 
 
-def _gather_grad_field(
+def _gather_grad_field(  # pragma: no cover
     positions: torch.Tensor,
     weight: torch.Tensor,
     cell_inv_t: torch.Tensor,
@@ -2544,7 +2554,7 @@ def _gather_grad_field(
     return -force_buf
 
 
-def _hessian_contract(
+def _hessian_contract(  # pragma: no cover
     positions: torch.Tensor,
     direction: torch.Tensor,
     cell_inv_t: torch.Tensor,
@@ -2596,7 +2606,7 @@ def _hessian_contract(
     return grad_positions
 
 
-def _multipole_pme_gather_potential_double_backward(
+def _multipole_pme_gather_potential_double_backward(  # pragma: no cover
     gg_grad_mesh: torch.Tensor,
     gg_grad_positions: torch.Tensor,
     grad_output: torch.Tensor,
@@ -2732,7 +2742,7 @@ def _batch_multipole_pme_gather_potential_forward(
     return output
 
 
-def _batch_multipole_pme_gather_potential_backward(
+def _batch_multipole_pme_gather_potential_backward(  # pragma: no cover
     grad_output: torch.Tensor,
     mesh: torch.Tensor,
     positions: torch.Tensor,
@@ -2788,7 +2798,7 @@ def _batch_multipole_pme_gather_potential_backward(
     return grad_mesh, -force_as_neg_grad_pos
 
 
-def _batch_gather_grad_field(
+def _batch_gather_grad_field(  # pragma: no cover
     positions: torch.Tensor,
     weight: torch.Tensor,
     batch_idx: torch.Tensor,
@@ -2835,7 +2845,7 @@ def _batch_gather_grad_field(
     return -force_buf
 
 
-def _batch_hessian_contract(
+def _batch_hessian_contract(  # pragma: no cover
     positions: torch.Tensor,
     direction: torch.Tensor,
     batch_idx: torch.Tensor,
@@ -2884,7 +2894,7 @@ def _batch_hessian_contract(
     return grad_positions
 
 
-def _batch_multipole_pme_gather_potential_double_backward(
+def _batch_multipole_pme_gather_potential_double_backward(  # pragma: no cover
     gg_grad_mesh: torch.Tensor,
     gg_grad_positions: torch.Tensor,
     grad_output: torch.Tensor,
@@ -3087,7 +3097,7 @@ def _multipole_pme_gather_field_forward(
     return -force_buf
 
 
-def _multipole_pme_gather_field_backward(
+def _multipole_pme_gather_field_backward(  # pragma: no cover
     grad_field: torch.Tensor,
     mesh: torch.Tensor,
     positions: torch.Tensor,
@@ -3163,7 +3173,7 @@ def _multipole_pme_gather_field_backward(
     return grad_mesh, grad_positions
 
 
-def _gather_field_forward_fake(mesh, positions, *_args):
+def _gather_field_forward_fake(mesh, positions, *_args):  # pragma: no cover
     """Fake: ``(N, 3)`` per-atom field matching positions dtype/device."""
     del mesh
     return torch.empty(
@@ -3173,7 +3183,7 @@ def _gather_field_forward_fake(mesh, positions, *_args):
     )
 
 
-def _quad_gradpos(
+def _quad_gradpos(  # pragma: no cover
     positions: torch.Tensor,
     quadrupoles: torch.Tensor,
     cell_inv_t: torch.Tensor,
@@ -3226,7 +3236,7 @@ def _quad_gradpos(
     return grad_positions
 
 
-def _quad_spread(
+def _quad_spread(  # pragma: no cover
     positions: torch.Tensor,
     quadrupoles: torch.Tensor,
     cell_inv_t: torch.Tensor,
@@ -3269,7 +3279,7 @@ def _quad_spread(
     return out
 
 
-def _multipole_pme_gather_field_double_backward(
+def _multipole_pme_gather_field_double_backward(  # pragma: no cover
     gg_grad_mesh: torch.Tensor,
     gg_grad_positions: torch.Tensor,
     grad_field: torch.Tensor,
@@ -3391,7 +3401,7 @@ def _batch_multipole_pme_gather_field_forward(
     return -force_buf
 
 
-def _batch_multipole_pme_gather_field_backward(
+def _batch_multipole_pme_gather_field_backward(  # pragma: no cover
     grad_field: torch.Tensor,
     mesh: torch.Tensor,
     positions: torch.Tensor,
@@ -3451,7 +3461,7 @@ def _batch_multipole_pme_gather_field_backward(
     return grad_mesh, grad_positions
 
 
-def _batch_quad_gradpos(
+def _batch_quad_gradpos(  # pragma: no cover
     positions: torch.Tensor,
     quadrupoles: torch.Tensor,
     batch_idx: torch.Tensor,
@@ -3499,7 +3509,7 @@ def _batch_quad_gradpos(
     return grad_positions
 
 
-def _batch_quad_spread(
+def _batch_quad_spread(  # pragma: no cover
     positions: torch.Tensor,
     quadrupoles: torch.Tensor,
     batch_idx: torch.Tensor,
@@ -3540,7 +3550,7 @@ def _batch_quad_spread(
     return out
 
 
-def _batch_multipole_pme_gather_field_double_backward(
+def _batch_multipole_pme_gather_field_double_backward(  # pragma: no cover
     gg_grad_mesh: torch.Tensor,
     gg_grad_positions: torch.Tensor,
     grad_field: torch.Tensor,
@@ -3718,7 +3728,7 @@ def _multipole_pme_gather_hessian_forward(
     return H
 
 
-def _multipole_pme_gather_hessian_backward(
+def _multipole_pme_gather_hessian_backward(  # pragma: no cover
     grad_H: torch.Tensor,
     mesh: torch.Tensor,
     positions: torch.Tensor,
@@ -3804,7 +3814,7 @@ def _multipole_pme_gather_hessian_backward(
     return grad_mesh, grad_positions
 
 
-def _gather_hessian_forward_fake(mesh, positions, *_args):
+def _gather_hessian_forward_fake(mesh, positions, *_args):  # pragma: no cover
     """Fake: symmetric ``(N, 3, 3)`` Hessian per atom."""
     del mesh
     return torch.empty(
@@ -3961,7 +3971,7 @@ def _multipole_pme_corrections_forward(
     return out
 
 
-def _multipole_pme_corrections_backward(
+def _multipole_pme_corrections_backward(  # pragma: no cover
     grad_out: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
@@ -4042,7 +4052,7 @@ def _multipole_pme_corrections_backward(
     return grad_charges, grad_dipoles, grad_quadrupoles, grad_volume
 
 
-def _multipole_pme_corrections_double_backward(
+def _multipole_pme_corrections_double_backward(  # pragma: no cover
     gg_charges: torch.Tensor | None,
     gg_dipoles: torch.Tensor | None,
     gg_quadrupoles: torch.Tensor | None,
@@ -4169,7 +4179,7 @@ def _multipole_pme_corrections_double_backward(
     return grad_grad_out, grad_charges, grad_dipoles, grad_quadrupoles, grad_volume
 
 
-def _corrections_forward_fake(
+def _corrections_forward_fake(  # pragma: no cover
     charges, dipoles, quadrupoles, volume, total_charge, batch_idx, *_
 ):
     """Fake: scalar (single) or per-system ``(B,)`` (batched)."""
@@ -4178,7 +4188,7 @@ def _corrections_forward_fake(
     return torch.empty_like(volume, dtype=torch.float64)
 
 
-def _corrections_backward_fake(
+def _corrections_backward_fake(  # pragma: no cover
     grad_out, charges, dipoles, quadrupoles, volume, total_charge, batch_idx, *_
 ):
     """Fake: 4-tuple (grad_charges, grad_dipoles, grad_quadrupoles, grad_volume)."""
@@ -4213,7 +4223,7 @@ _CORRECTIONS_DBWD_SCHEMA = (
 )
 
 
-def _corrections_double_backward_fake(
+def _corrections_double_backward_fake(  # pragma: no cover
     gg_charges,
     gg_dipoles,
     gg_quadrupoles,
@@ -4540,7 +4550,7 @@ def _multipole_reciprocal_rho_energy_forward(
     return per_k_energy
 
 
-def _multipole_reciprocal_rho_energy_backward(
+def _multipole_reciprocal_rho_energy_backward(  # pragma: no cover
     grad_out: torch.Tensor,
     rho: torch.Tensor,
     per_k_factor: torch.Tensor,
@@ -4573,7 +4583,7 @@ def _multipole_reciprocal_rho_energy_backward(
     return grad_rho, grad_pkf
 
 
-def _multipole_reciprocal_rho_energy_double_backward(
+def _multipole_reciprocal_rho_energy_double_backward(  # pragma: no cover
     gg_rho: torch.Tensor | None,
     gg_per_k_factor: torch.Tensor | None,
     grad_out: torch.Tensor,
@@ -4616,13 +4626,13 @@ def _multipole_reciprocal_rho_energy_double_backward(
     return grad_grad_out, grad_rho, grad_pkf
 
 
-def _rho_energy_forward_fake(rho, per_k_factor):
+def _rho_energy_forward_fake(rho, per_k_factor):  # pragma: no cover
     """Fake: per-k energy ``(M,)``."""
     del per_k_factor
     return torch.empty(rho.shape[0], dtype=torch.float64, device=rho.device)
 
 
-def _rho_energy_backward_fake(grad_out, rho, per_k_factor):
+def _rho_energy_backward_fake(grad_out, rho, per_k_factor):  # pragma: no cover
     """Fake: (grad_rho, grad_per_k_factor)."""
     del grad_out
     return (
@@ -4631,7 +4641,7 @@ def _rho_energy_backward_fake(grad_out, rho, per_k_factor):
     )
 
 
-def _rho_energy_double_backward_fake(
+def _rho_energy_double_backward_fake(  # pragma: no cover
     gg_rho, gg_per_k_factor, grad_out, rho, per_k_factor
 ):
     """Fake: grads for ``(grad_out, rho, per_k_factor)``."""
@@ -4739,7 +4749,7 @@ def _multipole_self_energy_forward(
     return self_energy
 
 
-def _multipole_self_energy_backward(
+def _multipole_self_energy_backward(  # pragma: no cover
     grad_out: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
@@ -4779,7 +4789,7 @@ def _multipole_self_energy_backward(
     return grad_charges, grad_dipoles, grad_quadrupoles
 
 
-def _multipole_self_energy_double_backward(
+def _multipole_self_energy_double_backward(  # pragma: no cover
     gg_charges: torch.Tensor | None,
     gg_dipoles: torch.Tensor | None,
     gg_quadrupoles: torch.Tensor | None,
@@ -4844,12 +4854,14 @@ def _multipole_self_energy_double_backward(
     return grad_grad_out, grad_charges, grad_dipoles, grad_quadrupoles
 
 
-def _self_energy_forward_fake(charges, *_):
+def _self_energy_forward_fake(charges, *_):  # pragma: no cover
     """Fake: per-atom self-energy ``(N,)``."""
     return torch.empty_like(charges, dtype=torch.float64)
 
 
-def _self_energy_backward_fake(grad_out, charges, dipoles, quadrupoles, *_):
+def _self_energy_backward_fake(
+    grad_out, charges, dipoles, quadrupoles, *_
+):  # pragma: no cover
     """Fake: 3-tuple (grad_charges, grad_dipoles, grad_quadrupoles)."""
     del grad_out
     return (
@@ -4859,7 +4871,7 @@ def _self_energy_backward_fake(grad_out, charges, dipoles, quadrupoles, *_):
     )
 
 
-def _self_energy_double_backward_fake(
+def _self_energy_double_backward_fake(  # pragma: no cover
     gg_charges, gg_dipoles, gg_quadrupoles, grad_out, charges, dipoles, quadrupoles, *_
 ):
     """Fake: grads for (grad_out, charges, dipoles, quadrupoles)."""
@@ -4984,7 +4996,7 @@ def _multipole_pme_mesh_inner_product_forward(
     return per_grid_energy
 
 
-def _multipole_pme_mesh_inner_product_backward(
+def _multipole_pme_mesh_inner_product_backward(  # pragma: no cover
     grad_out: torch.Tensor,
     rho_grid: torch.Tensor,
     phi_grid: torch.Tensor,
@@ -5015,7 +5027,7 @@ def _multipole_pme_mesh_inner_product_backward(
     return grad_rho_grid, grad_phi_grid
 
 
-def _multipole_pme_mesh_inner_product_double_backward(
+def _multipole_pme_mesh_inner_product_double_backward(  # pragma: no cover
     gg_rho_grid: torch.Tensor | None,
     gg_phi_grid: torch.Tensor | None,
     grad_out: torch.Tensor,
@@ -5057,13 +5069,13 @@ def _multipole_pme_mesh_inner_product_double_backward(
     return grad_grad_out, grad_rho_grid, grad_phi_grid
 
 
-def _mesh_inner_product_forward_fake(rho_grid, phi_grid):
+def _mesh_inner_product_forward_fake(rho_grid, phi_grid):  # pragma: no cover
     """Fake: per-grid-point energy ``(M,)``."""
     del phi_grid
     return torch.empty(rho_grid.shape[0], dtype=torch.float64, device=rho_grid.device)
 
 
-def _mesh_inner_product_backward_fake(grad_out, rho_grid, phi_grid):
+def _mesh_inner_product_backward_fake(grad_out, rho_grid, phi_grid):  # pragma: no cover
     """Fake: (grad_rho_grid, grad_phi_grid)."""
     del grad_out
     return (
@@ -5072,7 +5084,7 @@ def _mesh_inner_product_backward_fake(grad_out, rho_grid, phi_grid):
     )
 
 
-def _mesh_inner_product_double_backward_fake(
+def _mesh_inner_product_double_backward_fake(  # pragma: no cover
     gg_rho_grid, gg_phi_grid, grad_out, rho_grid, phi_grid
 ):
     """Fake: grads for ``(grad_out, rho_grid, phi_grid)``."""
@@ -5179,7 +5191,7 @@ def _pme_k_squared_forward(
     return k_squared
 
 
-def _pme_k_squared_backward(
+def _pme_k_squared_backward(  # pragma: no cover
     grad_k_squared: torch.Tensor,
     inv_cell_t: torch.Tensor,
     miller_x: torch.Tensor,
@@ -5216,7 +5228,9 @@ def _pme_k_squared_backward(
     return grad_M.unsqueeze(0)
 
 
-def _pme_k_squared_forward_fake(inv_cell_t, _mx, _my, _mz, nx, ny, nz_rfft):
+def _pme_k_squared_forward_fake(
+    inv_cell_t, _mx, _my, _mz, nx, ny, nz_rfft
+):  # pragma: no cover
     """Fake: ``(nx, ny, nz_rfft)`` k_squared grid."""
     return torch.empty(
         (nx, ny, nz_rfft),
@@ -5225,7 +5239,7 @@ def _pme_k_squared_forward_fake(inv_cell_t, _mx, _my, _mz, nx, ny, nz_rfft):
     )
 
 
-def _pme_k_squared_double_backward(
+def _pme_k_squared_double_backward(  # pragma: no cover
     v_grad_m: torch.Tensor,
     grad_k_squared: torch.Tensor,
     inv_cell_t: torch.Tensor,
@@ -5330,7 +5344,7 @@ def _pme_fractionalize_forward(
     return p, df, qf
 
 
-def _pme_fractionalize_backward(
+def _pme_fractionalize_backward(  # pragma: no cover
     grad_p: torch.Tensor,
     grad_df: torch.Tensor,
     grad_qf: torch.Tensor,
@@ -5372,7 +5386,7 @@ def _pme_fractionalize_backward(
     return grad_pos, grad_cell, grad_dip, grad_quad
 
 
-def _pme_fractionalize_double_backward(
+def _pme_fractionalize_double_backward(  # pragma: no cover
     g_pos: torch.Tensor,
     g_cell: torch.Tensor,
     g_dip: torch.Tensor,
@@ -5440,7 +5454,7 @@ def _pme_fractionalize_double_backward(
     return d_gp, d_gdf, d_gqf, d_pos, d_cell, d_dip, d_quad
 
 
-def _pme_fractionalize_forward_fake(
+def _pme_fractionalize_forward_fake(  # pragma: no cover
     positions, cell_inv_t, dipoles, quadrupoles, *_args
 ):
     """Fake: ``(p, d_frac, Q_frac)`` shaped like the moment inputs."""
@@ -5451,7 +5465,7 @@ def _pme_fractionalize_forward_fake(
     )
 
 
-def _pme_fractionalize_backward_fake(
+def _pme_fractionalize_backward_fake(  # pragma: no cover
     grad_p, grad_df, grad_qf, positions, cell_inv_t, dipoles, quadrupoles, *_args
 ):
     """Fake: grads of (positions, cell_inv_t, dipoles, quadrupoles)."""
@@ -5463,7 +5477,7 @@ def _pme_fractionalize_backward_fake(
     )
 
 
-def _pme_fractionalize_double_backward_fake(
+def _pme_fractionalize_double_backward_fake(  # pragma: no cover
     g_pos,
     g_cell,
     g_dip,

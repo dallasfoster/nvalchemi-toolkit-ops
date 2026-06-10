@@ -43,9 +43,15 @@ Public autograd.Function classes
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import warp as wp
+
+if TYPE_CHECKING:
+    from nvalchemiops.torch.interactions.electrostatics.multipole_scf_cache import (
+        MultipoleSCFCache,
+    )
 
 from nvalchemiops.interactions.electrostatics.multipole_ewald_cell_grad import (
     batch_multipole_real_space_dipole_csr_cell_grad,
@@ -164,7 +170,9 @@ class MultipoleRealSpaceMonopoleBackwardFunction(torch.autograd.Function):
         return grad_positions, grad_charges
 
     @staticmethod
-    def backward(ctx, gg_positions: torch.Tensor, gg_charges: torch.Tensor):
+    def backward(
+        ctx, gg_positions: torch.Tensor, gg_charges: torch.Tensor
+    ):  # pragma: no cover
         """Second-order backward: produces (gg_ge_2nd, gg_pos_2nd, gg_chg_2nd)."""
         (
             grad_energies,
@@ -346,7 +354,7 @@ class MultipoleRealSpaceMonopoleFusedScalarFunction(torch.autograd.Function):
         return energies_total
 
     @staticmethod
-    def backward(ctx, grad_E: torch.Tensor):
+    def backward(ctx, grad_E: torch.Tensor):  # pragma: no cover
         """Broadcast precomputed grads for plain forces; route through the
         on-tape backward Function under ``create_graph``. Cell-grad is always a
         scalar broadcast."""
@@ -473,7 +481,7 @@ class MultipoleRealSpaceMonopoleFunction(torch.autograd.Function):
         return energies
 
     @staticmethod
-    def backward(ctx, grad_energies: torch.Tensor):
+    def backward(ctx, grad_energies: torch.Tensor):  # pragma: no cover
         """Analytical backward via :class:`MultipoleRealSpaceMonopoleBackwardFunction`.
 
         Routing through the sub-Function is what enables double-backward:
@@ -587,7 +595,7 @@ class MultipoleRealSpaceBackwardFunction(torch.autograd.Function):
         return grad_positions, grad_charges, grad_dipoles
 
     @staticmethod
-    def backward(
+    def backward(  # pragma: no cover
         ctx,
         gg_positions: torch.Tensor,
         gg_charges: torch.Tensor,
@@ -801,7 +809,7 @@ class MultipoleRealSpaceDipoleFusedScalarFunction(torch.autograd.Function):
         return energies_total
 
     @staticmethod
-    def backward(ctx, grad_E: torch.Tensor):
+    def backward(ctx, grad_E: torch.Tensor):  # pragma: no cover
         """Broadcast precomputed grads for plain forces; route through the
         on-tape backward Function under ``create_graph``."""
         (
@@ -937,7 +945,7 @@ class MultipoleRealSpaceFunction(torch.autograd.Function):
         return energies
 
     @staticmethod
-    def backward(ctx, grad_energies: torch.Tensor):
+    def backward(ctx, grad_energies: torch.Tensor):  # pragma: no cover
         """Route through :class:`MultipoleRealSpaceBackwardFunction`."""
         (
             positions,
@@ -1018,7 +1026,7 @@ def _real_space_dipole_forward(
     return energies
 
 
-def _real_space_dipole_forward_fake(
+def _real_space_dipole_forward_fake(  # pragma: no cover
     positions: torch.Tensor,
     charges: torch.Tensor,
     dipoles: torch.Tensor,
@@ -1033,7 +1041,7 @@ def _real_space_dipole_forward_fake(
     return positions.new_empty((positions.shape[0],), dtype=torch.float64)
 
 
-def _real_space_dipole_backward(
+def _real_space_dipole_backward(  # pragma: no cover
     grad_energies: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -1076,7 +1084,7 @@ def _real_space_dipole_backward(
     return grad_positions, grad_charges, grad_dipoles
 
 
-def _real_space_dipole_double_backward(
+def _real_space_dipole_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor,
     gg_charges: torch.Tensor,
     gg_dipoles: torch.Tensor,
@@ -1183,7 +1191,7 @@ def _real_space_monopole_forward(
     return energies
 
 
-def _real_space_monopole_forward_fake(
+def _real_space_monopole_forward_fake(  # pragma: no cover
     positions: torch.Tensor,
     charges: torch.Tensor,
     cell: torch.Tensor,
@@ -1197,7 +1205,7 @@ def _real_space_monopole_forward_fake(
     return positions.new_empty((positions.shape[0],), dtype=torch.float64)
 
 
-def _real_space_monopole_backward(
+def _real_space_monopole_backward(  # pragma: no cover
     grad_energies: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -1236,7 +1244,7 @@ def _real_space_monopole_backward(
     return grad_positions, grad_charges
 
 
-def _real_space_monopole_double_backward(
+def _real_space_monopole_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor,
     gg_charges: torch.Tensor,
     grad_energies: torch.Tensor,
@@ -1342,7 +1350,7 @@ def _(positions, charges, dipoles, cell, sigma, alpha, idx_j, nptr, shifts, half
     return torch.empty_like(cell)
 
 
-def _rs_dipole_cell_grad_setup(ctx, inputs, output):
+def _rs_dipole_cell_grad_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs for the l=1 cell-grad double-backward (stress-loss)."""
     (
         positions,
@@ -1370,7 +1378,7 @@ def _rs_dipole_cell_grad_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _rs_dipole_cell_grad_backward(ctx, g_cell):
+def _rs_dipole_cell_grad_backward(ctx, g_cell):  # pragma: no cover
     """∂/∂{positions, charges, dipoles, cell} of ⟨g_cell, dE/dcell⟩ (l=1)."""
     (
         positions,
@@ -1499,7 +1507,7 @@ def _(positions, charges, dipoles, cell, sigma, alpha, idx_j, nptr, shifts, half
     )
 
 
-def _rs_dipole_fused_setup(ctx, inputs, output):
+def _rs_dipole_fused_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs + the precomputed moment grads (returned as op outputs)."""
     (
         positions,
@@ -1531,7 +1539,7 @@ def _rs_dipole_fused_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _rs_dipole_fused_backward(ctx, grad_E, _gg_pos, _gg_q, _gg_mu):
+def _rs_dipole_fused_backward(ctx, grad_E, _gg_pos, _gg_q, _gg_mu):  # pragma: no cover
     """Broadcast precomputed grads (plain forces); on-tape op under create_graph."""
     (
         positions,
@@ -1651,7 +1659,7 @@ class _AttachRealSpaceCellGradLmax1(torch.autograd.Function):
         return per_atom
 
     @staticmethod
-    def setup_context(ctx, inputs, output):
+    def setup_context(ctx, inputs, output):  # pragma: no cover
         """Save the inputs the backward re-evaluates the cell-grad op from."""
         (
             _per_atom,
@@ -1688,7 +1696,7 @@ class _AttachRealSpaceCellGradLmax1(torch.autograd.Function):
         ctx.half_neighbor_list = half_neighbor_list
 
     @staticmethod
-    def backward(ctx, grad_energy):
+    def backward(ctx, grad_energy):  # pragma: no cover
         """Pass ``grad_energy`` through to ``per_atom``; inject ``grad_cell``."""
         (
             cell,
@@ -1895,7 +1903,7 @@ def _(positions, charges, cell, sigma, alpha, idx_j, nptr, shifts, half):
     return torch.empty_like(cell)
 
 
-def _rs_monopole_cell_grad_setup(ctx, inputs, output):
+def _rs_monopole_cell_grad_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs for the cell-grad double-backward (stress-loss)."""
     (
         positions,
@@ -1914,7 +1922,7 @@ def _rs_monopole_cell_grad_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _rs_monopole_cell_grad_backward(ctx, g_cell):
+def _rs_monopole_cell_grad_backward(ctx, g_cell):  # pragma: no cover
     """∂/∂{positions, charges, cell} of ⟨g_cell, dE/dcell⟩ (stress-loss).
 
     Reuses the force-loss radial Hessian with the per-pair direction
@@ -2036,7 +2044,7 @@ def _(positions, charges, cell, sigma, alpha, idx_j, nptr, shifts, half):
     )
 
 
-def _rs_monopole_fused_setup(ctx, inputs, output):
+def _rs_monopole_fused_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs + the precomputed (position, charge) grads."""
     (
         positions,
@@ -2065,7 +2073,7 @@ def _rs_monopole_fused_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _rs_monopole_fused_backward(ctx, grad_E, _gg_pos, _gg_q):
+def _rs_monopole_fused_backward(ctx, grad_E, _gg_pos, _gg_q):  # pragma: no cover
     """Broadcast precomputed grads (plain forces); on-tape op under create_graph."""
     (
         positions,
@@ -2353,7 +2361,9 @@ class BatchMultipoleRealSpaceMonopoleBackwardFunction(torch.autograd.Function):
         return grad_positions, grad_charges
 
     @staticmethod
-    def backward(ctx, gg_positions: torch.Tensor, gg_charges: torch.Tensor):
+    def backward(
+        ctx, gg_positions: torch.Tensor, gg_charges: torch.Tensor
+    ):  # pragma: no cover
         """Second-order backward via :func:`batch_multipole_real_space_monopole_csr_energy_2nd_backward`."""
         (
             grad_energies,
@@ -2546,7 +2556,7 @@ class BatchMultipoleRealSpaceMonopoleFusedScalarFunction(torch.autograd.Function
         return per_system_energies
 
     @staticmethod
-    def backward(ctx, grad_E: torch.Tensor):
+    def backward(ctx, grad_E: torch.Tensor):  # pragma: no cover
         """Fast per-system precomputed-grad broadcast for plain forces; on-tape
         backward Function (double-backward capable) under ``create_graph``.
 
@@ -2673,7 +2683,7 @@ class BatchMultipoleRealSpaceMonopoleFunction(torch.autograd.Function):
         return energies
 
     @staticmethod
-    def backward(ctx, grad_energies: torch.Tensor):
+    def backward(ctx, grad_energies: torch.Tensor):  # pragma: no cover
         """Route through :class:`BatchMultipoleRealSpaceMonopoleBackwardFunction`."""
         (
             positions,
@@ -2754,12 +2764,12 @@ def _batch_real_space_monopole_forward(
     return energies
 
 
-def _batch_real_space_forward_fake(positions, *args):
+def _batch_real_space_forward_fake(positions, *args):  # pragma: no cover
     """Shape/dtype metadata: per-atom energies ``(N_total,)`` in float64."""
     return positions.new_empty((positions.shape[0],), dtype=torch.float64)
 
 
-def _batch_real_space_monopole_backward(
+def _batch_real_space_monopole_backward(  # pragma: no cover
     grad_energies: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -2800,7 +2810,7 @@ def _batch_real_space_monopole_backward(
     return grad_positions, grad_charges
 
 
-def _batch_real_space_monopole_double_backward(
+def _batch_real_space_monopole_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor,
     gg_charges: torch.Tensor,
     grad_energies: torch.Tensor,
@@ -2899,7 +2909,7 @@ def _batch_real_space_dipole_forward(
     return energies
 
 
-def _batch_real_space_dipole_backward(
+def _batch_real_space_dipole_backward(  # pragma: no cover
     grad_energies: torch.Tensor,
     positions: torch.Tensor,
     charges: torch.Tensor,
@@ -2944,7 +2954,7 @@ def _batch_real_space_dipole_backward(
     return grad_positions, grad_charges, grad_dipoles
 
 
-def _batch_real_space_dipole_double_backward(
+def _batch_real_space_dipole_double_backward(  # pragma: no cover
     gg_positions: torch.Tensor,
     gg_charges: torch.Tensor,
     gg_dipoles: torch.Tensor,
@@ -3075,7 +3085,7 @@ def _(
     return torch.empty_like(cells)
 
 
-def _batch_rs_dipole_cell_grad_setup(ctx, inputs, output):
+def _batch_rs_dipole_cell_grad_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs for the batched l=1 cell-grad double-backward."""
     (
         positions,
@@ -3105,7 +3115,7 @@ def _batch_rs_dipole_cell_grad_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _batch_rs_dipole_cell_grad_backward(ctx, g_cell):
+def _batch_rs_dipole_cell_grad_backward(ctx, g_cell):  # pragma: no cover
     """Batched ∂/∂{positions, charges, dipoles, cells} of ⟨g_cell, dE/dcell⟩."""
     (
         positions,
@@ -3254,7 +3264,7 @@ def _(
     )
 
 
-def _batch_rs_dipole_fused_setup(ctx, inputs, output):
+def _batch_rs_dipole_fused_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs + precomputed moment grads (returned as op outputs)."""
     (
         positions,
@@ -3288,7 +3298,7 @@ def _batch_rs_dipole_fused_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _batch_rs_dipole_fused_backward(ctx, grad_E, _ggp, _ggq, _ggm):
+def _batch_rs_dipole_fused_backward(ctx, grad_E, _ggp, _ggq, _ggm):  # pragma: no cover
     """Per-system grad_E[batch_idx] broadcast (plain forces) / on-tape op (create_graph)."""
     (
         positions,
@@ -3409,7 +3419,7 @@ def _(positions, charges, cells, sigmas, alphas, idx_j, nptr, shifts, batch_idx,
     return torch.empty_like(cells)
 
 
-def _batch_rs_monopole_cell_grad_setup(ctx, inputs, output):
+def _batch_rs_monopole_cell_grad_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs for the batched l=0 cell-grad double-backward."""
     (
         positions,
@@ -3437,7 +3447,7 @@ def _batch_rs_monopole_cell_grad_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _batch_rs_monopole_cell_grad_backward(ctx, g_cell):
+def _batch_rs_monopole_cell_grad_backward(ctx, g_cell):  # pragma: no cover
     """Batched ∂/∂{positions, charges, cells} of ⟨g_cell, dE/dcell⟩."""
     (
         positions,
@@ -3562,7 +3572,7 @@ def _(positions, charges, cells, sigmas, alphas, idx_j, nptr, shifts, batch_idx,
     )
 
 
-def _batch_rs_monopole_fused_setup(ctx, inputs, output):
+def _batch_rs_monopole_fused_setup(ctx, inputs, output):  # pragma: no cover
     """Save inputs + precomputed (position, charge) grads."""
     (
         positions,
@@ -3593,7 +3603,7 @@ def _batch_rs_monopole_fused_setup(ctx, inputs, output):
     ctx.half_neighbor_list = half_neighbor_list
 
 
-def _batch_rs_monopole_fused_backward(ctx, grad_E, _ggp, _ggq):
+def _batch_rs_monopole_fused_backward(ctx, grad_E, _ggp, _ggq):  # pragma: no cover
     """Per-system grad_E[batch_idx] broadcast (plain forces) / on-tape op (create_graph)."""
     (
         positions,
@@ -3874,7 +3884,7 @@ class BatchMultipoleRealSpaceBackwardFunction(torch.autograd.Function):
         return grad_positions, grad_charges, grad_dipoles
 
     @staticmethod
-    def backward(
+    def backward(  # pragma: no cover
         ctx,
         gg_positions: torch.Tensor,
         gg_charges: torch.Tensor,
@@ -4080,7 +4090,7 @@ class BatchMultipoleRealSpaceDipoleFusedScalarFunction(torch.autograd.Function):
         return per_system_energies
 
     @staticmethod
-    def backward(ctx, grad_E: torch.Tensor):
+    def backward(ctx, grad_E: torch.Tensor):  # pragma: no cover
         """Fast per-system precomputed-grad broadcast for plain forces; on-tape
         backward Function (double-backward capable) under ``create_graph``.
         ``grad_E`` is ``(B,)``; per-atom cotangent is ``grad_E[batch_idx[i]]``."""
@@ -4219,7 +4229,7 @@ class BatchMultipoleRealSpaceFunction(torch.autograd.Function):
         return energies
 
     @staticmethod
-    def backward(ctx, grad_energies: torch.Tensor):
+    def backward(ctx, grad_energies: torch.Tensor):  # pragma: no cover
         """Route through :class:`BatchMultipoleRealSpaceBackwardFunction`."""
         (
             positions,
@@ -4330,12 +4340,12 @@ def multipole_ewald_summation(
     *,
     sigma: float,
     alpha: float | None = None,
-    kspace_cutoff: float | None = None,
-    k_vectors: torch.Tensor | None = None,
+    k_cutoff: float | None = None,
     batch_idx: torch.Tensor | None = None,
     accuracy: float = 1e-6,
     cost_ratio: float = 1.0,
     half_neighbor_list: bool = False,
+    cache: MultipoleSCFCache | None = None,
 ) -> torch.Tensor:
     r"""Full GTO-Ewald multipole electrostatic total energy.
 
@@ -4387,30 +4397,38 @@ def multipole_ewald_summation(
         :func:`estimate_multipole_ewald_parameters` at the requested
         ``accuracy``. The caller must build the neighbor list with the matching
         real-space cutoff.
-    kspace_cutoff : float, optional
-        Maximum :math:`|k|` for the reciprocal sum. Auto-estimated from the same
-        Kolafa-Perram balance when ``None`` and ``k_vectors`` is also ``None``.
-        Required if ``k_vectors`` is not supplied (single mode) or always
-        (batched mode builds its own k-grid per system).
-    k_vectors : torch.Tensor, optional
-        Pre-computed :math:`(N_k, 3)` k-grid including the origin row 0.
-        Single-system only; ignored in batched mode.
+    k_cutoff : float, optional
+        Maximum :math:`|k|` for the reciprocal sum. Auto-estimated from the
+        Kolafa-Perram balance when ``None`` (single mode); batched mode always
+        builds its own k-grid per system. Unnecessary when a ``cache`` is
+        supplied (the cache already encodes the k-grid).
     batch_idx : torch.Tensor, optional
         :math:`(N_\text{total},)` int32. ``None`` selects single-system mode.
     accuracy : float, default 1e-6
         Target relative-energy accuracy used by the auto-estimator when
-        ``alpha`` and/or ``kspace_cutoff`` are ``None``. Ignored if both are
+        ``alpha`` and/or ``k_cutoff`` are ``None``. Ignored if both are
         supplied.
     cost_ratio : float, default 1.0
         Hardware-empirical :math:`C_r / C_k` (per-real-space-pair vs per-k cost
         ratio) passed to :func:`estimate_multipole_ewald_parameters`. ``1.0``
         reproduces canonical Kolafa-Perram; higher values shift the optimum
         toward smaller real-space cutoff and larger reciprocal cutoff. Ignored
-        if ``alpha`` and ``kspace_cutoff`` (or ``k_vectors``) are supplied.
+        if ``alpha`` and ``k_cutoff`` are supplied.
     half_neighbor_list : bool, default False
         Forwarded to the real-space pair sum. Set when the CSR neighbor list
         stores each pair once (only affects the :math:`l_{max}=2` path's
         cell-gradient kernel; no effect otherwise).
+    cache : MultipoleSCFCache, optional
+        Pre-built reciprocal cache (from :func:`prepare_multipole_scf_cache`).
+        When given, the per-call reciprocal-cache rebuild (k-grid + GTO-Fourier
+        ``phi_hat`` + per-k-factor tables) is skipped — the steady-state /
+        MD path, analogous to passing precomputed ``k_squared`` to
+        :func:`multipole_particle_mesh_ewald`. ``alpha`` is taken from the
+        cache when not supplied, and ``k_cutoff`` becomes
+        unnecessary. **Stress caveat:** a pre-built cache holds a fixed
+        (detached) k-grid/volume, so ``grad(E, cell)`` does not flow through
+        the reciprocal term — pass ``cache=None`` for stress / cell-gradient
+        training. Forces (``grad(E, positions)``) are unaffected.
 
     Returns
     -------
@@ -4425,11 +4443,18 @@ def multipole_ewald_summation(
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}")
 
-    # Auto-estimate alpha and/or kspace_cutoff from the Kolafa-Perram
+    # A prebuilt reciprocal cache already encodes alpha + the k-grid, so the
+    # estimator is unnecessary: take alpha from the cache when not given and
+    # skip the Kolafa-Perram balance entirely (the cache supplies k_cutoff
+    # implicitly). See the cache= note in the docstring for the stress caveat.
+    if cache is not None and alpha is None:
+        alpha = float(cache.alpha)
+
+    # Auto-estimate alpha and/or k_cutoff from the Kolafa-Perram
     # balance if either is missing. We only run the estimator once per
     # call (single-system mode); batched callers that want per-system
     # parameters should pass them in explicitly.
-    if alpha is None or (kspace_cutoff is None and k_vectors is None):
+    if cache is None and (alpha is None or k_cutoff is None):
         from nvalchemiops.torch.interactions.electrostatics.parameters import (
             estimate_multipole_ewald_parameters,
         )
@@ -4460,9 +4485,9 @@ def multipole_ewald_summation(
                         "each system separately."
                     )
                 alpha = alpha_min
-        if kspace_cutoff is None and k_vectors is None:
+        if k_cutoff is None:
             kcut_tensor = params.reciprocal_space_cutoff
-            kspace_cutoff = float(kcut_tensor.max().item())
+            k_cutoff = float(kcut_tensor.max().item())
 
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
@@ -4500,10 +4525,11 @@ def multipole_ewald_summation(
                 raise ValueError(
                     f"batched mode requires cell shape (B, 3, 3); got {tuple(cell.shape)}"
                 )
-            if kspace_cutoff is None:
+            if cache is None and k_cutoff is None:
                 raise ValueError(
-                    "batched mode requires kspace_cutoff (batched reciprocal "
-                    "builds its own k-grid per system)."
+                    "batched mode requires k_cutoff (batched reciprocal "
+                    "builds its own k-grid per system) unless a prebuilt "
+                    "cache= is supplied."
                 )
             B = cell.shape[0]
             sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
@@ -4530,7 +4556,8 @@ def multipole_ewald_summation(
                 batch_idx=batch_idx,
                 sigma=sigma,
                 alpha=alpha,
-                kspace_cutoff=kspace_cutoff,
+                k_cutoff=k_cutoff,
+                cache=cache,
             )
             atom_self = _multipole_ewald_self_energy_per_atom(
                 source_feats,
@@ -4565,8 +4592,8 @@ def multipole_ewald_summation(
             cell.reshape(3, 3) if cell.ndim == 3 else cell,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kspace_cutoff,
-            k_vectors=k_vectors,
+            k_cutoff=k_cutoff,
+            cache=cache,
         )
         e_self = _multipole_ewald_self_energy_per_atom(
             source_feats,
@@ -4596,10 +4623,11 @@ def multipole_ewald_summation(
         sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
         alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
 
-        if kspace_cutoff is None:
+        if cache is None and k_cutoff is None:
             raise ValueError(
-                "batched mode requires kspace_cutoff (batched reciprocal "
-                "builds its own k-grid per system)."
+                "batched mode requires k_cutoff (batched reciprocal "
+                "builds its own k-grid per system) unless a prebuilt cache= "
+                "is supplied."
             )
         # Per-atom (N_total,) for all three terms; caller owns the reduction.
         e_real = coulomb_scale * multipole_real_space_energy_with_stress(
@@ -4620,7 +4648,8 @@ def multipole_ewald_summation(
             batch_idx=batch_idx,
             sigma=sigma,
             alpha=alpha,
-            kspace_cutoff=kspace_cutoff,
+            k_cutoff=k_cutoff,
+            cache=cache,
         )
         atom_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
         return (e_real + e_recip - atom_self).to(torch.float64)
@@ -4645,8 +4674,8 @@ def multipole_ewald_summation(
         cell,
         sigma=sigma,
         alpha=alpha,
-        kspace_cutoff=kspace_cutoff,
-        k_vectors=k_vectors,
+        k_cutoff=k_cutoff,
+        cache=cache,
     )
     e_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
     return (e_real + e_recip - e_self).to(torch.float64)

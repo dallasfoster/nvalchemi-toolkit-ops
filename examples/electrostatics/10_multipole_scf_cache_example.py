@@ -131,17 +131,17 @@ print(f"source_feats shape (e3nn l_max=1 packed): {tuple(source_feats.shape)}")
 # kernels for this cell and returns an immutable bundle of device tensors. The
 # ``sigma`` is the density-side Gaussian width; ``receiver_sigmas`` are the
 # feature-side widths (only used by the feature step, but cheap to include).
-# ``kspace_cutoff`` sets the reciprocal-space k-grid. Built once, reused below.
+# ``k_cutoff`` sets the reciprocal-space k-grid. Built once, reused below.
 
 sigma = 1.0
 receiver_sigmas = [0.8, 1.2]
-kspace_cutoff = 3.5
+k_cutoff = 3.5
 
 cache = prepare_multipole_scf_cache(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     l_max=1,
     feature_max_l=1,
     density_normalize=NormMode.MULTIPOLES,
@@ -215,7 +215,7 @@ cache_expanded = prepare_multipole_scf_cache(
     cell_expanded,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     l_max=1,
 )
 E_orig = multipole_scf_step_energy(cache, positions, source_feats)
@@ -246,7 +246,7 @@ cache_batch = prepare_multipole_scf_cache(
     cells_batch,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     l_max=1,
     feature_max_l=1,
 )

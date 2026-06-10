@@ -133,12 +133,12 @@ print(f"Total charge: {charges.sum().item():+.4f}")
 # potential is projected onto. Each receiver width contributes one block of
 # ``(feature_max_l + 1)**2`` channels to the per-atom feature vector, so the
 # output width is ``len(receiver_sigmas) * (feature_max_l + 1)**2``.
-# ``kspace_cutoff`` bounds the reciprocal sum (pass ``k_vectors`` instead to
+# ``k_cutoff`` bounds the reciprocal sum (pass ``k_vectors`` instead to
 # reuse a precomputed grid across calls for a fixed geometry).
 
 sigma = 1.0
 receiver_sigmas = [0.7, 1.0, 1.5]
-kspace_cutoff = 4.0
+k_cutoff = 4.0
 n_sigma = len(receiver_sigmas)
 print(f"density sigma = {sigma}, receiver_sigmas = {receiver_sigmas}")
 
@@ -156,7 +156,7 @@ feats_fmax0 = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=0,
 )
 print(f"feature_max_l=0 features shape = {tuple(feats_fmax0.shape)}  (N, n_sigma * 1)")
@@ -178,7 +178,7 @@ feats_fmax1 = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
 )
 print(f"feature_max_l=1 features shape = {tuple(feats_fmax1.shape)}  (N, n_sigma * 4)")
@@ -229,7 +229,7 @@ feats_qd = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
 )
 feats_qdq = multipole_electrostatic_features(
@@ -238,7 +238,7 @@ feats_qdq = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
 )
 print("Effect of richer source moments (same receiver cap feature_max_l=1):")
@@ -264,7 +264,7 @@ feats_fmax2 = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=2,
 )
 print(f"feature_max_l=2 features shape = {tuple(feats_fmax2.shape)}  (N, n_sigma * 9)")
@@ -303,7 +303,7 @@ charges_only_fmax2 = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=2,
 )
 print(
@@ -327,7 +327,7 @@ feats_default = multipole_electrostatic_features(
     cell,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
     density_normalize=NormMode.MULTIPOLES,
     feature_normalize=NormMode.RECEIVER,
@@ -359,7 +359,7 @@ feats = multipole_electrostatic_features(
     cell_g,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
 )
 # A mock scalar readout (e.g. a linear head over the descriptor).
@@ -402,7 +402,7 @@ feats_batch = multipole_electrostatic_features(
     batch_idx=batch_idx,
     sigma=sigma,
     receiver_sigmas=receiver_sigmas,
-    kspace_cutoff=kspace_cutoff,
+    k_cutoff=k_cutoff,
     feature_max_l=1,
 )
 print(

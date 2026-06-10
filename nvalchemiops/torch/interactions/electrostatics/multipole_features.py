@@ -86,7 +86,7 @@ def multipole_electrostatic_features(
     batch_idx: torch.Tensor | None = None,
     sigma: float,
     receiver_sigmas: list[float] | tuple[float, ...] | torch.Tensor,
-    kspace_cutoff: float | None = None,
+    k_cutoff: float | None = None,
     k_vectors: torch.Tensor | None = None,
     feature_max_l: int = 1,
     density_normalize: NormMode | int | str = NormMode.MULTIPOLES,
@@ -120,7 +120,7 @@ def multipole_electrostatic_features(
     ---------------------------------
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use ``batch_idx`` to
-    select the batched path. Batched mode requires ``kspace_cutoff`` (a
+    select the batched path. Batched mode requires ``k_cutoff`` (a
     pre-generated ``k_vectors`` is single-system only).
 
     Parameters
@@ -140,10 +140,10 @@ def multipole_electrostatic_features(
         Density-side Gaussian width.
     receiver_sigmas : list of floats, tuple, or 1-D tensor
         Multi-σ receiver basis widths. Must be non-empty.
-    kspace_cutoff, k_vectors
+    k_cutoff, k_vectors
         Same semantics as :func:`multipole_electrostatic_energy`. Pass
         ``k_vectors`` to amortize setup across calls for fixed geometry
-        (single-system only). Batched mode requires ``kspace_cutoff``.
+        (single-system only). Batched mode requires ``k_cutoff``.
     feature_max_l : int, default 1
         Receiver angular cap: how many l-blocks are projected out per σ,
         independent of the source ``l_max``. ``1`` -> ``(N_σ * 4)`` features
@@ -175,7 +175,7 @@ def multipole_electrostatic_features(
         if k_vectors is not None:
             raise ValueError(
                 "k_vectors is not supported for batched features; pass "
-                "kspace_cutoff instead."
+                "k_cutoff instead."
             )
     elif cell.shape != (3, 3):
         raise ValueError(f"cell must be (3, 3) or (B, 3, 3), got {tuple(cell.shape)}")
@@ -193,10 +193,10 @@ def multipole_electrostatic_features(
         )
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}")
-    if k_vectors is None and (kspace_cutoff is None or kspace_cutoff <= 0.0):
+    if k_vectors is None and (k_cutoff is None or k_cutoff <= 0.0):
         raise ValueError(
-            "Either k_vectors must be supplied, or kspace_cutoff must be a "
-            f"positive float (got kspace_cutoff={kspace_cutoff})."
+            "Either k_vectors must be supplied, or k_cutoff must be a "
+            f"positive float (got k_cutoff={k_cutoff})."
         )
 
     if isinstance(receiver_sigmas, torch.Tensor):
@@ -225,7 +225,7 @@ def multipole_electrostatic_features(
         cell,
         sigma=sigma,
         receiver_sigmas=sigmas_list,
-        kspace_cutoff=kspace_cutoff,
+        k_cutoff=k_cutoff,
         k_vectors=None if is_batch else k_vectors,
         l_max=l_max,
         feature_max_l=feature_max_l,
