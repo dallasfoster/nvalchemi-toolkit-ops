@@ -112,6 +112,11 @@ class MultipoleSCFCache:
         Natural row-major output LUT for the feature projection kernel.
     out_col_lut_permuted : torch.Tensor, shape (N_σ, 4|9), int32
         Permuted output LUT for the feature projection kernel.
+    out_col_inv_perm : torch.Tensor, shape (N_σ · (feature_max_l+1)**2,), int64
+        Precomputed inverse permutation ``argsort(out_col_lut_permuted)`` that
+        maps the natural feature layout to the reference permuted flat layout.
+        Cached here (it is position-independent) so the feature step does not
+        re-run ``torch.argsort`` every call.
     volume : torch.Tensor, float64
         ``|det(cell)|``. Single shape ``()`` / batched ``(B,)``.
     cell : torch.Tensor, float64
@@ -152,6 +157,7 @@ class MultipoleSCFCache:
     feature_overlap_constants: torch.Tensor
     out_col_lut_natural: torch.Tensor
     out_col_lut_permuted: torch.Tensor
+    out_col_inv_perm: torch.Tensor
     volume: torch.Tensor
     cell: torch.Tensor
     sigma: float
@@ -494,6 +500,10 @@ def prepare_multipole_scf_cache(
     out_col_lut_permuted = _build_out_col_lut(
         n_sigma, permuted=True, device=device, feature_max_l=feature_max_l
     )
+    # Precompute the natural->permuted inverse permutation once (it only depends
+    # on the position-independent output LUT), so the feature step reuses it
+    # instead of re-running torch.argsort every call.
+    out_col_inv_perm = torch.argsort(out_col_lut_permuted.flatten().long())
 
     return MultipoleSCFCache(
         k_vectors=k_vectors,
@@ -506,6 +516,7 @@ def prepare_multipole_scf_cache(
         feature_overlap_constants=feature_oc,
         out_col_lut_natural=out_col_lut_natural,
         out_col_lut_permuted=out_col_lut_permuted,
+        out_col_inv_perm=out_col_inv_perm,
         volume=volume,
         cell=cell.to(device=device, dtype=torch.float64),
         sigma=float(sigma),
@@ -810,6 +821,9 @@ def _prepare_multipole_scf_cache_batch(
     out_col_lut_permuted = _build_out_col_lut(
         n_sigma, permuted=True, device=device, feature_max_l=feature_max_l
     )
+    # Position-independent inverse permutation — cached once (see single-system
+    # builder), so the batched feature step skips a per-call torch.argsort.
+    out_col_inv_perm = torch.argsort(out_col_lut_permuted.flatten().long())
 
     return MultipoleSCFCache(
         k_vectors=k_vectors,
@@ -822,6 +836,7 @@ def _prepare_multipole_scf_cache_batch(
         feature_overlap_constants=feature_oc,
         out_col_lut_natural=out_col_lut_natural,
         out_col_lut_permuted=out_col_lut_permuted,
+        out_col_inv_perm=out_col_inv_perm,
         volume=volume,
         cell=cells_dev,
         sigma=float(sigma),

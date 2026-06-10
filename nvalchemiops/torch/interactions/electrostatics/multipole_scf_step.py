@@ -482,9 +482,9 @@ def multipole_scf_step_features(
     # Inverse-permute using the cached LUT.
     n_lm = (cache.feature_max_l + 1) ** 2
     flat_natural = features_natural.reshape(n_atoms, cache.n_sigma * n_lm)
-    permuted_flat = cache.out_col_lut_permuted.flatten().long()
-    inv_perm = torch.argsort(permuted_flat)
-    return flat_natural.index_select(-1, inv_perm)
+    # Inverse-permute to the reference flat layout via the cache's precomputed
+    # argsort (position-independent — no per-call sort).
+    return flat_natural.index_select(-1, cache.out_col_inv_perm)
 
 
 # =============================================================================
@@ -806,9 +806,9 @@ def _multipole_scf_step_features_batch(
 
     n_lm = (cache.feature_max_l + 1) ** 2
     flat_natural = features_natural.reshape(n_total, cache.n_sigma * n_lm)
-    permuted_flat = cache.out_col_lut_permuted.flatten().long()
-    inv_perm = torch.argsort(permuted_flat)
-    return flat_natural.index_select(-1, inv_perm)
+    # Inverse-permute to the reference flat layout via the cache's precomputed
+    # argsort (position-independent — no per-call sort).
+    return flat_natural.index_select(-1, cache.out_col_inv_perm)
 
 
 # =============================================================================

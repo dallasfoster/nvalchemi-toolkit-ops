@@ -353,7 +353,21 @@ def pack_multipole_moments(
         If ``quadrupoles`` is given without ``dipoles`` (the packed l_max=2
         layout requires the ``(N, 4)`` charge+dipole block).
     """
+    # Input shape validation. This is a host-side constructor called once to
+    # build inputs (not on the torch.compile hot path), so cheap Python checks
+    # are safe and catch mis-shaped moments before they reach the kernels.
+    if charges.ndim != 1:
+        raise ValueError(f"charges must be 1-D (N,); got {tuple(charges.shape)}")
     n = charges.shape[0]
+    if dipoles is not None and dipoles.shape != (n, 3):
+        raise ValueError(
+            f"dipoles must be (N, 3) = ({n}, 3); got {tuple(dipoles.shape)}"
+        )
+    if quadrupoles is not None and quadrupoles.shape != (n, 3, 3):
+        raise ValueError(
+            f"quadrupoles must be (N, 3, 3) = ({n}, 3, 3); "
+            f"got {tuple(quadrupoles.shape)}"
+        )
     cols = [charges.reshape(n, 1)]
     if dipoles is not None:
         cols.append(dipole_cartesian_to_spherical(dipoles))  # (N, 3) e3nn order
