@@ -233,9 +233,11 @@ class TestGreenStructureFactor:
             spline_order=spline_order,
         )
 
-        # σ = 0 collapses the extra exp factor to 1, recovering monopole.
-        torch.testing.assert_close(green_multi, green_mono, rtol=0, atol=0)
-        torch.testing.assert_close(struct_multi, struct_mono, rtol=0, atol=0)
+        # σ = 0 collapses the extra exp factor to 1, recovering monopole. The
+        # multipole and monopole Green/structure-factor kernels are separate
+        # code paths (they agree to fp64 precision, not bit-for-bit).
+        torch.testing.assert_close(green_multi, green_mono, rtol=1e-12, atol=1e-14)
+        torch.testing.assert_close(struct_multi, struct_mono, rtol=1e-12, atol=1e-14)
 
     @pytest.mark.parametrize("sigma_val", [0.5, 1.0, 1.5])
     def test_gto_factor_analytical(self, sigma_val):
@@ -283,8 +285,9 @@ class TestGreenStructureFactor:
         expected_green = green_mono * gto
 
         torch.testing.assert_close(green_multi, expected_green, rtol=1e-12, atol=1e-14)
-        # Structure factor is source-distribution independent.
-        torch.testing.assert_close(struct_multi, struct_mono, rtol=0, atol=0)
+        # Structure factor is source-distribution independent (multipole and
+        # monopole kernels agree to fp64 precision, not bit-for-bit).
+        torch.testing.assert_close(struct_multi, struct_mono, rtol=1e-12, atol=1e-14)
 
     def test_k_zero_is_zero(self):
         """Tin-foil boundary: G̃(k=0) is zero regardless of σ."""

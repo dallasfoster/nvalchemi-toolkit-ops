@@ -951,8 +951,11 @@ class TestEstimateMultipolePMEParameters:
             positions, cell, sigma=1e-12, accuracy=1e-6
         )
         assert mono.mesh_dimensions == multi.mesh_dimensions
+        # The monopole and multipole estimators share the balance but run
+        # separate code paths, so the cutoff agrees to fp64 precision (not
+        # bit-for-bit, esp. on CUDA).
         assert torch.allclose(
-            mono.real_space_cutoff, multi.real_space_cutoff, rtol=0, atol=0
+            mono.real_space_cutoff, multi.real_space_cutoff, rtol=1e-9, atol=0
         )
 
     @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
