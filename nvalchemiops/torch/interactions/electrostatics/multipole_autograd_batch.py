@@ -2210,6 +2210,207 @@ torch.library.register_autograd(
 )
 
 
+# =============================================================================
+# Batched direct-k per-atom reciprocal gathers: g = Sᵀ·grad_rho (flat N_total).
+# Batched analogs of multipole_rho_gather_t / multipole_rho_q_gather_t; forward
+# = the batched moment-grad transpose, backward composes the batched rho /
+# rho_q forward + the batched rho backward sub-ops (twice-diff for free).
+# =============================================================================
+
+
+@torch.library.custom_op(
+    "nvalchemiops::batch_multipole_rho_gather_t",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_rho, Tensor positions, Tensor source_phi_hat, "
+        "Tensor k_vectors, Tensor volume, Tensor batch_idx) -> Tensor"
+    ),
+)
+def _batch_multipole_rho_gather_t_op(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    r"""Opaque forward: ``g = Sᵀ·grad_rho`` per-atom moment gradient ``(N_total, 4)``."""
+    cosines, sines = torch.ops.nvalchemiops.batch_multipole_structure_factor(
+        positions, k_vectors, batch_idx
+    )
+    return torch.ops.nvalchemiops.batch_multipole_rho_moment_grad(
+        grad_rho, cosines, sines, source_phi_hat, volume, batch_idx
+    )
+
+
+@torch.library.register_fake("nvalchemiops::batch_multipole_rho_gather_t")
+def _batch_multipole_rho_gather_t_fake(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_phi_hat: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``g`` is ``(N_total, 4)`` float64."""
+    return positions.new_empty((positions.shape[0], 4), dtype=torch.float64)
+
+
+def _batch_multipole_rho_gather_t_setup_context(ctx, inputs, output) -> None:
+    """Save forward inputs for the analytical backward."""
+    grad_rho, positions, source_phi_hat, k_vectors, volume, batch_idx = inputs
+    ctx.save_for_backward(
+        grad_rho, positions, source_phi_hat, k_vectors, volume, batch_idx
+    )
+
+
+def _batch_multipole_rho_gather_t_backward(ctx, g_cot: torch.Tensor):
+    r"""Adjoint of ``g = Sᵀ·grad_rho`` (batched): ``<cg, Sᵀ grad_rho> = <S·cg, grad_rho>``."""
+    grad_rho, positions, source_phi_hat, k_vectors, volume, batch_idx = (
+        ctx.saved_tensors
+    )
+    cg_q = g_cot[:, 0].contiguous()
+    cg_dip = g_cot[:, [3, 1, 2]].contiguous()
+    cosines, sines = torch.ops.nvalchemiops.batch_multipole_structure_factor(
+        positions.detach(), k_vectors.detach(), batch_idx
+    )
+    d_grad_rho = torch.ops.nvalchemiops.batch_multipole_rho(
+        cg_q, cg_dip, positions, source_phi_hat, k_vectors, volume, batch_idx
+    )
+    scale = (
+        torch.as_tensor(_TWO_PI_CUBED, dtype=torch.float64, device=positions.device)
+        / volume
+    )
+    d_positions = torch.ops.nvalchemiops.batch_multipole_rho_position_grad(
+        grad_rho,
+        cg_q,
+        cg_dip,
+        positions,
+        cosines,
+        sines,
+        source_phi_hat,
+        k_vectors,
+        scale,
+        batch_idx,
+    ).to(positions.dtype)
+    d_phi = torch.ops.nvalchemiops.batch_multipole_rho_phihat_grad(
+        grad_rho, cg_q, cg_dip, positions, cosines, sines, k_vectors, volume, batch_idx
+    )
+    d_kvec = torch.ops.nvalchemiops.batch_multipole_rho_kphase_grad(
+        grad_rho,
+        cg_q,
+        cg_dip,
+        positions,
+        cosines,
+        sines,
+        source_phi_hat,
+        k_vectors,
+        volume,
+        batch_idx,
+    )
+    # Slots: (grad_rho, positions, source_phi_hat, k_vectors, volume, batch_idx).
+    return d_grad_rho, d_positions, d_phi, d_kvec, None, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::batch_multipole_rho_gather_t",
+    _batch_multipole_rho_gather_t_backward,
+    setup_context=_batch_multipole_rho_gather_t_setup_context,
+)
+
+
+@torch.library.custom_op(
+    "nvalchemiops::batch_multipole_rho_q_gather_t",
+    mutates_args=(),
+    schema=(
+        "(Tensor grad_rho, Tensor positions, Tensor source_coeff2, "
+        "Tensor k_vectors, Tensor volume, Tensor batch_idx) -> Tensor"
+    ),
+)
+def _batch_multipole_rho_q_gather_t_op(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    r"""Opaque forward: ``g_Q = Sᵀ_Q·grad_rho`` per-atom quad gradient ``(N_total, 3, 3)``."""
+    cosines, sines = torch.ops.nvalchemiops.batch_multipole_structure_factor(
+        positions, k_vectors, batch_idx
+    )
+    return torch.ops.nvalchemiops.batch_multipole_rho_q_moment_grad(
+        grad_rho, positions, cosines, sines, k_vectors, source_coeff2, volume, batch_idx
+    )
+
+
+@torch.library.register_fake("nvalchemiops::batch_multipole_rho_q_gather_t")
+def _batch_multipole_rho_q_gather_t_fake(
+    grad_rho: torch.Tensor,
+    positions: torch.Tensor,
+    source_coeff2: torch.Tensor,
+    k_vectors: torch.Tensor,
+    volume: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype metadata: ``g_Q`` is ``(N_total, 3, 3)`` float64."""
+    return positions.new_empty((positions.shape[0], 3, 3), dtype=torch.float64)
+
+
+def _batch_multipole_rho_q_gather_t_setup_context(ctx, inputs, output) -> None:
+    """Save forward inputs for the analytical backward."""
+    grad_rho, positions, source_coeff2, k_vectors, volume, batch_idx = inputs
+    ctx.save_for_backward(
+        grad_rho, positions, source_coeff2, k_vectors, volume, batch_idx
+    )
+
+
+def _batch_multipole_rho_q_gather_t_backward(ctx, g_cot: torch.Tensor):
+    r"""Adjoint of ``g_Q = Sᵀ_Q·grad_rho`` (batched)."""
+    grad_rho, positions, source_coeff2, k_vectors, volume, batch_idx = ctx.saved_tensors
+    cg_q = g_cot.contiguous()
+    cosines, sines = torch.ops.nvalchemiops.batch_multipole_structure_factor(
+        positions.detach(), k_vectors.detach(), batch_idx
+    )
+    d_grad_rho = torch.ops.nvalchemiops.batch_multipole_rho_q(
+        cg_q, positions, source_coeff2, k_vectors, volume, batch_idx
+    )
+    d_positions = torch.ops.nvalchemiops.batch_multipole_rho_q_position_grad(
+        grad_rho,
+        cg_q,
+        positions,
+        cosines,
+        sines,
+        k_vectors,
+        source_coeff2,
+        volume,
+        batch_idx,
+    ).to(positions.dtype)
+    d_coeff2 = torch.ops.nvalchemiops.batch_multipole_rho_q_coeff2_grad(
+        grad_rho, cg_q, positions, cosines, sines, k_vectors, volume, batch_idx
+    )
+    d_kvec = torch.ops.nvalchemiops.batch_multipole_rho_q_kvec_grad(
+        grad_rho,
+        cg_q,
+        positions,
+        cosines,
+        sines,
+        k_vectors,
+        source_coeff2,
+        volume,
+        batch_idx,
+    )
+    # Slots: (grad_rho, positions, source_coeff2, k_vectors, volume, batch_idx).
+    return d_grad_rho, d_positions, d_coeff2, d_kvec, None, None
+
+
+torch.library.register_autograd(
+    "nvalchemiops::batch_multipole_rho_q_gather_t",
+    _batch_multipole_rho_q_gather_t_backward,
+    setup_context=_batch_multipole_rho_q_gather_t_setup_context,
+)
+
+
 class BatchMultipoleRhoQFunction:
     r"""Back-compat shim for the batched Cartesian-quadrupole :math:`\rho_Q(k)` contribution.
 
