@@ -43,3 +43,50 @@ operations:
 
   segmented_matvec:
     enabled: true
+
+  # ----------------------------------------------------------------------------
+  # PR 1 backward / double-backward groups.  Opt-in (default disabled): they
+  # multiply the run time substantially over the forward-only sweep, so a
+  # plain ``make pytest`` / default config run sticks to the forward ops above.
+  # Flip ``enabled: true`` on the rows you want to time.
+  # ----------------------------------------------------------------------------
+  segmented_sum_bwd:
+    enabled: false
+  segmented_sum_dbl:
+    enabled: false
+  segmented_dot_bwd:
+    enabled: false
+  segmented_dot_dbl:
+    enabled: false
+  segmented_mul_bwd:
+    enabled: false
+  segmented_mul_dbl:
+    enabled: false
+  segmented_matvec_bwd:
+    enabled: false
+  segmented_matvec_dbl:
+    enabled: false
+  segmented_max_norm_bwd:
+    enabled: false
+  segmented_max_norm_dbl:
+    enabled: false
+  segmented_rms_norm_bwd:
+    enabled: false
+  segmented_rms_norm_dbl:
+    enabled: false
+
+# ----------------------------------------------------------------------------
+# Public Torch bindings (nvalchemiops.torch.segment_ops custom ops).
+#
+# Separate from the Warp-vs-torch comparison above: times the bindings users
+# actually call (forward), eager and optionally under torch.compile, against
+# the hand-written torch they replace.  Opt-in.  Equivalent CLI flags:
+#   --torch-bindings   enable this section (overrides ``enabled`` below)
+#   --torch-compile    add the torch.compile(fullgraph=True) column
+# ----------------------------------------------------------------------------
+torch_bindings:
+  enabled: true
+  compile: true
+  # Subset of ops to time; omit to benchmark all six.
+  # ops: [segmented_sum, segmented_dot, segmented_mul, segmented_mean,
+  #       segmented_rms_norm, segmented_matvec]
