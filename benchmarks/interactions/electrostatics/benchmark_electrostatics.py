@@ -1994,21 +1994,6 @@ def prepare_multipole_batch_system(
     return system_data
 
 
-_MULTIPOLE_COMPILED: dict[str, object] = {}
-
-
-def _compiled_multipole(which: str):
-    """Return a cached ``torch.compile``-wrapped multipole composite."""
-    fn = _MULTIPOLE_COMPILED.get(which)
-    if fn is None:
-        if which == "ewald":
-            fn = torch.compile(_torch_electrostatics.multipole_ewald_summation)
-        else:  # "pme"
-            fn = torch.compile(_torch_pme_multipole.multipole_particle_mesh_ewald)
-        _MULTIPOLE_COMPILED[which] = fn
-    return fn
-
-
 def _real_space_sigma_alpha_tensors(
     system_data: dict, sigma: float, alpha: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2025,103 +2010,16 @@ def _real_space_sigma_alpha_tensors(
     return sigma_t, alpha_t
 
 
-def run_nvalchemiops_multipole_ewald(
-    system_data: dict,
-    compute_forces: bool,
-    compile_model: bool = False,
-    component: str = "full",
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run multipole Ewald summation using the nvalchemiops torch backend.
+def _multipole_energy_fn(method: str, component: str, system_data: dict):
+    """Return a closure ``positions -> per-atom energy`` for one method/component.
 
-    Single-system or batched (dispatched by ``batch_idx``). ``component``
-    selects ``"full"`` (the composite), ``"reciprocal"`` (direct-k GTO-Ewald
-    sum only), or ``"real"`` (the erfc-damped real-space pair sum only) so the
-    config's ``components`` list is honored. Forces are obtained via autograd on
-    positions when ``compute_forces`` is set. Returns ``(energy, forces)``.
+    Only ``positions`` varies (the autograd leaf); every other input is captured
+    from ``system_data``. This is the unit we hand to ``torch.compile``: the
+    energy-only forward is compile-clean for all multipole combos (single +
+    batched, l=0/1/2, full + reciprocal), whereas compiling energy **and** the
+    autograd-grad force pass together hits Inductor backward-codegen limits. So
+    the caller compiles *this* and takes ``torch.autograd.grad`` outside it.
     """
-    positions = system_data["positions"]
-    multipole_moments = system_data["multipole_moments"]
-    cell = system_data["cell"]
-    idx_j = system_data["idx_j"]
-    neighbor_ptr = system_data["neighbor_ptr"]
-    unit_shifts = system_data["unit_shifts"]
-    batch_idx = system_data.get("batch_idx")
-    sigma = system_data["sigma"]
-    alpha = system_data.get("alpha")
-
-    pos = positions
-    if compute_forces and not pos.requires_grad:
-        pos = pos.detach().requires_grad_(True)
-
-    if component == "reciprocal":
-        # Direct-k GTO-Ewald reciprocal sum (prebuilt cache excludes setup).
-        energy = _torch_electrostatics.multipole_reciprocal_space_energy(
-            pos,
-            multipole_moments,
-            cell,
-            batch_idx=batch_idx,
-            sigma=sigma,
-            alpha=alpha,
-            cache=system_data.get("ewald_cache"),
-        )
-    elif component == "real":
-        sigma_t, alpha_t = _real_space_sigma_alpha_tensors(system_data, sigma, alpha)
-        energy = _torch_electrostatics.multipole_real_space_energy(
-            pos,
-            multipole_moments,
-            cell,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            sigma_t,
-            alpha_t,
-            batch_idx=batch_idx,
-        )
-    else:  # "full"
-        ewald_fn = (
-            _compiled_multipole("ewald")
-            if compile_model
-            else _torch_electrostatics.multipole_ewald_summation
-        )
-        energy = ewald_fn(
-            pos,
-            multipole_moments,
-            cell,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            sigma=sigma,
-            alpha=alpha,
-            batch_idx=batch_idx,
-            # Prebuilt reciprocal cache (k-grid + phi_hat + per-k-factor) so the
-            # timed call excludes the per-step cache rebuild + param estimation.
-            cache=system_data.get("ewald_cache"),
-        )
-
-    forces = None
-    if compute_forces:
-        (grad,) = torch.autograd.grad(energy.sum(), pos)
-        forces = -grad.detach()
-        energy = energy.detach()
-    return energy, forces
-
-
-def run_nvalchemiops_multipole_pme(
-    system_data: dict,
-    compute_forces: bool,
-    compile_model: bool = False,
-    component: str = "full",
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run multipole PME using the nvalchemiops torch backend.
-
-    Single-system or batched (dispatched by ``batch_idx``). ``component``
-    selects ``"full"`` (the composite), ``"reciprocal"`` (the PME mesh
-    reciprocal sum only), or ``"real"`` (the erfc-damped real-space pair sum,
-    identical to the Ewald real-space term) so the config's ``components`` list
-    is honored. Forces are obtained via autograd on positions when
-    ``compute_forces`` is set. Returns ``(energy, forces)``.
-    """
-    positions = system_data["positions"]
     multipole_moments = system_data["multipole_moments"]
     cell = system_data["cell"]
     idx_j = system_data["idx_j"]
@@ -2133,71 +2031,153 @@ def run_nvalchemiops_multipole_pme(
     mesh_dimensions = system_data.get("mesh_dimensions")
     spline_order = system_data.get("spline_order", 4)
 
-    pos = positions
-    if compute_forces and not pos.requires_grad:
-        pos = pos.detach().requires_grad_(True)
+    if component == "real":
+        # Real-space is the same erfc-damped pair sum for Ewald and PME.
+        sigma_t, alpha_t = _real_space_sigma_alpha_tensors(system_data, sigma, alpha)
 
+        def energy_fn(pos):
+            return _torch_electrostatics.multipole_real_space_energy(
+                pos,
+                multipole_moments,
+                cell,
+                idx_j,
+                neighbor_ptr,
+                unit_shifts,
+                sigma_t,
+                alpha_t,
+                batch_idx=batch_idx,
+            )
+
+        return energy_fn
+
+    if method == "multipole_ewald":
+        if component == "reciprocal":
+            # Direct-k GTO-Ewald reciprocal sum (prebuilt cache excludes setup).
+            def energy_fn(pos):
+                return _torch_electrostatics.multipole_reciprocal_space_energy(
+                    pos,
+                    multipole_moments,
+                    cell,
+                    batch_idx=batch_idx,
+                    sigma=sigma,
+                    alpha=alpha,
+                    cache=system_data.get("ewald_cache"),
+                )
+        else:  # "full"
+
+            def energy_fn(pos):
+                return _torch_electrostatics.multipole_ewald_summation(
+                    pos,
+                    multipole_moments,
+                    cell,
+                    idx_j,
+                    neighbor_ptr,
+                    unit_shifts,
+                    sigma=sigma,
+                    alpha=alpha,
+                    batch_idx=batch_idx,
+                    # Prebuilt reciprocal cache so the timed call excludes the
+                    # per-step cache rebuild + parameter estimation.
+                    cache=system_data.get("ewald_cache"),
+                )
+
+        return energy_fn
+
+    # multipole_pme
     if component == "reciprocal":
         # PME mesh reciprocal sum (prebuilt k_squared / moduli exclude setup).
-        energy = _torch_pme_multipole.multipole_pme_reciprocal_space(
-            pos,
-            multipole_moments,
-            cell,
-            sigma=sigma,
-            alpha=alpha,
-            mesh_dimensions=mesh_dimensions,
-            spline_order=spline_order,
-            batch_idx=batch_idx,
-            cell_inv_t=system_data.get("pme_cell_inv_t"),
-            volume=system_data.get("pme_volume"),
-            moduli=system_data.get("pme_moduli"),
-            k_squared=system_data.get("pme_k_squared"),
-        )
-    elif component == "real":
-        # Real-space is the same erfc-damped pair sum as Ewald.
-        sigma_t, alpha_t = _real_space_sigma_alpha_tensors(system_data, sigma, alpha)
-        energy = _torch_electrostatics.multipole_real_space_energy(
-            pos,
-            multipole_moments,
-            cell,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            sigma_t,
-            alpha_t,
-            batch_idx=batch_idx,
-        )
+        def energy_fn(pos):
+            return _torch_pme_multipole.multipole_pme_reciprocal_space(
+                pos,
+                multipole_moments,
+                cell,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                cell_inv_t=system_data.get("pme_cell_inv_t"),
+                volume=system_data.get("pme_volume"),
+                moduli=system_data.get("pme_moduli"),
+                k_squared=system_data.get("pme_k_squared"),
+            )
     else:  # "full"
-        pme_fn = (
-            _compiled_multipole("pme")
-            if compile_model
-            else _torch_pme_multipole.multipole_particle_mesh_ewald
-        )
-        energy = pme_fn(
-            pos,
-            multipole_moments,
-            cell,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            sigma=sigma,
-            alpha=alpha,
-            mesh_dimensions=mesh_dimensions,
-            spline_order=spline_order,
-            batch_idx=batch_idx,
-            # Prebuilt reusables so the timed call excludes k-grid / modulus rebuild.
-            cell_inv_t=system_data.get("pme_cell_inv_t"),
-            volume=system_data.get("pme_volume"),
-            k_squared=system_data.get("pme_k_squared"),
-            moduli=system_data.get("pme_moduli"),
-        )
 
+        def energy_fn(pos):
+            return _torch_pme_multipole.multipole_particle_mesh_ewald(
+                pos,
+                multipole_moments,
+                cell,
+                idx_j,
+                neighbor_ptr,
+                unit_shifts,
+                sigma=sigma,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                # Prebuilt reusables so the timed call excludes k-grid / modulus rebuild.
+                cell_inv_t=system_data.get("pme_cell_inv_t"),
+                volume=system_data.get("pme_volume"),
+                k_squared=system_data.get("pme_k_squared"),
+                moduli=system_data.get("pme_moduli"),
+            )
+
+    return energy_fn
+
+
+def _run_multipole(
+    method: str,
+    system_data: dict,
+    compute_forces: bool,
+    component: str,
+    energy_fn=None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run one multipole method/component: energy via ``energy_fn`` (eager or
+    pre-``torch.compile``-d), forces via autograd taken **outside** ``energy_fn``.
+
+    ``energy_fn`` defaults to the eager closure; ``run_benchmark`` passes the
+    compiled closure under ``--torch-compile``. Returns ``(energy, forces)``.
+    """
+    pos = system_data["positions"]
+    if compute_forces and not pos.requires_grad:
+        pos = pos.detach().requires_grad_(True)
+    if energy_fn is None:
+        energy_fn = _multipole_energy_fn(method, component, system_data)
+
+    energy = energy_fn(pos)
     forces = None
     if compute_forces:
+        # Autograd is deliberately OUTSIDE energy_fn (the compiled unit) — the
+        # backward of the full composite is not Inductor-codegen-clean.
         (grad,) = torch.autograd.grad(energy.sum(), pos)
         forces = -grad.detach()
         energy = energy.detach()
     return energy, forces
+
+
+def run_nvalchemiops_multipole_ewald(
+    system_data: dict,
+    compute_forces: bool,
+    compile_model: bool = False,
+    component: str = "full",
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run multipole Ewald summation (eager). ``component`` selects ``"full"``,
+    ``"reciprocal"``, or ``"real"``. Compile is handled by ``run_benchmark`` via
+    :func:`_multipole_energy_fn`. Returns ``(energy, forces)``."""
+    return _run_multipole("multipole_ewald", system_data, compute_forces, component)
+
+
+def run_nvalchemiops_multipole_pme(
+    system_data: dict,
+    compute_forces: bool,
+    compile_model: bool = False,
+    component: str = "full",
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run multipole PME (eager). ``component`` selects ``"full"``,
+    ``"reciprocal"``, or ``"real"``. Compile is handled by ``run_benchmark`` via
+    :func:`_multipole_energy_fn`. Returns ``(energy, forces)``."""
+    return _run_multipole("multipole_pme", system_data, compute_forces, component)
 
 
 def _first_tensor(result):
@@ -3429,27 +3409,24 @@ def run_benchmark(
                     error_type="NotApplicable",
                 )
         elif method in MULTIPOLE_METHODS:
-            # Multipole methods are torch-only; the shared block below applies
-            # torch.compile when requested (so compile_model=False here). The
-            # runners honor the requested component (real / reciprocal / full).
-            if method == "multipole_ewald":
+            # Multipole methods are torch-only. Under --torch-compile we compile
+            # the ENERGY closure only and take autograd.grad OUTSIDE it (see
+            # _multipole_energy_fn): the energy-only forward is Inductor-clean
+            # for every combo, whereas compiling energy+force-backward together
+            # is not. So we bypass the shared full-bench torch.compile block
+            # below (which would re-wrap energy+autograd and fail).
+            multipole_energy_fn = _multipole_energy_fn(method, component, system_data)
+            if torch_compile:
+                multipole_energy_fn = torch.compile(multipole_energy_fn, fullgraph=True)
 
-                def bench_fn():
-                    return run_nvalchemiops_multipole_ewald(
-                        system_data,
-                        compute_forces,
-                        compile_model=False,
-                        component=component,
-                    )
-            else:  # multipole_pme
-
-                def bench_fn():
-                    return run_nvalchemiops_multipole_pme(
-                        system_data,
-                        compute_forces,
-                        compile_model=False,
-                        component=component,
-                    )
+            def bench_fn():
+                return _run_multipole(
+                    method,
+                    system_data,
+                    compute_forces,
+                    component,
+                    energy_fn=multipole_energy_fn,
+                )
         elif backend == "torch":
             if method in ("ewald", "ewald_slab"):
 
@@ -3609,7 +3586,14 @@ def run_benchmark(
         framework_compile_ms: float | None = None
         framework: str = "none"
         warp_compile_ms: float | None = None
-        if backend in ("torch", "torchpme", "torch_dsf") and torch_compile:
+        if (
+            backend in ("torch", "torchpme", "torch_dsf")
+            and torch_compile
+            and method not in MULTIPOLE_METHODS
+        ):
+            # Multipole compiles its ENERGY closure inside bench_fn (above) and
+            # keeps autograd eager — it must NOT be re-wrapped here, which would
+            # try to compile energy+force-backward together and fail.
             try:
                 # 1) Raw pre-warm — pays warp NVRTC + any cuFFT plan creation.
                 import time as _time

@@ -5690,111 +5690,104 @@ def multipole_pme_reciprocal_space(
             quadrupoles=quadrupoles,
         )
 
-    nvtx = torch.cuda.nvtx
-    with nvtx.range("pme_setup"):
-        cell_inv_t_resolved = _resolve_cell_inv_t(cell, cell_inv_t)
-        cell_2d = cell if cell.dim() == 2 else cell.squeeze(0)
-        if volume is None:
-            volume = torch.abs(torch.det(cell_2d.to(torch.float64)))
-        nx, ny, nz = mesh_dimensions
+    cell_inv_t_resolved = _resolve_cell_inv_t(cell, cell_inv_t)
+    cell_2d = cell if cell.dim() == 2 else cell.squeeze(0)
+    if volume is None:
+        volume = torch.abs(torch.det(cell_2d.to(torch.float64)))
+    nx, ny, nz = mesh_dimensions
 
-    with nvtx.range("pme_spread"):
-        # Unified ``(positions, charges, dipoles, quadrupoles)`` spread
-        # custom_op; selects the LMAX-specialized kernel at compile time
-        # (0/1/2 based on inputs) with full autograd through all channels.
-        if quadrupoles is not None:
-            lmax = 2
-        elif dipoles is not None:
-            lmax = 1
-        else:
-            lmax = 0
-        dipoles_in = (
-            dipoles
-            if dipoles is not None
-            else torch.zeros(
-                (positions.shape[0], 3),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
+    # Unified ``(positions, charges, dipoles, quadrupoles)`` spread
+    # custom_op; selects the LMAX-specialized kernel at compile time
+    # (0/1/2 based on inputs) with full autograd through all channels.
+    if quadrupoles is not None:
+        lmax = 2
+    elif dipoles is not None:
+        lmax = 1
+    else:
+        lmax = 0
+    dipoles_in = (
+        dipoles
+        if dipoles is not None
+        else torch.zeros(
+            (positions.shape[0], 3),
+            dtype=positions.dtype,
+            device=positions.device,
         )
-        quadrupoles_in = (
-            quadrupoles
-            if quadrupoles is not None
-            else torch.zeros(
-                (positions.shape[0], 3, 3),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
+    )
+    quadrupoles_in = (
+        quadrupoles
+        if quadrupoles is not None
+        else torch.zeros(
+            (positions.shape[0], 3, 3),
+            dtype=positions.dtype,
+            device=positions.device,
         )
-        # B-warp stress-loss path: factor ALL cell_inv_t coupling into the
-        # ``fractionalize`` op (p=M·r, df=Mμ, Qf=MQMᵀ) so the spread runs
-        # cell-free with an identity cell — bit-identical forward, but the
-        # cell autograd (1st + 2nd order, i.e. stress + stress-loss) now flows
-        # through fractionalize's analytic multilinear-map backward instead of
-        # the spread's missing cell double-backward.
-        batch_idx_single = torch.zeros(
-            positions.shape[0], dtype=torch.int32, device=positions.device
-        )
-        p_frac, df_frac, qf_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
-            positions,
-            cell_inv_t_resolved,
-            dipoles_in,
-            quadrupoles_in,
-            batch_idx_single,
-        )
-        identity_cell = torch.eye(
-            3, dtype=positions.dtype, device=positions.device
-        ).unsqueeze(0)
-        rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
-            p_frac,
-            charges,
-            df_frac,
-            qf_frac,
-            identity_cell,
-            nx,
-            ny,
-            nz,
-            spline_order,
-            lmax,
-        )
+    )
+    # B-warp stress-loss path: factor ALL cell_inv_t coupling into the
+    # ``fractionalize`` op (p=M·r, df=Mμ, Qf=MQMᵀ) so the spread runs
+    # cell-free with an identity cell — bit-identical forward, but the
+    # cell autograd (1st + 2nd order, i.e. stress + stress-loss) now flows
+    # through fractionalize's analytic multilinear-map backward instead of
+    # the spread's missing cell double-backward.
+    batch_idx_single = torch.zeros(
+        positions.shape[0], dtype=torch.int32, device=positions.device
+    )
+    p_frac, df_frac, qf_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
+        positions,
+        cell_inv_t_resolved,
+        dipoles_in,
+        quadrupoles_in,
+        batch_idx_single,
+    )
+    identity_cell = torch.eye(
+        3, dtype=positions.dtype, device=positions.device
+    ).unsqueeze(0)
+    rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
+        p_frac,
+        charges,
+        df_frac,
+        qf_frac,
+        identity_cell,
+        nx,
+        ny,
+        nz,
+        spline_order,
+        lmax,
+    )
 
-    with nvtx.range("pme_rfftn"):
-        # Force contiguous: under torch.compile, inductor otherwise propagates
-        # the rfft output's "natural" (non-contiguous) layout into the convolve
-        # custom op's planned output, while the real op returns a contiguous
-        # mesh -> assert_size_stride mismatch at large meshes (e.g. 128^3).
-        mesh_fft = torch.fft.rfftn(rho_grid, norm="backward").contiguous()
+    # Force contiguous: under torch.compile, inductor otherwise propagates
+    # the rfft output's "natural" (non-contiguous) layout into the convolve
+    # custom op's planned output, while the real op returns a contiguous
+    # mesh -> assert_size_stride mismatch at large meshes (e.g. 128^3).
+    mesh_fft = torch.fft.rfftn(rho_grid, norm="backward").contiguous()
 
-    with nvtx.range("pme_k_grid_resolve"):
-        # Build k-grid + precomputed B-spline modulus LUTs.
-        dtype = positions.dtype
-        k_squared = _resolve_pme_k_squared(cell_2d, mesh_dimensions, dtype, k_squared)
-        alpha_t = torch.tensor([alpha], dtype=dtype, device=positions.device)
-        sigma_t = torch.tensor([sigma], dtype=dtype, device=positions.device)
-        # ``volume`` may be ``()`` or ``(1,)``; reshape to a definite ``(1,)`` to
-        # match the ``alpha_t``/``sigma_t`` convention (unsqueeze turns ``(1,)``
-        # into ``(1, 1)``). reshape keeps the cell-autograd graph for stress.
-        volume_t = volume.to(dtype).reshape(1)
-        moduli_x, moduli_y, moduli_z = _resolve_pme_moduli(
-            mesh_dimensions, spline_order, dtype, positions.device, moduli
-        )
+    # Build k-grid + precomputed B-spline modulus LUTs.
+    dtype = positions.dtype
+    k_squared = _resolve_pme_k_squared(cell_2d, mesh_dimensions, dtype, k_squared)
+    alpha_t = torch.tensor([alpha], dtype=dtype, device=positions.device)
+    sigma_t = torch.tensor([sigma], dtype=dtype, device=positions.device)
+    # ``volume`` may be ``()`` or ``(1,)``; reshape to a definite ``(1,)`` to
+    # match the ``alpha_t``/``sigma_t`` convention (unsqueeze turns ``(1,)``
+    # into ``(1, 1)``). reshape keeps the cell-autograd graph for stress.
+    volume_t = volume.to(dtype).reshape(1)
+    moduli_x, moduli_y, moduli_z = _resolve_pme_moduli(
+        mesh_dimensions, spline_order, dtype, positions.device, moduli
+    )
 
-    with nvtx.range("pme_convolve"):
-        # Fused Green's + B-spline deconvolution + complex multiply in a
-        # single Warp kernel pass.
-        convolved = multipole_pme_convolve(
-            mesh_fft,
-            k_squared,
-            moduli_x,
-            moduli_y,
-            moduli_z,
-            alpha_t,
-            sigma_t,
-            volume_t,
-        )
+    # Fused Green's + B-spline deconvolution + complex multiply in a
+    # single Warp kernel pass.
+    convolved = multipole_pme_convolve(
+        mesh_fft,
+        k_squared,
+        moduli_x,
+        moduli_y,
+        moduli_z,
+        alpha_t,
+        sigma_t,
+        volume_t,
+    )
 
-    with nvtx.range("pme_irfftn"):
-        phi_grid = torch.fft.irfftn(convolved, s=(nx, ny, nz), norm="forward").to(dtype)
+    phi_grid = torch.fft.irfftn(convolved, s=(nx, ny, nz), norm="forward").to(dtype)
 
     # Per-atom reciprocal energy via the spread-transpose gather
     # ``g = Sᵀφ``: ``E_i = q_i g_q_i + d_i·g_d_i + Q_i:g_Q_i`` (fractional
@@ -5810,27 +5803,23 @@ def multipole_pme_reciprocal_space(
     # gathered energy in natural Coulomb units → multiply by ``F/(4π)`` to reach
     # F-scaled units; corrections are already F-scaled.
     coulomb_scale = FIELD_CONSTANT / (4.0 * math.pi)
-    with nvtx.range("pme_energy_gather_via_spread_t"):
-        g_q, g_d, g_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
-            phi_grid, p_frac, identity_cell, nx, ny, nz, spline_order, lmax
-        )
-        e_per_atom = (
-            charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
-        )
-        # Per-atom reciprocal energy ``(N,)``; the caller owns the reduction
-        # (PR #96 energy-autograd contract — ``grad(E.sum(), .)`` recovers the
-        # collective forces/stress/charge-grads).
-        e_recip_per_atom = coulomb_scale * e_per_atom
+    g_q, g_d, g_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+        phi_grid, p_frac, identity_cell, nx, ny, nz, spline_order, lmax
+    )
+    e_per_atom = charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
+    # Per-atom reciprocal energy ``(N,)``; the caller owns the reduction
+    # (PR #96 energy-autograd contract — ``grad(E.sum(), .)`` recovers the
+    # collective forces/stress/charge-grads).
+    e_recip_per_atom = coulomb_scale * e_per_atom
 
-    with nvtx.range("pme_corrections"):
-        corrections = multipole_pme_energy_corrections_per_atom(
-            charges,
-            dipoles,
-            sigma,
-            alpha,
-            volume,
-            quadrupoles=quadrupoles,
-        )
+    corrections = multipole_pme_energy_corrections_per_atom(
+        charges,
+        dipoles,
+        sigma,
+        alpha,
+        volume,
+        quadrupoles=quadrupoles,
+    )
     return e_recip_per_atom - corrections
 
 
