@@ -1,12 +1,15 @@
 # Changelog
 
-## v0.4.0 (Unreleased)
+## 0.4.0 (Unreleased)
 
 ### Added
 
 - Full Torch Ewald/PME APIs support energy-derived forces, charge
   gradients, and strain-first virials, including second-order force/stress
   losses.
+- 2D slab (Yeh-Berkowitz) correction for Ewald and PME summation, exposed as
+  `compute_slab_correction` and a `slab_correction=` keyword on the Ewald/PME
+  entry points, with both Torch and JAX bindings.
 - Torch slab correction participates in autograd when inputs require
   gradients.
 - Full JAX Ewald/PME energy-only calls support first-order gradients for
@@ -30,6 +33,10 @@
 
 - Fixed Torch Ewald gradients for non-uniform per-atom energy cotangents
   (`torch.autograd.grad(..., grad_outputs=w)`).
+- Coupled the FIRE2 variable-cell updates so positions and cell degrees of
+  freedom advance consistently during constrained/variable-cell relaxation.
+- Neighbor-list launchers now reject unbatched methods when batch metadata is
+  supplied, instead of silently producing incorrect lists.
 - **MTK NPT/NPH cell propagation**: kernels wrote `V·(P − P_ext)/W`
   (strain-rate units) into `cell_velocity` while consumers read it as
   `ḣ = dh/dt`, costing a factor of cell length in the cell response.
@@ -95,6 +102,9 @@
   moved enough to need a fresh list; unchanged systems keep their
   previous output. Supported for matrix and segmented-COO outputs in
   both the JAX and PyTorch bindings.
+- **JAX CUDA graph replay**: JAX neighbor-list builders accept a
+  `graph_mode` keyword (`GraphMode`) to capture and replay the build as a
+  CUDA graph, reducing per-step launch overhead in MD loops.
 
 ### Changed (neighbors)
 
@@ -118,6 +128,21 @@
   Warp kernels and `nvalchemiops.torch` bindings, single-system and batched, with
   energies, forces, moment gradients, stress, and force-loss (`create_graph`)
   training; the forward and first-order backward are `torch.compile`-compatible.
+
+### Added (segment ops)
+
+- Differentiable segment operations: backward kernels for the segment-op
+  reductions enable autograd through `nvalchemiops.segment_ops`, with Torch
+  (`nvalchemiops.torch.segment_ops`) and JAX (`nvalchemiops.jax.segment_ops`)
+  bindings, an autograd example (`examples/02_segment_ops_autograd.py`), user
+  guide docs, and benchmarks.
+
+### Changed
+
+- DFT-D3 dispersion kernels optimized for improved performance.
+- Loosened the PyTorch version requirement to widen compatible installs.
+- Updated the CUDA backend extras (`torch-cu12`/`jax-cu12` and related
+  optional dependencies).
 
 ## 0.3.0 - 2026-XX-XX
 
