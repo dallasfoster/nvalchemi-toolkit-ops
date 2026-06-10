@@ -4363,11 +4363,11 @@ def multipole_ewald_summation(
     Controlled by the optional ``batch_idx`` argument:
 
     * ``batch_idx=None`` (default) — single system. ``cell`` is :math:`(3, 3)`
-      or :math:`(1, 3, 3)`; returns a scalar float64.
+      or :math:`(1, 3, 3)`; returns per-atom :math:`(N,)` float64.
     * ``batch_idx`` provided (shape :math:`(N_\text{total},)`) — B systems
       packed into flat per-atom tensors. ``cell`` must be :math:`(B, 3, 3)`;
-      each atom's neighbors must live in the same system. Returns :math:`(B,)`
-      per-system totals.
+      each atom's neighbors must live in the same system. Returns per-atom
+      :math:`(N_\text{total},)` flat across systems.
 
     ``sigma`` and ``alpha`` are scalar floats in both modes (uniform across
     the batch).
@@ -4415,9 +4415,12 @@ def multipole_ewald_summation(
     Returns
     -------
     torch.Tensor
-        float64 on ``positions.device``. Scalar in single-system mode;
-        :math:`(B,)` per-system total in batched mode. Autograd-connected to
-        ``positions`` and ``multipole_moments``.
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems) on
+        ``positions.device``. Call ``.sum()`` for the total energy or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
+        Autograd-connected to ``positions`` and ``multipole_moments``.
     """
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}")
@@ -4505,8 +4508,8 @@ def multipole_ewald_summation(
             B = cell.shape[0]
             sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
             alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
-            # Real-space now returns per-atom (N_total,) for l=2 too; reduce to
-            # per-system to match the per-system reciprocal + self terms.
+            # Per-atom (N_total,) for all three terms; caller owns the
+            # reduction (PR #96 energy-autograd contract).
             e_real_atom = coulomb_scale * multipole_real_space_quadrupole_energy(
                 positions,
                 charges_l2,
@@ -4520,10 +4523,7 @@ def multipole_ewald_summation(
                 alphas,
                 batch_idx=batch_idx,
             )
-            e_real_b = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-                0, batch_idx, e_real_atom
-            )
-            e_recip_b = multipole_reciprocal_space_energy(
+            e_recip_atom = multipole_reciprocal_space_energy(
                 positions,
                 multipole_moments,
                 cell,
@@ -4538,10 +4538,7 @@ def multipole_ewald_summation(
                 alpha,
                 quadrupoles=quadrupoles,
             )
-            e_self_b = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-                0, batch_idx, atom_self
-            )
-            return (e_real_b + e_recip_b - e_self_b).to(torch.float64)
+            return (e_real_atom + e_recip_atom - atom_self).to(torch.float64)
 
         if cell.ndim == 3:
             cell_l2 = cell
@@ -4550,20 +4547,17 @@ def multipole_ewald_summation(
         sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
         alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
 
-        e_real = (
-            coulomb_scale
-            * multipole_real_space_quadrupole_energy(
-                positions,
-                charges_l2,
-                dipoles_cart_l2,
-                quadrupoles,
-                cell_l2,
-                idx_j,
-                neighbor_ptr,
-                unit_shifts,
-                sigma_t,
-                alpha_t,
-            ).sum()
+        e_real = coulomb_scale * multipole_real_space_quadrupole_energy(
+            positions,
+            charges_l2,
+            dipoles_cart_l2,
+            quadrupoles,
+            cell_l2,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigma_t,
+            alpha_t,
         )
         e_recip = multipole_reciprocal_space_energy(
             positions,
@@ -4579,7 +4573,8 @@ def multipole_ewald_summation(
             sigma,
             alpha,
             quadrupoles=quadrupoles,
-        ).sum()
+        )
+        # Per-atom (N,); caller owns the reduction.
         return (e_real + e_recip - e_self).to(torch.float64)
 
     # Delayed imports avoid a circular module graph.
@@ -4592,10 +4587,6 @@ def multipole_ewald_summation(
     # scale the real-space energy by F/(4π) to align the two.
     coulomb_scale = FIELD_CONSTANT / (4.0 * math.pi)
 
-    # Route real-space through the FusedScalarFunction variants so
-    # cell.requires_grad propagates (the per-atom Functions lack cell-grad).
-    charges_in, dipoles_cart_in, l_max_in = charges, dipoles_cart, l_max
-
     if is_batch:
         if cell.ndim != 3 or cell.shape[-2:] != (3, 3):
             raise ValueError(
@@ -4605,44 +4596,23 @@ def multipole_ewald_summation(
         sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
         alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
 
-        if l_max_in == 1:
-            per_system_real_raw = (
-                torch.ops.nvalchemiops.batch_multipole_real_space_dipole_fused(
-                    positions,
-                    charges_in,
-                    dipoles_cart_in,
-                    cell,
-                    sigmas,
-                    alphas,
-                    idx_j,
-                    neighbor_ptr,
-                    unit_shifts,
-                    batch_idx,
-                    False,
-                )[0]
-            )
-        else:
-            per_system_real_raw = (
-                torch.ops.nvalchemiops.batch_multipole_real_space_monopole_fused(
-                    positions,
-                    charges_in,
-                    cell,
-                    sigmas,
-                    alphas,
-                    idx_j,
-                    neighbor_ptr,
-                    unit_shifts,
-                    batch_idx,
-                    False,
-                )[0]
-            )
-        e_real = coulomb_scale * per_system_real_raw
-
         if kspace_cutoff is None:
             raise ValueError(
                 "batched mode requires kspace_cutoff (batched reciprocal "
                 "builds its own k-grid per system)."
             )
+        # Per-atom (N_total,) for all three terms; caller owns the reduction.
+        e_real = coulomb_scale * multipole_real_space_energy_with_stress(
+            positions,
+            multipole_moments,
+            cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigmas,
+            alphas,
+            batch_idx=batch_idx,
+        )
         e_recip = multipole_reciprocal_space_energy(
             positions,
             multipole_moments,
@@ -4652,44 +4622,23 @@ def multipole_ewald_summation(
             alpha=alpha,
             kspace_cutoff=kspace_cutoff,
         )
-
         atom_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
-        e_self = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-            0, batch_idx, atom_self
-        )
-
-        return (e_real + e_recip - e_self).to(torch.float64)
+        return (e_real + e_recip - atom_self).to(torch.float64)
 
     sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
     alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
 
-    if l_max_in == 1:
-        e_real_raw = torch.ops.nvalchemiops.multipole_real_space_dipole_fused(
-            positions,
-            charges_in,
-            dipoles_cart_in,
-            cell,
-            sigma_t,
-            alpha_t,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            False,
-        )[0]
-    else:
-        e_real_raw = torch.ops.nvalchemiops.multipole_real_space_monopole_fused(
-            positions,
-            charges_in,
-            cell,
-            sigma_t,
-            alpha_t,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            False,
-        )[0]
-    e_real = coulomb_scale * e_real_raw
-
+    # Per-atom (N,) for all three terms; caller owns the reduction.
+    e_real = coulomb_scale * multipole_real_space_energy_with_stress(
+        positions,
+        multipole_moments,
+        cell,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        sigma_t,
+        alpha_t,
+    )
     e_recip = multipole_reciprocal_space_energy(
         positions,
         multipole_moments,
@@ -4699,7 +4648,5 @@ def multipole_ewald_summation(
         kspace_cutoff=kspace_cutoff,
         k_vectors=k_vectors,
     )
-
-    e_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha).sum()
-
+    e_self = _multipole_ewald_self_energy_per_atom(source_feats, sigma, alpha)
     return (e_real + e_recip - e_self).to(torch.float64)

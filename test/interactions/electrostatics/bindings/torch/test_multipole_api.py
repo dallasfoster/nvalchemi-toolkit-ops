@@ -109,7 +109,7 @@ class TestBasics:
             sigma=1.0,
             kspace_cutoff=4.0,
         )
-        assert energy.shape == ()
+        assert energy.shape == (4,)
         assert energy.dtype == torch.float64
         assert energy.device.type == td
 
@@ -123,7 +123,7 @@ class TestBasics:
             sigma=1.0,
             kspace_cutoff=4.0,
         )
-        assert energy.dtype == torch.float64
+        assert energy.sum().dtype == torch.float64
 
     def test_charges_only_matches_zero_dipole_branch(self, device):
         """Passing ``dipoles=None`` matches passing an explicit zero array."""
@@ -145,7 +145,7 @@ class TestBasics:
             sigma=1.0,
             kspace_cutoff=4.0,
         )
-        assert torch.allclose(e_none, e_zero, rtol=1e-14, atol=1e-14)
+        assert torch.allclose(e_none.sum(), e_zero.sum(), rtol=1e-14, atol=1e-14)
 
     def test_include_self_interaction_adds_back_self_energy(self, device):
         """include_self_interaction=True equals the other path plus 0.5·E_self."""
@@ -169,8 +169,8 @@ class TestBasics:
             include_self_interaction=False,
         )
         # E_self is positive, so include_self=False gives the smaller energy.
-        assert float(e_with) != float(e_without)
-        assert float(e_with) > float(e_without)
+        assert float(e_with.sum()) != float(e_without.sum())
+        assert float(e_with.sum()) > float(e_without.sum())
 
 
 class TestValidation:
@@ -287,7 +287,7 @@ class TestNormalizationAndKVectors:
             sigma=1.0,
             k_vectors=k_vecs,
         )
-        assert float(e_internal) == float(e_external)
+        assert float(e_internal.sum()) == float(e_external.sum())
 
     def test_accepts_string_and_int_normalize(self, device):
         """``normalize=`` accepts ``NormMode``, int, and lowercase/uppercase strings."""
@@ -306,7 +306,12 @@ class TestNormalizationAndKVectors:
         )
         e_str_lower = multipole_electrostatic_energy(**kwargs, normalize="receiver")
         e_str_upper = multipole_electrostatic_energy(**kwargs, normalize="RECEIVER")
-        assert float(e_enum) == float(e_int) == float(e_str_lower) == float(e_str_upper)
+        assert (
+            float(e_enum.sum())
+            == float(e_int.sum())
+            == float(e_str_lower.sum())
+            == float(e_str_upper.sum())
+        )
 
 
 class TestPhysicalInvariants:
@@ -334,7 +339,7 @@ class TestPhysicalInvariants:
         )
         # |ρ(k)|² is phase-invariant, so the energy agrees to float64 noise.
         np.testing.assert_allclose(
-            float(e_before), float(e_after), rtol=1e-12, atol=1e-13
+            float(e_before.sum()), float(e_after.sum()), rtol=1e-12, atol=1e-13
         )
 
     def test_zero_moments_give_zero_energy(self, device):
@@ -350,7 +355,7 @@ class TestPhysicalInvariants:
             sigma=1.0,
             kspace_cutoff=3.5,
         )
-        assert float(e) == 0.0
+        assert float(e.sum()) == 0.0
 
 
 def _quadrupole_fixture(seed: int, n_atoms: int, L: float, device: str):
@@ -426,7 +431,7 @@ class TestQuadrupole:
             kspace_cutoff=kcut,
         )
         E_ref = _pathb_reference_quadrupole(pos, q, mu, Q, cell, sigma, kcut)
-        assert abs(float(E) - E_ref) / abs(E_ref) < 1e-8
+        assert abs(float(E.sum()) - E_ref) / abs(E_ref) < 1e-8
 
     def test_zero_quadrupole_matches_dipole(self, device):
         """Zero Q (l=2 packed) is bit-close to the l=1 packed energy."""
@@ -452,7 +457,9 @@ class TestQuadrupole:
             cell_t,
             **kw,
         )
-        assert abs(float(e_l2) - float(e_l1)) < 1e-9 * max(abs(float(e_l1)), 1.0)
+        assert abs(float(e_l2.sum()) - float(e_l1.sum())) < 1e-9 * max(
+            abs(float(e_l1.sum())), 1.0
+        )
 
     def test_grads_match_fd(self, device):
         """∂E/∂{pos,q,μ,Q} via autograd match central finite differences."""
@@ -465,7 +472,7 @@ class TestQuadrupole:
             mm = pack_multipole_moments(q_, mu_, Q_)
             return multipole_electrostatic_energy(
                 pos_, mm, cell_t, sigma=sigma, kspace_cutoff=kcut
-            )
+            ).sum()
 
         pos_t = torch.tensor(pos, device=td, requires_grad=True)
         q_t = torch.tensor(q, device=td, requires_grad=True)
@@ -656,7 +663,7 @@ def _make_value_fn(entry, mode, l_max, sys):
             def value(pos, mm, cell):
                 return multipole_electrostatic_energy(
                     pos, mm, cell, sigma=_SIGMA, kspace_cutoff=_KCUT
-                )
+                ).sum()
         else:
 
             def value(pos, mm, cell):
@@ -845,7 +852,7 @@ class TestCrossMethodPhysics:
                         sigma=_SIGMA,
                         alpha=alpha,
                         kspace_cutoff=7.0 / sc,
-                    )
+                    ).sum()
                 )
             )
         assert max(totals) - min(totals) < 1e-4, (
@@ -869,7 +876,7 @@ class TestCrossMethodPhysics:
         e_b = float(
             multipole_electrostatic_energy(
                 pos, mm, cell, sigma=_SIGMA, kspace_cutoff=_KCUT
-            )
+            ).sum()
         )
         e_ewald = float(
             multipole_ewald_summation(
@@ -882,7 +889,7 @@ class TestCrossMethodPhysics:
                 sigma=_SIGMA,
                 alpha=_ALPHA,
                 kspace_cutoff=_KCUT,
-            )
+            ).sum()
         )
         e_pme = float(
             multipole_particle_mesh_ewald(
@@ -895,7 +902,7 @@ class TestCrossMethodPhysics:
                 sigma=_SIGMA,
                 alpha=_ALPHA,
                 mesh_dimensions=_MESH,
-            )
+            ).sum()
         )
 
         # Ewald == direct-k to convergence floor; PME == Ewald to MESH accuracy
@@ -940,7 +947,7 @@ class TestTorchCompile:
         )
 
         def step(sf):
-            return multipole_scf_step_energy(cache, positions, sf)
+            return multipole_scf_step_energy(cache, positions, sf).sum()
 
         e_eager = step(source_feats)
         compiled = torch.compile(step, fullgraph=False)
@@ -997,7 +1004,7 @@ class TestTorchCompile:
                 cell,
                 sigma=1.0,
                 kspace_cutoff=3.5,
-            )
+            ).sum()
 
         e_eager = fn(source_feats)
         compiled = torch.compile(fn, fullgraph=False)
@@ -1053,7 +1060,7 @@ class TestAutogradEnergy:
         e = multipole_scf_step_energy(cache, positions, sf)
         # requires_grad: the self-interaction torch subtract combines the
         # detached raw energy with grad-tracking charge/dipole terms.
-        assert e.requires_grad
+        assert e.sum().requires_grad
 
     @pytest.mark.parametrize("seed", [11, 23, 31])
     def test_gradcheck_source_feats(self, device, seed):
@@ -1071,7 +1078,7 @@ class TestAutogradEnergy:
         )
 
         def fn(sf):
-            return multipole_scf_step_energy(cache, positions, sf)
+            return multipole_scf_step_energy(cache, positions, sf).sum()
 
         sf = source_feats.clone().requires_grad_(True)
         assert torch.autograd.gradcheck(fn, (sf,), eps=1e-6, atol=1e-4)
@@ -1093,7 +1100,7 @@ class TestAutogradEnergy:
         )
 
         def fn(p):
-            return multipole_scf_step_energy(cache, p, source_feats)
+            return multipole_scf_step_energy(cache, p, source_feats).sum()
 
         p = positions.clone().requires_grad_(True)
         assert torch.autograd.gradcheck(fn, (p,), eps=1e-6, atol=1e-4)
@@ -1115,7 +1122,7 @@ class TestAutogradEnergy:
         )
 
         def fn(p, sf):
-            return multipole_scf_step_energy(cache, p, sf)
+            return multipole_scf_step_energy(cache, p, sf).sum()
 
         p = positions.clone().requires_grad_(True)
         sf = source_feats.clone().requires_grad_(True)
@@ -1131,7 +1138,7 @@ class TestAutogradEnergy:
         e = multipole_electrostatic_energy(
             p, source_feats, cell, sigma=1.0, kspace_cutoff=3.5
         )
-        e.backward()
+        e.sum().backward()
         assert p.grad is not None
         assert p.grad.shape == positions.shape
         assert float(p.grad.abs().max()) > 0.0
@@ -1151,7 +1158,7 @@ class TestAutogradEnergy:
             cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
         )
         e = multipole_scf_step_energy(cache, positions, sf)
-        e.backward()
+        e.sum().backward()
         # Extract charge / dipole(Cartesian) gradients from source_feats.grad.
         # sph layout: [:, 0] = charge, [:, 1:4] = (mu_y, mu_z, mu_x).
         # Cartesian (x, y, z) dipole grads live at columns [3, 1, 2].
@@ -1190,8 +1197,8 @@ class TestAutogradEnergy:
         e = multipole_scf_step_energy(
             cache, positions, sf, include_self_interaction=True
         )
-        assert e.requires_grad
-        e.backward()
+        assert e.sum().requires_grad
+        e.sum().backward()
         assert sf.grad is not None
         assert float(sf.grad.abs().max()) > 0.0
 
@@ -1331,8 +1338,8 @@ class TestAutogradOneShotEnergy:
             cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
         )
         e_step = multipole_scf_step_energy(cache, positions, sf_step)
-        e_one.backward()
-        e_step.backward()
+        e_one.sum().backward()
+        e_step.sum().backward()
         np.testing.assert_allclose(
             sf_one.grad.detach().cpu().numpy(),
             sf_step.grad.detach().cpu().numpy(),
@@ -1364,7 +1371,7 @@ class TestCompileAutograd:
         )
 
         def step(p, sf):
-            return multipole_scf_step_energy(cache, p, sf)
+            return multipole_scf_step_energy(cache, p, sf).sum()
 
         p_eager = positions.clone().requires_grad_(True)
         sf_eager = source_feats.clone().requires_grad_(True)
@@ -1425,7 +1432,7 @@ class TestDoubleBackward:
         sf = source_feats.clone().requires_grad_(True)
 
         def f(sf_):
-            return multipole_scf_step_energy(cache, pos, sf_)
+            return multipole_scf_step_energy(cache, pos, sf_).sum()
 
         assert torch.autograd.gradgradcheck(f, (sf,), eps=1e-6, atol=1e-4)
 
@@ -1446,7 +1453,7 @@ class TestDoubleBackward:
         p = positions.clone().requires_grad_(True)
 
         def f(p_):
-            return multipole_scf_step_energy(cache, p_, sf)
+            return multipole_scf_step_energy(cache, p_, sf).sum()
 
         assert torch.autograd.gradgradcheck(f, (p,), eps=1e-6, atol=1e-4)
 
@@ -1469,7 +1476,7 @@ class TestDoubleBackward:
         sf = source_feats.clone().requires_grad_(True)
         p = positions.clone().requires_grad_(True)
 
-        energy = multipole_scf_step_energy(cache, p, sf)
+        energy = multipole_scf_step_energy(cache, p, sf).sum()
         (forces_neg,) = torch.autograd.grad(energy, p, create_graph=True)
         forces = -forces_neg
         # Any scalar loss on forces — check non-zero gradient to source_feats.
@@ -1496,7 +1503,7 @@ class TestDoubleBackward:
         sf = source_feats.clone()
         p = positions.clone().requires_grad_(True)
 
-        energy = multipole_scf_step_energy(cache, p, sf)
+        energy = multipole_scf_step_energy(cache, p, sf).sum()
         (forces_neg,) = torch.autograd.grad(energy, p, create_graph=True)
         loss = forces_neg.pow(2).sum()
         (gp,) = torch.autograd.grad(loss, (p,))
@@ -1524,7 +1531,7 @@ class TestDoubleBackward:
             kspace_cutoff=1.5,
             l_max=1,
         )
-        energy = multipole_scf_step_energy(cache, positions, source_feats)
+        energy = multipole_scf_step_energy(cache, positions, source_feats).sum()
         (gc,) = torch.autograd.grad(energy, cell)
         assert gc.abs().max().item() > 0.0, "expected nonzero ∂E/∂cell"
 
@@ -2079,7 +2086,7 @@ class TestEwaldAutoParameters:
             batch_idx=bidx,
             kspace_cutoff=8.0,  # provide kcut; let alpha auto-estimate
         )
-        assert torch.isfinite(e).all() and e.shape == (2,)
+        assert torch.isfinite(e).all() and e.shape == (4,)
 
 
 class TestBatchRealSpaceValidation:
@@ -2319,6 +2326,7 @@ class TestBatchStepParity:
 
     def test_energy_bit_parity(self, device):
         batch = _batch_fixture(device)
+        td = batch["device"]
         cache_b = prepare_multipole_scf_cache(
             batch["cells"],
             sigma=self.sigma,
@@ -2338,9 +2346,14 @@ class TestBatchStepParity:
             receiver_sigmas=self.receiver_sigmas,
             k_cut=self.k_cut,
         )
-        assert e_b.shape == (batch["cells"].shape[0],)
+        B = batch["cells"].shape[0]
+        assert e_b.shape == (sum(n for n, _ in batch["sizes"]),)
+        # Reduce per-atom to per-system for comparison.
+        e_b_per_sys = torch.zeros(B, dtype=torch.float64, device=td).scatter_add(
+            0, batch["batch_idx"].long(), e_b
+        )
         for b, ref in enumerate(per_e):
-            torch.testing.assert_close(e_b[b], ref.reshape(()), rtol=0, atol=1e-12)
+            torch.testing.assert_close(e_b_per_sys[b], ref.sum(), rtol=0, atol=1e-12)
 
     def test_features_parity(self, device):
         batch = _batch_fixture(device)
@@ -2434,7 +2447,7 @@ class TestBatchBackwardParity:
                 l_max=1,
             )
             e = multipole_scf_step_energy(cache, p, sf)
-            e.backward()
+            e.sum().backward()
             per_grads.append((p.grad, sf.grad))
 
         # Batched grads.
@@ -2687,7 +2700,12 @@ class TestBatchQuadrupole:
             sigma=self.sigma,
             kspace_cutoff=self.k_cut,
         )
-        assert e_b.shape == (len(sizes),)
+        N_total = sum(n for n, _ in sizes)
+        B = len(sizes)
+        assert e_b.shape == (N_total,)
+        e_b_per_sys = torch.zeros(B, dtype=torch.float64, device=td).scatter_add(
+            0, batch_idx.long(), e_b
+        )
         for b, (p, q, mu, Q, cell) in enumerate(systems):
             e_single = multipole_electrostatic_energy(
                 p,
@@ -2697,7 +2715,7 @@ class TestBatchQuadrupole:
                 kspace_cutoff=self.k_cut,
             )
             torch.testing.assert_close(
-                e_b[b], e_single.reshape(()), rtol=1e-9, atol=1e-9
+                e_b_per_sys[b], e_single.sum(), rtol=1e-9, atol=1e-9
             )
 
     def test_forces_match_per_system(self, device):
@@ -2735,7 +2753,7 @@ class TestBatchQuadrupole:
                 sigma=self.sigma,
                 kspace_cutoff=self.k_cut,
             )
-            (g_s,) = torch.autograd.grad(e_single, p_g)
+            (g_s,) = torch.autograd.grad(e_single.sum(), p_g)
             torch.testing.assert_close(g_b[off : off + n], g_s, rtol=1e-7, atol=1e-7)
             off += n
 

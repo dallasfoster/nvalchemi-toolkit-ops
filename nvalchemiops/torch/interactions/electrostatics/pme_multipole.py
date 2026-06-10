@@ -5646,10 +5646,12 @@ def multipole_pme_reciprocal_space(
     Returns
     -------
     energy : torch.Tensor
-        - Single-system: scalar (``shape=()``).
-        - Batched: ``(B,)`` per-system reciprocal energy minus
-          self/background corrections.
-        Both in ``FIELD_CONSTANT`` units.
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems), in
+        ``FIELD_CONSTANT`` units. Reciprocal energy minus self/background
+        corrections. Call ``.sum()`` for the total or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
     """
     # Split the packed e3nn ``multipole_moments`` into the Cartesian
     # channels the spread/correction kernels consume: charges ``(N,)``,
@@ -5801,20 +5803,21 @@ def multipole_pme_reciprocal_space(
         e_per_atom = (
             charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
         )
-        # NOTE: scalar reduction kept here for the current contract; Phase 4
-        # returns the per-atom ``coulomb_scale * e_per_atom`` directly.
-        e_recip_raw = coulomb_scale * e_per_atom.sum()
+        # Per-atom reciprocal energy ``(N,)``; the caller owns the reduction
+        # (PR #96 energy-autograd contract — ``grad(E.sum(), .)`` recovers the
+        # collective forces/stress/charge-grads).
+        e_recip_per_atom = coulomb_scale * e_per_atom
 
     with nvtx.range("pme_corrections"):
-        corrections = multipole_pme_energy_corrections(
+        corrections = multipole_pme_energy_corrections_per_atom(
             charges,
             dipoles,
-            sigma=sigma,
-            alpha=alpha,
-            volume=volume,
+            sigma,
+            alpha,
+            volume,
             quadrupoles=quadrupoles,
         )
-    return e_recip_raw - corrections
+    return e_recip_per_atom - corrections
 
 
 # =============================================================================
@@ -5930,8 +5933,10 @@ def multipole_particle_mesh_ewald(
     Returns
     -------
     energy : torch.Tensor, ``float64``
-        - Single-system: scalar (``shape=()``).
-        - Batched: ``(B,)`` per-system total Coulomb energy.
+        Per-atom :math:`(N,)` (single) or :math:`(N_\text{total},)` (batched,
+        flat across systems). Call ``.sum()`` for the total Coulomb energy or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
     """
     if sigma <= 0.0:
         raise ValueError(f"sigma must be positive, got {sigma}")
@@ -5969,13 +5974,9 @@ def multipole_particle_mesh_ewald(
     if alpha <= 0.0:
         raise ValueError(f"alpha must be positive, got {alpha}")
 
-    # Delayed imports to avoid circular module graph.
+    # Delayed import to avoid circular module graph.
     from nvalchemiops.torch.interactions.electrostatics.multipole_ewald import (
-        BatchMultipoleRealSpaceDipoleFusedScalarFunction,
-        BatchMultipoleRealSpaceMonopoleFusedScalarFunction,
-        MultipoleRealSpaceDipoleFusedScalarFunction,
-        MultipoleRealSpaceMonopoleFusedScalarFunction,
-        multipole_real_space_energy,
+        multipole_real_space_energy_with_stress,
     )
 
     device = positions.device
@@ -5984,10 +5985,10 @@ def multipole_particle_mesh_ewald(
 
     # The packed ``multipole_moments`` trailing dim (1 / 4 / 9) selects the
     # l_max path; ``infer_l_max`` validates it. Both halves take the packed
-    # tensor directly: the real-space entry and the PME reciprocal (which
-    # splits internally and folds the l=2 self-energy into its returned
+    # tensor directly: the real-space entry and the PME reciprocal (which split
+    # internally and fold the l=2 self-energy into the returned per-atom
     # ``E_recip − E_self − E_bg``).
-    l_max = infer_l_max(multipole_moments)
+    infer_l_max(multipole_moments)
 
     if batch_idx is not None:
         if cell.dim() != 3 or cell.shape[-2:] != (3, 3):
@@ -6003,60 +6004,18 @@ def multipole_particle_mesh_ewald(
         sigmas = torch.full((B,), sigma, dtype=input_dtype, device=device)
         alphas = torch.full((B,), alpha, dtype=input_dtype, device=device)
 
-        if l_max < 2:
-            # Route l<=1 batched real-space through the FusedScalar variants
-            # (per-system (B,) raw, cell-grad aware) instead of the per-atom
-            # ``multipole_real_space_energy(..., batch_idx=)`` (no cell-grad at l<=1).
-            charges_rs, dipoles_cart_rs, _quad_rs, _l_rs = split_multipole_moments(
-                multipole_moments
-            )
-            if l_max == 1:
-                per_system_real_raw = (
-                    BatchMultipoleRealSpaceDipoleFusedScalarFunction.apply(
-                        positions,
-                        charges_rs,
-                        dipoles_cart_rs,
-                        cell,
-                        sigmas,
-                        alphas,
-                        idx_j,
-                        neighbor_ptr,
-                        unit_shifts,
-                        batch_idx,
-                    )
-                )
-            else:
-                per_system_real_raw = (
-                    BatchMultipoleRealSpaceMonopoleFusedScalarFunction.apply(
-                        positions,
-                        charges_rs,
-                        cell,
-                        sigmas,
-                        alphas,
-                        idx_j,
-                        neighbor_ptr,
-                        unit_shifts,
-                        batch_idx,
-                    )
-                )
-            e_real = coulomb_scale * per_system_real_raw
-        else:
-            # l=2: batched real-space now returns per-atom (N_total,) and is
-            # cell-grad aware; reduce to per-system here.
-            real_out = multipole_real_space_energy(
-                positions,
-                multipole_moments,
-                cell,
-                idx_j,
-                neighbor_ptr,
-                unit_shifts,
-                sigmas,
-                alphas,
-                batch_idx=batch_idx,
-            )
-            e_real = torch.zeros(
-                B, dtype=torch.float64, device=positions.device
-            ).scatter_add(0, batch_idx, coulomb_scale * real_out)
+        # Per-atom real-space ``(N_total,)``, cell-grad aware for all l_max.
+        e_real = coulomb_scale * multipole_real_space_energy_with_stress(
+            positions,
+            multipole_moments,
+            cell,
+            idx_j,
+            neighbor_ptr,
+            unit_shifts,
+            sigmas,
+            alphas,
+            batch_idx=batch_idx,
+        )
 
         e_recip_minus_corr = multipole_pme_reciprocal_space(
             positions,
@@ -6078,52 +6037,19 @@ def multipole_particle_mesh_ewald(
     sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
     alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
 
-    # Real-space half. Route l<=1 through the FusedScalarFunction variants so
-    # ``cell.requires_grad`` propagates: the per-atom
-    # ``multipole_real_space_energy`` Functions don't carry cell-grad at
-    # l<=1, but the fused-scalar path does — and PME always reduces with
-    # ``.sum()``, so the scalar total is the exact fit. l=2 keeps the
-    # per-atom l=2 entry (already cell-grad aware).
-    charges_rs, dipoles_cart_rs, _quad_rs, l_max_rs = split_multipole_moments(
-        multipole_moments
+    # Per-atom real-space ``(N,)``, cell-grad aware for all l_max.
+    e_real = coulomb_scale * multipole_real_space_energy_with_stress(
+        positions,
+        multipole_moments,
+        cell,
+        idx_j,
+        neighbor_ptr,
+        unit_shifts,
+        sigma_t,
+        alpha_t,
     )
-    if l_max_rs == 2:
-        per_atom_real = multipole_real_space_energy(
-            positions,
-            multipole_moments,
-            cell,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-            sigma_t,
-            alpha_t,
-        )
-        e_real = coulomb_scale * per_atom_real.sum()
-    elif l_max_rs == 1:
-        e_real = coulomb_scale * MultipoleRealSpaceDipoleFusedScalarFunction.apply(
-            positions,
-            charges_rs,
-            dipoles_cart_rs,
-            cell,
-            sigma_t,
-            alpha_t,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-        )
-    else:
-        e_real = coulomb_scale * MultipoleRealSpaceMonopoleFusedScalarFunction.apply(
-            positions,
-            charges_rs,
-            cell,
-            sigma_t,
-            alpha_t,
-            idx_j,
-            neighbor_ptr,
-            unit_shifts,
-        )
 
-    # Reciprocal half. Returns E_recip - E_self - E_bg.
+    # Reciprocal half. Returns per-atom E_recip - E_self - E_bg.
     e_recip_minus_corr = multipole_pme_reciprocal_space(
         positions,
         multipole_moments,
@@ -6336,22 +6262,19 @@ def _batch_multipole_pme_reciprocal_space_impl(
         phi_grid, p_frac, batch_idx, identity_cell, nx, ny, nz, B, spline_order, lmax
     )
     e_per_atom = charges * g_q + (df_frac * g_d).sum(-1) + (qf_frac * g_Q).sum((-1, -2))
-    # NOTE: scatter to per-system kept here for the current contract; Phase 4
-    # returns the per-atom ``coulomb_scale * e_per_atom`` directly (caller
-    # reduces).
-    e_recip_per_system = coulomb_scale * torch.zeros(
-        B, dtype=dtype, device=positions.device
-    ).scatter_add(0, batch_idx.long(), e_per_atom)
+    # Per-atom reciprocal energy ``(N_total,)``; the caller owns the reduction
+    # (PR #96 energy-autograd contract).
+    e_recip_per_atom = coulomb_scale * e_per_atom
 
-    # Step 8: subtract per-system corrections (incl. l=2 self-energy).
-    corrections = multipole_pme_energy_corrections(
+    # Step 8: subtract per-atom corrections (incl. l=2 self-energy + background).
+    corrections = multipole_pme_energy_corrections_per_atom(
         charges,
         dipoles,
-        sigma=sigma,
-        alpha=alpha,
-        volume=volumes,
+        sigma,
+        alpha,
+        volumes,
         batch_idx=batch_idx,
         quadrupoles=quadrupoles,
         n_systems=B,
     )
-    return e_recip_per_system - corrections
+    return e_recip_per_atom - corrections

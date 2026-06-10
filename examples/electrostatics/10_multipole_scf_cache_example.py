@@ -178,6 +178,8 @@ print(
 # step. The cell never changes, so the cache stays valid.
 
 positions = positions0.clone()
+# ``multipole_scf_step_energy`` returns PER-ATOM energies, shape ``(N,)``.
+# Call ``.sum()`` for the system total; forces = ``-grad(E.sum(), positions)``.
 print("MD-style energy trajectory (cache reused every step):")
 for step in range(5):
     # Small random displacement, as an MD integrator would produce.
@@ -185,7 +187,7 @@ for step in range(5):
         rng.standard_normal((n_atoms, 3)), dtype=dtype, device=device
     )
     energy = multipole_scf_step_energy(cache, positions, source_feats)
-    print(f"  step {step}:  E = {energy.item():+.6f}")
+    print(f"  step {step}:  E = {energy.sum().item():+.6f}")
 
 # %%
 # Feature Extraction Reusing the Same Cache
@@ -218,8 +220,8 @@ cache_expanded = prepare_multipole_scf_cache(
 )
 E_orig = multipole_scf_step_energy(cache, positions, source_feats)
 E_expanded = multipole_scf_step_energy(cache_expanded, positions, source_feats)
-print(f"E with original-cell cache  = {E_orig.item():+.6f}")
-print(f"E with expanded-cell cache  = {E_expanded.item():+.6f}  (rebuilt cache)")
+print(f"E with original-cell cache  = {E_orig.sum().item():+.6f}")
+print(f"E with expanded-cell cache  = {E_expanded.sum().item():+.6f}  (rebuilt cache)")
 
 # %%
 # Batched SCF Cache (Multiple Cells at Once)
@@ -251,12 +253,20 @@ cache_batch = prepare_multipole_scf_cache(
 E_batch = multipole_scf_step_energy(
     cache_batch, positions_batch, source_feats_batch, batch_idx=batch_idx
 )
-print(f"Batched (B=2) step energy shape = {tuple(E_batch.shape)}")
-print(f"  system 0 (original cell) E = {E_batch[0].item():+.6f}")
-print(f"  system 1 (expanded cell) E = {E_batch[1].item():+.6f}")
+# E_batch is per-atom (N_total,). Reduce to per-system (B=2,) with scatter_add.
+B = 2
+E_batch_sys = torch.zeros(B, dtype=E_batch.dtype, device=E_batch.device).scatter_add(
+    0, batch_idx.long(), E_batch
+)
+print(
+    f"Batched (B=2) per-atom shape = {tuple(E_batch.shape)};"
+    f" per-system after scatter_add: {tuple(E_batch_sys.shape)}"
+)
+print(f"  system 0 (original cell) E = {E_batch_sys[0].item():+.6f}")
+print(f"  system 1 (expanded cell) E = {E_batch_sys[1].item():+.6f}")
 print(
     "batched system-0 energy matches single-cell cache: "
-    f"{torch.allclose(E_batch[0], E_orig)}"
+    f"{torch.allclose(E_batch_sys[0], E_orig.sum())}"
 )
 
 # %%
@@ -273,9 +283,10 @@ mu_g = dipoles_cart.clone().requires_grad_(True)
 source_feats_g = pack_multipole_moments(charges, mu_g)
 
 E = multipole_scf_step_energy(cache, pos_g, source_feats_g)
-grad_pos, grad_mu = torch.autograd.grad(E, [pos_g, mu_g])
+# E is per-atom (N,); differentiate the sum to get per-atom forces.
+grad_pos, grad_mu = torch.autograd.grad(E.sum(), [pos_g, mu_g])
 forces = -grad_pos
-print(f"autograd energy  E         = {E.item():+.6f}")
+print(f"autograd energy  E (total) = {E.sum().item():+.6f}")
 print(f"max |F| (= max |dE/dr|)    = {torch.norm(forces, dim=1).max().item():.4f}")
 print(f"max |dE/dmu| (= |E_field|) = {grad_mu.abs().max().item():.4f}")
 
@@ -294,3 +305,6 @@ print(f"max |dE/dmu| (= |E_field|) = {grad_mu.abs().max().item():.4f}")
 # * The cache is **cell-specific** — rebuild it whenever the cell changes.
 # * The step energy is autograd-connected to ``positions`` and ``source_feats``,
 #   so forces and moment gradients flow through normally.
+#   **Return shape:** per-atom ``(N,)`` single-system or ``(N_total,)`` batched
+#   — call ``.sum()`` for the system total; forces = ``-grad(E.sum(),
+#   positions)``; use ``scatter_add`` by ``batch_idx`` for per-system totals.

@@ -115,7 +115,7 @@ class TestMultipoleReciprocalSpaceLimit:
             alpha=0.05,
             kspace_cutoff=3.0,
         )
-        assert abs(e.item()) < 1e-10
+        assert abs(e.sum().item()) < 1e-10
 
 
 class TestMultipoleReciprocalSpaceShapes:
@@ -131,9 +131,10 @@ class TestMultipoleReciprocalSpaceShapes:
             alpha=0.4,
             kspace_cutoff=3.0,
         )
-        assert e.shape == ()
+        assert e.shape == (5,)
         assert e.dtype == torch.float64
         assert e.device.type == _torch_device(device)
+        assert torch.isfinite(e.sum())
 
 
 class TestMultipoleReciprocalSpaceAutograd:
@@ -153,7 +154,7 @@ class TestMultipoleReciprocalSpaceAutograd:
             alpha=0.4,
             kspace_cutoff=3.0,
         )
-        e.backward()
+        e.sum().backward()
         for t in (positions, source_feats):
             assert t.grad is not None
             assert torch.isfinite(t.grad).all()
@@ -176,7 +177,7 @@ class TestMultipoleReciprocalSpaceAutograd:
             alpha=0.4,
             kspace_cutoff=3.0,
         )
-        (forces_neg,) = torch.autograd.grad(e, positions, create_graph=True)
+        (forces_neg,) = torch.autograd.grad(e.sum(), positions, create_graph=True)
         loss = (forces_neg**2).sum()
         loss.backward()
         for t in (positions, source_feats):
@@ -216,7 +217,7 @@ class TestBatchMultipoleReciprocalSpace:
                     sigma=sigma,
                     alpha=alpha,
                     kspace_cutoff=kcut,
-                )
+                ).sum()
                 for (p, c, m, cell) in systems
             ]
         )
@@ -236,7 +237,11 @@ class TestBatchMultipoleReciprocalSpace:
             alpha=alpha,
             kspace_cutoff=kcut,
         )
-        torch.testing.assert_close(e_batch, per_e, rtol=0, atol=1e-14)
+        B = 3
+        e_batch_per_sys = torch.zeros(
+            B, dtype=torch.float64, device=e_batch.device
+        ).scatter_add(0, bi.long(), e_batch)
+        torch.testing.assert_close(e_batch_per_sys, per_e, rtol=0, atol=1e-14)
 
     def test_backward_runs(self, device):
         rng = np.random.default_rng(17)
@@ -270,7 +275,7 @@ class TestBatchMultipoleReciprocalSpace:
             alpha=0.4,
             kspace_cutoff=3.0,
         )
-        assert e.shape == (B,)
+        assert e.shape == (B * n_per,)
         e.sum().backward()
         for t in (positions, source_feats):
             assert t.grad is not None
@@ -401,7 +406,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             with_mu=True,
             include_self=include_self,
         )
-        e_r.backward()
+        e_r.sum().backward()
         p_f, q_f, mu_f, e_f = self._run_fused(
             gpu_system,
             with_pos=True,
@@ -409,7 +414,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             with_mu=True,
             include_self=include_self,
         )
-        e_f.backward()
+        e_f.sum().backward()
         torch.testing.assert_close(p_f.grad, p_r.grad, rtol=0, atol=0)
         torch.testing.assert_close(q_f.grad, q_r.grad, rtol=0, atol=0)
         torch.testing.assert_close(mu_f.grad, mu_r.grad, rtol=0, atol=0)
@@ -422,7 +427,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             with_mu=False,
             include_self=True,
         )
-        e_f.backward()
+        e_f.sum().backward()
         assert p_f.grad is not None
         assert q_f.grad is None
         assert mu_f.grad is None
@@ -436,7 +441,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             include_self=True,
         )
         assert not e_f.requires_grad
-        assert torch.isfinite(e_f).item()
+        assert torch.isfinite(e_f).all()
 
     def test_weighted_backward(self, gpu_system):
         """Custom upstream scalar grad multiplier; gradients scale linearly.
@@ -452,7 +457,7 @@ class TestMultipoleReciprocalSpaceDipoleFusedScalar:
             with_mu=True,
             include_self=True,
         )
-        upstream = torch.tensor(2.5, dtype=torch.float64, device=e_f.device)
+        upstream = torch.full_like(e_f, 2.5)
         e_f.backward(upstream)
         p_r, q_r, mu_r, e_r = self._run_reference(
             gpu_system,
@@ -612,7 +617,9 @@ class TestBatchMultipoleReciprocalSpaceDipoleFusedScalar:
             include_self=False,
         )
         weights = torch.tensor([1.5, -0.5, 2.0], dtype=torch.float64, device=e_f.device)
-        (weights * e_f).sum().backward()
+        # broadcast per-system weights to per-atom via batch_idx
+        atom_weights = weights[gpu_batch["batch_idx"].long()]
+        (atom_weights * e_f).sum().backward()
         p_r, q_r, mu_r, e_r = self._run_reference(
             gpu_batch,
             with_pos=True,
@@ -620,7 +627,7 @@ class TestBatchMultipoleReciprocalSpaceDipoleFusedScalar:
             with_mu=True,
             include_self=False,
         )
-        (weights * e_r).sum().backward()
+        (atom_weights * e_r).sum().backward()
         torch.testing.assert_close(p_f.grad, p_r.grad, rtol=1e-14, atol=1e-15)
         torch.testing.assert_close(q_f.grad, q_r.grad, rtol=1e-14, atol=1e-15)
         torch.testing.assert_close(mu_f.grad, mu_r.grad, rtol=1e-14, atol=1e-15)
@@ -716,7 +723,7 @@ def test_reciprocal_quadrupole_parity_vs_reference(sigma):
     # Reference uses the SAME traceless Q the converter feeds the kernel.
     Q_tl = Q - np.eye(3)[None] * (np.trace(Q, axis1=1, axis2=2)[:, None, None] / 3.0)
     E_ref = _ref_recip(pos, q, mu, Q_tl, ks_full, sigma, alpha, V)
-    assert abs(float(E) - E_ref) / abs(E_ref) < 1e-9
+    assert abs(float(E.sum()) - E_ref) / abs(E_ref) < 1e-9
 
 
 def test_reciprocal_quadrupole_grads_match_fd():
@@ -745,7 +752,7 @@ def test_reciprocal_quadrupole_grads_match_fd():
     mu_t = torch.tensor(mu, requires_grad=True)
     Q_t = torch.tensor(Q, requires_grad=True)
     E = energy(pos_t, q_t, mu_t, Q_t)
-    gpos, gq, gmu, gQ = torch.autograd.grad(E, [pos_t, q_t, mu_t, Q_t])
+    gpos, gq, gmu, gQ = torch.autograd.grad(E.sum(), [pos_t, q_t, mu_t, Q_t])
 
     h = 1e-6
     base = (torch.tensor(pos), torch.tensor(q), torch.tensor(mu), torch.tensor(Q))
@@ -763,7 +770,9 @@ def test_reciprocal_quadrupole_grads_match_fd():
             bm.view(-1)[i] -= h
             args_p[idx] = bp
             args_m[idx] = bm
-            flat[i] = (float(energy(*args_p)) - float(energy(*args_m))) / (2 * h)
+            flat[i] = (float(energy(*args_p).sum()) - float(energy(*args_m).sum())) / (
+                2 * h
+            )
         return out
 
     N = pos.shape[0]
@@ -793,7 +802,7 @@ def test_reciprocal_quadrupole_none_unchanged():
         torch.tensor(cell_np),
         **args,
     )
-    assert abs(float(E_none) - float(E_q0)) < 1e-12
+    assert abs(float(E_none.sum()) - float(E_q0.sum())) < 1e-12
 
 
 def _build_csr(pos, cell_np, cutoff):
@@ -856,7 +865,7 @@ def test_composite_quadrupole_matches_pme_composite():
             sigma=sigma,
             alpha=alpha,
             kspace_cutoff=kcut,
-        )
+        ).sum()
     )
 
     cs = F / (4.0 * math.pi)
@@ -883,7 +892,7 @@ def test_composite_quadrupole_matches_pme_composite():
             sigma=sigma,
             alpha=alpha,
             mesh_dimensions=(48, 48, 48),
-        )
+        ).sum()
     )
     E_pme = e_real + e_recip_pme
     assert abs(E_dk - E_pme) / abs(E_pme) < 2e-4
@@ -910,7 +919,7 @@ def test_composite_quadrupole_batched_matches_per_system():
             alpha=alpha,
             kspace_cutoff=kcut,
         )
-        E_single.append(float(E))
+        E_single.append(float(E.sum()))
 
     # Concatenate into a flat batch with offset CSR + batch_idx.
     pos_all, q_all, mu_all, Q_all, cells, bidx = [], [], [], [], [], []
@@ -956,9 +965,12 @@ def test_composite_quadrupole_batched_matches_per_system():
         kspace_cutoff=kcut,
         batch_idx=bidx,
     )
-    assert Eb.shape == (2,)
+    assert Eb.shape == (off,)
+    Eb_per_sys = torch.zeros(2, dtype=torch.float64).scatter_add(
+        0, bidx.long(), Eb.cpu()
+    )
     for i in range(2):
-        assert abs(float(Eb[i]) - E_single[i]) / abs(E_single[i]) < 1e-9
+        assert abs(float(Eb_per_sys[i]) - E_single[i]) / abs(E_single[i]) < 1e-9
     gpos, gQ = torch.autograd.grad(Eb.sum(), [pos_t, Q_t])
     assert torch.isfinite(gpos).all() and torch.isfinite(gQ).all()
 
@@ -992,7 +1004,7 @@ def test_pme_composite_quadrupole_matches_directk_and_batched():
             sigma=sigma,
             alpha=alpha,
             kspace_cutoff=kcut,
-        )
+        ).sum()
     )
     E_pme = multipole_particle_mesh_ewald(
         pos_t,
@@ -1005,8 +1017,8 @@ def test_pme_composite_quadrupole_matches_directk_and_batched():
         alpha=alpha,
         mesh_dimensions=(48, 48, 48),
     )
-    assert abs(float(E_pme) - E_dk) / abs(E_dk) < 2e-4
-    gpos, gQ = torch.autograd.grad(E_pme, [pos_t, Q_t])
+    assert abs(float(E_pme.sum()) - E_dk) / abs(E_dk) < 2e-4
+    gpos, gQ = torch.autograd.grad(E_pme.sum(), [pos_t, Q_t])
     assert torch.isfinite(gpos).all() and torch.isfinite(gQ).all()
     assert (gQ - gQ.transpose(-1, -2)).abs().max() < 1e-10
 
@@ -1027,8 +1039,10 @@ def test_pme_composite_quadrupole_matches_directk_and_batched():
         mesh_dimensions=(48, 48, 48),
         batch_idx=bidx,
     )
-    assert E_batch.shape == (1,)
-    torch.testing.assert_close(E_batch[0], E_pme.detach(), rtol=1e-9, atol=1e-9)
+    assert E_batch.shape == (pos.shape[0],)
+    torch.testing.assert_close(
+        E_batch.sum(), E_pme.detach().sum(), rtol=1e-9, atol=1e-9
+    )
     gpos_b, gQ_b = torch.autograd.grad(E_batch.sum(), [pos_b, Q_b])
     torch.testing.assert_close(gpos_b, gpos, rtol=1e-8, atol=1e-8)
     torch.testing.assert_close(gQ_b, gQ, rtol=1e-8, atol=1e-8)
@@ -1055,8 +1069,8 @@ def test_composite_quadrupole_autograd_connected():
         alpha=alpha,
         kspace_cutoff=12.0,
     )
-    assert torch.isfinite(E)
-    gpos, gsf, gQ = torch.autograd.grad(E, [pos_t, sf, Q_t])
+    assert torch.isfinite(E).all()
+    gpos, gsf, gQ = torch.autograd.grad(E.sum(), [pos_t, sf, Q_t])
     assert torch.isfinite(gpos).all()
     assert torch.isfinite(gsf).all()
     assert torch.isfinite(gQ).all()
@@ -1092,8 +1106,8 @@ def test_composite_stress_matches_fd(with_quad):
         )
 
     cell = torch.tensor(cell_np, requires_grad=True)
-    (gcell,) = torch.autograd.grad(energy(cell), [cell])
-    fd = _fd_cell_grad(lambda c: energy(torch.tensor(c)), cell_np)
+    (gcell,) = torch.autograd.grad(energy(cell).sum(), [cell])
+    fd = _fd_cell_grad(lambda c: energy(torch.tensor(c)).sum(), cell_np)
     rel = np.abs(gcell.numpy() - fd).max() / (np.abs(fd).max() + 1e-30)
     assert rel < 5e-5, f"stress rel vs FD = {rel:.3e}"
 
@@ -1113,7 +1127,7 @@ def test_batched_stress_matches_per_system(with_quad):
         ct = torch.tensor(cell_np, requires_grad=True)
         mm = _mm(q, mu, Q if with_quad else None)
         E = multipole_ewald_summation(torch.tensor(pos), mm, ct, idx_j, ptr, sh, **kw)
-        single_g.append(torch.autograd.grad(E, [ct])[0].numpy())
+        single_g.append(torch.autograd.grad(E.sum(), [ct])[0].numpy())
 
     # batched
     pos_all, q_all, mu_all, Q_all, cells, bidx = [], [], [], [], [], []
@@ -1176,13 +1190,13 @@ def test_reciprocal_quadrupole_pos_hvp_matches_fd():
         E = multipole_reciprocal_space_energy(
             pt, mm, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kcut
         )
-        return torch.autograd.grad(E, [pt], create_graph=create)[0]
+        return torch.autograd.grad(E.sum(), [pt], create_graph=create)[0]
 
     pt = torch.tensor(pos, requires_grad=True)
     E = multipole_reciprocal_space_energy(
         pt, mm, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kcut
     )
-    gp = torch.autograd.grad(E, [pt], create_graph=True)[0]
+    gp = torch.autograd.grad(E.sum(), [pt], create_graph=True)[0]
     hvp = torch.autograd.grad((gp * v).sum(), [pt])[0]
 
     h = 1e-6
@@ -1221,7 +1235,7 @@ def test_reciprocal_quadrupole_q_hvp_matches_fd():
             alpha=alpha,
             kspace_cutoff=kcut,
         )
-        return torch.autograd.grad(E, [Qt], create_graph=True)[0]
+        return torch.autograd.grad(E.sum(), [Qt], create_graph=True)[0]
 
     Qt = torch.tensor(Q, requires_grad=True)
     E = multipole_reciprocal_space_energy(
@@ -1232,7 +1246,7 @@ def test_reciprocal_quadrupole_q_hvp_matches_fd():
         alpha=alpha,
         kspace_cutoff=kcut,
     )
-    gQ = torch.autograd.grad(E, [Qt], create_graph=True)[0]
+    gQ = torch.autograd.grad(E.sum(), [Qt], create_graph=True)[0]
     qhvp = torch.autograd.grad((gQ * vQ).sum(), [Qt])[0]
 
     h = 1e-6
@@ -1327,7 +1341,7 @@ def test_reciprocal_quadrupole_batched_hvp_matches_per_system():
         E = multipole_scf_step_energy(
             cache, pt, torch.tensor(sf), include_self_interaction=True, quadrupoles=Qt
         )
-        gp, gQ = torch.autograd.grad(E, [pt, Qt], create_graph=True)
+        gp, gQ = torch.autograd.grad(E.sum(), [pt, Qt], create_graph=True)
         ph = torch.autograd.grad((gp * vpos[sl]).sum(), [pt], retain_graph=True)[0]
         qh = torch.autograd.grad((gQ * vQ[sl]).sum(), [Qt], retain_graph=True)[0]
         assert (ph - poshvp_b[sl].detach()).abs().max() < 1e-12
@@ -1357,9 +1371,7 @@ def _recip_stress_dot(positions, mm, cell, g, *, batch_idx=None):
         alpha=0.45,
         kspace_cutoff=9.0,
     )
-    if batch_idx is not None:
-        e = e.sum()
-    (stress,) = torch.autograd.grad(e, cell, create_graph=True)
+    (stress,) = torch.autograd.grad(e.sum(), cell, create_graph=True)
     return (stress * g).sum()
 
 
@@ -1438,7 +1450,8 @@ class TestDirectKGatherPerAtom:
             sd["cache"], sd["positions"], sd["charges"], sd["dipoles"]
         )
         assert e_i.shape == (sd["positions"].shape[0],)
-        torch.testing.assert_close(e_i.sum(), e_coll, rtol=1e-12, atol=1e-12)
+        assert e_coll.shape == (sd["positions"].shape[0],)
+        torch.testing.assert_close(e_i.sum(), e_coll.sum(), rtol=1e-12, atol=1e-12)
 
     def test_force_loss_parity(self, gpu_system):
         """Force-loss grads (∂²E/∂r∂θ) match the collective path bit-for-bit."""
@@ -1578,7 +1591,8 @@ class TestDirectKGatherPerAtomLmax2:
             cache, sd["positions"], sd["charges"], sd["dipoles"], sd["quadrupoles"]
         )
         assert e_i.shape == (sd["positions"].shape[0],)
-        torch.testing.assert_close(e_i.sum(), e_coll, rtol=1e-12, atol=1e-12)
+        assert e_coll.shape == (sd["positions"].shape[0],)
+        torch.testing.assert_close(e_i.sum(), e_coll.sum(), rtol=1e-12, atol=1e-12)
 
     def test_force_loss_parity(self, gpu_system):
         sd = gpu_system
@@ -1742,10 +1756,14 @@ class TestDirectKGatherPerAtomBatched:
         e_i = self._peratom(sd, cache, sd["pos"], sd["q"], sd["mu"], sd["quad"])
         e_coll = self._collective(sd, cache, sd["pos"], sd["q"], sd["mu"], sd["quad"])
         assert e_i.shape == (sd["pos"].shape[0],)
-        per_sys = torch.zeros(
+        assert e_coll.shape == (sd["pos"].shape[0],)
+        per_sys_i = torch.zeros(
             sd["B"], dtype=torch.float64, device="cuda:0"
         ).scatter_add(0, sd["bidx"].long(), e_i)
-        torch.testing.assert_close(per_sys, e_coll, rtol=1e-12, atol=1e-12)
+        per_sys_coll = torch.zeros(
+            sd["B"], dtype=torch.float64, device="cuda:0"
+        ).scatter_add(0, sd["bidx"].long(), e_coll)
+        torch.testing.assert_close(per_sys_i, per_sys_coll, rtol=1e-12, atol=1e-12)
 
     def test_force_loss_parity(self, sd):
         cells = torch.tensor(sd["cells_np"], device="cuda:0")
@@ -1809,7 +1827,9 @@ class TestReciprocalStressLoss:
                     em = multipole_reciprocal_space_energy(
                         p_, mm, cm, sigma=0.5, alpha=0.45, kspace_cutoff=9.0
                     )
-                    acc += float(g[i, j]) * (float(ep) - float(em)) / (2 * ec)
+                    acc += (
+                        float(g[i, j]) * (float(ep.sum()) - float(em.sum())) / (2 * ec)
+                    )
             return acc
 
         eps = 1e-4
@@ -1925,7 +1945,9 @@ class TestEwaldCompositeStressLoss:
 
         def stress_dot(p_):
             cell = cell0.clone().requires_grad_(True)
-            (stress,) = torch.autograd.grad(energy(p_, cell), cell, create_graph=True)
+            (stress,) = torch.autograd.grad(
+                energy(p_, cell).sum(), cell, create_graph=True
+            )
             return (stress * g).sum()
 
         p = torch.tensor(pos, requires_grad=True)
@@ -1943,7 +1965,7 @@ class TestEwaldCompositeStressLoss:
                     cm[i, j] -= ec
                     acc += (
                         float(g[i, j])
-                        * (float(energy(p_, cp)) - float(energy(p_, cm)))
+                        * (float(energy(p_, cp).sum()) - float(energy(p_, cm).sum()))
                         / (2 * ec)
                     )
             return acc

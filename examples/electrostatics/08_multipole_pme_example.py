@@ -182,8 +182,14 @@ E_l0 = multipole_particle_mesh_ewald(
     mesh_dimensions=None,  # auto-estimate
     accuracy=1e-6,
 )
-forces_l0 = -torch.autograd.grad(E_l0, pos_g)[0]
-print(f"l_max=0 PME E = {E_l0.item():.6f}")
+# ``multipole_particle_mesh_ewald`` returns PER-ATOM energies, shape ``(N,)``.
+# Call ``.sum()`` for the system total; use ``scatter_add`` by ``batch_idx``
+# for per-system totals in batched mode (see the batched section below).
+forces_l0 = -torch.autograd.grad(E_l0.sum(), pos_g)[0]
+print(
+    f"l_max=0 PME E (total) = {E_l0.sum().item():.6f},"
+    f" per-atom shape {tuple(E_l0.shape)}"
+)
 print(f"l_max=0 PME max |F| = {torch.norm(forces_l0, dim=1).max().item():.4f}")
 
 # %%
@@ -238,8 +244,8 @@ E_l1 = multipole_particle_mesh_ewald(
     sigma=sigma,
     alpha=0.35,
 )
-grad_pos, grad_mu = torch.autograd.grad(E_l1, [pos_g, mu_cart_g])
-print(f"l_max=1 PME E = {E_l1.item():.6f}")
+grad_pos, grad_mu = torch.autograd.grad(E_l1.sum(), [pos_g, mu_cart_g])
+print(f"l_max=1 PME E (total) = {E_l1.sum().item():.6f}")
 print(
     f"l_max=1 PME max |F|             = {torch.norm(-grad_pos, dim=1).max().item():.4f}"
 )
@@ -298,8 +304,8 @@ E_l2 = multipole_particle_mesh_ewald(
     alpha=alpha,
     mesh_dimensions=mesh,
 )
-grads = torch.autograd.grad(E_l2, [pos_g, q_g, mu_g_cart, Q_g])
-print(f"l_max=2 PME total E = {E_l2.item():.6f}")
+grads = torch.autograd.grad(E_l2.sum(), [pos_g, q_g, mu_g_cart, Q_g])
+print(f"l_max=2 PME total E = {E_l2.sum().item():.6f}")
 print(f"l_max=2 PME max |F|     = {torch.norm(-grads[0], dim=1).max().item():.4f}")
 print(f"l_max=2 PME max |∂E/∂q| = {grads[1].abs().max().item():.4f}")
 print(f"l_max=2 PME max |∂E/∂μ| = {grads[2].abs().max().item():.4f}")
@@ -335,7 +341,7 @@ E_for_stress = multipole_particle_mesh_ewald(
     sigma=sigma,
     alpha=alpha,
 )
-(grad_cell_l1,) = torch.autograd.grad(E_for_stress, [cell_g])
+(grad_cell_l1,) = torch.autograd.grad(E_for_stress.sum(), [cell_g])
 volume = float(torch.det(cell[0]))
 stress_l1 = (cell_g[0].T @ grad_cell_l1[0]) / volume
 print("l_max=1 PME stress (real + reciprocal cell-grad both wired):")
@@ -355,7 +361,7 @@ E_l2_for_stress = multipole_particle_mesh_ewald(
     alpha=alpha,
     mesh_dimensions=mesh,
 )
-(grad_cell_l2,) = torch.autograd.grad(E_l2_for_stress, [cell_g])
+(grad_cell_l2,) = torch.autograd.grad(E_l2_for_stress.sum(), [cell_g])
 stress_l2 = (cell[0].T @ grad_cell_l2[0]) / volume
 print("\nl_max=2 PME stress (composite; real + reciprocal cell-grad both wired):")
 print(stress_l2)
@@ -385,7 +391,8 @@ E_fl = multipole_particle_mesh_ewald(
     alpha=alpha,
     mesh_dimensions=mesh,
 )
-forces = -torch.autograd.grad(E_fl, pos_g, create_graph=True)[0]
+# E_fl is per-atom (N,); sum to a scalar before differentiating.
+forces = -torch.autograd.grad(E_fl.sum(), pos_g, create_graph=True)[0]
 force_labels = torch.randn_like(forces)
 force_loss = ((forces - force_labels) ** 2).mean()
 (grad_pos_2nd,) = torch.autograd.grad(force_loss, [pos_g])
@@ -417,7 +424,7 @@ E_sl = multipole_particle_mesh_ewald(
     mesh_dimensions=mesh,
 )
 # Virial stress with create_graph=True (real + reciprocal cell second-order).
-(grad_cell_sl,) = torch.autograd.grad(E_sl, cell_g, create_graph=True)
+(grad_cell_sl,) = torch.autograd.grad(E_sl.sum(), cell_g, create_graph=True)
 stress_sl = (cell[0].T @ grad_cell_sl[0]) / volume
 stress_label = torch.randn_like(stress_sl)
 stress_label = 0.5 * (stress_label + stress_label.T)
@@ -469,7 +476,7 @@ E_auto = multipole_particle_mesh_ewald(
     alpha=alpha_auto,
     mesh_dimensions=mesh_auto,
 )
-print(f"auto-parameters PME (l_max=1): E = {E_auto.item():.6f}")
+print(f"auto-parameters PME (l_max=1): E = {E_auto.sum().item():.6f}")
 # Equivalent shortcut — pass None and let the composite estimate internally:
 E_auto_via_none = multipole_particle_mesh_ewald(
     positions,
@@ -484,7 +491,8 @@ E_auto_via_none = multipole_particle_mesh_ewald(
     accuracy=1e-6,
 )
 print(
-    f"  (matches alpha=None / mesh_dimensions=None shortcut: {E_auto_via_none.item():.6f})"
+    f"  (matches alpha=None / mesh_dimensions=None shortcut:"
+    f" {E_auto_via_none.sum().item():.6f})"
 )
 
 
@@ -534,7 +542,12 @@ E_batch_pme = multipole_particle_mesh_ewald(
     alpha=alpha,
     batch_idx=batch_idx,
 )
-print(f"Batched (B=2) l_max=0 PME per-system: {E_batch_pme.tolist()}")
+# E_batch_pme is per-atom (N_total,). Reduce to per-system (B,) with scatter_add.
+B = int(cells_batch.shape[0])
+E_batch_pme_sys = torch.zeros(
+    B, dtype=E_batch_pme.dtype, device=E_batch_pme.device
+).scatter_add(0, batch_idx.long(), E_batch_pme)
+print(f"Batched (B=2) l_max=0 PME per-system: {E_batch_pme_sys.tolist()}")
 
 # Batched l_max=2 PME composite — same ``batch_idx`` path as the
 # single-system call: one packed ``multipole_moments`` (N_total, 9) tensor.
@@ -557,8 +570,11 @@ E_batch_l2 = multipole_particle_mesh_ewald(
     alpha=alpha,
     batch_idx=batch_idx,
 )
-print(f"Batched (B=2) l_max=2 PME per-system: {E_batch_l2.tolist()}")
-# Per-system forces flow from the batched composite (sum to scatter the grad).
+E_batch_l2_sys = torch.zeros(
+    B, dtype=E_batch_l2.dtype, device=E_batch_l2.device
+).scatter_add(0, batch_idx.long(), E_batch_l2)
+print(f"Batched (B=2) l_max=2 PME per-system: {E_batch_l2_sys.tolist()}")
+# Per-system forces flow from the batched composite (sum over all atoms).
 (forces_batch_l2,) = torch.autograd.grad(E_batch_l2.sum(), [pos_b])
 print(
     "Batched (B=2) l_max=2 PME max |F| per system: "
@@ -596,7 +612,7 @@ for lmax_tag, mm_b in (("l_max=1", mm_l1_batch), ("l_max=2", mm_l2_batch)):
         alpha=alpha,
         batch_idx=batch_idx,
     )
-    # ``E_fl`` is per-system ``(B,)``; ``.sum()`` gives the per-atom forces.
+    # ``E_fl`` is per-atom ``(N_total,)``; ``.sum()`` gives the per-atom forces.
     forces_batch = -torch.autograd.grad(E_fl.sum(), pos_g_batch, create_graph=True)[0]
     force_loss_batch = ((forces_batch - force_labels_batch) ** 2).mean()
     (grad_pos_2nd_batch,) = torch.autograd.grad(force_loss_batch, [pos_g_batch])
@@ -660,6 +676,10 @@ for lmax_tag, mm_b in (("l_max=1", mm_l1_batch), ("l_max=2", mm_l2_batch)):
 #   ``cell`` all carry ``requires_grad`` and gradients flow through autograd —
 #   energy, forces, per-moment grads, and the **full stress tensor** (real +
 #   reciprocal) at all l_max, including batched.
+#   **Return shape:** per-atom ``(N,)`` single-system or ``(N_total,)``
+#   batched — call ``.sum()`` for the system total, or ``scatter_add`` by
+#   ``batch_idx`` for per-system totals; forces = ``-grad(E.sum(),
+#   positions)``; stress = ``grad(E.sum(), cell)``.
 # * The unified real-space-only entry point is
 #   ``multipole_real_space_energy``, which takes the same packed
 #   ``multipole_moments``, for when you need just the short-range half.

@@ -27,8 +27,8 @@ calculator. It is designed as a drop-in companion to the customer reference
 * bit-for-bit parity with the reference at float64 for ``l_max in {0, 1}``
   under matched inputs.
 
-The forward path returns the energy as a torch scalar that is autograd-connected
-to ``positions`` and ``multipole_moments``.
+The forward path returns per-atom energies :math:`(N,)` that are
+autograd-connected to ``positions`` and ``multipole_moments``.
 """
 
 from __future__ import annotations
@@ -91,8 +91,9 @@ def multipole_electrostatic_energy(
     ---------------------------------
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use ``batch_idx`` to
-    select the batched path (returns a ``(B,)`` tensor). Batched mode requires
-    ``kspace_cutoff`` (a pre-generated ``k_vectors`` is single-system only).
+    select the batched path (returns per-atom :math:`(N_\text{total},)`).
+    Batched mode requires ``kspace_cutoff`` (a pre-generated ``k_vectors`` is
+    single-system only).
 
     Parameters
     ----------
@@ -140,9 +141,12 @@ def multipole_electrostatic_energy(
     Returns
     -------
     torch.Tensor
-        Scalar tensor (shape ``()``) on ``positions.device``, always
-        ``float64`` regardless of input dtype. Autograd-connected to
-        ``positions`` and ``multipole_moments``.
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems) on
+        ``positions.device``. Call ``.sum()`` for the total energy or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
+        Autograd-connected to ``positions`` and ``multipole_moments``.
     """
     is_batch = batch_idx is not None
     if is_batch:
@@ -239,9 +243,9 @@ def multipole_reciprocal_space_energy(
     ---------------------------------
     Mirrors :func:`multipole_ewald_summation`: pass ``cell`` of shape
     ``(3, 3)`` (single) or ``(B, 3, 3)`` (batched) and use ``batch_idx`` to
-    select the batched path (returns a ``(B,)`` tensor). Batched mode
-    requires ``kspace_cutoff`` (a pre-generated ``k_vectors`` is
-    single-system only).
+    select the batched path (returns per-atom :math:`(N_\text{total},)`).
+    Batched mode requires ``kspace_cutoff`` (a pre-generated ``k_vectors``
+    is single-system only).
 
     Parameters
     ----------
@@ -257,11 +261,13 @@ def multipole_reciprocal_space_energy(
     Returns
     -------
     torch.Tensor
-        Scalar ``float64`` total reciprocal-space energy on
-        ``positions.device`` (single), or a ``(B,)`` tensor of per-system
-        energies (batched). Does **not** subtract any self-interaction
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems) on
+        ``positions.device``. Does **not** subtract any self-interaction
         correction — the caller combines this with the real-space and
         self / background terms to get the full Ewald total.
+        Call ``.sum()`` for the total or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals.
     """
     is_batch = batch_idx is not None
     if is_batch:

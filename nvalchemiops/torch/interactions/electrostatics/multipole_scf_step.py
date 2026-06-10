@@ -20,8 +20,8 @@ Exposes user-facing functions that consume a prebuilt
 :class:`MultipoleSCFCache` and run one autograd-connected pipeline per
 call:
 
-* :func:`multipole_scf_step_energy` — total periodic electrostatic
-  energy (scalar :math:`\text{float64}`).
+* :func:`multipole_scf_step_energy` — per-atom periodic electrostatic
+  energies :math:`(N,)` :math:`\text{float64}`.
 * :func:`multipole_scf_step_features` — atom-centered features in
   the reference permuted flat :math:`(N_\text{atoms}, N_\sigma \cdot 4)`
   layout.
@@ -151,14 +151,19 @@ def multipole_scf_step_energy(
     include_self_interaction: bool = False,
     quadrupoles: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    r"""Total PBC electrostatic energy for a single or batched SCF step.
+    r"""Per-atom PBC electrostatic energies for a single or batched SCF step.
 
     Consumes the position-independent tensors in ``cache`` and the
-    per-step ``(positions, source_feats)``. With a single-system cache
-    (``batch_idx=None``) returns a scalar :math:`\text{float64}` tensor; with
-    a batched cache (``cache.is_batched`` and ``batch_idx`` supplied) returns
-    a :math:`(B,)` tensor of per-system energies. The result is
-    autograd-connected to both inputs.
+    per-step ``(positions, source_feats)``. Returns per-atom
+    :math:`(N,)` :math:`\text{float64}` (single) or
+    :math:`(N_\text{total},)` (batched, flat across all systems).
+    The result is autograd-connected to both inputs.
+
+    The caller owns the reduction: ``.sum()`` for the total energy, or
+    ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals.
+    Forces, stress, and charge-grads are obtained via
+    ``grad(E.sum(), ...)``. The per-atom energies sum to the same total
+    bit-for-bit as the old scalar / ``(B,)`` convention.
 
     Parameters
     ----------
@@ -189,8 +194,12 @@ def multipole_scf_step_energy(
     Returns
     -------
     torch.Tensor
-        Scalar :math:`\text{float64}` (single) or :math:`(B,)` (batched) on
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems) on
         ``cache.device``. Autograd-connected to positions and source_feats.
+        Call ``.sum()`` for the total energy or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
     """
     _check_batch_dispatch(cache, batch_idx)
     if batch_idx is not None:
@@ -254,20 +263,38 @@ def multipole_scf_step_energy(
     # The rho-assembly kernels bake the (2pi)^3/V scale with V detached.
     # Reintroduce its volume-grad via a value-preserving factor (== 1) so
     # dE/dcell captures rho's 1/V dependence.
-    rho = rho * (cache.volume.detach() / cache.volume)
-    # Per-element |rho|^2 physics runs in the shared Warp op; the .sum()
-    # reduction + the (0.5 V / (2pi)^6) scale (carrying the volume cell-grad)
-    # stay in torch.
-    per_k_energy = _per_k_energy_op(cache, rho)
-    raw_energy = per_k_energy.sum() * (0.5 * cache.volume / _TWO_PI_6)
+    vol_ratio = cache.volume.detach() / cache.volume
+    rho = rho * vol_ratio
+    # Per-atom reciprocal energy via the spread-transpose gather: with the
+    # per-k potential phi_hat = 2 f_k rho, ``E_i = scale * m_i · (Sᵀ phi_hat)_i``
+    # and ``Σ_i E_i`` equals the collective ``scale · Σ_k 2 f_k |rho|²``
+    # bit-for-bit. The gather restores the moment-grad's detached 1/V via the
+    # value-preserving ``vol_ratio`` (== 1) so dE/dcell stays exact.
+    phi_hat = (2.0 * cache.per_k_factor).unsqueeze(-1) * rho
+    g = (
+        torch.ops.nvalchemiops.multipole_rho_gather_t(
+            phi_hat, positions, cache.source_phi_hat, cache.k_vectors, cache.volume
+        )
+        * vol_ratio
+    )
+    scale_const = 0.5 * cache.volume / _TWO_PI_6
+    raw_per_atom = scale_const * (charges * g[:, 0] + (dip * g[:, [3, 1, 2]]).sum(-1))
+    if quadrupoles is not None:
+        g_q = (
+            torch.ops.nvalchemiops.multipole_rho_q_gather_t(
+                phi_hat, positions, cache.source_coeff2, cache.k_vectors, cache.volume
+            )
+            * vol_ratio
+        )
+        raw_per_atom = raw_per_atom + scale_const * (quadrupoles * g_q).sum((-1, -2))
     if include_self_interaction:
-        return raw_energy.reshape(()).to(torch.float64)
+        return raw_per_atom.to(torch.float64)
 
-    # Per-atom Σ_l c_l moment_l^2 runs in the shared self-energy op; the
-    # .sum() reduction stays in torch. dipoles only when l_max>=1.
+    # Per-atom Σ_l c_l moment_l^2 via the shared self-energy op (per-atom, no
+    # reduction — caller owns it). dipoles only when l_max>=1.
     dip_self = dipoles_cart if l_max == 1 else None
-    e_self = _self_energy_op(cache, charges, dip_self, quadrupoles).sum()
-    return (raw_energy - 0.5 * e_self).reshape(()).to(torch.float64)
+    atom_self = _self_energy_op(cache, charges, dip_self, quadrupoles)
+    return (raw_per_atom - 0.5 * atom_self).to(torch.float64)
 
 
 # =============================================================================
@@ -506,9 +533,11 @@ def _multipole_scf_step_energy_batch(
 
     Consumes a batched :class:`MultipoleSCFCache` and a flat
     :math:`(N_\text{total}, \dots)` set of per-atom inputs with a ``batch_idx``
-    mapping atoms to systems. Returns a :math:`(B,)` :math:`\text{float64}`
-    tensor of per-system energies, autograd-connected to ``positions`` and
-    ``source_feats``.
+    mapping atoms to systems. Returns per-atom
+    :math:`(N_\text{total},)` :math:`\text{float64}` (flat across all systems),
+    autograd-connected to ``positions`` and ``source_feats``.
+    Call ``.sum()`` for the total energy or
+    ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals.
 
     Parameters
     ----------
@@ -530,8 +559,9 @@ def _multipole_scf_step_energy_batch(
     Returns
     -------
     torch.Tensor
-        Per-system energies, shape :math:`(B,)`, :math:`\text{float64}` on
-        ``cache.device``.
+        Per-atom energies, shape :math:`(N_\text{total},)`,
+        :math:`\text{float64}` on ``cache.device``. Flat across all systems;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
     """
     _validate_batch_inputs(cache, positions, source_feats, batch_idx)
     n_total = positions.shape[0]
@@ -578,25 +608,46 @@ def _multipole_scf_step_energy_batch(
             batch_idx,
         )
     # Per-system value-preserving volume ratio (== 1) so dE/dcell captures
-    # rho's 1/V_b dependence.
-    rho = rho * (cache.volume.detach() / cache.volume).reshape(-1, 1, 1)
-    # Per-element |rho|^2 physics runs in the shared Warp op; the per-system
-    # sum + the (0.5 V / (2pi)^6) scale (carrying the volume cell-grad) stay
-    # in torch. rho is (B, K, 2) → per_k_energy (B, K).
-    per_k_energy = _per_k_energy_op(cache, rho)
-    raw_energy = per_k_energy.sum(dim=1) * (0.5 * cache.volume / _TWO_PI_6)
+    # rho's 1/V_b dependence. rho is (B, K, 2).
+    vol_ratio = cache.volume.detach() / cache.volume  # (B,)
+    rho = rho * vol_ratio.reshape(-1, 1, 1)
+    # Per-atom reciprocal energy via the batched spread-transpose gathers
+    # (phi_hat = 2 f_k rho, (B, K, 2)); ``Σ_i over a system`` equals the
+    # collective per-system raw reciprocal bit-for-bit. The gathers map the
+    # (B, K, 2) field to per-atom (N_total, ...) via batch_idx; the detached
+    # 1/V_b is restored per atom via vol_ratio[batch_idx].
+    bl = batch_idx.long()
+    phi_hat = (2.0 * cache.per_k_factor).unsqueeze(-1) * rho  # (B, K, 2)
+    vr_atom = vol_ratio.index_select(0, bl)
+    g = torch.ops.nvalchemiops.batch_multipole_rho_gather_t(
+        phi_hat,
+        positions,
+        cache.source_phi_hat,
+        cache.k_vectors,
+        cache.volume,
+        batch_idx,
+    ) * vr_atom.reshape(-1, 1)
+    scale_atom = (0.5 * cache.volume / _TWO_PI_6).index_select(0, bl)
+    raw_per_atom = scale_atom * (charges * g[:, 0] + (dip * g[:, [3, 1, 2]]).sum(-1))
+    if quadrupoles is not None:
+        g_q = torch.ops.nvalchemiops.batch_multipole_rho_q_gather_t(
+            phi_hat,
+            positions,
+            cache.source_coeff2,
+            cache.k_vectors,
+            cache.volume,
+            batch_idx,
+        ) * vr_atom.reshape(-1, 1, 1)
+        raw_per_atom = raw_per_atom + scale_atom * (quadrupoles * g_q).sum((-1, -2))
 
     if include_self_interaction:
-        return raw_energy.to(torch.float64)
+        return raw_per_atom.to(torch.float64)
 
-    # Per-atom Σ_l c_l moment_l^2 via the shared self-energy op; the
-    # per-system scatter_add reduction stays in torch. dipoles only when
-    # l_max>=1.
+    # Per-atom Σ_l c_l moment_l^2 via the shared self-energy op (per-atom, no
+    # reduction — caller owns it). dipoles only when l_max>=1.
     dip_self = dipoles_cart if l_max == 1 else None
     atom_self = _self_energy_op(cache, charges, dip_self, quadrupoles)
-    e_self = torch.zeros(cache.batch_size, dtype=torch.float64, device=cache.device)
-    e_self = e_self.scatter_add(0, batch_idx, atom_self)
-    return (raw_energy - 0.5 * e_self).to(torch.float64)
+    return (raw_per_atom - 0.5 * atom_self).to(torch.float64)
 
 
 def _multipole_scf_step_features_batch(
@@ -802,9 +853,10 @@ def multipole_ewald_scf_step_energy(
     Same convention as :func:`multipole_ewald_summation`:
 
     * ``batch_idx=None`` — single system; cache must be single-system
-      (built from a ``(3, 3)`` cell); returns scalar ``float64``.
+      (built from a ``(3, 3)`` cell); returns per-atom ``(N,)`` float64.
     * ``batch_idx`` provided — B systems flat-packed; cache must be batched
-      (built from a ``(B, 3, 3)`` cell); returns ``(B,)``.
+      (built from a ``(B, 3, 3)`` cell); returns per-atom
+      ``(N_total,)`` (flat across systems).
 
     Parameters
     ----------
@@ -824,9 +876,12 @@ def multipole_ewald_scf_step_energy(
     Returns
     -------
     torch.Tensor
-        :math:`\text{float64}` total GTO-Ewald energy (scalar or
-        :math:`(B,)`). Autograd-connected to ``positions`` and
-        ``multipole_moments``.
+        Per-atom :math:`(N,)` :math:`\text{float64}` (single) or
+        :math:`(N_\text{total},)` (batched, flat across systems).
+        Call ``.sum()`` for the total energy or
+        ``torch.zeros(B).scatter_add(0, batch_idx, E)`` for per-system totals;
+        forces/stress/charge-grads flow from ``grad(E.sum(), ...)``.
+        Autograd-connected to ``positions`` and ``multipole_moments``.
     """
     if cache.alpha is None:
         raise ValueError(
@@ -875,11 +930,6 @@ def multipole_ewald_scf_step_energy(
             alphas,
             batch_idx=batch_idx,
         )
-        # multipole_real_space_energy returns per-atom (N_total,) for ALL l_max;
-        # reduce to per-system here.
-        e_real = torch.zeros(B, dtype=torch.float64, device=device).scatter_add(
-            0, batch_idx, coulomb_scale * real
-        )
     else:
         sigma_t = torch.tensor([sigma], dtype=input_dtype, device=device)
         alpha_t = torch.tensor([alpha], dtype=input_dtype, device=device)
@@ -893,12 +943,14 @@ def multipole_ewald_scf_step_energy(
             sigma_t,
             alpha_t,
         )
-        e_real = coulomb_scale * real.sum()
+    # multipole_real_space_energy returns per-atom (N,)/(N_total,) for all l_max.
+    e_real_per_atom = coulomb_scale * real
 
     # Reciprocal via cache (no per-step k-space rebuild).
     # include_self_interaction=True returns the raw reciprocal; the Ewald self
     # term is handled analytically below.
-    e_recip = multipole_scf_step_energy(
+    # multipole_scf_step_energy returns per-atom (N,)/(N_total,).
+    e_recip_per_atom = multipole_scf_step_energy(
         cache,
         positions,
         source_feats_l1,
@@ -910,10 +962,5 @@ def multipole_ewald_scf_step_energy(
     atom_self = _multipole_ewald_self_energy_per_atom(
         source_feats_l1, sigma, alpha, quadrupoles=quadrupoles
     )
-    if is_batch:
-        e_self = torch.zeros(
-            cache.batch_size, dtype=torch.float64, device=device
-        ).scatter_add(0, batch_idx, atom_self)
-    else:
-        e_self = atom_self.sum()
-    return (e_real + e_recip - e_self).to(torch.float64)
+    # Return per-atom (N,)/(N_total,) — caller owns the reduction.
+    return (e_real_per_atom + e_recip_per_atom - atom_self).to(torch.float64)

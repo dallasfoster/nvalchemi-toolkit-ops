@@ -745,7 +745,7 @@ class TestEnergyStep:
             cell, sigma=1.0, receiver_sigmas=[1.0], kspace_cutoff=3.5
         )
         e = multipole_scf_step_energy(cache, positions, source_feats)
-        assert e.shape == ()
+        assert e.shape == (5,)
         assert e.dtype == torch.float64
         assert e.device.type == td
 
@@ -775,7 +775,7 @@ class TestEnergyStep:
             kspace_cutoff=kspace_cutoff,
         )
         np.testing.assert_allclose(
-            float(e_scf), float(e_one_shot), rtol=1e-14, atol=1e-14
+            float(e_scf.sum()), float(e_one_shot.sum()), rtol=1e-14, atol=1e-14
         )
 
     def test_charges_only_matches_zero_dipole_branch(self, device):
@@ -806,7 +806,7 @@ class TestEnergyStep:
         )
         e_a_scf = multipole_scf_step_energy(cache, positions, source_feats_a)
         e_b_scf = multipole_scf_step_energy(cache, positions, source_feats_b)
-        assert float(e_a_scf) != float(e_b_scf)
+        assert float(e_a_scf.sum()) != float(e_b_scf.sum())
 
         e_a_one = multipole_electrostatic_energy(
             positions,
@@ -823,10 +823,10 @@ class TestEnergyStep:
             kspace_cutoff=3.5,
         )
         np.testing.assert_allclose(
-            float(e_a_scf), float(e_a_one), rtol=1e-14, atol=1e-14
+            float(e_a_scf.sum()), float(e_a_one.sum()), rtol=1e-14, atol=1e-14
         )
         np.testing.assert_allclose(
-            float(e_b_scf), float(e_b_one), rtol=1e-14, atol=1e-14
+            float(e_b_scf.sum()), float(e_b_one.sum()), rtol=1e-14, atol=1e-14
         )
 
     def test_rejects_wrong_n_atoms(self, device):

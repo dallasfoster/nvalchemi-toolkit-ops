@@ -2165,7 +2165,7 @@ def _path_a_vs_b(
     E_B = float(
         multipole_electrostatic_energy(
             pos, source_feats, cell, sigma=sigma, kspace_cutoff=kcut
-        )
+        ).sum()
     )
     E_A = float(
         multipole_ewald_summation(
@@ -2178,7 +2178,7 @@ def _path_a_vs_b(
             sigma=sigma,
             alpha=alpha,
             kspace_cutoff=kcut,
-        )
+        ).sum()
     )
     return E_A - E_B
 
@@ -2222,7 +2222,7 @@ class TestPathAEquivPathB:
         E_B = float(
             multipole_electrostatic_energy(
                 pos, sf, cell, sigma=sigma, kspace_cutoff=kcut
-            )
+            ).sum()
         )
         E_A = float(
             multipole_ewald_summation(
@@ -2235,7 +2235,7 @@ class TestPathAEquivPathB:
                 sigma=sigma,
                 alpha=alpha,
                 kspace_cutoff=kcut,
-            )
+            ).sum()
         )
         assert abs(E_A - E_B) < 1e-4, (
             f"α={alpha}  E_A={E_A:.6f}  E_B={E_B:.6f}  Δ={E_A - E_B:.3e}"
@@ -2305,7 +2305,7 @@ class TestBatchedEwaldSummation:
                     sigma=sigma,
                     alpha=alpha,
                     kspace_cutoff=kcut,
-                )
+                ).sum()
             )
             per_system_e.append(e)
 
@@ -2352,10 +2352,14 @@ class TestBatchedEwaldSummation:
             kspace_cutoff=kcut,
             batch_idx=batch_idx,
         )
-        assert e_batch.shape == (len(systems),)
+        assert e_batch.shape == (pos_all.shape[0],)
+        B = len(systems)
+        e_batch_per_sys = torch.zeros(
+            B, dtype=torch.float64, device=e_batch.device
+        ).scatter_add(0, batch_idx.long(), e_batch)
         for b, e_ref in enumerate(per_system_e):
-            assert abs(float(e_batch[b]) - e_ref) < 1e-10, (
-                f"sys {b} l_max={l_max}: batch={float(e_batch[b]):.6e} "
+            assert abs(float(e_batch_per_sys[b]) - e_ref) < 1e-10, (
+                f"sys {b} l_max={l_max}: batch={float(e_batch_per_sys[b]):.6e} "
                 f"single={e_ref:.6e}"
             )
 
@@ -2379,7 +2383,7 @@ class TestBatchedEwaldSummation:
                 float(
                     multipole_electrostatic_energy(
                         pos, sf, cell, sigma=sigma, kspace_cutoff=kcut
-                    )
+                    ).sum()
                 )
             )
             L = cell_np[0, 0]
@@ -2427,9 +2431,13 @@ class TestBatchedEwaldSummation:
             kspace_cutoff=kcut,
             batch_idx=batch_idx,
         )
+        B_sys = len(per_b)
+        e_batch_per_sys = torch.zeros(
+            B_sys, dtype=torch.float64, device=e_batch.device
+        ).scatter_add(0, batch_idx.long(), e_batch)
         for b, e_b_ref in enumerate(per_b):
-            assert abs(float(e_batch[b]) - e_b_ref) < 5e-4, (
-                f"sys {b} l_max={l_max}: A_batch={float(e_batch[b]):.6e} "
+            assert abs(float(e_batch_per_sys[b]) - e_b_ref) < 5e-4, (
+                f"sys {b} l_max={l_max}: A_batch={float(e_batch_per_sys[b]):.6e} "
                 f"B={e_b_ref:.6e}"
             )
 
@@ -2468,7 +2476,7 @@ class TestEwaldSCFStepEnergy:
                 sigma=sigma,
                 alpha=alpha,
                 kspace_cutoff=kcut,
-            )
+            ).sum()
         )
 
         cache = prepare_multipole_scf_cache(
@@ -2481,7 +2489,7 @@ class TestEwaldSCFStepEnergy:
             device=pos.device,
         )
         E_cached = float(
-            multipole_ewald_scf_step_energy(cache, pos, sf, idx_j, nptr, sh)
+            multipole_ewald_scf_step_energy(cache, pos, sf, idx_j, nptr, sh).sum()
         )
         assert abs(E_cached - E_one_shot) < 1e-10, (
             f"l_max={l_max} α={alpha}: cached={E_cached:.6e} "
@@ -2624,7 +2632,7 @@ class TestCudaCpuTileRouting:
                     sigma=sigma,
                     alpha=alpha,
                     kspace_cutoff=kcut,
-                )
+                ).sum()
             )
         assert abs(out["cpu"] - out["gpu"]) / max(abs(out["cpu"]), 1e-300) < 1e-10, (
             f"CUDA tile path ({out['gpu']:.15e}) disagrees with CPU CSR path "
@@ -2664,7 +2672,7 @@ class TestCudaCpuTileRouting:
                 alpha=alpha,
                 kspace_cutoff=kcut,
             )
-            energy.backward()
+            energy.sum().backward()
             grads[f"{device}_pos"] = pos.grad.detach().cpu().clone()
             grads[f"{device}_sf"] = sf.grad.detach().cpu().clone()
 
@@ -2844,7 +2852,7 @@ def test_quadrupole_total_is_alpha_independent():
                 sigma=sigma,
                 alpha=alpha,
                 kspace_cutoff=7.0 / sc,
-            )
+            ).sum()
         )
         totals.append(E)
     spread = max(totals) - min(totals)
@@ -2870,8 +2878,8 @@ def test_multipole_ewald_summation_quadrupole_computes():
         alpha=0.35,
         kspace_cutoff=6.0,
     )
-    assert E.ndim == 0 and torch.isfinite(E)
-    gpos, gmm = torch.autograd.grad(E, [pos, mm])
+    assert E.shape == (p["positions"].shape[0],) and torch.isfinite(E).all()
+    gpos, gmm = torch.autograd.grad(E.sum(), [pos, mm])
     assert torch.isfinite(gpos).all() and torch.isfinite(gmm).all()
     # gradient flows to the l=2 (5-component) e3nn block.
     assert gmm.shape == (p["positions"].shape[0], 9)
@@ -2909,9 +2917,13 @@ def test_multipole_ewald_summation_quadrupole_batched_matches_single():
         kspace_cutoff=6.0,
         batch_idx=batch_idx,
     )
-    assert E_batch.shape == (1,)
+    n = p["positions"].shape[0]
+    assert E_batch.shape == (n,)
     assert torch.isfinite(E_batch).all()
-    assert abs(float(E_batch[0]) - float(E_single)) / abs(float(E_single)) < 1e-9
+    assert (
+        abs(float(E_batch.sum()) - float(E_single.sum())) / abs(float(E_single.sum()))
+        < 1e-9
+    )
 
 
 def test_multipole_ewald_summation_validates_packed_shape():

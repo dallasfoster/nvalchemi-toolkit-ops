@@ -1047,7 +1047,7 @@ class TestReciprocalSpace:
             positions, sf, cell, sigma=sigma, alpha=alpha, kspace_cutoff=kspace_cutoff
         )
         e_self = _multipole_ewald_self_energy_per_atom(sf, sigma, alpha).sum()
-        return recip - e_self
+        return recip.sum() - e_self
 
     @pytest.mark.parametrize("sigma", [0.5, 1.0, 1.5])
     @pytest.mark.parametrize("alpha", [0.4, 0.6])
@@ -1077,7 +1077,7 @@ class TestReciprocalSpace:
         target = self._path_a_oracle(
             positions, charges, dipoles, cell, sigma, alpha, kspace_cutoff=12.0
         )
-        torch.testing.assert_close(ours, target, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(ours.sum(), target, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.parametrize("sigma", [0.5, 1.0, 1.5])
     @pytest.mark.parametrize("alpha", [0.4, 0.6])
@@ -1102,7 +1102,7 @@ class TestReciprocalSpace:
         target = self._path_a_oracle(
             positions, charges, dipoles, cell, sigma, alpha, kspace_cutoff=12.0
         )
-        torch.testing.assert_close(ours, target, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(ours.sum(), target, rtol=1e-4, atol=1e-4)
 
     def test_translation_invariance(self):
         """Shifting all atoms by a lattice vector leaves the energy invariant."""
@@ -1132,7 +1132,7 @@ class TestReciprocalSpace:
             spline_order=4,
         )
         # Translation invariance up to PME aliasing (~1e-5 at this mesh).
-        torch.testing.assert_close(e1, e2, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(e1.sum(), e2.sum(), rtol=1e-4, atol=1e-4)
 
     def test_position_backward_runs(self):
         """Autograd through the full composite returns finite gradients on positions."""
@@ -1152,7 +1152,7 @@ class TestReciprocalSpace:
             mesh_dimensions=(32, 32, 32),
             spline_order=4,
         )
-        e.backward()
+        e.sum().backward()
         assert positions.grad is not None
         assert positions.grad.shape == positions.shape
         assert torch.isfinite(positions.grad).all()
@@ -1188,7 +1188,7 @@ class TestReciprocalSpace:
             alpha=alpha,
             mesh_dimensions=mesh,
         )
-        torch.testing.assert_close(e_none, e_zeros, rtol=0, atol=0)
+        torch.testing.assert_close(e_none.sum(), e_zeros.sum(), rtol=0, atol=0)
 
 
 def _o_n2_csr_neighbors(
@@ -1305,7 +1305,7 @@ class TestParticleMeshEwald:
             mesh_dimensions=(60, 60, 60),
             spline_order=spline_order,
         )
-        torch.testing.assert_close(e_pme, e_a, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(e_pme.sum(), e_a.sum(), rtol=1e-4, atol=1e-4)
 
     @pytest.mark.parametrize("alpha", [0.4, 0.6])
     @pytest.mark.parametrize("sigma", [0.8, 1.0, 1.2])
@@ -1344,7 +1344,7 @@ class TestParticleMeshEwald:
             mesh_dimensions=(60, 60, 60),
             spline_order=spline_order,
         )
-        torch.testing.assert_close(e_pme, e_a, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(e_pme.sum(), e_a.sum(), rtol=1e-4, atol=1e-4)
 
     def test_position_backward_runs(self):
         """Autograd flows through real + reciprocal halves to position gradients."""
@@ -1369,7 +1369,7 @@ class TestParticleMeshEwald:
             mesh_dimensions=(40, 40, 40),
             spline_order=4,
         )
-        e.backward()
+        e.sum().backward()
         assert positions.grad is not None
         assert positions.grad.shape == positions.shape
         assert torch.isfinite(positions.grad).all()
@@ -1766,7 +1766,7 @@ class TestBatchedReciprocalSpace:
                 alpha=alpha,
                 mesh_dimensions=(mesh_dim,) * 3,
             )
-            per_system.append(float(e))
+            per_system.append(float(e.sum()))
 
         positions = torch.from_numpy(np.concatenate([s[0] for s in systems])).to(
             td, torch.float64
@@ -1787,6 +1787,7 @@ class TestBatchedReciprocalSpace:
             [torch.eye(3, dtype=torch.float64, device=td) * L for _ in systems]
         )
 
+        B = 3
         e_batch = multipole_pme_reciprocal_space(
             positions,
             pack_multipole_moments(charges, dipoles),
@@ -1796,10 +1797,13 @@ class TestBatchedReciprocalSpace:
             mesh_dimensions=(mesh_dim,) * 3,
             batch_idx=batch_idx,
         )
-        assert e_batch.shape == (3,)
-        for b in range(3):
+        assert e_batch.shape == (positions.shape[0],)
+        e_batch_per_sys = torch.zeros(B, dtype=torch.float64, device=td).scatter_add(
+            0, batch_idx.long(), e_batch
+        )
+        for b in range(B):
             torch.testing.assert_close(
-                e_batch[b],
+                e_batch_per_sys[b],
                 torch.tensor(per_system[b], dtype=torch.float64, device=td),
                 rtol=1e-12,
                 atol=1e-12,
@@ -1892,7 +1896,7 @@ class TestBatchedParticleMeshEwald:
                 alpha=alpha,
                 mesh_dimensions=(mesh_dim,) * 3,
             )
-            per_system.append(float(e))
+            per_system.append(float(e.sum()))
 
         positions = torch.from_numpy(np.concatenate([s[0] for s in systems])).to(
             td, torch.float64
@@ -1914,6 +1918,7 @@ class TestBatchedParticleMeshEwald:
             [torch.eye(3, dtype=torch.float64, device=td) * L for _ in systems]
         )
 
+        B = 3
         idx_j_b, nptr_b, sh_b = _build_batched_csr(systems, L, cutoff)
         e_batch = multipole_particle_mesh_ewald(
             positions,
@@ -1927,10 +1932,13 @@ class TestBatchedParticleMeshEwald:
             mesh_dimensions=(mesh_dim,) * 3,
             batch_idx=batch_idx,
         )
-        assert e_batch.shape == (3,)
-        for b in range(3):
+        assert e_batch.shape == (positions.shape[0],)
+        e_batch_per_sys = torch.zeros(B, dtype=torch.float64, device=td).scatter_add(
+            0, batch_idx.long(), e_batch
+        )
+        for b in range(B):
             torch.testing.assert_close(
-                e_batch[b],
+                e_batch_per_sys[b],
                 torch.tensor(per_system[b], dtype=torch.float64, device=td),
                 rtol=1e-10,
                 atol=1e-10,
@@ -2051,8 +2059,8 @@ class TestBatchedParticleMeshEwald:
                 alpha=alpha,
                 mesh_dimensions=(mesh_dim,) * 3,
             )
-            gp, gc, gQ = torch.autograd.grad(e, [P, cell, Qt])
-            return float(e), gp, gc, gQ
+            gp, gc, gQ = torch.autograd.grad(e.sum(), [P, cell, Qt])
+            return float(e.sum().detach()), gp, gc, gQ
 
         singles = [run_single(p, q, d, Q) for (p, q, d), Q in zip(systems, quads)]
 
@@ -2098,14 +2106,18 @@ class TestBatchedParticleMeshEwald:
             mesh_dimensions=(mesh_dim,) * 3,
             batch_idx=batch_idx,
         )
-        assert e_b.shape == (3,)
+        B = len(systems)
+        assert e_b.shape == (positions.shape[0],)
+        e_b_per_sys = torch.zeros(B, dtype=torch.float64, device=td).scatter_add(
+            0, batch_idx.long(), e_b
+        )
         gp_b, gc_b, gQ_b = torch.autograd.grad(e_b.sum(), [positions, cells, Qt])
 
         off = 0
         for b, (e_s, gp_s, gc_s, gQ_s) in enumerate(singles):
             n = systems[b][0].shape[0]
             torch.testing.assert_close(
-                e_b[b],
+                e_b_per_sys[b],
                 torch.tensor(e_s, dtype=torch.float64, device=td),
                 rtol=1e-9,
                 atol=1e-9,
@@ -2164,7 +2176,7 @@ class TestBatchedParticleMeshEwald:
                 alpha=alpha,
                 mesh_dimensions=(mesh_dim,) * 3,
             )
-            g = torch.autograd.grad(E, P, create_graph=True)[0]
+            g = torch.autograd.grad(E.sum(), P, create_graph=True)[0]
             vt = torch.from_numpy(v).to(td, torch.float64)
             return torch.autograd.grad((g * vt).sum(), [P])[0].detach()
 
@@ -2451,10 +2463,10 @@ class TestCompositeForceLoss:
 
         def grad_at(p):
             pt = torch.tensor(p, dtype=torch.float64, device=td, requires_grad=True)
-            return torch.autograd.grad(energy(pt), pt)[0]
+            return torch.autograd.grad(energy(pt).sum(), pt)[0]
 
         pt = torch.tensor(pos0, dtype=torch.float64, device=td, requires_grad=True)
-        g = torch.autograd.grad(energy(pt), pt, create_graph=True)[0]
+        g = torch.autograd.grad(energy(pt).sum(), pt, create_graph=True)[0]
         hvp = torch.autograd.grad((g * v).sum(), [pt])[0]
         h = 1e-6
         fd = np.zeros((N, 3))
@@ -2495,13 +2507,13 @@ class TestCompositeForceLoss:
             )
 
         Ql = Q.clone().detach().requires_grad_(True)
-        gQ = torch.autograd.grad(energy(Ql), Ql, create_graph=True)[0]
+        gQ = torch.autograd.grad(energy(Ql).sum(), Ql, create_graph=True)[0]
         hvpQ = torch.autograd.grad((gQ * vq).sum(), [Ql])[0]
         analytic = float((hvpQ * vq).sum())
         h = 1e-5
-        ep = float(energy(Q + h * vq).detach())
-        e0 = float(energy(Q).detach())
-        em = float(energy(Q - h * vq).detach())
+        ep = float(energy(Q + h * vq).sum().detach())
+        e0 = float(energy(Q).sum().detach())
+        em = float(energy(Q - h * vq).sum().detach())
         fd = (ep - 2.0 * e0 + em) / h**2
         rel = abs(analytic - fd) / (abs(fd) + 1e-30)
         assert rel < 1e-3, (
@@ -2560,7 +2572,9 @@ class TestQuadrupolePMEForwardEnergy:
                 alpha=0.4632,
                 mesh_dimensions=(32, 32, 32),
                 spline_order=4,
-            ).item()
+            )
+            .sum()
+            .item()
         )
 
     def test_zero_quadrupole_matches_dipole_no_dipoles(self, fix):
@@ -2703,7 +2717,7 @@ class TestQuadrupoleAutogradBackward:
             alpha=fix["alpha"],
             mesh=fix["mesh"],
         )
-        e.backward()
+        e.sum().backward()
         grad_analytical = pos_leaf.grad.detach().clone()
 
         atom_idx, axis_idx = 3, 1
@@ -2711,28 +2725,36 @@ class TestQuadrupoleAutogradBackward:
         with torch.no_grad():
             pos_plus = fix["positions"].clone()
             pos_plus[atom_idx, axis_idx] += eps
-            e_plus = self._energy(
-                pos_plus,
-                fix["charges"],
-                fix["dipoles"],
-                fix["quadrupoles"],
-                fix["cell"],
-                sigma=fix["sigma"],
-                alpha=fix["alpha"],
-                mesh=fix["mesh"],
-            ).item()
+            e_plus = (
+                self._energy(
+                    pos_plus,
+                    fix["charges"],
+                    fix["dipoles"],
+                    fix["quadrupoles"],
+                    fix["cell"],
+                    sigma=fix["sigma"],
+                    alpha=fix["alpha"],
+                    mesh=fix["mesh"],
+                )
+                .sum()
+                .item()
+            )
             pos_minus = fix["positions"].clone()
             pos_minus[atom_idx, axis_idx] -= eps
-            e_minus = self._energy(
-                pos_minus,
-                fix["charges"],
-                fix["dipoles"],
-                fix["quadrupoles"],
-                fix["cell"],
-                sigma=fix["sigma"],
-                alpha=fix["alpha"],
-                mesh=fix["mesh"],
-            ).item()
+            e_minus = (
+                self._energy(
+                    pos_minus,
+                    fix["charges"],
+                    fix["dipoles"],
+                    fix["quadrupoles"],
+                    fix["cell"],
+                    sigma=fix["sigma"],
+                    alpha=fix["alpha"],
+                    mesh=fix["mesh"],
+                )
+                .sum()
+                .item()
+            )
         grad_fd = (e_plus - e_minus) / (2 * eps)
         grad_an = float(grad_analytical[atom_idx, axis_idx].item())
         rel_err = abs(grad_an - grad_fd) / max(abs(grad_fd), 1e-12)
@@ -2842,7 +2864,7 @@ class TestQuadrupoleAutogradBackward:
 
         cell_leaf = cell_diag.detach().clone().requires_grad_(True)
         e = energy(cell_leaf)
-        e.backward()
+        e.sum().backward()
         grad_an = cell_leaf.grad.detach().clone()
 
         # FD on each diagonal component of the cell.
@@ -2852,10 +2874,10 @@ class TestQuadrupoleAutogradBackward:
             with torch.no_grad():
                 cp = cell_diag.clone()
                 cp[i] += eps
-                ep = energy(cp).item()
+                ep = energy(cp).sum().item()
                 cm = cell_diag.clone()
                 cm[i] -= eps
-                em = energy(cm).item()
+                em = energy(cm).sum().item()
             grad_fd[i] = (ep - em) / (2 * eps)
         max_abs_err = (grad_an - grad_fd).abs().max().item()
         rel_err = max_abs_err / max(grad_fd.abs().max().item(), 1e-12)
@@ -2891,7 +2913,7 @@ class TestQuadrupoleAutogradBackward:
             alpha=fix["alpha"],
             mesh=fix["mesh"],
         )
-        e.backward()
+        e.sum().backward()
         # Symmetric DOF gradient = grad[ai,bi] + grad[bi,ai].
         grad_an = float(
             Q_leaf.grad[atom_idx, ai, bi].item() + Q_leaf.grad[atom_idx, bi, ai].item()
@@ -2902,29 +2924,37 @@ class TestQuadrupoleAutogradBackward:
             Q_plus = fix["quadrupoles"].clone()
             Q_plus[atom_idx, ai, bi] += eps
             Q_plus[atom_idx, bi, ai] += eps  # symmetric
-            e_plus = self._energy(
-                fix["positions"],
-                fix["charges"],
-                fix["dipoles"],
-                Q_plus,
-                fix["cell"],
-                sigma=fix["sigma"],
-                alpha=fix["alpha"],
-                mesh=fix["mesh"],
-            ).item()
+            e_plus = (
+                self._energy(
+                    fix["positions"],
+                    fix["charges"],
+                    fix["dipoles"],
+                    Q_plus,
+                    fix["cell"],
+                    sigma=fix["sigma"],
+                    alpha=fix["alpha"],
+                    mesh=fix["mesh"],
+                )
+                .sum()
+                .item()
+            )
             Q_minus = fix["quadrupoles"].clone()
             Q_minus[atom_idx, ai, bi] -= eps
             Q_minus[atom_idx, bi, ai] -= eps  # symmetric
-            e_minus = self._energy(
-                fix["positions"],
-                fix["charges"],
-                fix["dipoles"],
-                Q_minus,
-                fix["cell"],
-                sigma=fix["sigma"],
-                alpha=fix["alpha"],
-                mesh=fix["mesh"],
-            ).item()
+            e_minus = (
+                self._energy(
+                    fix["positions"],
+                    fix["charges"],
+                    fix["dipoles"],
+                    Q_minus,
+                    fix["cell"],
+                    sigma=fix["sigma"],
+                    alpha=fix["alpha"],
+                    mesh=fix["mesh"],
+                )
+                .sum()
+                .item()
+            )
         grad_fd = (e_plus - e_minus) / (2 * eps)
         rel_err = abs(grad_an - grad_fd) / max(abs(grad_fd), 1e-12)
         print(
@@ -3066,7 +3096,7 @@ class TestPMEStressLoss:
                 mesh_dimensions=mesh,
                 spline_order=4,
             )
-            (stress,) = torch.autograd.grad(E, cell, create_graph=True)
+            (stress,) = torch.autograd.grad(E.sum(), cell, create_graph=True)
             return (stress * w).sum()
 
         pos = pos0.clone().requires_grad_(True)
