@@ -21,8 +21,8 @@ Electrostatics Benchmark
 CLI tool to benchmark electrostatic interaction methods (Ewald summation, Ewald
 with slab correction, PME, PME with slab correction, and DSF) and generate CSV
 files for documentation.
-Results are saved with GPU-specific naming:
-`electrostatics_benchmark_<method>_<backend>_<gpu_sku>.csv`
+Results are saved with GPU- and dtype-specific naming:
+`electrostatics_benchmark_<method>_<backend>_<dtype>_<gpu_sku>.csv`
 
 Supports multiple backends:
 1. torch (Warp kernels): Custom implementation using PyTorch + Warp
@@ -36,14 +36,6 @@ Methods:
 - PME (Particle Mesh Ewald)
 - PME with 2D slab correction
 - DSF (Damped Shifted Force)
-- Multipole Ewald summation (charges/dipoles/quadrupoles; torch backend only)
-- Multipole PME (charges/dipoles/quadrupoles; torch backend only)
-
-The multipole methods take an extra ``--l-max {0,1,2}`` flag selecting the
-maximum multipole order (0 = charges, 1 = +dipoles, 2 = +quadrupoles). They
-have no JAX / torchpme reference, so they are skipped for those backends with
-an explicit warning (a multipole method requested with ``--backend jax`` /
-``torchpme`` / ``torch_dsf`` emits a ``UserWarning`` and produces no rows).
 
 Usage:
     python benchmark_electrostatics.py --config benchmark_config.yaml --output-dir ./results
@@ -54,14 +46,13 @@ Usage:
     python benchmark_electrostatics.py --config benchmark_config.yaml --backend jax --method ewald_slab
     python benchmark_electrostatics.py --config benchmark_config.yaml --backend jax --method pme_slab
     python benchmark_electrostatics.py --config benchmark_config.yaml --method dsf --backend both
-    python benchmark_electrostatics.py --config benchmark_config.yaml --method multipole_ewald --l-max 2
-    python benchmark_electrostatics.py --config benchmark_config.yaml --method multipole_pme --l-max 1
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
 import math
 import sys
@@ -79,6 +70,62 @@ import yaml
 from benchmarks.systems import create_crystal_system
 from benchmarks.utils import BackendType, BenchmarkTimer
 
+BENCHMARK_CSV_FIELDNAMES = [
+    "total_atoms",
+    "batch_size",
+    "supercell_size",
+    "mode",
+    "method",
+    "backend",
+    "component",
+    "derivative_contract",
+    "workload",
+    "compute_forces",
+    "compute_virial",
+    "neighbor_format",
+    "dtype",
+    "config_path",
+    "config_sha256",
+    "accuracy",
+    "real_space_cutoff",
+    "cache_mode",
+    "compile_policy",
+    "backend_framework",
+    "median_time_ms",
+    "peak_memory_mb",
+    "compile_ms",
+    "warp_compile_ms",
+    "framework_compile_ms",
+    "framework",
+    "success",
+    "error",
+    "error_type",
+]
+
+DerivativeContract = Literal["energy_autograd", "legacy_direct"]
+BenchmarkWorkload = Literal[
+    "forward",
+    "backward",
+    "double_backward",
+    "legacy_direct",
+    "autograd_reference",
+]
+
+
+def benchmark_output_file(
+    output_dir: Path,
+    method: str,
+    backend: str,
+    dtype_str: str,
+    gpu_sku: str,
+) -> Path:
+    """Return the CSV path for one benchmark result group."""
+    return (
+        output_dir
+        / f"electrostatics_benchmark_{method}_{backend}_{dtype_str}_{gpu_sku}.csv"
+    )
+
+
 # -- Torch backend -----------------------------------------------------------
 try:
     import torch
@@ -87,22 +134,22 @@ try:
     _torch_electrostatics = importlib.import_module(
         "nvalchemiops.torch.interactions.electrostatics"
     )
-    # ``multipole_particle_mesh_ewald`` is not re-exported by the package
-    # __init__, so it must be pulled from its submodule directly.
+    _torch_neighbors = importlib.import_module("nvalchemiops.torch.neighbors")
+    _neighbor_utils = importlib.import_module("nvalchemiops.neighbors.neighbor_utils")
+    # ``multipole_particle_mesh_ewald`` / ``multipole_pme_reciprocal_space`` live
+    # in the pme_multipole submodule (not re-exported by the package root).
     _torch_pme_multipole = importlib.import_module(
         "nvalchemiops.torch.interactions.electrostatics.pme_multipole"
     )
-    _torch_neighbors = importlib.import_module("nvalchemiops.torch.neighbors")
-    _neighbor_utils = importlib.import_module("nvalchemiops.neighbors.neighbor_utils")
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
     torch = None  # type: ignore
     wp = None  # type: ignore
     _torch_electrostatics = None
-    _torch_pme_multipole = None
     _torch_neighbors = None
     _neighbor_utils = None
+    _torch_pme_multipole = None
 
 # -- JAX backend --------------------------------------------------------------
 try:
@@ -125,6 +172,229 @@ except ImportError:
 SLAB_AXIS = 2
 SLAB_VACUUM_FACTOR = 3.0
 SLAB_METHODS = ("ewald_slab", "pme_slab")
+EWALD_METHODS = ("ewald", "ewald_slab")
+MULTIPOLE_METHODS = ("multipole_ewald", "multipole_pme")
+DEFAULT_METHODS = ["ewald", "pme"]
+ALL_METHODS = [
+    "ewald",
+    "ewald_slab",
+    "pme",
+    "pme_slab",
+    "dsf",
+    "multipole_ewald",
+    "multipole_pme",
+]
+CUSTOM_EWALD_PME_BACKENDS = ("torch", "jax")
+
+
+def _electrostatic_method_family(method: str) -> Literal["ewald", "pme"]:
+    """Return the parameter family used by an electrostatics benchmark method."""
+    if method in EWALD_METHODS:
+        return "ewald"
+    if method in ("pme", "pme_slab"):
+        return "pme"
+    raise ValueError(f"Method {method!r} does not use Ewald/PME parameters")
+
+
+def _system_cache_key(method: str) -> str:
+    """Return the prepared-system cache key for an electrostatics method."""
+    if method in MULTIPOLE_METHODS:
+        return "multipole"
+    family = _electrostatic_method_family(method)
+    suffix = "_slab" if method in SLAB_METHODS else ""
+    return f"{family}{suffix}"
+
+
+def _neighbor_cutoff_from_params(
+    params: dict, family: Literal["ewald", "pme"]
+) -> float:
+    """Return the real-space neighbor cutoff for a method parameter family."""
+    return float(params[family]["cutoff"])
+
+
+def resolve_methods(
+    cli_method: str | None, config_methods: list[str] | None
+) -> list[str]:
+    """Return the ordered benchmark methods requested by CLI/config."""
+    if cli_method is not None:
+        if cli_method == "both":
+            return list(DEFAULT_METHODS)
+        if cli_method == "all":
+            return list(ALL_METHODS)
+        return [cli_method]
+
+    if not config_methods:
+        return list(DEFAULT_METHODS)
+    return list(config_methods)
+
+
+def get_backends_for_method(cli_backend: str, method: str) -> list[str]:
+    """Return concrete benchmark backends for one method/backend request."""
+    if cli_backend == "both":
+        if method in ("ewald", "pme"):
+            result = ["torch"]
+            if JAX_AVAILABLE:
+                result.append("jax")
+            if TORCHPME_AVAILABLE:
+                result.append("torchpme")
+            return result
+        if method in SLAB_METHODS:
+            result = ["torch"]
+            if JAX_AVAILABLE:
+                result.append("jax")
+            return result
+        if method == "dsf":
+            return ["torch", "torch_dsf"]
+    elif cli_backend == "torch":
+        return ["torch"]
+    elif cli_backend == "jax":
+        if method in ("ewald", "ewald_slab", "pme", "pme_slab"):
+            return ["jax"]
+        return []
+    elif cli_backend == "torchpme":
+        if method in SLAB_METHODS:
+            raise ValueError(f"torchpme does not support slab method {method!r}")
+        if method in ("ewald", "pme"):
+            return ["torchpme"] if TORCHPME_AVAILABLE else []
+        return []
+    elif cli_backend == "torch_dsf":
+        if method == "dsf":
+            return ["torch_dsf"]
+        return []
+    return ["torch"]
+
+
+def compile_policy_for_backend(backend: str, torch_compile: bool = False) -> str:
+    """Return the framework compilation policy label for a backend."""
+    if torch_compile and backend in ("torch", "torchpme", "torch_dsf"):
+        return "torch.compile"
+    if backend == "jax":
+        return "jax.jit"
+    return "eager"
+
+
+def resolve_derivative_contract(
+    cli_contract: str | None,
+    config_contract: str | None,
+) -> DerivativeContract:
+    """Return the benchmark derivative contract requested by CLI/config."""
+    contract = cli_contract or config_contract or "energy_autograd"
+    if contract not in ("energy_autograd", "legacy_direct"):
+        raise ValueError(
+            "derivative_contract must be 'energy_autograd' or 'legacy_direct'"
+        )
+    return contract
+
+
+def benchmark_workloads(
+    *,
+    method: str,
+    backend: str,
+    derivative_contract: DerivativeContract,
+    compute_forces: bool,
+    compute_virial: bool,
+) -> list[BenchmarkWorkload]:
+    """Return the workload rows to emit for one benchmark request."""
+    if method == "dsf" or backend in ("torchpme", "torch_dsf"):
+        return ["autograd_reference"]
+    if derivative_contract == "legacy_direct":
+        return ["legacy_direct"]
+    if method not in ("ewald", "ewald_slab", "pme", "pme_slab"):
+        return ["forward"]
+
+    workloads: list[BenchmarkWorkload] = ["forward"]
+    if compute_forces or compute_virial:
+        workloads.append("backward")
+        if backend == "torch":
+            workloads.append("double_backward")
+    return workloads
+
+
+def benchmark_result_row(
+    *,
+    system_data: dict,
+    method: str,
+    backend: str,
+    component: str,
+    compute_forces: bool,
+    compute_virial: bool,
+    derivative_contract: DerivativeContract = "energy_autograd",
+    workload: BenchmarkWorkload = "forward",
+    neighbor_format: str,
+    torch_compile: bool = False,
+    success: bool,
+    median_time_ms: float | None = None,
+    peak_memory_mb: float | None = None,
+    compile_ms: float | None = None,
+    warp_compile_ms: float | None = None,
+    framework_compile_ms: float | None = None,
+    framework: str = "none",
+    error: str = "",
+    error_type: str = "",
+    **extra,
+) -> dict:
+    """Build one stable benchmark CSV row for success or failure."""
+    row = {
+        "total_atoms": system_data["total_atoms"],
+        "batch_size": system_data.get("batch_size", 1),
+        "supercell_size": "",
+        "mode": "",
+        "method": method,
+        "backend": backend,
+        "component": component,
+        "derivative_contract": derivative_contract,
+        "workload": workload,
+        "compute_forces": compute_forces,
+        "compute_virial": compute_virial,
+        "neighbor_format": neighbor_format,
+        "dtype": "",
+        "config_path": "",
+        "config_sha256": "",
+        "accuracy": "",
+        "real_space_cutoff": "",
+        "cache_mode": system_data.get("cache_mode", "precomputed"),
+        "compile_policy": compile_policy_for_backend(backend, torch_compile),
+        "backend_framework": backend,
+        "median_time_ms": (
+            float(median_time_ms) if median_time_ms is not None else float("inf")
+        ),
+        "peak_memory_mb": peak_memory_mb,
+        "compile_ms": compile_ms,
+        "warp_compile_ms": warp_compile_ms,
+        "framework_compile_ms": framework_compile_ms,
+        "framework": framework,
+        "success": bool(success),
+        "error": "" if success else str(error),
+        "error_type": "" if success else str(error_type or "Unknown"),
+    }
+    row.update(extra)
+    return row
+
+
+def annotate_result_row(
+    row: dict,
+    *,
+    supercell_size: int,
+    mode: str,
+    dtype: str,
+    config_path: str,
+    config_sha256: str,
+    accuracy: float,
+    real_space_cutoff: float | None,
+) -> dict:
+    """Add run-level metadata to an existing benchmark row."""
+    row.update(
+        {
+            "supercell_size": supercell_size,
+            "mode": mode,
+            "dtype": dtype,
+            "config_path": config_path,
+            "config_sha256": config_sha256,
+            "accuracy": accuracy,
+            "real_space_cutoff": "" if real_space_cutoff is None else real_space_cutoff,
+        }
+    )
+    return row
 
 
 def _get_backend_modules(
@@ -427,6 +697,8 @@ def convert_to_backend(
 def compute_electrostatics_params(
     backend_data: dict,
     backend: str,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
 ) -> dict:
     """Compute Ewald/PME parameters using the appropriate backend.
 
@@ -437,6 +709,16 @@ def compute_electrostatics_params(
         optionally batch_idx.
     backend : str
         "torch" or "jax".
+    real_space_cutoff : float, optional
+        If provided, forwarded to ``estimate_pme_parameters``; ``alpha``
+        and mesh dimensions are then derived from this cutoff instead
+        of the cost-optimal one. The Ewald-parameter side uses the
+        cost-optimal cutoff regardless (Ewald has no auto-cutoff
+        equivalent to PME's).
+    accuracy : float, default=1e-4
+        Target relative force accuracy passed to ``estimate_ewald_parameters``
+        and ``estimate_pme_parameters``. Drives the cost-model choice of
+        alpha, real-space cutoff, and mesh dimensions.
 
     Returns
     -------
@@ -452,37 +734,78 @@ def compute_electrostatics_params(
 
     if batch_idx is None:
         ewald_params = electrostatics_mod.estimate_ewald_parameters(
-            positions, cell, accuracy=1e-6
+            positions, cell, accuracy=accuracy
         )
-        k_cutoff = ewald_params.reciprocal_space_cutoff.item()
-        cutoff = ewald_params.real_space_cutoff.item()
+        ewald_k_cutoff = ewald_params.reciprocal_space_cutoff.item()
+        ewald_cutoff = ewald_params.real_space_cutoff.item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, accuracy=1e-6
+            positions,
+            cell,
+            accuracy=accuracy,
+            real_space_cutoff=real_space_cutoff,
         )
     else:
         ewald_params = electrostatics_mod.estimate_ewald_parameters(
-            positions, cell, batch_idx, accuracy=1e-6
+            positions, cell, batch_idx, accuracy=accuracy
         )
-        k_cutoff = ewald_params.reciprocal_space_cutoff[0].item()
-        cutoff = ewald_params.real_space_cutoff[0].item()
+        ewald_k_cutoff = ewald_params.reciprocal_space_cutoff[0].item()
+        ewald_cutoff = ewald_params.real_space_cutoff[0].item()
 
         pme_params = electrostatics_mod.estimate_pme_parameters(
-            positions, cell, batch_idx, accuracy=1e-6
+            positions,
+            cell,
+            batch_idx,
+            accuracy=accuracy,
+            real_space_cutoff=real_space_cutoff,
         )
 
-    alpha = pme_params.alpha
+    pme_alpha = pme_params.alpha
+    pme_cutoff = (
+        float(real_space_cutoff)
+        if real_space_cutoff is not None
+        else (
+            pme_params.real_space_cutoff.item()
+            if batch_idx is None
+            else pme_params.real_space_cutoff[0].item()
+        )
+    )
     mesh_dimensions = pme_params.mesh_dimensions
     mesh_spacing = pme_params.mesh_spacing
 
+    cell_static = (
+        cell.detach() if hasattr(cell, "detach") else jax.lax.stop_gradient(cell)
+    )
     k_vectors_pme, k_squared_pme = electrostatics_mod.generate_k_vectors_pme(
-        cell, mesh_dimensions
+        cell_static, mesh_dimensions
     )
 
+    ewald_block = {
+        "alpha": ewald_params.alpha,
+        "k_cutoff": ewald_k_cutoff,
+        "cutoff": ewald_cutoff,
+    }
+    pme_block = {
+        "alpha": pme_alpha,
+        "cutoff": pme_cutoff,
+        "mesh_dimensions": mesh_dimensions,
+        "mesh_spacing": mesh_spacing,
+        "k_vectors_pme": k_vectors_pme,
+        "k_squared_pme": k_squared_pme,
+    }
+
     return {
-        "alpha": alpha,
-        "k_cutoff": k_cutoff,
-        "cutoff": cutoff,
+        "ewald": ewald_block,
+        "pme": pme_block,
+        # Backward-compatible aliases used by older helpers. Prefer the
+        # explicit method blocks for new benchmark code.
+        "alpha": pme_alpha,
+        "alpha_ewald": ewald_block["alpha"],
+        "alpha_pme": pme_block["alpha"],
+        "k_cutoff": ewald_k_cutoff,
+        "cutoff": pme_cutoff,
+        "cutoff_ewald": ewald_cutoff,
+        "cutoff_pme": pme_cutoff,
         "mesh_dimensions": mesh_dimensions,
         "mesh_spacing": mesh_spacing,
         "k_vectors_pme": k_vectors_pme,
@@ -538,16 +861,85 @@ def compute_neighbor_list(
         )
 
 
+def _torch_pme_static_metadata(
+    cell: torch.Tensor,
+    mesh_dimensions: tuple[int, int, int],
+    spline_order: int,
+) -> dict:
+    """Return fixed-cell PME metadata tensors for repeated Torch timings."""
+    cell_static = cell.detach()
+    cell_inv_t = torch.linalg.inv(cell_static).transpose(-1, -2).contiguous()
+    volume = torch.abs(torch.linalg.det(cell_static)).reshape(-1).to(cell.dtype)
+
+    mesh_nx, mesh_ny, mesh_nz = mesh_dimensions
+    device = cell.device
+    miller_x = torch.fft.fftfreq(
+        mesh_nx, d=1.0 / mesh_nx, device=device, dtype=cell.dtype
+    )
+    miller_y = torch.fft.fftfreq(
+        mesh_ny, d=1.0 / mesh_ny, device=device, dtype=cell.dtype
+    )
+    miller_z = torch.fft.rfftfreq(
+        mesh_nz, d=1.0 / mesh_nz, device=device, dtype=cell.dtype
+    )
+
+    return {
+        "cell_inv_t": cell_inv_t,
+        "volume": volume,
+        "moduli_x": _torch_electrostatics.compute_bspline_moduli_1d(
+            miller_x, mesh_nx, spline_order
+        ),
+        "moduli_y": _torch_electrostatics.compute_bspline_moduli_1d(
+            miller_y, mesh_ny, spline_order
+        ),
+        "moduli_z": _torch_electrostatics.compute_bspline_moduli_1d(
+            miller_z, mesh_nz, spline_order
+        ),
+    }
+
+
+def _jax_pme_static_metadata(
+    cell: jax.Array,
+    mesh_dimensions: tuple[int, int, int],
+    spline_order: int,
+) -> dict:
+    """Return fixed-cell PME metadata arrays for repeated JAX timings."""
+    cell_static = jax.lax.stop_gradient(cell)
+    cell_inv = jnp.linalg.inv(cell_static)
+    cell_inv_t = cell_inv.T if cell.ndim == 2 else jnp.transpose(cell_inv, (0, 2, 1))
+    volume = jnp.abs(jnp.linalg.det(cell_static)).reshape(-1).astype(cell.dtype)
+
+    mesh_nx, mesh_ny, mesh_nz = mesh_dimensions
+    miller_x = jnp.fft.fftfreq(mesh_nx, d=1.0 / mesh_nx).astype(cell.dtype)
+    miller_y = jnp.fft.fftfreq(mesh_ny, d=1.0 / mesh_ny).astype(cell.dtype)
+    miller_z = jnp.fft.rfftfreq(mesh_nz, d=1.0 / mesh_nz).astype(cell.dtype)
+
+    return {
+        "cell_inv_t": cell_inv_t,
+        "volume": volume,
+        "moduli_x": _jax_electrostatics.compute_bspline_moduli_1d(
+            miller_x, mesh_nx, spline_order
+        ),
+        "moduli_y": _jax_electrostatics.compute_bspline_moduli_1d(
+            miller_y, mesh_ny, spline_order
+        ),
+        "moduli_z": _jax_electrostatics.compute_bspline_moduli_1d(
+            miller_z, mesh_nz, spline_order
+        ),
+    }
+
+
 def prepare_single_system(
     supercell_size: int,
     device: str,
     dtype: torch.dtype,
     np_data: dict | None = None,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
+    build_neighbors: bool = True,
+    neighbor_family: Literal["ewald", "pme"] = "pme",
 ) -> dict:
     """Prepare a single system for benchmarking.
-
-    Backward-compatible wrapper that uses the new decoupled helpers internally.
-    The return value structure is identical to the original implementation.
 
     Parameters
     ----------
@@ -558,12 +950,24 @@ def prepare_single_system(
         Device string for torch tensors.
     dtype : torch.dtype
         Data type for torch tensors.
+    real_space_cutoff : float, optional
+        If provided, forwarded to ``estimate_pme_parameters`` (pins PME's
+        rc / alpha) and also used as the cutoff for the neighbor matrix.
+    accuracy : float, default=1e-4
+        Target relative force accuracy for the Ewald/PME parameter estimator.
+    build_neighbors : bool, default=True
+        Build the neighbor matrix. Set to ``False`` to skip when the
+        benchmark only exercises the reciprocal half of PME.
+    neighbor_family : {"ewald", "pme"}, default="pme"
+        Which method family's real-space cutoff to use for the prebuilt
+        neighbor matrix.
 
     Returns
     -------
     dict
         System data ready for electrostatics benchmarks, containing positions,
-        charges, cell, pbc, neighbor list data, and computed parameters.
+        charges, cell, pbc, neighbor list data (or ``None`` when
+        ``build_neighbors=False``), and computed parameters.
     """
     dtype_str = str(dtype).split(".")[-1]
 
@@ -574,11 +978,23 @@ def prepare_single_system(
         np_data, "torch", device=device, dtype_str=dtype_str
     )
 
-    params = compute_electrostatics_params(backend_data, "torch")
-
-    neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
-        backend_data, "torch", params["cutoff"]
+    params = compute_electrostatics_params(
+        backend_data,
+        "torch",
+        real_space_cutoff=real_space_cutoff,
+        accuracy=accuracy,
     )
+
+    if build_neighbors:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params, neighbor_family)
+        neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
+            backend_data, "torch", neighbor_cutoff
+        )
+    else:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params, neighbor_family)
+        neighbor_matrix = None
+        num_neighbors = None
+        neighbor_matrix_shifts = None
 
     pbc = backend_data["pbc"]
     if pbc.dim() == 2 and pbc.shape[0] == 1:
@@ -591,10 +1007,16 @@ def prepare_single_system(
     if hasattr(mesh_spacing, "tolist"):
         mesh_spacing = mesh_spacing.tolist()
 
+    cell_t = backend_data["cell"]
+    pme_static = _torch_pme_static_metadata(
+        cell_t, params["mesh_dimensions"], spline_order=4
+    )
+
     return {
         "positions": backend_data["positions"],
         "charges": backend_data["charges"],
-        "cell": backend_data["cell"],
+        "cell": cell_t,
+        **pme_static,
         "pbc": pbc,
         "pbc_slab": pbc_slab,
         "neighbor_matrix": neighbor_matrix,
@@ -603,8 +1025,13 @@ def prepare_single_system(
         "total_atoms": backend_data["total_atoms"],
         "batch_idx": None,
         "alpha": params["alpha"],
+        "alpha_ewald": params["ewald"]["alpha"],
+        "alpha_pme": params["pme"]["alpha"],
         "k_cutoff": params["k_cutoff"],
-        "cutoff": params["cutoff"],
+        "cutoff_ewald": params["ewald"]["cutoff"],
+        "cutoff_pme": params["pme"]["cutoff"],
+        "cutoff": neighbor_cutoff,
+        "neighbor_family": neighbor_family,
         "mesh_dimensions": params["mesh_dimensions"],
         "mesh_spacing": mesh_spacing,
         "spline_order": 4,
@@ -619,11 +1046,17 @@ def prepare_batch_system(
     device: str,
     dtype: torch.dtype,
     np_data: dict | None = None,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
+    build_neighbors: bool = True,
+    neighbor_family: Literal["ewald", "pme"] = "pme",
 ) -> dict:
     """Prepare a batched system for benchmarking.
 
-    Backward-compatible wrapper that uses the new decoupled helpers internally.
-    The return value structure is identical to the original implementation.
+    This is the batched Torch companion to :func:`prepare_single_system`. It
+    computes method-family-specific Ewald/PME parameter blocks, optional
+    prebuilt neighbor data, and fixed-cell PME metadata used by repeated timing
+    calls.
 
     Parameters
     ----------
@@ -636,12 +1069,24 @@ def prepare_batch_system(
         Device string for torch tensors.
     dtype : torch.dtype
         Data type for torch tensors.
+    real_space_cutoff : float, optional
+        If provided, pins PME's real-space cutoff and derived alpha. Ewald keeps
+        its own estimator-derived reciprocal cutoff.
+    accuracy : float, default=1e-4
+        Target relative force accuracy for Ewald/PME parameter estimation.
+    build_neighbors : bool, default=True
+        Build neighbor matrices. When false, neighbor-list fields in the return
+        value are ``None`` for reciprocal-only benchmark paths.
+    neighbor_family : {"ewald", "pme"}, default="pme"
+        Which method family's real-space cutoff to use for prebuilt neighbors.
 
     Returns
     -------
     dict
-        System data ready for electrostatics benchmarks, containing positions,
-        charges, cell, pbc, neighbor list data, batch information, and computed parameters.
+        System data ready for electrostatics benchmarks. Contains backend
+        tensors, batch metadata, optional neighbor data, separate Ewald/PME
+        alpha/cutoff entries, PME mesh/k-vector caches, and fixed-cell metadata
+        (`cell_inv_t`, `volume`, `moduli_x`, `moduli_y`, `moduli_z`).
     """
     dtype_str = str(dtype).split(".")[-1]
 
@@ -652,19 +1097,37 @@ def prepare_batch_system(
         np_data, "torch", device=device, dtype_str=dtype_str
     )
 
-    params = compute_electrostatics_params(backend_data, "torch")
-
-    neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
-        backend_data, "torch", params["cutoff"]
+    params = compute_electrostatics_params(
+        backend_data,
+        "torch",
+        real_space_cutoff=real_space_cutoff,
+        accuracy=accuracy,
     )
 
     pbc_slab = backend_data["pbc"].clone()
     pbc_slab[..., SLAB_AXIS] = False
 
+    if build_neighbors:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params, neighbor_family)
+        neighbor_matrix, num_neighbors, neighbor_matrix_shifts = compute_neighbor_list(
+            backend_data, "torch", neighbor_cutoff
+        )
+    else:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params, neighbor_family)
+        neighbor_matrix = None
+        num_neighbors = None
+        neighbor_matrix_shifts = None
+
+    cell_t_b = backend_data["cell"]
+    pme_static = _torch_pme_static_metadata(
+        cell_t_b, params["mesh_dimensions"], spline_order=4
+    )
+
     return {
         "positions": backend_data["positions"],
         "charges": backend_data["charges"],
-        "cell": backend_data["cell"],
+        "cell": cell_t_b,
+        **pme_static,
         "pbc": backend_data["pbc"],
         "pbc_slab": pbc_slab,
         "neighbor_matrix": neighbor_matrix,
@@ -674,8 +1137,13 @@ def prepare_batch_system(
         "batch_idx": backend_data["batch_idx"],
         "batch_size": batch_size,
         "alpha": params["alpha"],
+        "alpha_ewald": params["ewald"]["alpha"],
+        "alpha_pme": params["pme"]["alpha"],
         "k_cutoff": params["k_cutoff"],
-        "cutoff": params["cutoff"],
+        "cutoff_ewald": params["ewald"]["cutoff"],
+        "cutoff_pme": params["pme"]["cutoff"],
+        "cutoff": neighbor_cutoff,
+        "neighbor_family": neighbor_family,
         "mesh_dimensions": params["mesh_dimensions"],
         "mesh_spacing": params["mesh_spacing"],
         "spline_order": 4,
@@ -684,19 +1152,44 @@ def prepare_batch_system(
     }
 
 
-def prepare_jax_ewald_pme_system(np_data: dict, dtype_str: str) -> dict:
+def prepare_jax_ewald_pme_system(
+    np_data: dict,
+    dtype_str: str,
+    real_space_cutoff: float | None = None,
+    accuracy: float = 1e-4,
+    build_neighbors: bool = True,
+    neighbor_family: Literal["ewald", "pme"] = "pme",
+) -> dict:
     """Prepare a JAX system dictionary for Ewald and PME benchmarks."""
     backend_data = convert_to_backend(np_data, "jax", dtype_str=dtype_str)
-    params_data = compute_electrostatics_params(backend_data, "jax")
-    nl_matrix, nl_num_neighbors, nl_matrix_shifts = compute_neighbor_list(
-        backend_data, "jax", params_data["cutoff"]
+    params_data = compute_electrostatics_params(
+        backend_data,
+        "jax",
+        real_space_cutoff=real_space_cutoff,
+        accuracy=accuracy,
     )
+    if build_neighbors:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params_data, neighbor_family)
+        nl_matrix, nl_num_neighbors, nl_matrix_shifts = compute_neighbor_list(
+            backend_data, "jax", neighbor_cutoff
+        )
+    else:
+        neighbor_cutoff = _neighbor_cutoff_from_params(params_data, neighbor_family)
+        nl_matrix = None
+        nl_num_neighbors = None
+        nl_matrix_shifts = None
+
     pbc_slab = backend_data["pbc"].at[..., SLAB_AXIS].set(False)
+    cell_j = backend_data["cell"]
+    pme_static = _jax_pme_static_metadata(
+        cell_j, params_data["mesh_dimensions"], spline_order=4
+    )
 
     system_data = {
         "positions": backend_data["positions"],
         "charges": backend_data["charges"],
-        "cell": backend_data["cell"],
+        "cell": cell_j,
+        **pme_static,
         "pbc": backend_data["pbc"],
         "pbc_slab": pbc_slab,
         "neighbor_matrix": nl_matrix,
@@ -706,8 +1199,13 @@ def prepare_jax_ewald_pme_system(np_data: dict, dtype_str: str) -> dict:
         "num_atoms_per_system": backend_data["num_atoms_per_system"],
         "batch_idx": backend_data["batch_idx"],
         "alpha": params_data["alpha"],
+        "alpha_ewald": params_data["ewald"]["alpha"],
+        "alpha_pme": params_data["pme"]["alpha"],
         "k_cutoff": params_data["k_cutoff"],
-        "cutoff": params_data["cutoff"],
+        "cutoff_ewald": params_data["ewald"]["cutoff"],
+        "cutoff_pme": params_data["pme"]["cutoff"],
+        "cutoff": neighbor_cutoff,
+        "neighbor_family": neighbor_family,
         "mesh_dimensions": params_data["mesh_dimensions"],
         "mesh_spacing": params_data["mesh_spacing"],
         "spline_order": 4,
@@ -720,17 +1218,496 @@ def prepare_jax_ewald_pme_system(np_data: dict, dtype_str: str) -> dict:
 
 
 # ==============================================================================
-# Multipole System Preparation
+# DSF System Preparation
 # ==============================================================================
-#
-# The multipole Ewald / PME entry points consume a CSR neighbor list
-# (``idx_j`` / ``neighbor_ptr`` / ``unit_shifts``) plus a packed
-# ``multipole_moments`` tensor, rather than the dense neighbor-matrix +
-# bare ``charges`` the monopole runners use. These helpers build a neutral
-# BCC supercell (reusing the shared crystal builder), attach random
-# Cartesian dipoles (l_max>=1) and random symmetric-traceless quadrupoles
-# (l_max>=2), pack them via ``pack_multipole_moments``, and build the CSR
-# neighbor list at the GTO-Ewald real-space cutoff.
+
+
+def build_neighbors(
+    system_data: dict,
+    neighbor_format: str,
+) -> None:
+    """Build neighbor data in-place for the requested format.
+
+    Modifies *system_data* to add the neighbor keys for exactly one format
+    (CSR or matrix).  Any previously-stored neighbor data is removed first
+    so that only one representation is in GPU memory at a time.
+
+    Parameters
+    ----------
+    system_data : dict
+        System dictionary produced by one of the ``prepare_*`` functions.
+    neighbor_format : str
+        ``"list"`` for CSR (sparse), ``"matrix"`` for dense neighbor matrix,
+        or ``"n/a"`` which is treated as CSR (used by torchpme / torch_dsf).
+    """
+    for key in [
+        "neighbor_list",
+        "neighbor_ptr",
+        "neighbor_shifts",
+        "neighbor_matrix",
+        "neighbor_matrix_shifts",
+        "fill_value",
+        "num_neighbors",
+    ]:
+        system_data.pop(key, None)
+
+    positions = system_data["positions"]
+    cutoff = system_data["cutoff"]
+    cell = system_data.get("cell")
+    pbc = system_data.get("pbc")
+    batch_idx = system_data.get("batch_idx")
+    total_atoms = system_data["total_atoms"]
+
+    nl_kwargs: dict = dict(cell=cell, pbc=pbc)
+    if batch_idx is not None:
+        nl_kwargs["batch_idx"] = batch_idx
+        nl_kwargs["method"] = "batch_naive"
+
+    if cell is not None:
+        batch_size = system_data.get("batch_size", 1)
+        cell_2d = cell[0] if cell.dim() == 3 else cell
+        volume = torch.abs(torch.det(cell_2d)).item()
+        density = (total_atoms / batch_size) / volume
+        max_nbrs = _neighbor_utils.estimate_max_neighbors(
+            cutoff, atomic_density=density, safety_factor=1.2
+        )
+        nl_kwargs["max_neighbors"] = max_nbrs
+
+    if neighbor_format == "matrix":
+        nm, num_nbrs, nm_shifts = _torch_neighbors.neighbor_list(
+            positions, cutoff, **nl_kwargs
+        )
+        system_data["neighbor_matrix"] = nm
+        system_data["num_neighbors"] = num_nbrs
+        system_data["neighbor_matrix_shifts"] = nm_shifts
+        system_data["fill_value"] = total_atoms
+    else:  # "list" or "n/a" (CSR)
+        nl_data, nl_ptr, nl_shifts = _torch_neighbors.neighbor_list(
+            positions, cutoff, return_neighbor_list=True, **nl_kwargs
+        )
+        system_data["neighbor_list"] = nl_data
+        system_data["neighbor_ptr"] = nl_ptr
+        system_data["neighbor_shifts"] = nl_shifts
+
+
+def prepare_dsf_single_system(
+    supercell_size: int,
+    device: str,
+    dtype: torch.dtype,
+    cutoff: float = 12.0,
+    alpha: float = 0.2,
+) -> dict:
+    """Prepare a single system for DSF benchmarking.
+
+    DSF does not need k-vectors, PME mesh, or Ewald parameter estimation.
+    Neighbor data is built by ``build_neighbors()`` before each run.
+
+    Parameters
+    ----------
+    supercell_size : int
+        Linear dimension of the supercell. For BCC lattice (2 atoms per unit cell),
+        this creates 2 * supercell_size^3 atoms total.
+    """
+    target_atoms = 2 * supercell_size**3
+    system = create_crystal_system(
+        target_atoms,
+        lattice_type="bcc",
+        lattice_constant=4.14,
+        device=device,
+        dtype=dtype,
+    )
+    total_atoms = system["num_atoms"]
+    positions = system["positions"]
+    charges = system["atomic_charges"]
+    cell = system["cell"]
+    pbc = system["pbc"]
+
+    return {
+        "positions": positions,
+        "charges": charges,
+        "cell": cell,
+        "pbc": pbc,
+        "total_atoms": total_atoms,
+        "batch_idx": None,
+        "cutoff": cutoff,
+        "alpha": alpha,
+    }
+
+
+def prepare_dsf_batch_system(
+    supercell_size: int,
+    batch_size: int,
+    device: str,
+    dtype: torch.dtype,
+    cutoff: float = 12.0,
+    alpha: float = 0.2,
+) -> dict:
+    """Prepare a batched system for DSF benchmarking.
+
+    Neighbor data is built by ``build_neighbors()`` before each run.
+
+    Parameters
+    ----------
+    supercell_size : int
+        Linear dimension of each supercell.
+    batch_size : int
+        Number of systems to batch together.
+    """
+    target_atoms_per_system = 2 * supercell_size**3
+
+    all_positions = []
+    all_charges = []
+    all_cells = []
+    all_pbc = []
+    batch_idx_list = []
+
+    for i in range(batch_size):
+        system = create_crystal_system(
+            target_atoms_per_system,
+            lattice_type="bcc",
+            lattice_constant=4.14,
+            device=device,
+            dtype=dtype,
+        )
+        n_atoms = system["num_atoms"]
+        all_positions.append(system["positions"])
+        all_charges.append(system["atomic_charges"])
+        all_cells.append(system["cell"])
+        all_pbc.append(system["pbc"])
+        batch_idx_list.extend([i] * n_atoms)
+
+    positions = torch.cat(all_positions, dim=0)
+    charges = torch.cat(all_charges, dim=0)
+    cells = torch.cat(all_cells, dim=0)
+    pbc = torch.stack(all_pbc, dim=0)
+    batch_idx = torch.tensor(batch_idx_list, dtype=torch.int32, device=device)
+    total_atoms = positions.shape[0]
+
+    return {
+        "positions": positions,
+        "charges": charges,
+        "cell": cells,
+        "pbc": pbc,
+        "total_atoms": total_atoms,
+        "batch_idx": batch_idx,
+        "batch_size": batch_size,
+        "cutoff": cutoff,
+        "alpha": alpha,
+    }
+
+
+# ==============================================================================
+# nvalchemiops Backend
+# ==============================================================================
+
+
+def run_nvalchemiops_dsf(
+    system_data: dict,
+    compute_forces: bool,
+    compute_virial: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run DSF using nvalchemiops backend (neighbor matrix format)."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    cutoff = system_data["cutoff"]
+    alpha = system_data["alpha"]
+    neighbor_matrix = system_data["neighbor_matrix"]
+    neighbor_matrix_shifts = system_data["neighbor_matrix_shifts"]
+    fill_value = system_data["fill_value"]
+    num_systems = system_data.get("batch_size", 1)
+
+    return _torch_electrostatics.dsf_coulomb(
+        positions=positions,
+        charges=charges,
+        cutoff=cutoff,
+        alpha=alpha,
+        cell=cell,
+        batch_idx=batch_idx,
+        neighbor_matrix=neighbor_matrix,
+        neighbor_matrix_shifts=neighbor_matrix_shifts,
+        fill_value=fill_value,
+        compute_forces=compute_forces,
+        compute_virial=compute_virial,
+        num_systems=num_systems,
+    )
+
+
+def run_nvalchemiops_dsf_csr(
+    system_data: dict,
+    compute_forces: bool,
+    compute_virial: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run DSF using nvalchemiops backend (CSR neighbor list format)."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    cutoff = system_data["cutoff"]
+    alpha = system_data["alpha"]
+    neighbor_list_data = system_data["neighbor_list"]
+    neighbor_ptr = system_data["neighbor_ptr"]
+    neighbor_shifts = system_data["neighbor_shifts"]
+    num_systems = system_data.get("batch_size", 1)
+
+    return _torch_electrostatics.dsf_coulomb(
+        positions=positions,
+        charges=charges,
+        cutoff=cutoff,
+        alpha=alpha,
+        cell=cell,
+        batch_idx=batch_idx,
+        neighbor_list=neighbor_list_data,
+        neighbor_ptr=neighbor_ptr,
+        unit_shifts=neighbor_shifts,
+        compute_forces=compute_forces,
+        compute_virial=compute_virial,
+        num_systems=num_systems,
+    )
+
+
+def run_nvalchemiops_ewald(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    slab_correction: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run Ewald summation using nvalchemiops backend."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    alpha = system_data.get("alpha_ewald", system_data.get("alpha"))
+    k_cutoff = system_data.get("k_cutoff")
+    k_vectors = _torch_electrostatics.generate_k_vectors_ewald_summation(
+        cell.detach(), k_cutoff
+    )
+    pbc_slab = system_data.get("pbc_slab")
+
+    neighbor_matrix_data = system_data.get("neighbor_matrix")
+    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
+
+    if batch_idx is None:
+        if component == "real":
+            return _torch_electrostatics.ewald_real_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        elif component == "reciprocal":
+            return _torch_electrostatics.ewald_reciprocal_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                k_vectors=k_vectors,
+                alpha=alpha,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        else:  # full
+            return _torch_electrostatics.ewald_summation(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                k_cutoff=k_cutoff,
+                k_vectors=k_vectors,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                pbc=pbc_slab,
+                slab_correction=slab_correction,
+            )
+    else:
+        if component == "real":
+            return _torch_electrostatics.ewald_real_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                batch_idx=batch_idx,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        elif component == "reciprocal":
+            return _torch_electrostatics.ewald_reciprocal_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                k_vectors=k_vectors,
+                alpha=alpha,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        else:  # full
+            return _torch_electrostatics.ewald_summation(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                k_cutoff=k_cutoff,
+                k_vectors=k_vectors,
+                batch_idx=batch_idx,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                pbc=pbc_slab,
+                slab_correction=slab_correction,
+            )
+
+
+def run_nvalchemiops_pme(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    slab_correction: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run PME using nvalchemiops backend."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    cell_inv_t = system_data.get("cell_inv_t")
+    volume = system_data.get("volume")
+    moduli_x = system_data.get("moduli_x")
+    moduli_y = system_data.get("moduli_y")
+    moduli_z = system_data.get("moduli_z")
+    batch_idx = system_data.get("batch_idx")
+    alpha = system_data.get("alpha_pme", system_data.get("alpha"))
+    mesh_dimensions = system_data.get("mesh_dimensions")
+    spline_order = system_data.get("spline_order")
+    k_vectors_pme = system_data.get("k_vectors_pme")
+    k_squared_pme = system_data.get("k_squared_pme")
+    pbc_slab = system_data.get("pbc_slab")
+
+    neighbor_matrix_data = system_data.get("neighbor_matrix")
+    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
+
+    if batch_idx is None:
+        if component == "real":
+            return _torch_electrostatics.ewald_real_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        elif component == "reciprocal":
+            return _torch_electrostatics.pme_reciprocal_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                k_vectors=k_vectors_pme,
+                k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
+            )
+        else:  # full
+            return _torch_electrostatics.particle_mesh_ewald(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                k_vectors=k_vectors_pme,
+                k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
+                pbc=pbc_slab,
+                slab_correction=slab_correction,
+            )
+    else:
+        if component == "real":
+            return _torch_electrostatics.ewald_real_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                batch_idx=batch_idx,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+            )
+        elif component == "reciprocal":
+            return _torch_electrostatics.pme_reciprocal_space(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                k_vectors=k_vectors_pme,
+                k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
+            )
+        else:  # full
+            return _torch_electrostatics.particle_mesh_ewald(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                alpha=alpha,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+                batch_idx=batch_idx,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                compute_forces=compute_forces,
+                compute_virial=compute_virial,
+                k_vectors=k_vectors_pme,
+                k_squared=k_squared_pme,
+                cell_inv_t=cell_inv_t,
+                volume=volume,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
+                pbc=pbc_slab,
+                slab_correction=slab_correction,
+            )
+
+
+# ==============================================================================
+# Multipole (charges + dipoles + quadrupoles) benchmark methods (torch-only)
+# ==============================================================================
+
 
 # GTO density-basis width shared across the multipole sweep; only affects
 # the energy value, not the timing signal.
@@ -1007,474 +1984,6 @@ def prepare_multipole_batch_system(
     return system_data
 
 
-# ==============================================================================
-# DSF System Preparation
-# ==============================================================================
-
-
-def build_neighbors(
-    system_data: dict,
-    neighbor_format: str,
-) -> None:
-    """Build neighbor data in-place for the requested format.
-
-    Modifies *system_data* to add the neighbor keys for exactly one format
-    (CSR or matrix).  Any previously-stored neighbor data is removed first
-    so that only one representation is in GPU memory at a time.
-
-    Parameters
-    ----------
-    system_data : dict
-        System dictionary produced by one of the ``prepare_*`` functions.
-    neighbor_format : str
-        ``"list"`` for CSR (sparse), ``"matrix"`` for dense neighbor matrix,
-        or ``"n/a"`` which is treated as CSR (used by torchpme / torch_dsf).
-    """
-    for key in [
-        "neighbor_list",
-        "neighbor_ptr",
-        "neighbor_shifts",
-        "neighbor_matrix",
-        "neighbor_matrix_shifts",
-        "fill_value",
-        "num_neighbors",
-    ]:
-        system_data.pop(key, None)
-
-    positions = system_data["positions"]
-    cutoff = system_data["cutoff"]
-    cell = system_data.get("cell")
-    pbc = system_data.get("pbc")
-    batch_idx = system_data.get("batch_idx")
-    total_atoms = system_data["total_atoms"]
-
-    nl_kwargs: dict = dict(cell=cell, pbc=pbc)
-    if batch_idx is not None:
-        nl_kwargs["batch_idx"] = batch_idx
-        nl_kwargs["method"] = "batch_naive"
-
-    if cell is not None:
-        batch_size = system_data.get("batch_size", 1)
-        cell_2d = cell[0] if cell.dim() == 3 else cell
-        volume = torch.abs(torch.det(cell_2d)).item()
-        density = (total_atoms / batch_size) / volume
-        max_nbrs = _neighbor_utils.estimate_max_neighbors(
-            cutoff, atomic_density=density, safety_factor=1.2
-        )
-        nl_kwargs["max_neighbors"] = max_nbrs
-
-    if neighbor_format == "matrix":
-        nm, num_nbrs, nm_shifts = _torch_neighbors.neighbor_list(
-            positions, cutoff, **nl_kwargs
-        )
-        system_data["neighbor_matrix"] = nm
-        system_data["num_neighbors"] = num_nbrs
-        system_data["neighbor_matrix_shifts"] = nm_shifts
-        system_data["fill_value"] = total_atoms
-    else:  # "list" or "n/a" (CSR)
-        nl_data, nl_ptr, nl_shifts = _torch_neighbors.neighbor_list(
-            positions, cutoff, return_neighbor_list=True, **nl_kwargs
-        )
-        system_data["neighbor_list"] = nl_data
-        system_data["neighbor_ptr"] = nl_ptr
-        system_data["neighbor_shifts"] = nl_shifts
-
-
-def prepare_dsf_single_system(
-    supercell_size: int,
-    device: str,
-    dtype: torch.dtype,
-    cutoff: float = 12.0,
-    alpha: float = 0.2,
-) -> dict:
-    """Prepare a single system for DSF benchmarking.
-
-    DSF does not need k-vectors, PME mesh, or Ewald parameter estimation.
-    Neighbor data is built by ``build_neighbors()`` before each run.
-
-    Parameters
-    ----------
-    supercell_size : int
-        Linear dimension of the supercell. For BCC lattice (2 atoms per unit cell),
-        this creates 2 * supercell_size^3 atoms total.
-    """
-    target_atoms = 2 * supercell_size**3
-    system = create_crystal_system(
-        target_atoms,
-        lattice_type="bcc",
-        lattice_constant=4.14,
-        device=device,
-        dtype=dtype,
-    )
-    total_atoms = system["num_atoms"]
-    positions = system["positions"]
-    charges = system["atomic_charges"]
-    cell = system["cell"]
-    pbc = system["pbc"]
-
-    return {
-        "positions": positions,
-        "charges": charges,
-        "cell": cell,
-        "pbc": pbc,
-        "total_atoms": total_atoms,
-        "batch_idx": None,
-        "cutoff": cutoff,
-        "alpha": alpha,
-    }
-
-
-def prepare_dsf_batch_system(
-    supercell_size: int,
-    batch_size: int,
-    device: str,
-    dtype: torch.dtype,
-    cutoff: float = 12.0,
-    alpha: float = 0.2,
-) -> dict:
-    """Prepare a batched system for DSF benchmarking.
-
-    Neighbor data is built by ``build_neighbors()`` before each run.
-
-    Parameters
-    ----------
-    supercell_size : int
-        Linear dimension of each supercell.
-    batch_size : int
-        Number of systems to batch together.
-    """
-    target_atoms_per_system = 2 * supercell_size**3
-
-    all_positions = []
-    all_charges = []
-    all_cells = []
-    all_pbc = []
-    batch_idx_list = []
-
-    for i in range(batch_size):
-        system = create_crystal_system(
-            target_atoms_per_system,
-            lattice_type="bcc",
-            lattice_constant=4.14,
-            device=device,
-            dtype=dtype,
-        )
-        n_atoms = system["num_atoms"]
-        all_positions.append(system["positions"])
-        all_charges.append(system["atomic_charges"])
-        all_cells.append(system["cell"])
-        all_pbc.append(system["pbc"])
-        batch_idx_list.extend([i] * n_atoms)
-
-    positions = torch.cat(all_positions, dim=0)
-    charges = torch.cat(all_charges, dim=0)
-    cells = torch.cat(all_cells, dim=0)
-    pbc = torch.stack(all_pbc, dim=0)
-    batch_idx = torch.tensor(batch_idx_list, dtype=torch.int32, device=device)
-    total_atoms = positions.shape[0]
-
-    return {
-        "positions": positions,
-        "charges": charges,
-        "cell": cells,
-        "pbc": pbc,
-        "total_atoms": total_atoms,
-        "batch_idx": batch_idx,
-        "batch_size": batch_size,
-        "cutoff": cutoff,
-        "alpha": alpha,
-    }
-
-
-# ==============================================================================
-# nvalchemiops Backend
-# ==============================================================================
-
-
-def run_nvalchemiops_dsf(
-    system_data: dict,
-    compute_forces: bool,
-    compute_virial: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run DSF using nvalchemiops backend (neighbor matrix format)."""
-    positions = system_data["positions"]
-    charges = system_data["charges"]
-    cell = system_data["cell"]
-    batch_idx = system_data.get("batch_idx")
-    cutoff = system_data["cutoff"]
-    alpha = system_data["alpha"]
-    neighbor_matrix = system_data["neighbor_matrix"]
-    neighbor_matrix_shifts = system_data["neighbor_matrix_shifts"]
-    fill_value = system_data["fill_value"]
-    num_systems = system_data.get("batch_size", 1)
-
-    return _torch_electrostatics.dsf_coulomb(
-        positions=positions,
-        charges=charges,
-        cutoff=cutoff,
-        alpha=alpha,
-        cell=cell,
-        batch_idx=batch_idx,
-        neighbor_matrix=neighbor_matrix,
-        neighbor_matrix_shifts=neighbor_matrix_shifts,
-        fill_value=fill_value,
-        compute_forces=compute_forces,
-        compute_virial=compute_virial,
-        num_systems=num_systems,
-    )
-
-
-def run_nvalchemiops_dsf_csr(
-    system_data: dict,
-    compute_forces: bool,
-    compute_virial: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run DSF using nvalchemiops backend (CSR neighbor list format)."""
-    positions = system_data["positions"]
-    charges = system_data["charges"]
-    cell = system_data["cell"]
-    batch_idx = system_data.get("batch_idx")
-    cutoff = system_data["cutoff"]
-    alpha = system_data["alpha"]
-    neighbor_list_data = system_data["neighbor_list"]
-    neighbor_ptr = system_data["neighbor_ptr"]
-    neighbor_shifts = system_data["neighbor_shifts"]
-    num_systems = system_data.get("batch_size", 1)
-
-    return _torch_electrostatics.dsf_coulomb(
-        positions=positions,
-        charges=charges,
-        cutoff=cutoff,
-        alpha=alpha,
-        cell=cell,
-        batch_idx=batch_idx,
-        neighbor_list=neighbor_list_data,
-        neighbor_ptr=neighbor_ptr,
-        unit_shifts=neighbor_shifts,
-        compute_forces=compute_forces,
-        compute_virial=compute_virial,
-        num_systems=num_systems,
-    )
-
-
-def run_nvalchemiops_ewald(
-    system_data: dict,
-    component: Literal["real", "reciprocal", "full"],
-    compute_forces: bool,
-    compute_virial: bool = False,
-    slab_correction: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run Ewald summation using nvalchemiops backend."""
-    positions = system_data["positions"]
-    charges = system_data["charges"]
-    cell = system_data["cell"]
-    batch_idx = system_data.get("batch_idx")
-    alpha = system_data.get("alpha")
-    k_cutoff = system_data.get("k_cutoff")
-    k_vectors = _torch_electrostatics.generate_k_vectors_ewald_summation(cell, k_cutoff)
-    pbc_slab = system_data.get("pbc_slab")
-
-    neighbor_matrix_data = system_data.get("neighbor_matrix")
-    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
-
-    if batch_idx is None:
-        if component == "real":
-            return _torch_electrostatics.ewald_real_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        elif component == "reciprocal":
-            return _torch_electrostatics.ewald_reciprocal_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                k_vectors=k_vectors,
-                alpha=alpha,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        else:  # full
-            return _torch_electrostatics.ewald_summation(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                k_cutoff=k_cutoff,
-                k_vectors=k_vectors,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                pbc=pbc_slab,
-                slab_correction=slab_correction,
-            )
-    else:
-        if component == "real":
-            return _torch_electrostatics.ewald_real_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                batch_idx=batch_idx,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        elif component == "reciprocal":
-            return _torch_electrostatics.ewald_reciprocal_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                k_vectors=k_vectors,
-                alpha=alpha,
-                batch_idx=batch_idx,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        else:  # full
-            return _torch_electrostatics.ewald_summation(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                k_cutoff=k_cutoff,
-                k_vectors=k_vectors,
-                batch_idx=batch_idx,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                pbc=pbc_slab,
-                slab_correction=slab_correction,
-            )
-
-
-def run_nvalchemiops_pme(
-    system_data: dict,
-    component: Literal["real", "reciprocal", "full"],
-    compute_forces: bool,
-    compute_virial: bool = False,
-    slab_correction: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run PME using nvalchemiops backend."""
-    positions = system_data["positions"]
-    charges = system_data["charges"]
-    cell = system_data["cell"]
-    batch_idx = system_data.get("batch_idx")
-    alpha = system_data.get("alpha")
-    mesh_dimensions = system_data.get("mesh_dimensions")
-    spline_order = system_data.get("spline_order")
-    k_vectors_pme = system_data.get("k_vectors_pme")
-    k_squared_pme = system_data.get("k_squared_pme")
-    pbc_slab = system_data.get("pbc_slab")
-
-    neighbor_matrix_data = system_data.get("neighbor_matrix")
-    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
-
-    if batch_idx is None:
-        if component == "real":
-            return _torch_electrostatics.ewald_real_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        elif component == "reciprocal":
-            return _torch_electrostatics.pme_reciprocal_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                mesh_dimensions=mesh_dimensions,
-                spline_order=spline_order,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                k_vectors=k_vectors_pme,
-                k_squared=k_squared_pme,
-            )
-        else:  # full
-            return _torch_electrostatics.particle_mesh_ewald(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                mesh_dimensions=mesh_dimensions,
-                spline_order=spline_order,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                k_vectors=k_vectors_pme,
-                k_squared=k_squared_pme,
-                pbc=pbc_slab,
-                slab_correction=slab_correction,
-            )
-    else:
-        if component == "real":
-            return _torch_electrostatics.ewald_real_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                batch_idx=batch_idx,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-            )
-        elif component == "reciprocal":
-            return _torch_electrostatics.pme_reciprocal_space(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                mesh_dimensions=mesh_dimensions,
-                spline_order=spline_order,
-                batch_idx=batch_idx,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                k_vectors=k_vectors_pme,
-                k_squared=k_squared_pme,
-            )
-        else:  # full
-            return _torch_electrostatics.particle_mesh_ewald(
-                positions=positions,
-                charges=charges,
-                cell=cell,
-                alpha=alpha,
-                mesh_dimensions=mesh_dimensions,
-                spline_order=spline_order,
-                batch_idx=batch_idx,
-                neighbor_matrix=neighbor_matrix_data,
-                neighbor_matrix_shifts=neighbor_matrix_shifts,
-                compute_forces=compute_forces,
-                compute_virial=compute_virial,
-                k_vectors=k_vectors_pme,
-                k_squared=k_squared_pme,
-                pbc=pbc_slab,
-                slab_correction=slab_correction,
-            )
-
-
-# ==============================================================================
-# nvalchemiops Multipole Backend (torch only)
-# ==============================================================================
-
-# Lazily-built ``torch.compile`` wrappers for the multipole composites. Compiled
-# once and reused; torch.compile specializes per input shape via guards and
-# recompiles as needed, so the first call at each new shape pays the compile
-# cost (absorbed by the warmup phase). Keyed by "ewald"/"pme".
 _MULTIPOLE_COMPILED: dict[str, object] = {}
 
 
@@ -1681,6 +2190,172 @@ def run_nvalchemiops_multipole_pme(
     return energy, forces
 
 
+def _first_tensor(result):
+    """Return the first tensor from a backend result tuple or the tensor itself."""
+    return result[0] if isinstance(result, tuple) else result
+
+
+def _torch_deformed_energy_inputs(
+    system_data: dict,
+    *,
+    use_strain: bool,
+) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return differentiable Torch inputs for energy-autograd benchmark rows."""
+    positions = system_data["positions"].detach().clone().requires_grad_(True)
+    charges = system_data["charges"].detach().clone().requires_grad_(True)
+    cell = system_data["cell"].detach().clone()
+    data = dict(system_data)
+    data["positions"] = positions
+    data["charges"] = charges
+
+    if not use_strain:
+        data["cell"] = cell
+        return data, positions, charges, None
+
+    cell_3d = cell if cell.ndim == 3 else cell.unsqueeze(0)
+    num_systems = cell_3d.shape[0]
+    strain = torch.zeros(
+        num_systems,
+        3,
+        3,
+        dtype=positions.dtype,
+        device=positions.device,
+        requires_grad=True,
+    )
+    deform = torch.eye(3, dtype=positions.dtype, device=positions.device).unsqueeze(0)
+    deform = deform + strain
+    batch_idx = system_data.get("batch_idx")
+    if batch_idx is None:
+        atom_system = torch.zeros(
+            positions.shape[0], dtype=torch.long, device=positions.device
+        )
+    else:
+        atom_system = batch_idx.to(device=positions.device, dtype=torch.long)
+
+    data["positions"] = torch.einsum("ni,nij->nj", positions, deform[atom_system])
+    data["cell"] = torch.einsum("bij,bjk->bik", cell_3d, deform)
+    for key in (
+        "cell_inv_t",
+        "volume",
+        "moduli_x",
+        "moduli_y",
+        "moduli_z",
+        "k_vectors_pme",
+        "k_squared_pme",
+    ):
+        data.pop(key, None)
+    return data, positions, charges, strain
+
+
+def _run_torch_energy_autograd(
+    runner,
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool,
+    workload: BenchmarkWorkload,
+    slab_correction: bool,
+):
+    """Run one Torch energy-autograd benchmark workload."""
+    needs_strain = compute_virial and workload in ("backward", "double_backward")
+    data, positions, charges, strain = _torch_deformed_energy_inputs(
+        system_data, use_strain=needs_strain
+    )
+    energy = _first_tensor(
+        runner(
+            data,
+            component,
+            False,
+            False,
+            slab_correction=slab_correction,
+        )
+    )
+    if workload == "forward" or not (compute_forces or compute_virial):
+        return energy
+
+    targets: list[torch.Tensor] = []
+    if compute_forces:
+        targets.append(positions)
+    if compute_virial and strain is not None:
+        targets.append(strain)
+    grads = torch.autograd.grad(
+        energy.sum(),
+        tuple(targets),
+        create_graph=workload == "double_backward",
+        allow_unused=True,
+    )
+
+    outputs: list[torch.Tensor | None] = [energy]
+    offset = 0
+    force_grad = None
+    strain_grad = None
+    if compute_forces:
+        force_grad = grads[offset]
+        outputs.append(None if force_grad is None else -force_grad)
+        offset += 1
+    if compute_virial and strain is not None:
+        strain_grad = grads[offset]
+        outputs.append(None if strain_grad is None else -strain_grad)
+
+    if workload != "double_backward":
+        return tuple(outputs)
+
+    loss = energy.new_zeros(())
+    if force_grad is not None:
+        loss = loss + force_grad.square().mean()
+    if strain_grad is not None:
+        loss = loss + strain_grad.square().mean()
+    second_targets: list[torch.Tensor] = [positions, charges]
+    if strain is not None:
+        second_targets.append(strain)
+    second_grads = torch.autograd.grad(
+        loss,
+        tuple(second_targets),
+        allow_unused=True,
+    )
+    return (*outputs, loss, *second_grads)
+
+
+def run_nvalchemiops_ewald_energy_autograd(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    workload: BenchmarkWorkload = "backward",
+    slab_correction: bool = False,
+):
+    """Run Torch Ewald via public energy API plus autograd-derived derivatives."""
+    return _run_torch_energy_autograd(
+        run_nvalchemiops_ewald,
+        system_data,
+        component,
+        compute_forces,
+        compute_virial,
+        workload,
+        slab_correction,
+    )
+
+
+def run_nvalchemiops_pme_energy_autograd(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    workload: BenchmarkWorkload = "backward",
+    slab_correction: bool = False,
+):
+    """Run Torch PME via public energy API plus autograd-derived derivatives."""
+    return _run_torch_energy_autograd(
+        run_nvalchemiops_pme,
+        system_data,
+        component,
+        compute_forces,
+        compute_virial,
+        workload,
+        slab_correction,
+    )
+
+
 # ==============================================================================
 # nvalchemiops JAX Backend
 # ==============================================================================
@@ -1721,7 +2396,7 @@ def prepare_jax_ewald(
     charges = system_data["charges"]
     cell = system_data["cell"]
     batch_idx = system_data.get("batch_idx")
-    alpha = system_data.get("alpha")
+    alpha = system_data.get("alpha_ewald", system_data.get("alpha"))
     k_cutoff = system_data.get("k_cutoff")
     num_atoms_per_system = system_data.get("num_atoms_per_system")
     pbc_slab = system_data.get("pbc_slab")
@@ -1778,7 +2453,9 @@ def prepare_jax_ewald(
         @jax.jit
         def _jit_fn(positions, charges, cell, alpha, batch_idx):
             k_vectors = _jax_electrostatics.generate_k_vectors_ewald_summation(
-                cell, _k_cutoff, miller_bounds=_miller_bounds
+                jax.lax.stop_gradient(cell),
+                _k_cutoff,
+                miller_bounds=_miller_bounds,
             )
             return _jax_electrostatics.ewald_reciprocal_space(
                 positions=positions,
@@ -1875,10 +2552,17 @@ def prepare_jax_pme(
     charges = system_data["charges"]
     cell = system_data["cell"]
     batch_idx = system_data.get("batch_idx")
-    alpha = system_data.get("alpha")
+    alpha = system_data.get("alpha_pme", system_data.get("alpha"))
     mesh_dimensions = system_data.get("mesh_dimensions")
     spline_order = system_data.get("spline_order")
     pbc_slab = system_data.get("pbc_slab")
+    cell_inv_t = system_data.get("cell_inv_t")
+    volume = system_data.get("volume")
+    moduli_x = system_data.get("moduli_x")
+    moduli_y = system_data.get("moduli_y")
+    moduli_z = system_data.get("moduli_z")
+    k_vectors_pme = system_data.get("k_vectors_pme")
+    k_squared_pme = system_data.get("k_squared_pme")
 
     neighbor_matrix_data = system_data.get("neighbor_matrix")
     neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
@@ -1933,6 +2617,13 @@ def prepare_jax_pme(
             cell,
             alpha,
             batch_idx,
+            cell_inv_t,
+            volume,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            k_vectors,
+            k_squared,
         ):
             return _jax_electrostatics.pme_reciprocal_space(
                 positions=positions,
@@ -1942,8 +2633,13 @@ def prepare_jax_pme(
                 mesh_dimensions=_mesh_dimensions,
                 spline_order=_spline_order,
                 batch_idx=batch_idx,
-                k_vectors=None,
-                k_squared=None,
+                k_vectors=k_vectors,
+                k_squared=k_squared,
+                volume=volume,
+                cell_inv_t=cell_inv_t,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
                 compute_forces=_compute_forces,
                 compute_virial=_compute_virial,
             )
@@ -1955,6 +2651,13 @@ def prepare_jax_pme(
                 cell,
                 alpha,
                 batch_idx,
+                cell_inv_t,
+                volume,
+                moduli_x,
+                moduli_y,
+                moduli_z,
+                k_vectors_pme,
+                k_squared_pme,
             )
 
     else:  # full
@@ -1968,6 +2671,13 @@ def prepare_jax_pme(
             neighbor_matrix,
             neighbor_matrix_shifts,
             batch_idx,
+            cell_inv_t,
+            volume,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            k_vectors,
+            k_squared,
             pbc_slab,
         ):
             return _jax_electrostatics.particle_mesh_ewald(
@@ -1978,10 +2688,15 @@ def prepare_jax_pme(
                 mesh_dimensions=_mesh_dimensions,
                 spline_order=_spline_order,
                 batch_idx=batch_idx,
-                k_vectors=None,
-                k_squared=None,
+                k_vectors=k_vectors,
+                k_squared=k_squared,
                 neighbor_matrix=neighbor_matrix,
                 neighbor_matrix_shifts=neighbor_matrix_shifts,
+                volume=volume,
+                cell_inv_t=cell_inv_t,
+                moduli_x=moduli_x,
+                moduli_y=moduli_y,
+                moduli_z=moduli_z,
                 compute_forces=_compute_forces,
                 compute_virial=_compute_virial,
                 pbc=pbc_slab,
@@ -1997,8 +2712,242 @@ def prepare_jax_pme(
                 neighbor_matrix_data,
                 neighbor_matrix_shifts,
                 batch_idx,
+                cell_inv_t,
+                volume,
+                moduli_x,
+                moduli_y,
+                moduli_z,
+                k_vectors_pme,
+                k_squared_pme,
                 pbc_slab,
             )
+
+    return call
+
+
+def _jax_deformed_inputs(
+    positions,
+    cell,
+    batch_idx,
+    strain,
+):
+    """Apply row-vector strain to JAX positions and cells."""
+    cell_3d = cell if cell.ndim == 3 else cell[jnp.newaxis, ...]
+    deform = jnp.eye(3, dtype=positions.dtype)[jnp.newaxis, ...] + strain
+    if batch_idx is None:
+        atom_system = jnp.zeros((positions.shape[0],), dtype=jnp.int32)
+    else:
+        atom_system = batch_idx.astype(jnp.int32)
+    positions_def = jnp.einsum("ni,nij->nj", positions, deform[atom_system])
+    cell_def = jnp.einsum("bij,bjk->bik", cell_3d, deform)
+    return positions_def, cell_def
+
+
+def prepare_jax_ewald_energy_autograd(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    workload: BenchmarkWorkload = "backward",
+    slab_correction: bool = False,
+):
+    """Prepare a JIT-compiled JAX Ewald energy-autograd benchmark callable."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    alpha = system_data.get("alpha_ewald", system_data.get("alpha"))
+    k_cutoff = system_data.get("k_cutoff")
+    num_atoms_per_system = system_data.get("num_atoms_per_system")
+    pbc_slab = system_data.get("pbc_slab")
+    neighbor_matrix_data = system_data.get("neighbor_matrix")
+    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
+    cell_for_miller = cell if cell.ndim == 3 else cell[jnp.newaxis, ...]
+    _bounds = _jax_electrostatics.generate_miller_indices(cell_for_miller, k_cutoff)
+    _miller_bounds = (int(_bounds[0]), int(_bounds[1]), int(_bounds[2]))
+    _k_cutoff = k_cutoff
+    _slab_correction = slab_correction
+
+    def _energy(pos, cell_arg):
+        if component == "real":
+            return _jax_electrostatics.ewald_real_space(
+                positions=pos,
+                charges=charges,
+                cell=cell_arg,
+                alpha=alpha,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                batch_idx=batch_idx,
+            )
+        if component == "reciprocal":
+            k_vectors = _jax_electrostatics.generate_k_vectors_ewald_summation(
+                jax.lax.stop_gradient(cell_arg),
+                _k_cutoff,
+                miller_bounds=_miller_bounds,
+            )
+            return _jax_electrostatics.ewald_reciprocal_space(
+                positions=pos,
+                charges=charges,
+                cell=cell_arg,
+                k_vectors=k_vectors,
+                alpha=alpha,
+                batch_idx=batch_idx,
+                max_atoms_per_system=num_atoms_per_system,
+            )
+        return _jax_electrostatics.ewald_summation(
+            positions=pos,
+            charges=charges,
+            cell=cell_arg,
+            alpha=alpha,
+            k_cutoff=_k_cutoff,
+            k_vectors=None,
+            miller_bounds=_miller_bounds,
+            batch_idx=batch_idx,
+            max_atoms_per_system=num_atoms_per_system,
+            neighbor_matrix=neighbor_matrix_data,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
+            pbc=pbc_slab,
+            slab_correction=_slab_correction,
+        )
+
+    if workload == "forward" or not (compute_forces or compute_virial):
+
+        @jax.jit
+        def _jit_forward(pos, cell_arg):
+            return _energy(pos, cell_arg)
+
+        def call():
+            return _jit_forward(positions, cell)
+
+        return call
+
+    if compute_virial:
+        cell_3d = cell if cell.ndim == 3 else cell[jnp.newaxis, ...]
+        strain0 = jnp.zeros(cell_3d.shape, dtype=positions.dtype)
+
+        def _strained_total(pos, strain):
+            pos_def, cell_def = _jax_deformed_inputs(pos, cell, batch_idx, strain)
+            return _energy(pos_def, cell_def).sum()
+
+        @jax.jit
+        def _jit_backward(pos, strain):
+            value, grads = jax.value_and_grad(
+                _strained_total,
+                argnums=(0, 1),
+            )(pos, strain)
+            return value, grads
+
+        def call():
+            return _jit_backward(positions, strain0)
+
+        return call
+
+    @jax.jit
+    def _jit_backward(pos):
+        return jax.value_and_grad(lambda p: _energy(p, cell).sum())(pos)
+
+    def call():
+        return _jit_backward(positions)
+
+    return call
+
+
+def prepare_jax_pme_energy_autograd(
+    system_data: dict,
+    component: Literal["real", "reciprocal", "full"],
+    compute_forces: bool,
+    compute_virial: bool = False,
+    workload: BenchmarkWorkload = "backward",
+    slab_correction: bool = False,
+):
+    """Prepare a JIT-compiled JAX PME energy-autograd benchmark callable."""
+    positions = system_data["positions"]
+    charges = system_data["charges"]
+    cell = system_data["cell"]
+    batch_idx = system_data.get("batch_idx")
+    alpha = system_data.get("alpha_pme", system_data.get("alpha"))
+    mesh_dimensions = system_data.get("mesh_dimensions")
+    spline_order = system_data.get("spline_order")
+    pbc_slab = system_data.get("pbc_slab")
+    neighbor_matrix_data = system_data.get("neighbor_matrix")
+    neighbor_matrix_shifts = system_data.get("neighbor_matrix_shifts")
+    _mesh_dimensions = mesh_dimensions
+    _spline_order = spline_order
+    _slab_correction = slab_correction
+
+    def _energy(pos, cell_arg):
+        if component == "real":
+            return _jax_electrostatics.ewald_real_space(
+                positions=pos,
+                charges=charges,
+                cell=cell_arg,
+                alpha=alpha,
+                neighbor_matrix=neighbor_matrix_data,
+                neighbor_matrix_shifts=neighbor_matrix_shifts,
+                batch_idx=batch_idx,
+            )
+        if component == "reciprocal":
+            return _jax_electrostatics.pme_reciprocal_space(
+                positions=pos,
+                charges=charges,
+                cell=cell_arg,
+                alpha=alpha,
+                mesh_dimensions=_mesh_dimensions,
+                spline_order=_spline_order,
+                batch_idx=batch_idx,
+            )
+        return _jax_electrostatics.particle_mesh_ewald(
+            positions=pos,
+            charges=charges,
+            cell=cell_arg,
+            alpha=alpha,
+            mesh_dimensions=_mesh_dimensions,
+            spline_order=_spline_order,
+            batch_idx=batch_idx,
+            neighbor_matrix=neighbor_matrix_data,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
+            pbc=pbc_slab,
+            slab_correction=_slab_correction,
+        )
+
+    if workload == "forward" or not (compute_forces or compute_virial):
+
+        @jax.jit
+        def _jit_forward(pos, cell_arg):
+            return _energy(pos, cell_arg)
+
+        def call():
+            return _jit_forward(positions, cell)
+
+        return call
+
+    if compute_virial:
+        cell_3d = cell if cell.ndim == 3 else cell[jnp.newaxis, ...]
+        strain0 = jnp.zeros(cell_3d.shape, dtype=positions.dtype)
+
+        def _strained_total(pos, strain):
+            pos_def, cell_def = _jax_deformed_inputs(pos, cell, batch_idx, strain)
+            return _energy(pos_def, cell_def).sum()
+
+        @jax.jit
+        def _jit_backward(pos, strain):
+            value, grads = jax.value_and_grad(
+                _strained_total,
+                argnums=(0, 1),
+            )(pos, strain)
+            return value, grads
+
+        def call():
+            return _jit_backward(positions, strain0)
+
+        return call
+
+    @jax.jit
+    def _jit_backward(pos):
+        return jax.value_and_grad(lambda p: _energy(p, cell).sum())(pos)
+
+    def call():
+        return _jit_backward(positions)
 
     return call
 
@@ -2070,7 +3019,7 @@ def run_torchpme_ewald(
     positions = system_data["positions"]
     charges = system_data["charges"]
     cell = system_data["cell"]
-    alpha = system_data.get("alpha").item()
+    alpha = system_data.get("alpha_ewald", system_data.get("alpha")).item()
     k_cutoff = system_data.get("k_cutoff")
     dtype = positions.dtype
     device = positions.device
@@ -2133,7 +3082,7 @@ def run_torchpme_pme(
     positions = system_data["positions"]
     charges = system_data["charges"]
     cell = system_data["cell"]
-    alpha = system_data.get("alpha").item()
+    alpha = system_data.get("alpha_pme", system_data.get("alpha")).item()
     mesh_spacing = system_data.get("mesh_spacing")[0][0]
     spline_order = system_data.get("spline_order")
     dtype = positions.dtype
@@ -2410,15 +3359,7 @@ def run_torch_dsf(
 
 
 def run_benchmark(
-    method: Literal[
-        "ewald",
-        "ewald_slab",
-        "pme",
-        "pme_slab",
-        "dsf",
-        "multipole_ewald",
-        "multipole_pme",
-    ],
+    method: Literal["ewald", "ewald_slab", "pme", "pme_slab", "dsf"],
     backend: Literal["torch", "jax", "torchpme", "torch_dsf"],
     system_data: dict,
     component: Literal["real", "reciprocal", "full"],
@@ -2426,56 +3367,24 @@ def run_benchmark(
     compute_virial: bool,
     timer: BenchmarkTimer,
     neighbor_format: str = "list",
-    compile_model: bool = False,
+    derivative_contract: DerivativeContract = "energy_autograd",
+    workload: BenchmarkWorkload = "forward",
+    torch_compile: bool = False,
 ) -> dict:
     """Run a single benchmark configuration.
 
-    ``compile_model`` wraps the benchmarked callable in ``torch.compile``
-    (currently honored by the torch multipole methods).
+    When ``torch_compile`` is True and the backend is ``torch`` /
+    ``torchpme`` / ``torch_dsf``, the bench callable is wrapped in
+    ``torch.compile(fullgraph=True)``. Framework-compile cost
+    (``torch.compile`` Dynamo + Inductor trace; or for the jax backend
+    the first XLA trace) is measured separately as
+    ``framework_compile_ms`` in the returned dict, isolated from the
+    warp NVRTC cost which is paid by a pre-warm raw call beforehand.
     """
-    total_atoms = system_data["total_atoms"]
-    batch_size = system_data.get("batch_size", 1)
-
     effective_virial = compute_virial
 
     try:
-        if method in ("multipole_ewald", "multipole_pme"):
-            # Multipole methods are torch-only (no jax / torchpme reference).
-            if backend != "torch":
-                return {
-                    "total_atoms": total_atoms,
-                    "batch_size": batch_size,
-                    "method": method,
-                    "backend": backend,
-                    "component": component,
-                    "compute_forces": compute_forces,
-                    "compute_virial": effective_virial,
-                    "neighbor_format": neighbor_format,
-                    "median_time_ms": float("inf"),
-                    "peak_memory_mb": None,
-                    "success": False,
-                    "error": f"Backend '{backend}' not applicable for {method}",
-                    "error_type": "NotApplicable",
-                }
-            if method == "multipole_ewald":
-
-                def bench_fn():
-                    return run_nvalchemiops_multipole_ewald(
-                        system_data,
-                        compute_forces,
-                        compile_model=compile_model,
-                        component=component,
-                    )
-            else:  # multipole_pme
-
-                def bench_fn():
-                    return run_nvalchemiops_multipole_pme(
-                        system_data,
-                        compute_forces,
-                        compile_model=compile_model,
-                        component=component,
-                    )
-        elif method == "dsf":
+        if method == "dsf":
             if backend == "torch":
                 if neighbor_format == "matrix":
 
@@ -2494,76 +3403,152 @@ def run_benchmark(
                 def bench_fn():
                     return run_torch_dsf(system_data, compute_forces, effective_virial)
             else:
-                return {
-                    "total_atoms": total_atoms,
-                    "batch_size": batch_size,
-                    "method": method,
-                    "backend": backend,
-                    "component": component,
-                    "compute_forces": compute_forces,
-                    "compute_virial": effective_virial,
-                    "neighbor_format": neighbor_format,
-                    "median_time_ms": float("inf"),
-                    "peak_memory_mb": None,
-                    "success": False,
-                    "error": f"Backend '{backend}' not applicable for DSF",
-                    "error_type": "NotApplicable",
-                }
+                return benchmark_result_row(
+                    system_data=system_data,
+                    method=method,
+                    backend=backend,
+                    component=component,
+                    compute_forces=compute_forces,
+                    compute_virial=effective_virial,
+                    derivative_contract=derivative_contract,
+                    workload=workload,
+                    neighbor_format=neighbor_format,
+                    torch_compile=torch_compile,
+                    success=False,
+                    error=f"Backend '{backend}' not applicable for DSF",
+                    error_type="NotApplicable",
+                )
+        elif method in MULTIPOLE_METHODS:
+            # Multipole methods are torch-only; the shared block below applies
+            # torch.compile when requested (so compile_model=False here). The
+            # runners honor the requested component (real / reciprocal / full).
+            if method == "multipole_ewald":
+
+                def bench_fn():
+                    return run_nvalchemiops_multipole_ewald(
+                        system_data,
+                        compute_forces,
+                        compile_model=False,
+                        component=component,
+                    )
+            else:  # multipole_pme
+
+                def bench_fn():
+                    return run_nvalchemiops_multipole_pme(
+                        system_data,
+                        compute_forces,
+                        compile_model=False,
+                        component=component,
+                    )
         elif backend == "torch":
             if method in ("ewald", "ewald_slab"):
 
                 def bench_fn():
-                    return run_nvalchemiops_ewald(
+                    if derivative_contract == "legacy_direct":
+                        return run_nvalchemiops_ewald(
+                            system_data,
+                            component,
+                            compute_forces,
+                            effective_virial,
+                            slab_correction=method == "ewald_slab",
+                        )
+                    return run_nvalchemiops_ewald_energy_autograd(
+                        system_data,
+                        component,
+                        compute_forces,
+                        effective_virial,
+                        workload=workload,
+                        slab_correction=method == "ewald_slab",
+                    )
+            else:  # pme
+
+                def bench_fn():
+                    if derivative_contract == "legacy_direct":
+                        return run_nvalchemiops_pme(
+                            system_data,
+                            component,
+                            compute_forces,
+                            effective_virial,
+                            slab_correction=method == "pme_slab",
+                        )
+                    return run_nvalchemiops_pme_energy_autograd(
+                        system_data,
+                        component,
+                        compute_forces,
+                        effective_virial,
+                        workload=workload,
+                        slab_correction=method == "pme_slab",
+                    )
+        elif backend == "jax":
+            if method in ("ewald", "ewald_slab"):
+                if derivative_contract == "legacy_direct":
+                    bench_fn = prepare_jax_ewald(
                         system_data,
                         component,
                         compute_forces,
                         effective_virial,
                         slab_correction=method == "ewald_slab",
                     )
+                else:
+                    bench_fn = prepare_jax_ewald_energy_autograd(
+                        system_data,
+                        component,
+                        compute_forces,
+                        effective_virial,
+                        workload=workload,
+                        slab_correction=method == "ewald_slab",
+                    )
             else:  # pme
-
-                def bench_fn():
-                    return run_nvalchemiops_pme(
+                if derivative_contract == "legacy_direct":
+                    bench_fn = prepare_jax_pme(
                         system_data,
                         component,
                         compute_forces,
                         effective_virial,
                         slab_correction=method == "pme_slab",
                     )
-        elif backend == "jax":
-            if method in ("ewald", "ewald_slab"):
-                bench_fn = prepare_jax_ewald(
-                    system_data,
-                    component,
-                    compute_forces,
-                    effective_virial,
-                    slab_correction=method == "ewald_slab",
-                )
-            else:  # pme
-                bench_fn = prepare_jax_pme(
-                    system_data,
-                    component,
-                    compute_forces,
-                    effective_virial,
-                    slab_correction=method == "pme_slab",
-                )
+                else:
+                    bench_fn = prepare_jax_pme_energy_autograd(
+                        system_data,
+                        component,
+                        compute_forces,
+                        effective_virial,
+                        workload=workload,
+                        slab_correction=method == "pme_slab",
+                    )
         elif backend == "torchpme":
+            if method in SLAB_METHODS:
+                return benchmark_result_row(
+                    system_data=system_data,
+                    method=method,
+                    backend=backend,
+                    component=component,
+                    compute_forces=compute_forces,
+                    compute_virial=effective_virial,
+                    derivative_contract=derivative_contract,
+                    workload=workload,
+                    neighbor_format=neighbor_format,
+                    torch_compile=torch_compile,
+                    success=False,
+                    error=f"torchpme does not support slab method {method!r}",
+                    error_type="NotApplicable",
+                )
             if system_data.get("batch_idx") is not None:
-                return {
-                    "total_atoms": total_atoms,
-                    "batch_size": batch_size,
-                    "method": method,
-                    "backend": backend,
-                    "component": component,
-                    "compute_forces": compute_forces,
-                    "compute_virial": effective_virial,
-                    "neighbor_format": neighbor_format,
-                    "median_time_ms": float("inf"),
-                    "peak_memory_mb": None,
-                    "success": False,
-                    "error": "torchpme does not support native batched evaluation",
-                    "error_type": "NotImplemented",
-                }
+                return benchmark_result_row(
+                    system_data=system_data,
+                    method=method,
+                    backend=backend,
+                    component=component,
+                    compute_forces=compute_forces,
+                    compute_virial=effective_virial,
+                    derivative_contract=derivative_contract,
+                    workload=workload,
+                    neighbor_format=neighbor_format,
+                    torch_compile=torch_compile,
+                    success=False,
+                    error="torchpme does not support native batched evaluation",
+                    error_type="NotImplemented",
+                )
 
             if method == "ewald":
 
@@ -2580,76 +3565,180 @@ def run_benchmark(
                         effective_virial,
                     )
         else:
-            return {
-                "total_atoms": total_atoms,
-                "batch_size": batch_size,
-                "method": method,
-                "backend": backend,
-                "component": component,
-                "compute_forces": compute_forces,
-                "compute_virial": effective_virial,
-                "neighbor_format": neighbor_format,
-                "median_time_ms": float("inf"),
-                "peak_memory_mb": None,
-                "success": False,
-                "error": f"Backend '{backend}' not applicable for {method}",
-                "error_type": "NotApplicable",
-            }
+            return benchmark_result_row(
+                system_data=system_data,
+                method=method,
+                backend=backend,
+                component=component,
+                compute_forces=compute_forces,
+                compute_virial=effective_virial,
+                derivative_contract=derivative_contract,
+                workload=workload,
+                neighbor_format=neighbor_format,
+                torch_compile=torch_compile,
+                success=False,
+                error=f"Backend '{backend}' not applicable for {method}",
+                error_type="NotApplicable",
+            )
 
-        # Run benchmark
+        if derivative_contract == "legacy_direct":
+            raw_bench_fn = bench_fn
+
+            def bench_fn():
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        category=DeprecationWarning,
+                    )
+                    return raw_bench_fn()
+
+        # Framework-compile cost (torch.compile or JAX jit) measured by a
+        # one-shot wrap + first-call timing AFTER the raw bench_fn has been
+        # called once to warm warp / cuFFT. This isolates Dynamo+Inductor
+        # (or XLA) trace cost from NVRTC kernel compile cost.
+        framework_compile_ms: float | None = None
+        framework: str = "none"
+        warp_compile_ms: float | None = None
+        if backend in ("torch", "torchpme", "torch_dsf") and torch_compile:
+            try:
+                # 1) Raw pre-warm — pays warp NVRTC + any cuFFT plan creation.
+                import time as _time
+
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                _t0 = _time.perf_counter()
+                bench_fn()
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                warp_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                # Use the default torch.compile mode. CUDA-graph capture modes
+                # clash with warp's stream binding in this benchmark.
+                compiled_fn = torch.compile(bench_fn, fullgraph=True)
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                _t0 = _time.perf_counter()
+                compiled_fn()
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                framework_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                framework = "torch.compile"
+                bench_fn = compiled_fn
+            except Exception as _e:
+                framework = f"torch.compile-FAILED:{type(_e).__name__}"
+                framework_compile_ms = None
+                return benchmark_result_row(
+                    system_data=system_data,
+                    method=method,
+                    backend=backend,
+                    component=component,
+                    compute_forces=compute_forces,
+                    compute_virial=effective_virial,
+                    derivative_contract=derivative_contract,
+                    workload=workload,
+                    neighbor_format=neighbor_format,
+                    torch_compile=torch_compile,
+                    success=False,
+                    warp_compile_ms=warp_compile_ms,
+                    framework_compile_ms=framework_compile_ms,
+                    framework=framework,
+                    error=str(_e),
+                    error_type=type(_e).__name__,
+                )
+        elif backend == "jax":
+            # JAX path is already JIT-ed inside prepare_jax_pme; time the
+            # first call separately as a proxy for XLA trace cost.
+            try:
+                import time as _time
+
+                # First call: XLA trace + warp NVRTC + GPU kernel
+                _t0 = _time.perf_counter()
+                _res = bench_fn()
+                if _res is not None:
+                    jax.block_until_ready(_res)
+                framework_compile_ms = (_time.perf_counter() - _t0) * 1000.0
+                framework = "jax.jit"
+            except Exception as _e:
+                framework = f"jax.jit-FAILED:{type(_e).__name__}"
+                framework_compile_ms = None
+                return benchmark_result_row(
+                    system_data=system_data,
+                    method=method,
+                    backend=backend,
+                    component=component,
+                    compute_forces=compute_forces,
+                    compute_virial=effective_virial,
+                    derivative_contract=derivative_contract,
+                    workload=workload,
+                    neighbor_format=neighbor_format,
+                    torch_compile=torch_compile,
+                    success=False,
+                    warp_compile_ms=warp_compile_ms,
+                    framework_compile_ms=framework_compile_ms,
+                    framework=framework,
+                    error=str(_e),
+                    error_type=type(_e).__name__,
+                )
+
+        # Run steady-state benchmark
         timing_results = timer.time_function(bench_fn)
         if TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
         if not timing_results["success"]:
             print(f"Benchmark failed: {timing_results.get('error', 'Unknown error')}")
-            return {
-                "total_atoms": total_atoms,
-                "batch_size": batch_size,
-                "method": method,
-                "backend": backend,
-                "component": component,
-                "compute_forces": compute_forces,
-                "compute_virial": effective_virial,
-                "neighbor_format": neighbor_format,
-                "median_time_ms": float("inf"),
-                "peak_memory_mb": timing_results.get("peak_memory_mb"),
-                "success": False,
-                "error": timing_results.get("error", "Unknown error"),
-                "error_type": timing_results.get("error_type", "Unknown"),
-            }
+            return benchmark_result_row(
+                system_data=system_data,
+                method=method,
+                backend=backend,
+                component=component,
+                compute_forces=compute_forces,
+                compute_virial=effective_virial,
+                derivative_contract=derivative_contract,
+                workload=workload,
+                neighbor_format=neighbor_format,
+                torch_compile=torch_compile,
+                success=False,
+                peak_memory_mb=timing_results.get("peak_memory_mb"),
+                compile_ms=timing_results.get("compile_ms"),
+                warp_compile_ms=warp_compile_ms,
+                framework_compile_ms=framework_compile_ms,
+                framework=framework,
+                error=timing_results.get("error", "Unknown error"),
+                error_type=timing_results.get("error_type", "Unknown"),
+            )
 
-        return {
-            "total_atoms": total_atoms,
-            "batch_size": batch_size,
-            "method": method,
-            "backend": backend,
-            "component": component,
-            "compute_forces": compute_forces,
-            "compute_virial": effective_virial,
-            "neighbor_format": neighbor_format,
-            "median_time_ms": float(timing_results["median"]),
-            "peak_memory_mb": timing_results.get("peak_memory_mb"),
-            "compile_ms": timing_results.get("compile_ms"),
-            "success": True,
-        }
+        return benchmark_result_row(
+            system_data=system_data,
+            method=method,
+            backend=backend,
+            component=component,
+            compute_forces=compute_forces,
+            compute_virial=effective_virial,
+            derivative_contract=derivative_contract,
+            workload=workload,
+            neighbor_format=neighbor_format,
+            torch_compile=torch_compile,
+            success=True,
+            median_time_ms=timing_results["median"],
+            peak_memory_mb=timing_results.get("peak_memory_mb"),
+            compile_ms=timing_results.get("compile_ms"),
+            warp_compile_ms=warp_compile_ms,
+            framework_compile_ms=framework_compile_ms,
+            framework=framework,
+        )
 
     except Exception as e:
         print(f"Benchmark failed: {e}")
-        return {
-            "total_atoms": total_atoms,
-            "batch_size": batch_size,
-            "method": method,
-            "backend": backend,
-            "component": component,
-            "compute_forces": compute_forces,
-            "compute_virial": effective_virial,
-            "neighbor_format": neighbor_format,
-            "median_time_ms": float("inf"),
-            "peak_memory_mb": None,
-            "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__,
-        }
+        return benchmark_result_row(
+            system_data=system_data,
+            method=method,
+            backend=backend,
+            component=component,
+            compute_forces=compute_forces,
+            compute_virial=effective_virial,
+            derivative_contract=derivative_contract,
+            workload=workload,
+            neighbor_format=neighbor_format,
+            torch_compile=torch_compile,
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
 
 
 # ==============================================================================
@@ -2698,12 +3787,12 @@ def main():
         ],
         default=None,
         help=(
-            "Method to benchmark. When omitted, falls back to the config's "
-            "`methods:` list, else 'both'. "
-            "'both' = ewald + pme (backward compat). "
+            "Method to benchmark. When omitted, the YAML ``methods:`` list "
+            "controls; if that is also empty, defaults to ewald + pme. "
+            "'both' = ewald + pme. "
             "'all' = ewald + ewald_slab + pme + pme_slab + dsf + "
-            "multipole_ewald + multipole_pme. "
-            "'multipole_ewald'/'multipole_pme' are torch-only."
+            "multipole_ewald + multipole_pme. The multipole methods are "
+            "torch-only and take an extra --l-max flag."
         ),
     )
     parser.add_argument(
@@ -2712,20 +3801,10 @@ def main():
         choices=[0, 1, 2],
         default=None,
         help=(
-            "Maximum multipole order for the multipole methods. When omitted, "
-            "falls back to the config's `l_max:` value, else 1. "
-            "0 = charges, 1 = +dipoles, 2 = +quadrupoles. Ignored by "
-            "non-multipole methods."
-        ),
-    )
-    parser.add_argument(
-        "--compile",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Wrap the benchmarked callable in torch.compile. When omitted, "
-            "falls back to the config's `compile:` value, else off. Currently "
-            "honored by the torch multipole methods (others ignore it)."
+            "Maximum multipole order for the multipole_* methods. When "
+            "omitted, falls back to the config 'l_max:' value, else 1. "
+            "0 = charges, 1 = +dipoles, 2 = +quadrupoles. Ignored by the "
+            "point-charge methods."
         ),
     )
     parser.add_argument(
@@ -2751,6 +3830,53 @@ def main():
         default=None,
         help="Override dtype from config (default: use config value)",
     )
+    parser.add_argument(
+        "--real-space-cutoff",
+        type=float,
+        default=None,
+        help=(
+            "Override the PME real-space cutoff (Angstrom). When set, alpha "
+            "and the mesh dimensions are derived from this rc instead of the "
+            "cost-optimized value. Overrides the same field in config "
+            "parameters."
+        ),
+    )
+    parser.add_argument(
+        "--accuracy",
+        type=float,
+        default=None,
+        help=(
+            "Target relative force accuracy passed to the Ewald/PME parameter "
+            "estimator. Drives alpha, real-space cutoff (when not pinned), and "
+            "mesh dimensions. Overrides the ``accuracy`` field in config "
+            "parameters (default 1e-4)."
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help=(
+            "Wrap each torch-backend bench callable in "
+            "``torch.compile(fullgraph=True)`` and "
+            "record the framework-compile cost in a separate CSV column. "
+            "The pre-warm pass calls the raw bench_fn once first so warp "
+            "NVRTC compile and torch.compile (Dynamo + Inductor) costs "
+            "appear in distinct columns. JAX backend always JITs; the "
+            "first-call XLA trace cost is recorded under the same column."
+        ),
+    )
+    parser.add_argument(
+        "--derivative-contract",
+        type=str,
+        choices=["energy_autograd", "legacy_direct"],
+        default=None,
+        help=(
+            "Derivative contract for nvalchemiops Ewald/PME rows. "
+            "Default is energy_autograd, which benchmarks energy-only calls plus "
+            "framework autograd for force/stress workloads. Use legacy_direct to "
+            "benchmark deprecated compute_forces/compute_virial direct outputs."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2759,6 +3885,8 @@ def main():
 
     # Load config
     config = load_config(args.config)
+    config_path = str(args.config)
+    config_sha256 = hashlib.sha256(args.config.read_bytes()).hexdigest()
 
     # Resolve framework-level backend type
     backend_type = _resolve_backend_type(args.backend)
@@ -2794,98 +3922,57 @@ def main():
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize timer
-    timer = BenchmarkTimer(backend=backend_type, warmup_runs=warmup, timing_runs=timing)
+    # Initialize timers. ``--backend both`` may dispatch Torch-family and JAX
+    # rows in one process, and each timer owns framework-specific sync logic.
+    timers = {}
+    if args.backend != "jax":
+        timers["torch"] = BenchmarkTimer(
+            backend="torch", warmup_runs=warmup, timing_runs=timing
+        )
+    if args.backend == "jax" or (args.backend == "both" and JAX_AVAILABLE):
+        timers["jax"] = BenchmarkTimer(
+            backend="jax", warmup_runs=warmup, timing_runs=timing
+        )
 
     # Initialize Warp (only needed for torch backend)
     if backend_type == "torch" and wp is not None:
         wp.init()
 
-    # Determine what to benchmark. Precedence: explicit --method (CLI) >
-    # the config's `methods:` list > the back-compat default (ewald + pme).
-    if args.method == "both":
-        methods = ["ewald", "pme"]
-    elif args.method == "all":
-        methods = [
-            "ewald",
-            "ewald_slab",
-            "pme",
-            "pme_slab",
-            "dsf",
-            "multipole_ewald",
-            "multipole_pme",
-        ]
-    elif args.method is not None:
-        methods = [args.method]
-    elif config.get("methods"):
-        methods = list(config["methods"])
-    else:
-        methods = ["ewald", "pme"]
-
-    # Maximum multipole order: --l-max (CLI) > config `l_max:` > 1.
-    l_max = args.l_max if args.l_max is not None else int(config.get("l_max", 1))
-
-    # torch.compile the benchmarked callable: --compile/--no-compile (CLI) >
-    # config `compile:` > False. Currently honored by the torch multipole
-    # methods (the other methods ignore it).
-    compile_enabled = (
-        args.compile if args.compile is not None else bool(config.get("compile", False))
-    )
-
-    multipole_methods = ("multipole_ewald", "multipole_pme")
-
-    # The multipole methods are torch-only (no JAX / torchpme reference). If the
-    # user explicitly requested an incompatible backend together with a
-    # multipole method, warn loudly up front — otherwise they are skipped with
-    # no output rows, leaving the user wondering why nothing ran.
-    if args.backend not in ("torch", "both"):
-        requested_multipole = [m for m in methods if m in multipole_methods]
-        if requested_multipole:
-            warnings.warn(
-                f"Multipole methods {requested_multipole} have no "
-                f"'{args.backend}' backend implementation (torch-only); they "
-                "will be skipped. Re-run with --backend torch (or both) to "
-                "benchmark them.",
-                stacklevel=2,
-            )
-
-    # Build per-method backend list
-    def get_backends_for_method(method: str) -> list[str]:
-        # Multipole methods are torch-only (no jax / torchpme reference); skip
-        # gracefully when a non-torch backend is requested.
-        if method in multipole_methods:
-            if args.backend in ("torch", "both"):
-                return ["torch"]
-            return []
-        if args.backend == "both":
-            if method in ("ewald", "pme"):
-                result = ["torch"]
-                if TORCHPME_AVAILABLE:
-                    result.append("torchpme")
-                return result
-            elif method in ("ewald_slab", "pme_slab"):
-                return ["torch"]
-            elif method == "dsf":
-                return ["torch", "torch_dsf"]
-        elif args.backend == "torch":
-            return ["torch"]
-        elif args.backend == "jax":
-            if method in ("ewald", "ewald_slab", "pme", "pme_slab"):
-                return ["jax"]
-            return []
-        elif args.backend == "torchpme":
-            if method in ("ewald", "pme"):
-                return ["torchpme"] if TORCHPME_AVAILABLE else []
-            return []
-        elif args.backend == "torch_dsf":
-            if method == "dsf":
-                return ["torch_dsf"]
-            return []
-        return ["torch"]
+    # Determine what to benchmark. The CLI ``--method`` wins when explicitly
+    # passed; otherwise the YAML's ``methods:`` list controls. If neither is
+    # set, default to the historical ewald + pme pair.
+    methods = resolve_methods(args.method, config.get("methods"))
+    for method in methods:
+        get_backends_for_method(args.backend, method)
 
     components = config.get("components", ["full"])
     compute_forces = config.get("compute_forces", True)
     compute_virial = config.get("compute_virial", False)
+    derivative_contract = resolve_derivative_contract(
+        args.derivative_contract,
+        config.get("derivative_contract"),
+    )
+    # Max multipole order for the multipole_* methods: --l-max > config > 1.
+    l_max = args.l_max if args.l_max is not None else int(config.get("l_max", 1))
+
+    # Optional PME real-space cutoff (CLI overrides config)
+    if args.real_space_cutoff is not None:
+        real_space_cutoff = float(args.real_space_cutoff)
+    else:
+        rc_cfg = params.get("real_space_cutoff", None)
+        real_space_cutoff = float(rc_cfg) if rc_cfg is not None else None
+
+    # Target relative force accuracy passed to the Ewald/PME parameter
+    # estimator (CLI overrides config; default 1e-4 if neither is set).
+    if args.accuracy is not None:
+        accuracy = float(args.accuracy)
+    else:
+        accuracy = float(params.get("accuracy", 1e-4))
+
+    # Skip neighbor-list construction only for pure reciprocal non-slab runs.
+    should_build_neighbors = set(components) != {"reciprocal"} or any(
+        method in SLAB_METHODS for method in methods
+    )
 
     # DSF-specific parameters (hardcoded defaults)
     dsf_cutoff = 12.0
@@ -2900,12 +3987,13 @@ def main():
     print(f"GPU SKU: {gpu_sku}")
     print(f"Dtype: {dtype_str}")
     print(f"Methods: {methods}")
-    if any(m in multipole_methods for m in methods):
-        print(f"Max multipole order (l_max): {l_max}")
-        print(f"torch.compile: {compile_enabled}")
     print(f"Components: {components}")
+    print(f"Derivative contract: {derivative_contract}")
     print(f"Compute forces: {compute_forces}")
     print(f"Compute virial: {compute_virial}")
+    print(f"Accuracy: {accuracy:g}")
+    if real_space_cutoff is not None:
+        print(f"Real-space cutoff (pinned): {real_space_cutoff} A")
     print(f"Warmup iterations: {warmup}")
     print(f"Timing iterations: {timing}")
     print(f"Output directory: {output_dir}")
@@ -2918,6 +4006,7 @@ def main():
 
     def _print_result(result, method, backend, component):
         """Print benchmark result."""
+        workload = result.get("workload", "forward")
         if result["success"]:
             throughput = result["total_atoms"] / result["median_time_ms"] * 1000
             mem_str = ""
@@ -2928,13 +4017,13 @@ def main():
                 compile_str = f" | warmup {result['compile_ms']:.0f} ms"
             print(
                 f"    {method:5s} {backend:16s} {component:10s}: "
-                f"{result['median_time_ms']:.3f} ms "
+                f"{workload:15s} {result['median_time_ms']:.3f} ms "
                 f"({throughput:.1f} atoms/s){mem_str}{compile_str}"
             )
         else:
             print(
                 f"    {method:5s} {backend:16s} {component:10s}: "
-                f"FAILED ({result.get('error_type', 'Unknown')})"
+                f"{workload:15s} FAILED ({result.get('error_type', 'Unknown')})"
             )
 
     for system_config in config["systems"]:
@@ -2953,19 +4042,36 @@ def main():
                 print(f"\n  ~{expected_atoms:,d} atoms (supercell {size}³)...")
 
                 # Reset memory
-                timer.clear_memory()
+                for timer in timers.values():
+                    timer.clear_memory()
 
-                # Prepare systems (method-specific)
+                # Prepare systems (method/backend-specific)
                 system_data_cache = {}
                 for method in methods:
-                    if method in multipole_methods:
-                        # Only torch runs multipole; skip prep when no backend
-                        # applies (e.g. --backend jax) to avoid a noisy error.
-                        if not get_backends_for_method(method):
-                            continue
-                        if "multipole" not in system_data_cache:
+                    backends = get_backends_for_method(args.backend, method)
+                    for backend in backends:
+                        if method == "dsf":
+                            cache_key = ("dsf", "torch")
+                            if cache_key in system_data_cache:
+                                continue
                             try:
-                                system_data_cache["multipole"] = (
+                                system_data_cache[cache_key] = (
+                                    prepare_dsf_single_system(
+                                        size, device, dtype, dsf_cutoff, dsf_alpha
+                                    )
+                                )
+                            except Exception as e:
+                                print(f"    Failed to prepare DSF system: {e}")
+                                traceback.print_exc()
+                                system_data_cache[cache_key] = None
+                            continue
+
+                        if method in MULTIPOLE_METHODS:
+                            cache_key = ("multipole", "torch")
+                            if cache_key in system_data_cache:
+                                continue
+                            try:
+                                system_data_cache[cache_key] = (
                                     prepare_multipole_single_system(
                                         size, device, dtype, l_max
                                     )
@@ -2973,64 +4079,69 @@ def main():
                             except Exception as e:
                                 print(f"    Failed to prepare multipole system: {e}")
                                 traceback.print_exc()
-                                system_data_cache["multipole"] = None
-                    elif method == "dsf":
-                        if "dsf" not in system_data_cache:
-                            try:
-                                system_data_cache["dsf"] = prepare_dsf_single_system(
-                                    size, device, dtype, dsf_cutoff, dsf_alpha
-                                )
-                            except Exception as e:
-                                print(f"    Failed to prepare DSF system: {e}")
-                                traceback.print_exc()
-                                system_data_cache["dsf"] = None
-                    else:
-                        cache_key = (
-                            "ewald_pme_slab" if method in SLAB_METHODS else "ewald_pme"
-                        )
-                        if cache_key not in system_data_cache:
-                            try:
-                                np_data = (
-                                    prepare_slab_system_numpy(size, batch_size=1)
-                                    if method in SLAB_METHODS
-                                    else prepare_system_numpy(size, batch_size=1)
-                                )
-                                if args.backend == "jax":
-                                    system_data_cache[cache_key] = (
-                                        prepare_jax_ewald_pme_system(np_data, dtype_str)
-                                    )
-                                else:
-                                    system_data_cache[cache_key] = (
-                                        prepare_single_system(
-                                            size, device, dtype, np_data=np_data
-                                        )
-                                    )
-                            except Exception as e:
-                                print(f"    Failed to prepare system: {e}")
-                                traceback.print_exc()
                                 system_data_cache[cache_key] = None
+                            continue
+
+                        prep_backend = "jax" if backend == "jax" else "torch"
+                        cache_key = (_system_cache_key(method), prep_backend)
+                        if cache_key in system_data_cache:
+                            continue
+                        try:
+                            np_data = (
+                                prepare_slab_system_numpy(size, batch_size=1)
+                                if method in SLAB_METHODS
+                                else prepare_system_numpy(size, batch_size=1)
+                            )
+                            if prep_backend == "jax":
+                                system_data_cache[cache_key] = (
+                                    prepare_jax_ewald_pme_system(
+                                        np_data,
+                                        dtype_str,
+                                        real_space_cutoff=real_space_cutoff,
+                                        accuracy=accuracy,
+                                        build_neighbors=should_build_neighbors,
+                                        neighbor_family=_electrostatic_method_family(
+                                            method
+                                        ),
+                                    )
+                                )
+                            else:
+                                system_data_cache[cache_key] = prepare_single_system(
+                                    size,
+                                    device,
+                                    dtype,
+                                    np_data=np_data,
+                                    real_space_cutoff=real_space_cutoff,
+                                    accuracy=accuracy,
+                                    build_neighbors=should_build_neighbors,
+                                    neighbor_family=_electrostatic_method_family(
+                                        method
+                                    ),
+                                )
+                        except Exception as e:
+                            print(f"    Failed to prepare system: {e}")
+                            traceback.print_exc()
+                            system_data_cache[cache_key] = None
 
                 for method in methods:
-                    backends = get_backends_for_method(method)
-                    if method == "dsf":
-                        cache_key = "dsf"
-                    elif method in multipole_methods:
-                        cache_key = "multipole"
-                    elif method in SLAB_METHODS:
-                        cache_key = "ewald_pme_slab"
-                    else:
-                        cache_key = "ewald_pme"
-                    system_data = system_data_cache.get(cache_key)
-                    if system_data is None:
-                        continue
+                    backends = get_backends_for_method(args.backend, method)
 
-                    if method == "dsf" or method in SLAB_METHODS:
-                        method_components = ["full"]
-                    else:
-                        # multipole methods honor the configured components
-                        # (full / reciprocal / real), like the monopole path.
-                        method_components = components
+                    method_components = (
+                        ["full"]
+                        if method == "dsf" or method in SLAB_METHODS
+                        else components
+                    )
                     for backend in backends:
+                        prep_backend = "jax" if backend == "jax" else "torch"
+                        cache_key = (
+                            ("dsf", "torch")
+                            if method == "dsf"
+                            else (_system_cache_key(method), prep_backend)
+                        )
+                        system_data = system_data_cache.get(cache_key)
+                        if system_data is None:
+                            continue
+                        timer = timers[prep_backend]
                         for component in method_components:
                             if method == "dsf" and backend in ("torch", "torch_dsf"):
                                 nf_arg = args.neighbor_format
@@ -3041,56 +4152,85 @@ def main():
                                 nf_list = ["n/a"]
 
                             for nf in nf_list:
-                                try:
-                                    if method == "dsf":
-                                        build_neighbors(system_data, nf)
-                                    result = run_benchmark(
-                                        method,
-                                        backend,
-                                        system_data,
-                                        component,
-                                        compute_forces,
-                                        compute_virial,
-                                        timer,
-                                        neighbor_format=nf,
-                                        compile_model=compile_enabled,
-                                    )
-                                    result["supercell_size"] = size
-                                    result["mode"] = mode
-                                    all_results.append(result)
-                                    nf_tag = f" [{nf}]" if nf != "n/a" else ""
-                                    _print_result(
-                                        result, method, backend + nf_tag, component
-                                    )
-                                except (torch.OutOfMemoryError, RuntimeError) as oom:
-                                    if (
-                                        isinstance(oom, RuntimeError)
-                                        and "out of memory" not in str(oom).lower()
-                                    ):
-                                        raise
-                                    torch.cuda.empty_cache()
-                                    nf_tag = f" [{nf}]" if nf != "n/a" else ""
-                                    result = {
-                                        "total_atoms": system_data["total_atoms"],
-                                        "batch_size": system_data.get("batch_size", 1),
-                                        "method": method,
-                                        "backend": backend,
-                                        "component": component,
-                                        "compute_forces": compute_forces,
-                                        "neighbor_format": nf,
-                                        "median_time_ms": float("inf"),
-                                        "peak_memory_mb": None,
-                                        "success": False,
-                                        "error": str(oom).split(".")[0],
-                                        "error_type": type(oom).__name__,
-                                        "supercell_size": size,
-                                        "mode": mode,
-                                    }
-                                    all_results.append(result)
-                                    print(
-                                        f"    {method:5s} {backend + nf_tag:16s} "
-                                        f"{component:10s}: SKIPPED (OOM)"
-                                    )
+                                workloads = benchmark_workloads(
+                                    method=method,
+                                    backend=backend,
+                                    derivative_contract=derivative_contract,
+                                    compute_forces=compute_forces,
+                                    compute_virial=compute_virial,
+                                )
+                                for workload in workloads:
+                                    try:
+                                        if method == "dsf":
+                                            build_neighbors(system_data, nf)
+                                        result = run_benchmark(
+                                            method,
+                                            backend,
+                                            system_data,
+                                            component,
+                                            compute_forces,
+                                            compute_virial,
+                                            timer,
+                                            neighbor_format=nf,
+                                            derivative_contract=derivative_contract,
+                                            workload=workload,
+                                            torch_compile=args.torch_compile,
+                                        )
+                                        annotate_result_row(
+                                            result,
+                                            supercell_size=size,
+                                            mode=mode,
+                                            dtype=dtype_str,
+                                            config_path=config_path,
+                                            config_sha256=config_sha256,
+                                            accuracy=accuracy,
+                                            real_space_cutoff=real_space_cutoff,
+                                        )
+                                        all_results.append(result)
+                                        nf_tag = f" [{nf}]" if nf != "n/a" else ""
+                                        _print_result(
+                                            result, method, backend + nf_tag, component
+                                        )
+                                    except RuntimeError as oom:
+                                        if "out of memory" not in str(oom).lower():
+                                            raise
+                                        if (
+                                            TORCH_AVAILABLE
+                                            and torch.cuda.is_available()
+                                        ):
+                                            torch.cuda.empty_cache()
+                                        nf_tag = f" [{nf}]" if nf != "n/a" else ""
+                                        result = benchmark_result_row(
+                                            system_data=system_data,
+                                            method=method,
+                                            backend=backend,
+                                            component=component,
+                                            compute_forces=compute_forces,
+                                            compute_virial=compute_virial,
+                                            derivative_contract=derivative_contract,
+                                            workload=workload,
+                                            neighbor_format=nf,
+                                            torch_compile=args.torch_compile,
+                                            success=False,
+                                            error=str(oom).split(".")[0],
+                                            error_type=type(oom).__name__,
+                                        )
+                                        annotate_result_row(
+                                            result,
+                                            supercell_size=size,
+                                            mode=mode,
+                                            dtype=dtype_str,
+                                            config_path=config_path,
+                                            config_sha256=config_sha256,
+                                            accuracy=accuracy,
+                                            real_space_cutoff=real_space_cutoff,
+                                        )
+                                        all_results.append(result)
+                                        print(
+                                            f"    {method:5s} {backend + nf_tag:16s} "
+                                            f"{component:10s}: {workload:15s} "
+                                            "SKIPPED (OOM)"
+                                        )
 
         else:  # batched
             base_size = system_config["base_supercell_size"]
@@ -3105,35 +4245,20 @@ def main():
                 )
 
                 # Reset memory
-                timer.clear_memory()
+                for timer in timers.values():
+                    timer.clear_memory()
 
-                # Prepare systems (method-specific)
+                # Prepare systems (method/backend-specific)
                 system_data_cache = {}
                 for method in methods:
-                    if method in multipole_methods:
-                        # Only torch runs multipole; skip prep when no backend
-                        # applies (e.g. --backend jax) to avoid a noisy error.
-                        if not get_backends_for_method(method):
-                            continue
-                        if "multipole" not in system_data_cache:
+                    backends = get_backends_for_method(args.backend, method)
+                    for backend in backends:
+                        if method == "dsf":
+                            cache_key = ("dsf", "torch")
+                            if cache_key in system_data_cache:
+                                continue
                             try:
-                                system_data_cache["multipole"] = (
-                                    prepare_multipole_batch_system(
-                                        base_size,
-                                        batch_size,
-                                        device,
-                                        dtype,
-                                        l_max,
-                                    )
-                                )
-                            except Exception as e:
-                                print(f"    Failed to prepare multipole batch: {e}")
-                                traceback.print_exc()
-                                system_data_cache["multipole"] = None
-                    elif method == "dsf":
-                        if "dsf" not in system_data_cache:
-                            try:
-                                system_data_cache["dsf"] = prepare_dsf_batch_system(
+                                system_data_cache[cache_key] = prepare_dsf_batch_system(
                                     base_size,
                                     batch_size,
                                     device,
@@ -3144,60 +4269,90 @@ def main():
                             except Exception as e:
                                 print(f"    Failed to prepare DSF batch: {e}")
                                 traceback.print_exc()
-                                system_data_cache["dsf"] = None
-                    else:
-                        cache_key = (
-                            "ewald_pme_slab" if method in SLAB_METHODS else "ewald_pme"
-                        )
-                        if cache_key not in system_data_cache:
+                                system_data_cache[cache_key] = None
+                            continue
+
+                        if method in MULTIPOLE_METHODS:
+                            cache_key = ("multipole", "torch")
+                            if cache_key in system_data_cache:
+                                continue
                             try:
-                                np_data = (
-                                    prepare_slab_system_numpy(
-                                        base_size, batch_size=batch_size
-                                    )
-                                    if method in SLAB_METHODS
-                                    else prepare_system_numpy(
-                                        base_size, batch_size=batch_size
+                                system_data_cache[cache_key] = (
+                                    prepare_multipole_batch_system(
+                                        base_size, batch_size, device, dtype, l_max
                                     )
                                 )
-                                if args.backend == "jax":
-                                    system_data_cache[cache_key] = (
-                                        prepare_jax_ewald_pme_system(np_data, dtype_str)
-                                    )
-                                else:
-                                    system_data_cache[cache_key] = prepare_batch_system(
-                                        base_size,
-                                        batch_size,
-                                        device,
-                                        dtype,
-                                        np_data=np_data,
-                                    )
                             except Exception as e:
-                                print(f"    Failed to prepare system: {e}")
+                                print(f"    Failed to prepare multipole batch: {e}")
                                 traceback.print_exc()
                                 system_data_cache[cache_key] = None
+                            continue
+
+                        prep_backend = "jax" if backend == "jax" else "torch"
+                        cache_key = (_system_cache_key(method), prep_backend)
+                        if cache_key in system_data_cache:
+                            continue
+                        try:
+                            np_data = (
+                                prepare_slab_system_numpy(
+                                    base_size, batch_size=batch_size
+                                )
+                                if method in SLAB_METHODS
+                                else prepare_system_numpy(
+                                    base_size, batch_size=batch_size
+                                )
+                            )
+                            if prep_backend == "jax":
+                                system_data_cache[cache_key] = (
+                                    prepare_jax_ewald_pme_system(
+                                        np_data,
+                                        dtype_str,
+                                        real_space_cutoff=real_space_cutoff,
+                                        accuracy=accuracy,
+                                        build_neighbors=should_build_neighbors,
+                                        neighbor_family=_electrostatic_method_family(
+                                            method
+                                        ),
+                                    )
+                                )
+                            else:
+                                system_data_cache[cache_key] = prepare_batch_system(
+                                    base_size,
+                                    batch_size,
+                                    device,
+                                    dtype,
+                                    np_data=np_data,
+                                    real_space_cutoff=real_space_cutoff,
+                                    accuracy=accuracy,
+                                    build_neighbors=should_build_neighbors,
+                                    neighbor_family=_electrostatic_method_family(
+                                        method
+                                    ),
+                                )
+                        except Exception as e:
+                            print(f"    Failed to prepare system: {e}")
+                            traceback.print_exc()
+                            system_data_cache[cache_key] = None
 
                 for method in methods:
-                    backends = get_backends_for_method(method)
-                    if method == "dsf":
-                        cache_key = "dsf"
-                    elif method in multipole_methods:
-                        cache_key = "multipole"
-                    elif method in SLAB_METHODS:
-                        cache_key = "ewald_pme_slab"
-                    else:
-                        cache_key = "ewald_pme"
-                    system_data = system_data_cache.get(cache_key)
-                    if system_data is None:
-                        continue
+                    backends = get_backends_for_method(args.backend, method)
 
-                    if method == "dsf" or method in SLAB_METHODS:
-                        method_components = ["full"]
-                    else:
-                        # multipole methods honor the configured components
-                        # (full / reciprocal / real), like the monopole path.
-                        method_components = components
+                    method_components = (
+                        ["full"]
+                        if method == "dsf" or method in SLAB_METHODS
+                        else components
+                    )
                     for backend in backends:
+                        prep_backend = "jax" if backend == "jax" else "torch"
+                        cache_key = (
+                            ("dsf", "torch")
+                            if method == "dsf"
+                            else (_system_cache_key(method), prep_backend)
+                        )
+                        system_data = system_data_cache.get(cache_key)
+                        if system_data is None:
+                            continue
+                        timer = timers[prep_backend]
                         for component in method_components:
                             if method == "dsf" and backend in ("torch", "torch_dsf"):
                                 nf_arg = args.neighbor_format
@@ -3208,56 +4363,85 @@ def main():
                                 nf_list = ["n/a"]
 
                             for nf in nf_list:
-                                try:
-                                    if method == "dsf":
-                                        build_neighbors(system_data, nf)
-                                    result = run_benchmark(
-                                        method,
-                                        backend,
-                                        system_data,
-                                        component,
-                                        compute_forces,
-                                        compute_virial,
-                                        timer,
-                                        neighbor_format=nf,
-                                        compile_model=compile_enabled,
-                                    )
-                                    result["supercell_size"] = base_size
-                                    result["mode"] = mode
-                                    all_results.append(result)
-                                    nf_tag = f" [{nf}]" if nf != "n/a" else ""
-                                    _print_result(
-                                        result, method, backend + nf_tag, component
-                                    )
-                                except (torch.OutOfMemoryError, RuntimeError) as oom:
-                                    if (
-                                        isinstance(oom, RuntimeError)
-                                        and "out of memory" not in str(oom).lower()
-                                    ):
-                                        raise
-                                    torch.cuda.empty_cache()
-                                    nf_tag = f" [{nf}]" if nf != "n/a" else ""
-                                    result = {
-                                        "total_atoms": system_data["total_atoms"],
-                                        "batch_size": system_data.get("batch_size", 1),
-                                        "method": method,
-                                        "backend": backend,
-                                        "component": component,
-                                        "compute_forces": compute_forces,
-                                        "neighbor_format": nf,
-                                        "median_time_ms": float("inf"),
-                                        "peak_memory_mb": None,
-                                        "success": False,
-                                        "error": str(oom).split(".")[0],
-                                        "error_type": type(oom).__name__,
-                                        "supercell_size": base_size,
-                                        "mode": mode,
-                                    }
-                                    all_results.append(result)
-                                    print(
-                                        f"    {method:5s} {backend + nf_tag:16s} "
-                                        f"{component:10s}: SKIPPED (OOM)"
-                                    )
+                                workloads = benchmark_workloads(
+                                    method=method,
+                                    backend=backend,
+                                    derivative_contract=derivative_contract,
+                                    compute_forces=compute_forces,
+                                    compute_virial=compute_virial,
+                                )
+                                for workload in workloads:
+                                    try:
+                                        if method == "dsf":
+                                            build_neighbors(system_data, nf)
+                                        result = run_benchmark(
+                                            method,
+                                            backend,
+                                            system_data,
+                                            component,
+                                            compute_forces,
+                                            compute_virial,
+                                            timer,
+                                            neighbor_format=nf,
+                                            derivative_contract=derivative_contract,
+                                            workload=workload,
+                                            torch_compile=args.torch_compile,
+                                        )
+                                        annotate_result_row(
+                                            result,
+                                            supercell_size=base_size,
+                                            mode=mode,
+                                            dtype=dtype_str,
+                                            config_path=config_path,
+                                            config_sha256=config_sha256,
+                                            accuracy=accuracy,
+                                            real_space_cutoff=real_space_cutoff,
+                                        )
+                                        all_results.append(result)
+                                        nf_tag = f" [{nf}]" if nf != "n/a" else ""
+                                        _print_result(
+                                            result, method, backend + nf_tag, component
+                                        )
+                                    except RuntimeError as oom:
+                                        if "out of memory" not in str(oom).lower():
+                                            raise
+                                        if (
+                                            TORCH_AVAILABLE
+                                            and torch.cuda.is_available()
+                                        ):
+                                            torch.cuda.empty_cache()
+                                        nf_tag = f" [{nf}]" if nf != "n/a" else ""
+                                        result = benchmark_result_row(
+                                            system_data=system_data,
+                                            method=method,
+                                            backend=backend,
+                                            component=component,
+                                            compute_forces=compute_forces,
+                                            compute_virial=compute_virial,
+                                            derivative_contract=derivative_contract,
+                                            workload=workload,
+                                            neighbor_format=nf,
+                                            torch_compile=args.torch_compile,
+                                            success=False,
+                                            error=str(oom).split(".")[0],
+                                            error_type=type(oom).__name__,
+                                        )
+                                        annotate_result_row(
+                                            result,
+                                            supercell_size=base_size,
+                                            mode=mode,
+                                            dtype=dtype_str,
+                                            config_path=config_path,
+                                            config_sha256=config_sha256,
+                                            accuracy=accuracy,
+                                            real_space_cutoff=real_space_cutoff,
+                                        )
+                                        all_results.append(result)
+                                        print(
+                                            f"    {method:5s} {backend + nf_tag:16s} "
+                                            f"{component:10s}: {workload:15s} "
+                                            "SKIPPED (OOM)"
+                                        )
 
     # Save results
     if all_results:
@@ -3270,15 +4454,18 @@ def main():
                     if r["method"] == method and r["backend"] == backend
                 ]
                 if method_results:
-                    output_file = (
-                        output_dir
-                        / f"electrostatics_benchmark_{method}_{backend}_{gpu_sku}.csv"
+                    output_file = benchmark_output_file(
+                        output_dir,
+                        method,
+                        backend,
+                        dtype_str,
+                        gpu_sku,
                     )
-                    all_fieldnames = []
+                    all_fieldnames = list(BENCHMARK_CSV_FIELDNAMES)
                     seen = set()
                     for r in method_results:
                         for k in r.keys():
-                            if k not in seen:
+                            if k not in all_fieldnames and k not in seen:
                                 all_fieldnames.append(k)
                                 seen.add(k)
                     with open(output_file, "w", newline="") as f:

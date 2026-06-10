@@ -858,6 +858,225 @@ class TestNeighborListExplicitMethod:
         assert len(wrapper_result) == len(direct_result)
         assert_neighbor_matrix_equal(wrapper_result, direct_result)
 
+    @pytest.mark.parametrize(
+        ("method", "expected_route", "expected_options"),
+        [
+            ("naive", "batch_naive", {"native_strategy": "auto"}),
+            ("cell_list", "batch_cell_list", {"strategy": "auto"}),
+            ("cluster_tile", "batch_cluster_tile", {}),
+            ("naive_dual_cutoff", "batch_naive_dual_cutoff", {}),
+            ("naive_scalar", "batch_naive", {"native_strategy": "scalar"}),
+            ("naive_tile", "batch_naive", {"native_strategy": "tile"}),
+            (
+                "cell_list_atom_centric",
+                "batch_cell_list",
+                {"strategy": "atom_centric", "atom_centric_path": "direct"},
+            ),
+            (
+                "cell_list_pair_centric",
+                "batch_cell_list",
+                {"strategy": "pair_centric", "atom_centric_path": "sorted"},
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("batch_arg", ["batch_idx", "batch_ptr", "both"])
+    def test_explicit_unbatched_method_promotes_with_batch_metadata(
+        self, method, expected_route, expected_options, batch_arg, device, monkeypatch
+    ):
+        """Explicit single-system methods route to their batch equivalents."""
+        positions = torch.zeros(6, 3, dtype=torch.float32, device=device)
+        cell = torch.eye(3, dtype=torch.float32, device=device).repeat(2, 1, 1) * 8.0
+        pbc = torch.ones(2, 3, dtype=torch.bool, device=device)
+        kwargs = {
+            "batch_idx": torch.tensor(
+                [0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device
+            ),
+            "batch_ptr": torch.tensor([0, 3, 6], dtype=torch.int32, device=device),
+        }
+        if batch_arg == "batch_idx":
+            kwargs.pop("batch_ptr")
+        elif batch_arg == "batch_ptr":
+            kwargs.pop("batch_idx")
+
+        seen = {}
+
+        def fake_batch_naive(*args, **call_kwargs):
+            seen["route"] = "batch_naive"
+            seen["kwargs"] = call_kwargs
+            return "batch_naive"
+
+        def fake_batch_cell_list(*args, **call_kwargs):
+            seen["route"] = "batch_cell_list"
+            seen["args"] = args
+            seen["kwargs"] = call_kwargs
+            return "batch_cell_list"
+
+        def fake_batch_cluster_tile(*args, **call_kwargs):
+            seen["route"] = "batch_cluster_tile"
+            seen["args"] = args
+            seen["kwargs"] = call_kwargs
+            return "batch_cluster_tile"
+
+        def fake_batch_naive_dual_cutoff(*args, **call_kwargs):
+            seen["route"] = "batch_naive_dual_cutoff"
+            seen["kwargs"] = call_kwargs
+            return "batch_naive_dual_cutoff"
+
+        monkeypatch.setattr(
+            neighbor_module, "batch_naive_neighbor_list", fake_batch_naive
+        )
+        monkeypatch.setattr(neighbor_module, "batch_cell_list", fake_batch_cell_list)
+        monkeypatch.setattr(
+            neighbor_module,
+            "batch_cluster_tile_neighbor_list",
+            fake_batch_cluster_tile,
+        )
+        monkeypatch.setattr(
+            neighbor_module,
+            "batch_naive_neighbor_list_dual_cutoff",
+            fake_batch_naive_dual_cutoff,
+        )
+
+        result = neighbor_list(
+            positions,
+            2.0,
+            cutoff2=3.0 if method == "naive_dual_cutoff" else None,
+            cell=cell,
+            pbc=pbc,
+            method=method,
+            **kwargs,
+        )
+
+        assert result == expected_route
+        assert seen["route"] == expected_route
+        for key, expected in expected_options.items():
+            assert seen["kwargs"][key] == expected
+
+    @pytest.mark.parametrize("method", ["naive", "cell_list"])
+    def test_explicit_unbatched_method_without_batch_metadata_stays_unbatched(
+        self, method, device, monkeypatch
+    ):
+        """A 3D cell alone is not batch metadata for explicit methods."""
+        positions = torch.zeros(6, 3, dtype=torch.float32, device=device)
+        cell = torch.eye(3, dtype=torch.float32, device=device).repeat(2, 1, 1) * 8.0
+        pbc = torch.zeros(2, 3, dtype=torch.bool, device=device)
+
+        def fake_unbatched(*args, **kwargs):
+            return "unbatched"
+
+        def fail_batched(*args, **kwargs):
+            raise AssertionError("batch method should not be selected")
+
+        monkeypatch.setattr(neighbor_module, "batch_naive_neighbor_list", fail_batched)
+        monkeypatch.setattr(neighbor_module, "batch_cell_list", fail_batched)
+        monkeypatch.setattr(neighbor_module, "naive_neighbor_list", fake_unbatched)
+        monkeypatch.setattr(neighbor_module, "cell_list", fake_unbatched)
+
+        assert (
+            neighbor_list(positions, 2.0, cell=cell, pbc=pbc, method=method)
+            == "unbatched"
+        )
+
+    @pytest.mark.parametrize(
+        ("method", "expected_route"),
+        [("naive", "batch_naive"), ("cell_list", "batch_cell_list")],
+    )
+    @pytest.mark.parametrize("batch_arg", ["batch_idx", "batch_ptr", "both"])
+    def test_explicit_unbatched_method_promotes_single_system_batch_metadata(
+        self, method, expected_route, batch_arg, device, monkeypatch
+    ):
+        """Even one-system batch metadata is still explicit batch metadata."""
+        positions = torch.zeros(6, 3, dtype=torch.float32, device=device)
+        cell = torch.eye(3, dtype=torch.float32, device=device).reshape(1, 3, 3) * 8.0
+        pbc = torch.zeros(1, 3, dtype=torch.bool, device=device)
+        kwargs = {
+            "batch_idx": torch.zeros(6, dtype=torch.int32, device=device),
+            "batch_ptr": torch.tensor([0, 6], dtype=torch.int32, device=device),
+        }
+        if batch_arg == "batch_idx":
+            kwargs.pop("batch_ptr")
+        elif batch_arg == "batch_ptr":
+            kwargs.pop("batch_idx")
+
+        def fake_batch_naive(*args, **call_kwargs):
+            return "batch_naive"
+
+        def fake_batch_cell_list(*args, **call_kwargs):
+            return "batch_cell_list"
+
+        monkeypatch.setattr(
+            neighbor_module, "batch_naive_neighbor_list", fake_batch_naive
+        )
+        monkeypatch.setattr(neighbor_module, "batch_cell_list", fake_batch_cell_list)
+
+        assert (
+            neighbor_list(positions, 2.0, cell=cell, pbc=pbc, method=method, **kwargs)
+            == expected_route
+        )
+
+    def test_invalid_method_with_batch_metadata_stays_invalid(self, device):
+        """Unknown method names are not promoted into generated batch names."""
+        positions = torch.zeros(6, 3, dtype=torch.float32, device=device)
+        batch_idx = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device)
+
+        with pytest.raises(ValueError, match="Invalid method"):
+            neighbor_list(positions, 2.0, method="not_a_method", batch_idx=batch_idx)
+
+    def test_promoted_naive_does_not_cross_batch_boundaries(self, device):
+        """Promoted naive honors batch boundaries for overlapping coordinates."""
+        molecule = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
+            dtype=torch.float32,
+            device=device,
+        )
+        positions = torch.cat([molecule, molecule], dim=0)
+        batch_idx = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device)
+        batch_ptr = torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+
+        pairs, _ptr = neighbor_list(
+            positions,
+            1.1,
+            method="naive",
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            return_neighbor_list=True,
+            max_neighbors=4,
+        )
+
+        assert pairs.shape[1] == 8
+        assert torch.all(batch_idx[pairs[0].long()] == batch_idx[pairs[1].long()])
+
+    def test_method_none_and_batch_method_accept_batch_metadata(self, device):
+        """Auto and explicit batch methods accept batch metadata."""
+        positions = torch.zeros(6, 3, dtype=torch.float32, device=device)
+        cell = torch.eye(3, dtype=torch.float32, device=device).repeat(2, 1, 1)
+        pbc = torch.zeros(2, 3, dtype=torch.bool, device=device)
+        batch_idx = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device=device)
+        batch_ptr = torch.tensor([0, 3, 6], dtype=torch.int32, device=device)
+
+        auto_result = neighbor_list(
+            positions,
+            2.0,
+            cell=cell,
+            pbc=pbc,
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            max_neighbors=8,
+        )
+        batch_result = neighbor_list(
+            positions,
+            2.0,
+            cell=cell,
+            pbc=pbc,
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            method="batch_naive",
+            max_neighbors=8,
+        )
+
+        assert auto_result[0].shape == (6, 8)
+        assert batch_result[0].shape == (6, 8)
+
 
 class TestNeighborListBatchProcessing:
     """Test batch processing with batch_idx."""
@@ -2091,6 +2310,7 @@ def test_suggest_then_run_under_torch_compile():
     matrix-format result compiled as eager.
     """
     from nvalchemiops.torch.neighbors import suggest_neighbor_list_method
+    from nvalchemiops.torch.neighbors.neighbor_utils import compute_naive_num_shifts
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
@@ -2101,13 +2321,81 @@ def test_suggest_then_run_under_torch_compile():
     batch_ptr = torch.tensor([0, n], dtype=torch.int32, device=device)
 
     method = suggest_neighbor_list_method(batch_ptr, cell, pbc, 5.0)
+    shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+        cell, 5.0, pbc.reshape(1, 3)
+    )
 
-    def run(pos):
-        return neighbor_list(
-            pos, 5.0, cell=cell, pbc=pbc, method=method, max_neighbors=128
+    def alloc_outputs():
+        return (
+            torch.full((n, 128), n, dtype=torch.int32, device=device),
+            torch.zeros(n, dtype=torch.int32, device=device),
+            torch.zeros((n, 128, 3), dtype=torch.int32, device=device),
         )
 
-    eager = run(positions)
-    compiled = torch.compile(run)(positions)
+    def run(pos, neighbor_matrix, num_neighbors, neighbor_matrix_shifts):
+        return neighbor_list(
+            pos,
+            5.0,
+            cell=cell,
+            pbc=pbc,
+            method=method,
+            neighbor_matrix=neighbor_matrix,
+            num_neighbors=num_neighbors,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
+            shift_range_per_dimension=shift_range,
+            num_shifts_per_system=num_shifts,
+            max_shifts_per_system=max_shifts,
+        )
+
+    eager = run(positions, *alloc_outputs())
+    compiled = torch.compile(run)(positions, *alloc_outputs())
 
     assert torch.equal(eager[1], compiled[1])  # num_neighbors agree
+
+
+def test_host_only_suggest_rejects_inside_torch_compile():
+    """Strategy estimation must happen before Dynamo traces the runtime call."""
+    from nvalchemiops.torch.neighbors import suggest_neighbor_list_method
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_ptr = torch.tensor([0, 4], dtype=torch.int32, device=device)
+    cell = torch.eye(3, dtype=torch.float32, device=device).reshape(1, 3, 3)
+    pbc = torch.ones(3, dtype=torch.bool, device=device)
+
+    def run(ptr, cell_arg, pbc_arg):
+        return suggest_neighbor_list_method(ptr, cell_arg, pbc_arg, 1.0)
+
+    with pytest.raises(RuntimeError, match="host-only neighbor-list helper"):
+        torch.compile(run)(batch_ptr, cell, pbc)
+
+
+def test_host_only_auto_method_rejects_inside_torch_compile():
+    """Auto dispatch is host-only; compiled callers must pass method= explicitly."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    positions = torch.rand(4, 3, dtype=torch.float32, device=device)
+    cell = torch.eye(3, dtype=torch.float32, device=device).reshape(1, 3, 3)
+    pbc = torch.ones(3, dtype=torch.bool, device=device)
+
+    def run(pos):
+        return neighbor_list(pos, 1.0, cell=cell, pbc=pbc)
+
+    with pytest.raises(RuntimeError, match="neighbor_list\\(method=None\\)"):
+        torch.compile(run)(positions)
+
+
+def test_host_only_naive_shift_metadata_rejects_inside_torch_compile():
+    """Naive PBC shift metadata is prepared once and reused inside compile."""
+    from nvalchemiops.torch.neighbors.neighbor_utils import compute_naive_num_shifts
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cell = torch.eye(3, dtype=torch.float32, device=device).reshape(1, 3, 3)
+    pbc = torch.ones((1, 3), dtype=torch.bool, device=device)
+
+    def run(cell_arg, pbc_arg):
+        shift_range, num_shifts, _max_shifts = compute_naive_num_shifts(
+            cell_arg, 1.0, pbc_arg
+        )
+        return shift_range, num_shifts
+
+    with pytest.raises(RuntimeError, match="compute_naive_num_shifts"):
+        torch.compile(run)(cell, pbc)

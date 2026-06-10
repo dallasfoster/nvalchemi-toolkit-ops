@@ -17,22 +17,30 @@
 
 from __future__ import annotations
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import pytest
 
 from nvalchemiops.jax.interactions.electrostatics import compute_slab_correction
 from nvalchemiops.jax.interactions.electrostatics.ewald import (
-    ewald_real_space,
-    ewald_reciprocal_space,
-    ewald_summation,
+    ewald_real_space as _ewald_real_space,
+)
+from nvalchemiops.jax.interactions.electrostatics.ewald import (
+    ewald_reciprocal_space as _ewald_reciprocal_space,
+)
+from nvalchemiops.jax.interactions.electrostatics.ewald import (
+    ewald_summation as _ewald_summation,
 )
 from nvalchemiops.jax.interactions.electrostatics.k_vectors import (
     generate_k_vectors_ewald_summation,
 )
 from nvalchemiops.jax.interactions.electrostatics.pme import (
-    particle_mesh_ewald,
-    pme_reciprocal_space,
+    particle_mesh_ewald as _particle_mesh_ewald,
+)
+from nvalchemiops.jax.interactions.electrostatics.pme import (
+    pme_reciprocal_space as _pme_reciprocal_space,
 )
 from nvalchemiops.jax.neighbors import batch_cell_list, cell_list
 
@@ -52,6 +60,78 @@ OUTPUT_CASES = [
     (False, True, True, ("energies", "charge_grads", "virial")),
     (True, True, True, ("energies", "forces", "charge_grads", "virial")),
 ]
+
+
+def _call_without_direct_output_deprecation(api_name, api, *args, **kwargs):
+    """Call a deprecated direct-output full API without polluting test warnings."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=f"The direct-output flags .* on {api_name} are deprecated",
+            category=DeprecationWarning,
+        )
+        return api(*args, **kwargs)
+
+
+def _call_without_component_direct_output_deprecation(api_name, api, *args, **kwargs):
+    """Call deprecated component direct outputs without polluting test warnings."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=f"The component direct-output flag.* on {api_name} are deprecated",
+            category=DeprecationWarning,
+        )
+        return api(*args, **kwargs)
+
+
+def ewald_summation(*args, **kwargs):
+    """Test-local wrapper suppressing intentional direct-output deprecations."""
+    return _call_without_direct_output_deprecation(
+        "ewald_summation",
+        _ewald_summation,
+        *args,
+        **kwargs,
+    )
+
+
+def ewald_real_space(*args, **kwargs):
+    """Test-local wrapper suppressing intentional component deprecations."""
+    return _call_without_component_direct_output_deprecation(
+        "ewald_real_space",
+        _ewald_real_space,
+        *args,
+        **kwargs,
+    )
+
+
+def ewald_reciprocal_space(*args, **kwargs):
+    """Test-local wrapper suppressing intentional component deprecations."""
+    return _call_without_component_direct_output_deprecation(
+        "ewald_reciprocal_space",
+        _ewald_reciprocal_space,
+        *args,
+        **kwargs,
+    )
+
+
+def particle_mesh_ewald(*args, **kwargs):
+    """Test-local wrapper suppressing intentional direct-output deprecations."""
+    return _call_without_direct_output_deprecation(
+        "particle_mesh_ewald",
+        _particle_mesh_ewald,
+        *args,
+        **kwargs,
+    )
+
+
+def pme_reciprocal_space(*args, **kwargs):
+    """Test-local wrapper suppressing intentional component deprecations."""
+    return _call_without_component_direct_output_deprecation(
+        "pme_reciprocal_space",
+        _pme_reciprocal_space,
+        *args,
+        **kwargs,
+    )
 
 
 def _make_slab_system(dtype=jnp.float64):
@@ -229,6 +309,43 @@ def _component_sum(
     }
 
 
+def _assert_full_slab_energy_autodiff_matches_outputs(
+    slab_energy_from_full_api,
+    positions,
+    charges,
+    cell,
+    slab_outputs,
+    *,
+    rtol=1e-9,
+    atol=1e-10,
+):
+    """Validate full energy-only slab contribution derivatives."""
+    _energies, forces, charge_grads, virial = slab_outputs
+
+    grad_positions = jax.grad(
+        lambda pos: slab_energy_from_full_api(pos, charges, cell)
+    )(positions)
+    grad_charges = jax.grad(
+        lambda chg: slab_energy_from_full_api(positions, chg, cell)
+    )(charges)
+
+    eps = jnp.zeros((3, 3), dtype=positions.dtype)
+
+    def strained_energy(eps_in):
+        deformation = jnp.eye(3, dtype=positions.dtype) + eps_in
+        return slab_energy_from_full_api(
+            positions @ deformation,
+            charges,
+            cell @ deformation,
+        )
+
+    grad_strain = jax.grad(strained_energy)(eps)
+
+    _assert_close(-grad_positions, forces, rtol=rtol, atol=atol)
+    _assert_close(grad_charges, charge_grads, rtol=rtol, atol=atol)
+    _assert_close(-grad_strain, virial[0], rtol=rtol, atol=atol)
+
+
 def _expected_by_name(outputs):
     """Return a name-to-array mapping for full slab reference outputs."""
     return {
@@ -321,9 +438,9 @@ class TestStandaloneSlabCorrection:
         def strained_reference_energy(eps_in):
             deformation = jnp.eye(3, dtype=positions.dtype) + eps_in
             return reference_energy(
-                positions @ deformation.T,
+                positions @ deformation,
                 charges,
-                cell @ deformation.T,
+                cell @ deformation,
             )
 
         autograd_virial = -jax.grad(strained_reference_energy)(eps)
@@ -340,6 +457,127 @@ class TestStandaloneSlabCorrection:
         _assert_close(forces, -grad_positions)
         _assert_close(charge_grads, grad_charges)
         _assert_close(virial[0], autograd_virial, rtol=1e-9, atol=1e-10)
+
+    def test_energy_autodiff_matches_explicit_derivative_outputs(self, device):  # noqa: ARG002
+        """Energy-only slab path exposes explicit Warp first derivatives."""
+        positions, charges, cell, pbc = _make_slab_system()
+
+        def slab_energy(pos, chg, cell_in):
+            return compute_slab_correction(pos, chg, cell_in, pbc).sum()
+
+        grad_positions, grad_charges, grad_cell = jax.grad(
+            slab_energy,
+            argnums=(0, 1, 2),
+        )(positions, charges, cell)
+        _, forces, charge_grads, _virial = compute_slab_correction(
+            positions,
+            charges,
+            cell,
+            pbc,
+            compute_forces=True,
+            compute_charge_gradients=True,
+            compute_virial=True,
+        )
+        reference_grad_cell = jax.grad(
+            lambda cell_in: _reference_slab_correction(
+                positions,
+                charges,
+                cell_in,
+                pbc,
+            )[0].sum()
+        )(cell)
+        jit_grad_positions = jax.jit(
+            jax.grad(lambda pos: slab_energy(pos, charges, cell))
+        )(positions)
+
+        _assert_close(-grad_positions, forces, rtol=1e-9, atol=1e-10)
+        _assert_close(grad_charges, charge_grads, rtol=1e-9, atol=1e-10)
+        _assert_close(grad_cell, reference_grad_cell, rtol=1e-9, atol=1e-10)
+        _assert_close(jit_grad_positions, grad_positions, rtol=1e-9, atol=1e-10)
+
+    def test_energy_second_derivative_losses_are_finite(self, device):  # noqa: ARG002
+        """Standalone slab force, charge, and cell losses support nested gradients."""
+        positions, charges, cell, pbc = _make_slab_system()
+
+        def slab_energy(pos, chg, cell_in):
+            return compute_slab_correction(pos, chg, cell_in, pbc).sum()
+
+        def force_loss(pos):
+            grad_positions = jax.grad(
+                lambda pos_in: slab_energy(pos_in, charges, cell)
+            )(pos)
+            return jnp.sum(grad_positions * grad_positions)
+
+        def charge_loss(chg):
+            grad_charges = jax.grad(
+                lambda charges_in: slab_energy(positions, charges_in, cell)
+            )(chg)
+            return jnp.sum(grad_charges * grad_charges)
+
+        def cell_loss(cell_in):
+            grad_cell = jax.grad(
+                lambda cell_arg: slab_energy(positions, charges, cell_arg)
+            )(cell_in)
+            return jnp.sum(grad_cell * grad_cell)
+
+        h_positions = jnp.array(
+            [[0.3, -0.2, 0.1], [0.0, 0.4, -0.5], [0.2, 0.1, -0.3]],
+            dtype=positions.dtype,
+        )
+        h_charges = jnp.array([0.2, -0.1, 0.3], dtype=charges.dtype)
+        h_cell = jnp.array(
+            [[[0.02, -0.01, 0.03], [0.01, 0.02, -0.02], [0.0, 0.01, 0.02]]],
+            dtype=cell.dtype,
+        )
+
+        def first_derivatives(pos, chg, cell_in):
+            return jax.grad(slab_energy, argnums=(0, 1, 2))(pos, chg, cell_in)
+
+        _, hvp = jax.jvp(
+            first_derivatives,
+            (positions, charges, cell),
+            (h_positions, h_charges, h_cell),
+        )
+        step = jnp.asarray(1e-4, dtype=positions.dtype)
+        plus = first_derivatives(
+            positions + step * h_positions,
+            charges + step * h_charges,
+            cell + step * h_cell,
+        )
+        minus = first_derivatives(
+            positions - step * h_positions,
+            charges - step * h_charges,
+            cell - step * h_cell,
+        )
+        fd_hvp = tuple((p - m) / (2.0 * step) for p, m in zip(plus, minus))
+        for actual, expected in zip(hvp, fd_hvp, strict=True):
+            _assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+
+        jit_hvp = jax.jit(
+            lambda pos, chg, cell_in, hpos, hchg, hcell: jax.jvp(
+                first_derivatives,
+                (pos, chg, cell_in),
+                (hpos, hchg, hcell),
+            )[1]
+        )(positions, charges, cell, h_positions, h_charges, h_cell)
+        for actual, expected in zip(jit_hvp, hvp, strict=True):
+            _assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+        grad_force_loss = jax.grad(force_loss)(positions)
+        grad_charge_loss = jax.grad(charge_loss)(charges)
+        grad_cell_loss = jax.grad(cell_loss)(cell)
+        direction = h_positions
+        direction = direction / jnp.linalg.norm(direction)
+        force_loss_fd = (
+            force_loss(positions + step * direction)
+            - force_loss(positions - step * direction)
+        ) / (2.0 * step)
+        force_loss_jvp = jnp.sum(grad_force_loss * direction)
+
+        assert bool(jnp.isfinite(grad_force_loss).all())
+        assert bool(jnp.isfinite(grad_charge_loss).all())
+        assert bool(jnp.isfinite(grad_cell_loss).all())
+        _assert_close(force_loss_jvp, force_loss_fd, rtol=1e-4, atol=1e-7)
 
     def test_translation_invariance_non_neutral(self, device):  # noqa: ARG002
         """Non-neutral triclinic slab outputs are translation invariant."""
@@ -875,6 +1113,57 @@ class TestJaxEwaldSlabIntegration:
         assert charge_grads.dtype == jnp.float64
         assert virial.dtype == dtype
 
+    def test_full_ewald_energy_slab_autodiff_matches_standalone_outputs(self, device):  # noqa: ARG002
+        """Energy-only Ewald slab contribution differentiates through full API."""
+        positions, charges, cell, pbc = _make_slab_system()
+        neighbor_matrix, _, neighbor_matrix_shifts = cell_list(
+            positions,
+            REAL_SPACE_CUTOFF,
+            cell,
+            pbc,
+        )
+        common_kwargs = {
+            "alpha": EWALD_ALPHA,
+            "k_cutoff": EWALD_K_CUTOFF,
+            "neighbor_matrix": neighbor_matrix,
+            "neighbor_matrix_shifts": neighbor_matrix_shifts,
+        }
+
+        def slab_energy_from_full_api(pos, chg, cell_in):
+            slab_energy = ewald_summation(
+                pos,
+                chg,
+                cell_in,
+                pbc=pbc,
+                slab_correction=True,
+                **common_kwargs,
+            ).sum()
+            base_energy = ewald_summation(
+                pos,
+                chg,
+                cell_in,
+                **common_kwargs,
+            ).sum()
+            return slab_energy - base_energy
+
+        slab_outputs = compute_slab_correction(
+            positions,
+            charges,
+            cell,
+            pbc,
+            compute_forces=True,
+            compute_charge_gradients=True,
+            compute_virial=True,
+        )
+
+        _assert_full_slab_energy_autodiff_matches_outputs(
+            slab_energy_from_full_api,
+            positions,
+            charges,
+            cell,
+            slab_outputs,
+        )
+
 
 class TestJaxPMESlabIntegration:
     """Full JAX PME slab wrapper composition and output order."""
@@ -1048,6 +1337,97 @@ class TestJaxPMESlabIntegration:
         assert forces.dtype == dtype
         assert charge_grads.dtype == jnp.float64
         assert virial.dtype == dtype
+
+    def test_full_pme_energy_slab_autodiff_matches_standalone_outputs(self, device):  # noqa: ARG002
+        """Energy-only PME slab contribution differentiates through full API."""
+        positions, charges, cell, pbc = _make_slab_system()
+        neighbor_matrix, _, neighbor_matrix_shifts = cell_list(
+            positions,
+            REAL_SPACE_CUTOFF,
+            cell,
+            pbc,
+        )
+        common_kwargs = {
+            "alpha": EWALD_ALPHA,
+            "mesh_dimensions": PME_MESH,
+            "neighbor_matrix": neighbor_matrix,
+            "neighbor_matrix_shifts": neighbor_matrix_shifts,
+        }
+
+        def slab_energy_from_full_api(pos, chg, cell_in):
+            slab_energy = particle_mesh_ewald(
+                pos,
+                chg,
+                cell_in,
+                pbc=pbc,
+                slab_correction=True,
+                **common_kwargs,
+            ).sum()
+            base_energy = particle_mesh_ewald(
+                pos,
+                chg,
+                cell_in,
+                **common_kwargs,
+            ).sum()
+            return slab_energy - base_energy
+
+        slab_outputs = compute_slab_correction(
+            positions,
+            charges,
+            cell,
+            pbc,
+            compute_forces=True,
+            compute_charge_gradients=True,
+            compute_virial=True,
+        )
+
+        _assert_full_slab_energy_autodiff_matches_outputs(
+            slab_energy_from_full_api,
+            positions,
+            charges,
+            cell,
+            slab_outputs,
+        )
+
+    def test_full_pme_slab_jit_smoke(self, device):  # noqa: ARG002
+        """Energy-only full PME slab composition works under jax.jit."""
+        positions, charges, cell, pbc = _make_slab_system()
+        neighbor_matrix, _, neighbor_matrix_shifts = cell_list(
+            positions,
+            REAL_SPACE_CUTOFF,
+            cell,
+            pbc,
+        )
+
+        def full_pme_slab(pos, chg, cell_in, nm, nms):
+            return particle_mesh_ewald(
+                pos,
+                chg,
+                cell_in,
+                alpha=EWALD_ALPHA,
+                mesh_dimensions=PME_MESH,
+                neighbor_matrix=nm,
+                neighbor_matrix_shifts=nms,
+                pbc=pbc,
+                slab_correction=True,
+            )
+
+        eager = full_pme_slab(
+            positions,
+            charges,
+            cell,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+        )
+        jitted = jax.jit(full_pme_slab)(
+            positions,
+            charges,
+            cell,
+            neighbor_matrix,
+            neighbor_matrix_shifts,
+        )
+
+        _assert_close(jitted, eager, rtol=1e-9, atol=1e-10)
 
     def test_full_pme_slab_3d_pbc_noop(self, device):  # noqa: ARG002
         """3D periodic PME slab mode matches standard PME."""

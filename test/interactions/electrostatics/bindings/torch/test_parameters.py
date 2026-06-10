@@ -454,6 +454,48 @@ class TestEstimatePMEParameters:
         assert params.mesh_spacing.shape == (2, 3)
 
     @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_batch_uses_shared_median_system_cutoff_and_alpha(self, device):
+        """Batched PME uses one cutoff/alpha from median batch properties."""
+        positions = torch.randn(120, 3, dtype=torch.float64, device=device)
+        cells = torch.stack(
+            [
+                torch.eye(3, dtype=torch.float64, device=device) * 10.0,
+                torch.eye(3, dtype=torch.float64, device=device) * 20.0,
+                torch.eye(3, dtype=torch.float64, device=device) * 30.0,
+            ]
+        )
+        batch_idx = torch.tensor(
+            [0] * 20 + [1] * 40 + [2] * 60,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        accuracy = 1e-6
+        params = estimate_pme_parameters(
+            positions,
+            cells,
+            batch_idx=batch_idx,
+            accuracy=accuracy,
+        )
+
+        n_repr = 40.0
+        v_repr = 20.0**3
+        eta = (v_repr**2 / n_repr) ** (1.0 / 6.0) / math.sqrt(2.0 * math.pi)
+        expected_cutoff = math.sqrt(-2.0 * math.log(accuracy)) * eta
+        expected_alpha = 1.0 / (math.sqrt(2.0) * eta)
+
+        assert torch.allclose(params.real_space_cutoff, params.real_space_cutoff[0])
+        assert torch.allclose(params.alpha, params.alpha[0])
+        assert torch.allclose(
+            params.real_space_cutoff,
+            torch.full_like(params.real_space_cutoff, expected_cutoff),
+        )
+        assert torch.allclose(
+            params.alpha,
+            torch.full_like(params.alpha, expected_alpha),
+        )
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
     def test_mesh_dimensions_are_power_of_two(self, device):
         """Test that mesh dimensions are powers of 2."""
         positions = torch.randn(100, 3, device=device)
@@ -465,17 +507,53 @@ class TestEstimatePMEParameters:
             assert d > 0 and (d & (d - 1)) == 0, f"{d} is not a power of 2"
 
     @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
-    def test_consistency_with_ewald_parameters(self, device):
-        """Test that alpha matches estimate_ewald_parameters."""
+    def test_pme_alpha_matches_ewald_closed_form(self, device):
+        """Default PME estimator uses the same Essmann/Kolafa-Perram
+        closed-form as the Ewald estimator (both derive rc and α from
+        a single length scale η)."""
         positions = torch.randn(100, 3, device=device)
         cell = torch.eye(3, device=device).unsqueeze(0) * 20.0
 
         pme_params = estimate_pme_parameters(positions, cell, accuracy=1e-6)
         ewald_params = estimate_ewald_parameters(positions, cell, accuracy=1e-6)
 
-        assert torch.allclose(pme_params.alpha, ewald_params.alpha)
         assert torch.allclose(
             pme_params.real_space_cutoff, ewald_params.real_space_cutoff
+        )
+        assert torch.allclose(pme_params.alpha, ewald_params.alpha)
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_pme_cutoff_in_sane_range(self, device):
+        """Cost-optimal PME rc should land in the 4–20 Å band for typical systems."""
+        positions = torch.randn(500, 3, device=device)
+        cell = torch.eye(3, device=device).unsqueeze(0) * 25.0
+
+        params = estimate_pme_parameters(positions, cell, accuracy=1e-6)
+        rc = float(params.real_space_cutoff[0].item())
+        assert 4.0 <= rc <= 20.0, f"rc={rc} outside sane band"
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_pme_user_supplied_cutoff_respected(self, device):
+        """When real_space_cutoff is given, it is used as-is."""
+        positions = torch.randn(100, 3, device=device)
+        cell = torch.eye(3, device=device).unsqueeze(0) * 20.0
+
+        params = estimate_pme_parameters(
+            positions,
+            cell,
+            accuracy=1e-6,
+            real_space_cutoff=7.5,
+        )
+        assert torch.allclose(
+            params.real_space_cutoff,
+            torch.tensor([7.5], dtype=positions.dtype, device=device),
+        )
+        # Alpha derived from the user-supplied rc: α = √(-log ε) / rc.
+        expected_alpha = math.sqrt(-math.log(1e-6)) / 7.5
+        assert torch.allclose(
+            params.alpha,
+            torch.tensor([expected_alpha], dtype=positions.dtype, device=device),
+            rtol=1e-5,
         )
 
     @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
