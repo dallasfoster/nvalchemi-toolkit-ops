@@ -111,3 +111,6 @@ slurm-*.out
 
 # Exclude version file from VCS
 nvalchemiops/_version.py
+
+# Warp kernel cache (CI persists this via actions/cache at $GITHUB_WORKSPACE/.warp-cache)
+.warp-cache/
