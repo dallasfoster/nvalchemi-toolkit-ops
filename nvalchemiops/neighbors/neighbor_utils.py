@@ -1031,10 +1031,40 @@ def _make_wrap_positions_kernel(
         ) -> None:
             """Wrap positions into periodic axes and store integer offsets.
 
+            Parameters
+            ----------
+            positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+                Current Cartesian coordinates.
+            cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+                Cell matrix for each system.
+            inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+                Inverse cell matrix for each system.
+            pbc : wp.array2d, shape (num_systems, 3), dtype=wp.bool
+                Per-axis periodicity flags; wrapping is skipped on non-periodic
+                axes.
+            batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+                System index for each atom. Zero-size sentinel in single-system
+                specializations.
+            positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+                OUTPUT: Wrapped positions.
+            per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+                OUTPUT: Integer cell offsets applied per atom.
+
+            Returns
+            -------
+            None
+                This function modifies the input arrays in-place.
+
             Notes
             -----
             - Thread launch: One thread per atom.
             - Modifies: ``positions_wrapped`` and ``per_atom_cell_offsets``.
+            ``BATCHED`` is a static specialization. Single-system launchers pass
+            a zero-size ``batch_idx`` sentinel that is not read.
+
+            See Also
+            --------
+            get_wrap_positions_kernel : Return the specialized position-wrapping kernel.
             """
             i = wp.tid()
             isys = wp.int32(0)
@@ -1066,10 +1096,37 @@ def _make_wrap_positions_kernel(
         ) -> None:
             """Wrap positions into the primary cell and store integer offsets.
 
+            Parameters
+            ----------
+            positions : wp.array, shape (total_atoms,), dtype=wp.vec3*
+                Current Cartesian coordinates.
+            cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+                Cell matrix for each system.
+            inv_cell : wp.array, shape (num_systems,), dtype=wp.mat33*
+                Inverse cell matrix for each system.
+            batch_idx : wp.array, shape (total_atoms,), dtype=wp.int32
+                System index for each atom. Zero-size sentinel in single-system
+                specializations.
+            positions_wrapped : wp.array, shape (total_atoms,), dtype=wp.vec3*
+                OUTPUT: Wrapped positions.
+            per_atom_cell_offsets : wp.array, shape (total_atoms,), dtype=wp.vec3i
+                OUTPUT: Integer cell offsets applied per atom.
+
+            Returns
+            -------
+            None
+                This function modifies the input arrays in-place.
+
             Notes
             -----
             - Thread launch: One thread per atom.
             - Modifies: ``positions_wrapped`` and ``per_atom_cell_offsets``.
+            ``BATCHED`` is a static specialization. Single-system launchers pass
+            a zero-size ``batch_idx`` sentinel that is not read.
+
+            See Also
+            --------
+            get_wrap_positions_kernel : Return the specialized position-wrapping kernel.
             """
             i = wp.tid()
             isys = wp.int32(0)
