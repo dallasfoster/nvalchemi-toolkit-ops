@@ -43,6 +43,30 @@
 
 ### Fixed
 
+- Fixed an issue with JAX `naive` PBC pair-output paths that dropped non-zero 
+  periodic images. The  JAX `naive_neighbor_list` pair-output path (`return_distances` /
+  `return_vectors`, and now `pair_fn`) launched its periodic kernel with the
+  shift axis pinned to 1, so when `cutoff` exceeded half the cell width (R>1)
+  every non-zero periodic image was silently dropped — yielding too few
+  neighbors and incorrect per-pair distances/vectors/forces relative to the
+  PyTorch binding. The launch now enumerates all shifts (`max_shifts`), matching
+  PyTorch and the analytic neighbor set in the multi-image regime. The
+  single-cutoff `cutoff < half-cell` (R==1) case is unchanged.
+- Fixed an issue with JAX per-pair distance/vector higher-order gradients.
+  The JAX neighbor-list autograd returned the *detached*
+  Warp-kernel distances/vectors and re-attached only a first-order gradient via a
+  `custom_vjp`, so the Hessian / Hessian-vector-product was incorrect (~45% off)
+  whenever the downstream loss was nonlinear in the returned distances (e.g.
+  `(distances**2).sum()`); first-order gradients (forces) were unaffected. The
+  geometry is now reconstructed as a live, differentiable pure-JAX function of
+  positions/cell, so gradients of all orders are exact (matching PyTorch and the
+  analytic Hessian). Affects all JAX `return_distances`/`return_vectors` bindings
+  (`naive`, `cell_list`, `cluster_tile`, batched).
+- Fixed DFT-D3 forces and virials with S5 smoothing. When smoothing was
+  active, the CN-chain `dE/dCN` used the unswitched pair energy, so CN-chain
+  forces and virials did not exactly match the gradient of the switched energy.
+  Only runs with S5 smoothing enabled were affected; the default (smoothing
+  disabled) was already correct and is unchanged.
 - Naive PBC neighbor wrapping now leaves non-periodic axes unwrapped when
   per-axis `pbc` flags are supplied.
 - Fixed Torch Ewald gradients for non-uniform per-atom energy cotangents.
@@ -72,6 +96,7 @@
   `ḣ = dh/dt`.
 - `npt_barostat_half_step{,_aniso,_triclinic}` drop the `eta_dots` argument.
 - The internal `make_outer_neigh_offsets` helper was removed.
+
 
 ## Version 0.3.0
 
