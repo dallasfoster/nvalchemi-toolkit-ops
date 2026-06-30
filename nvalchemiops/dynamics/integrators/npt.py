@@ -1550,6 +1550,61 @@ def _npt_thermostat_chain_update_kernel(
 # ==============================================================================
 
 
+def compute_kinetic_tensor(
+    velocities: wp.array,
+    masses: wp.array,
+    kinetic_tensors: wp.array,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    """
+    Fill kinetic_tensors[s] = sum_{i in s} m_i (v_i ⊗ v_i) (vec9 layout) — the
+    same accumulation ``compute_pressure_tensor`` performs internally, exposed
+    standalone.
+
+    Under domain decomposition the caller computes the per-rank (local) kinetic
+    tensor with this helper, all-reduces it across the process mesh, then feeds
+    the global result back via
+    ``compute_pressure_tensor(..., compute_kinetic=False)``. Using this kernel
+    for the local reduction gives machine-precision parity with the
+    single-process reference.
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Particle velocities. Shape (N,).
+    masses : wp.array
+        Particle masses. Shape (N,).
+    kinetic_tensors : wp.array(dtype=scalar, ndim=2)
+        Output kinetic tensor. Shape (B, 9). Zeroed internally before
+        accumulation. MODIFIED in-place.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. If None, assumes single system.
+    device : str, optional
+        Warp device.
+
+    Returns
+    -------
+    wp.array
+        The ``kinetic_tensors`` array, filled with sum m (v ⊗ v) per system.
+    """
+    if device is None:
+        device = velocities.device
+
+    num_atoms = velocities.shape[0]
+
+    kinetic_tensors.zero_()
+    if batch_idx is None:
+        kernel = _KINETIC_TENSOR_FAMILY.single
+        inputs = [velocities, masses, kinetic_tensors]
+    else:
+        kernel = _KINETIC_TENSOR_FAMILY.batch_idx
+        inputs = [velocities, masses, batch_idx, kinetic_tensors]
+    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_DIM)
+
+    return kinetic_tensors
+
+
 def compute_pressure_tensor(
     velocities: wp.array,
     masses: wp.array,
@@ -1560,6 +1615,7 @@ def compute_pressure_tensor(
     volumes: wp.array,
     batch_idx: wp.array = None,
     device: str = None,
+    compute_kinetic: bool = True,
 ) -> wp.array:
     """
     Compute full pressure tensor.
@@ -1577,8 +1633,12 @@ def compute_pressure_tensor(
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
     kinetic_tensors : wp.array(dtype=scalar, ndim=2)
-        Scratch array for kinetic tensor accumulation. Shape (B, 9).
-        Zeroed internally before each use.
+        Kinetic tensor K[s] = sum_{i in s} m_i (v_i ⊗ v_i), vec9 layout. Shape
+        (B, 9). When compute_kinetic is True (default) this is a scratch array
+        zeroed and filled internally from velocities/masses. When
+        compute_kinetic is False it is an INPUT supplying a caller-computed
+        (e.g. domain-decomposed, mesh-reduced) global kinetic tensor; it is not
+        zeroed or recomputed.
     pressure_tensors : wp.array(dtype=vec9f or vec9d)
         Output pressure tensor. Shape (B,).
     volumes : wp.array(dtype=scalar)
@@ -1588,6 +1648,15 @@ def compute_pressure_tensor(
         System index for each atom. If None, assumes single system.
     device : str, optional
         Warp device.
+    compute_kinetic : bool, optional
+        If True (default), recompute the kinetic tensor from velocities/masses
+        internally (byte-identical to legacy behavior). If False, trust the
+        global kinetic tensor supplied in ``kinetic_tensors`` instead of
+        recomputing it from the local atom set — used under domain
+        decomposition, where the caller all-reduces the per-rank kinetic tensor
+        across the process mesh and feeds the global value back (the virial is
+        already global). See ``compute_kinetic_tensor`` for the matching
+        reduction helper.
 
     Returns
     -------
@@ -1597,17 +1666,20 @@ def compute_pressure_tensor(
     if device is None:
         device = velocities.device
 
-    kinetic_tensors.zero_()
     num_atoms = velocities.shape[0]
     num_systems = cells.shape[0]
 
-    if batch_idx is None:
-        kernel = _KINETIC_TENSOR_FAMILY.single
-        inputs = [velocities, masses, kinetic_tensors]
-    else:
-        kernel = _KINETIC_TENSOR_FAMILY.batch_idx
-        inputs = [velocities, masses, batch_idx, kinetic_tensors]
-    wp.launch(kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_DIM)
+    if compute_kinetic:
+        kinetic_tensors.zero_()
+        if batch_idx is None:
+            kernel = _KINETIC_TENSOR_FAMILY.single
+            inputs = [velocities, masses, kinetic_tensors]
+        else:
+            kernel = _KINETIC_TENSOR_FAMILY.batch_idx
+            inputs = [velocities, masses, batch_idx, kinetic_tensors]
+        wp.launch(
+            kernel, dim=num_atoms, inputs=inputs, device=device, block_dim=TILE_DIM
+        )
 
     wp.launch(
         _finalize_pressure_tensor_kernel,
