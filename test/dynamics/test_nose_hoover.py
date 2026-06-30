@@ -1778,9 +1778,7 @@ class TestNHCComputeKE:
         wp.synchronize_device(device)
 
         per_atom = mass_np * (vel_np * vel_np).sum(axis=1)
-        expected = np.array(
-            [per_atom[batch_np == s].sum() for s in range(num_systems)]
-        )
+        expected = np.array([per_atom[batch_np == s].sum() for s in range(num_systems)])
         np.testing.assert_allclose(ke2.numpy(), expected, rtol=_tol(np_dtype))
 
     @pytest.mark.parametrize("device", DEVICES)

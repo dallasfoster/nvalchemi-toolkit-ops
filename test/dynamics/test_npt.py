@@ -4064,9 +4064,7 @@ class TestCellKineticEnergyConvention:
 _PRESSURE_CELLS = {
     "isotropic": np.diag([10.0, 10.0, 10.0]),
     "anisotropic": np.diag([8.0, 11.0, 13.0]),
-    "triclinic": np.array(
-        [[10.0, 0.0, 0.0], [1.5, 9.0, 0.0], [0.7, 1.1, 11.0]]
-    ),
+    "triclinic": np.array([[10.0, 0.0, 0.0], [1.5, 9.0, 0.0], [0.7, 1.1, 11.0]]),
 }
 
 
@@ -4236,12 +4234,8 @@ class TestComputeKineticFlag:
         # Split: reduce each half separately, then sum to the full kinetic tensor.
         kt_a = wp.empty((1, 9), dtype=scalar_dtype, device=device)
         kt_b = wp.empty((1, 9), dtype=scalar_dtype, device=device)
-        compute_kinetic_tensor(
-            velocities[:half], masses[:half], kt_a, device=device
-        )
-        compute_kinetic_tensor(
-            velocities[half:], masses[half:], kt_b, device=device
-        )
+        compute_kinetic_tensor(velocities[:half], masses[:half], kt_a, device=device)
+        compute_kinetic_tensor(velocities[half:], masses[half:], kt_b, device=device)
         kt_summed = wp.array(
             kt_a.numpy() + kt_b.numpy(), dtype=scalar_dtype, device=device
         )
