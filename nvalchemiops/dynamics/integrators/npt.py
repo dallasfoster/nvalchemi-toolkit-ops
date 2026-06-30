@@ -1562,12 +1562,11 @@ def compute_kinetic_tensor(
     same accumulation ``compute_pressure_tensor`` performs internally, exposed
     standalone.
 
-    Under domain decomposition the caller computes the per-rank (local) kinetic
-    tensor with this helper, all-reduces it across the process mesh, then feeds
-    the global result back via
+    Lets a caller compute the kinetic tensor separately, optionally
+    post-process it, and feed it back via
     ``compute_pressure_tensor(..., compute_kinetic=False)``. Using this kernel
-    for the local reduction gives machine-precision parity with the
-    single-process reference.
+    for the reduction gives machine-precision parity with the value
+    ``compute_pressure_tensor`` would otherwise compute itself.
 
     Parameters
     ----------
@@ -1636,9 +1635,8 @@ def compute_pressure_tensor(
         Kinetic tensor K[s] = sum_{i in s} m_i (v_i ⊗ v_i), vec9 layout. Shape
         (B, 9). When compute_kinetic is True (default) this is a scratch array
         zeroed and filled internally from velocities/masses. When
-        compute_kinetic is False it is an INPUT supplying a caller-computed
-        (e.g. domain-decomposed, mesh-reduced) global kinetic tensor; it is not
-        zeroed or recomputed.
+        compute_kinetic is False it is an INPUT supplying a caller-precomputed
+        kinetic tensor; it is not zeroed or recomputed.
     pressure_tensors : wp.array(dtype=vec9f or vec9d)
         Output pressure tensor. Shape (B,).
     volumes : wp.array(dtype=scalar)
@@ -1650,12 +1648,9 @@ def compute_pressure_tensor(
         Warp device.
     compute_kinetic : bool, optional
         If True (default), recompute the kinetic tensor from velocities/masses
-        internally (byte-identical to legacy behavior). If False, trust the
-        global kinetic tensor supplied in ``kinetic_tensors`` instead of
-        recomputing it from the local atom set — used under domain
-        decomposition, where the caller all-reduces the per-rank kinetic tensor
-        across the process mesh and feeds the global value back (the virial is
-        already global). See ``compute_kinetic_tensor`` for the matching
+        internally (byte-identical to legacy behavior). If False, use the
+        caller-supplied value already in ``kinetic_tensors`` instead of
+        recomputing it. See ``compute_kinetic_tensor`` for the matching
         reduction helper.
 
     Returns

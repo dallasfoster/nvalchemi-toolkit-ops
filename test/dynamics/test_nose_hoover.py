@@ -1708,7 +1708,7 @@ class TestNHCAtomPtr:
 
 
 # ==============================================================================
-# compute_ke flag + nhc_compute_2ke helper (domain-decomposition support)
+# compute_ke flag + nhc_compute_2ke helper
 # ==============================================================================
 
 
@@ -1848,20 +1848,24 @@ class TestNHCComputeKE:
         ref = make_state()
         run(ref, wp.empty(1, dtype=dtype_scalar, device=device), compute_ke=True)
 
-        # DD path: pre-fill ke2 from the same atoms, then skip the recompute.
-        dd = make_state()
+        # Supplied path: pre-fill ke2 from the same atoms, then skip the recompute.
+        supplied = make_state()
         ke2_in = wp.empty(1, dtype=dtype_scalar, device=device)
-        nhc_compute_2ke(dd["velocities"], dd["masses"], ke2_in, device=device)
-        run(dd, ke2_in, compute_ke=False)
+        nhc_compute_2ke(
+            supplied["velocities"], supplied["masses"], ke2_in, device=device
+        )
+        run(supplied, ke2_in, compute_ke=False)
 
         wp.synchronize_device(device)
         rtol = _tol(np_dtype)
         np.testing.assert_allclose(
-            dd["velocities"].numpy(), ref["velocities"].numpy(), rtol=rtol
+            supplied["velocities"].numpy(), ref["velocities"].numpy(), rtol=rtol
         )
-        np.testing.assert_allclose(dd["eta"].numpy(), ref["eta"].numpy(), rtol=rtol)
         np.testing.assert_allclose(
-            dd["eta_dot"].numpy(), ref["eta_dot"].numpy(), rtol=rtol
+            supplied["eta"].numpy(), ref["eta"].numpy(), rtol=rtol
+        )
+        np.testing.assert_allclose(
+            supplied["eta_dot"].numpy(), ref["eta_dot"].numpy(), rtol=rtol
         )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -1944,26 +1948,28 @@ class TestNHCComputeKE:
         ref = make_state()
         run(ref, wp.empty(num_systems, dtype=dtype_scalar, device=device), True)
 
-        dd = make_state()
+        supplied = make_state()
         ke2_in = wp.empty(num_systems, dtype=dtype_scalar, device=device)
         nhc_compute_2ke(
-            dd["velocities"],
-            dd["masses"],
+            supplied["velocities"],
+            supplied["masses"],
             ke2_in,
             batch_idx=batch_idx,
             num_systems=num_systems,
             device=device,
         )
-        run(dd, ke2_in, False)
+        run(supplied, ke2_in, False)
 
         wp.synchronize_device(device)
         rtol = _tol(np_dtype)
         np.testing.assert_allclose(
-            dd["velocities"].numpy(), ref["velocities"].numpy(), rtol=rtol
+            supplied["velocities"].numpy(), ref["velocities"].numpy(), rtol=rtol
         )
-        np.testing.assert_allclose(dd["eta"].numpy(), ref["eta"].numpy(), rtol=rtol)
         np.testing.assert_allclose(
-            dd["eta_dot"].numpy(), ref["eta_dot"].numpy(), rtol=rtol
+            supplied["eta"].numpy(), ref["eta"].numpy(), rtol=rtol
+        )
+        np.testing.assert_allclose(
+            supplied["eta_dot"].numpy(), ref["eta_dot"].numpy(), rtol=rtol
         )
 
     @pytest.mark.parametrize("device", DEVICES)
@@ -1971,9 +1977,10 @@ class TestNHCComputeKE:
     def test_global_vs_split_trajectory(
         self, device, dtype_vec, dtype_scalar, np_dtype
     ):
-        """The domain-decomposition scenario: a whole N-atom system run with
-        compute_ke=True must match two half-shards whose local 2*KE are summed
-        and fed back with compute_ke=False, over many integration steps."""
+        """A whole N-atom system run with compute_ke=True must match a run that
+        computes 2*KE over two disjoint halves of the atoms, sums them, and
+        feeds the result back with compute_ke=False, over many integration
+        steps."""
         num_atoms = 80
         half = num_atoms // 2
         chain_length = 3
@@ -2018,8 +2025,7 @@ class TestNHCComputeKE:
 
         def chain_update(st, split):
             if split:
-                # Local reductions on each shard, summed -> global 2*KE (the
-                # all_reduce the toolkit performs across the process mesh).
+                # Reduce each half separately, then sum to the full 2*KE.
                 ke2_a = wp.empty(1, dtype=dtype_scalar, device=device)
                 ke2_b = wp.empty(1, dtype=dtype_scalar, device=device)
                 nhc_compute_2ke(

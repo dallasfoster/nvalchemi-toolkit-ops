@@ -4054,7 +4054,7 @@ class TestCellKineticEnergyConvention:
 
 
 # ==============================================================================
-# compute_kinetic flag + compute_kinetic_tensor helper (domain decomposition)
+# compute_kinetic flag + compute_kinetic_tensor helper
 # ==============================================================================
 
 
@@ -4175,15 +4175,15 @@ class TestComputeKineticFlag:
             device=device,
         )
 
-        # DD path: pre-fill the (global) kinetic tensor, skip the recompute.
-        kt_dd = wp.empty((1, 9), dtype=scalar_dtype, device=device)
-        compute_kinetic_tensor(velocities, masses, kt_dd, device=device)
-        p_dd = compute_pressure_tensor(
+        # Supplied path: pre-fill the kinetic tensor, skip the recompute.
+        kt_supplied = wp.empty((1, 9), dtype=scalar_dtype, device=device)
+        compute_kinetic_tensor(velocities, masses, kt_supplied, device=device)
+        p_supplied = compute_pressure_tensor(
             velocities,
             masses,
             virial_tensors,
             cells,
-            kt_dd,
+            kt_supplied,
             wp.empty(1, dtype=tensor_dtype, device=device),
             volumes,
             device=device,
@@ -4192,13 +4192,13 @@ class TestComputeKineticFlag:
         wp.synchronize_device(device)
 
         np.testing.assert_allclose(
-            p_dd.numpy(), p_ref.numpy(), rtol=self._rtol(dtype)
+            p_supplied.numpy(), p_ref.numpy(), rtol=self._rtol(dtype)
         )
 
     def test_compute_kinetic_global_vs_split(self, dtype, device):
-        """DD scenario: one N-atom system's pressure (compute_kinetic=True) must
-        match two half-shards whose local kinetic tensors are summed and fed
-        with compute_kinetic=False."""
+        """One N-atom system's pressure (compute_kinetic=True) must match a run
+        that computes the kinetic tensor over two disjoint halves of the atoms,
+        sums them, and feeds the result with compute_kinetic=False."""
         vec_dtype = wp.vec3f if dtype == "float32" else wp.vec3d
         scalar_dtype = wp.float32 if dtype == "float32" else wp.float64
         tensor_dtype = vec9f if dtype == "float32" else vec9d
@@ -4233,7 +4233,7 @@ class TestComputeKineticFlag:
             device=device,
         )
 
-        # Split: per-shard kinetic tensors summed -> global K (the all_reduce).
+        # Split: reduce each half separately, then sum to the full kinetic tensor.
         kt_a = wp.empty((1, 9), dtype=scalar_dtype, device=device)
         kt_b = wp.empty((1, 9), dtype=scalar_dtype, device=device)
         compute_kinetic_tensor(
@@ -4242,7 +4242,7 @@ class TestComputeKineticFlag:
         compute_kinetic_tensor(
             velocities[half:], masses[half:], kt_b, device=device
         )
-        kt_global = wp.array(
+        kt_summed = wp.array(
             kt_a.numpy() + kt_b.numpy(), dtype=scalar_dtype, device=device
         )
         p_split = compute_pressure_tensor(
@@ -4250,7 +4250,7 @@ class TestComputeKineticFlag:
             masses,
             virial_tensors,
             cells,
-            kt_global,
+            kt_summed,
             wp.empty(1, dtype=tensor_dtype, device=device),
             volumes,
             device=device,

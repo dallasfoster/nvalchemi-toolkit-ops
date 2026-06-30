@@ -1064,11 +1064,10 @@ def nhc_compute_2ke(
     Fill ke2[s] = sum_{i in s} m_i * ||v_i||^2 — the same 2*KE reduction that
     ``nhc_thermostat_chain_update`` performs internally, exposed standalone.
 
-    Under domain decomposition the caller computes the per-rank (local) 2*KE
-    with this helper, all-reduces it across the process mesh, then feeds the
-    global result back via ``nhc_thermostat_chain_update(..., compute_ke=False)``.
-    Using this kernel for the local reduction gives machine-precision parity
-    with the single-process reference.
+    Lets a caller compute 2*KE separately, optionally post-process it, and feed
+    it back via ``nhc_thermostat_chain_update(..., compute_ke=False)``. Using
+    this kernel for the reduction gives machine-precision parity with the
+    value the chain update would otherwise compute itself.
 
     Parameters
     ----------
@@ -1168,8 +1167,8 @@ def nhc_thermostat_chain_update(
         2*KE = sum(m * v^2) per system. When compute_ke is True (default) this
         is a scratch array zeroed and filled internally from velocities/masses
         before use. When compute_ke is False it is an INPUT supplying a
-        caller-computed (e.g. domain-decomposed, mesh-reduced) global 2*KE; it
-        is not zeroed. Either way the chain forward sweep rescales it in place.
+        caller-precomputed 2*KE; it is not zeroed. Either way the chain forward
+        sweep rescales it in place.
         Shape (1,) for single system, (num_systems,) for batched.
     total_scale : wp.array
         Scratch array for accumulated velocity scale factor.
@@ -1192,11 +1191,9 @@ def nhc_thermostat_chain_update(
         Warp device. If None, inferred from velocities.
     compute_ke : bool, optional
         If True (default), recompute 2*KE from velocities/masses internally
-        (byte-identical to legacy behavior). If False, trust the global 2*KE
-        supplied in ``ke2`` instead of recomputing it from the local atom set
-        — used under domain decomposition, where the caller all-reduces the
-        per-rank 2*KE across the process mesh and feeds the global value back.
-        See ``nhc_compute_2ke`` for the matching reduction helper.
+        (byte-identical to legacy behavior). If False, use the caller-supplied
+        value already in ``ke2`` instead of recomputing it. See
+        ``nhc_compute_2ke`` for the matching reduction helper.
     """
     if device is None:
         device = velocities.device
@@ -1227,9 +1224,8 @@ def nhc_thermostat_chain_update(
         )
 
     # Compute 2*KE - ke2 is zeroed internally before each use UNLESS the caller
-    # supplied it (e.g. a domain-decomposed global reduction performed outside
-    # this kernel). When compute_ke is False, ke2 arrives pre-filled with the
-    # global 2*KE and is NOT zeroed — the caller owns it.
+    # supplied it. When compute_ke is False, ke2 arrives pre-filled and is NOT
+    # zeroed — the caller owns it.
     vec_dtype = velocities.dtype
     chain_dtype = eta.dtype
     n_scale = num_systems if is_batched else 1
@@ -1440,8 +1436,8 @@ def nhc_thermostat_chain_update_out(
     device : str, optional
         Warp device. If None, inferred from velocities.
     compute_ke : bool, optional
-        If True (default), recompute 2*KE internally. If False, trust the
-        caller-supplied global 2*KE in ``ke2``. See
+        If True (default), recompute 2*KE internally. If False, use the
+        caller-supplied value in ``ke2``. See
         ``nhc_thermostat_chain_update`` for details.
 
     Returns
