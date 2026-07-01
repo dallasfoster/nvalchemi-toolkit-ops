@@ -1772,7 +1772,6 @@ class TestNHCComputeKE:
             masses,
             ke2,
             batch_idx=batch_idx,
-            num_systems=num_systems,
             device=device,
         )
         wp.synchronize_device(device)
@@ -1953,7 +1952,6 @@ class TestNHCComputeKE:
             supplied["masses"],
             ke2_in,
             batch_idx=batch_idx,
-            num_systems=num_systems,
             device=device,
         )
         run(supplied, ke2_in, False)

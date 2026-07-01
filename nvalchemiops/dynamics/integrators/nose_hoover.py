@@ -1057,7 +1057,6 @@ def nhc_compute_2ke(
     masses: wp.array,
     ke2: wp.array,
     batch_idx: wp.array = None,
-    num_systems: int = 1,
     device: str = None,
 ) -> wp.array:
     """
@@ -1076,12 +1075,11 @@ def nhc_compute_2ke(
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,).
     ke2 : wp.array
-        Output 2*KE. Shape (1,) for single system, (num_systems,) for batched.
-        Zeroed internally before accumulation. MODIFIED in-place.
+        Output 2*KE. Shape (1,) for single system, (num_systems,) for batched
+        (its length sets the number of systems). Zeroed internally before
+        accumulation. MODIFIED in-place.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Required for batched mode.
-    num_systems : int, optional
-        Number of systems for batched mode. Default: 1.
     device : str, optional
         Warp device. If None, inferred from velocities.
 
@@ -1409,7 +1407,10 @@ def nhc_thermostat_chain_update_out(
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
     ke2 : wp.array
-        Scratch array for 2*KE computation. Zeroed internally before each use.
+        2*KE = sum(m * v^2) per system. Zeroed and filled internally when
+        compute_ke is True (default); when compute_ke is False it is an INPUT
+        supplying a caller-precomputed 2*KE that is not zeroed. See
+        ``nhc_thermostat_chain_update``.
         Shape (1,) for single system, (num_systems,) for batched.
     total_scale : wp.array
         Scratch array for accumulated velocity scale factor.
