@@ -1052,6 +1052,71 @@ def nhc_compute_masses(
     return masses
 
 
+def nhc_compute_2ke(
+    velocities: wp.array,
+    masses: wp.array,
+    ke2: wp.array,
+    batch_idx: wp.array = None,
+    device: str = None,
+) -> wp.array:
+    r"""
+    Fill ``ke2[s]`` with :math:`\sum_{i \in s} m_i \lVert \mathbf{v}_i \rVert^2`
+    (i.e. :math:`2\,\mathrm{KE}` per system) — the same reduction that
+    ``nhc_thermostat_chain_update`` performs internally, exposed standalone.
+
+    Lets a caller compute :math:`2\,\mathrm{KE}` separately, optionally
+    post-process it, and feed it back via
+    ``nhc_thermostat_chain_update(..., compute_ke=False)``. Using this kernel for
+    the reduction gives machine-precision parity with the value the chain update
+    would otherwise compute itself.
+
+    Parameters
+    ----------
+    velocities : wp.array(dtype=wp.vec3f or wp.vec3d)
+        Atomic velocities. Shape (N,).
+    masses : wp.array(dtype=wp.float32 or wp.float64)
+        Atomic masses. Shape (N,).
+    ke2 : wp.array
+        Output :math:`2\,\mathrm{KE}`. Shape (1,) for single system,
+        (num_systems,) for batched (its length sets the number of systems).
+        Zeroed internally before accumulation. MODIFIED in-place.
+    batch_idx : wp.array(dtype=wp.int32), optional
+        System index for each atom. Required for batched mode.
+    device : str, optional
+        Warp device. If None, inferred from velocities.
+
+    Returns
+    -------
+    wp.array
+        The ``ke2`` array, filled with :math:`2\,\mathrm{KE}` per system.
+    """
+    if device is None:
+        device = velocities.device
+
+    num_atoms = velocities.shape[0]
+    is_batched = batch_idx is not None
+    vec_dtype = velocities.dtype
+    out_dtype = ke2.dtype
+
+    ke2.zero_()
+    if is_batched:
+        wp.launch(
+            _batch_compute_2ke_kernel_overload[(vec_dtype, out_dtype)],
+            dim=num_atoms,
+            inputs=[velocities, masses, batch_idx, ke2],
+            device=device,
+        )
+    else:
+        wp.launch(
+            _compute_2ke_kernel_overload[(vec_dtype, out_dtype)],
+            dim=num_atoms,
+            inputs=[velocities, masses, ke2],
+            device=device,
+        )
+
+    return ke2
+
+
 def nhc_thermostat_chain_update(
     velocities: wp.array,
     masses: wp.array,
@@ -1069,6 +1134,7 @@ def nhc_thermostat_chain_update(
     batch_idx: wp.array = None,
     num_systems: int = 1,
     device: str = None,
+    compute_ke: bool = True,
 ) -> None:
     """
     Propagate Nosé-Hoover chain and scale velocities (in-place).
@@ -1098,7 +1164,11 @@ def nhc_thermostat_chain_update(
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (num_systems,).
     ke2 : wp.array
-        Scratch array for 2*KE computation. Zeroed internally before each use.
+        2*KE = sum(m * v^2) per system. When compute_ke is True (default) this
+        is a scratch array zeroed and filled internally from velocities/masses
+        before use. When compute_ke is False it is an INPUT supplying a
+        caller-precomputed 2*KE; it is not zeroed. Either way the chain forward
+        sweep rescales it in place.
         Shape (1,) for single system, (num_systems,) for batched.
     total_scale : wp.array
         Scratch array for accumulated velocity scale factor.
@@ -1119,6 +1189,11 @@ def nhc_thermostat_chain_update(
         Number of systems for batched mode. Default: 1.
     device : str, optional
         Warp device. If None, inferred from velocities.
+    compute_ke : bool, optional
+        If True (default), recompute 2*KE from velocities/masses internally
+        (byte-identical to legacy behavior). If False, use the caller-supplied
+        value already in ``ke2`` instead of recomputing it. See
+        ``nhc_compute_2ke`` for the matching reduction helper.
     """
     if device is None:
         device = velocities.device
@@ -1148,25 +1223,28 @@ def nhc_thermostat_chain_update(
             f"Chain length {chain_length} exceeds maximum {MAX_CHAIN_LENGTH}"
         )
 
-    # Compute 2*KE - ke2 is zeroed internally before each use
+    # Compute 2*KE - ke2 is zeroed internally before each use UNLESS the caller
+    # supplied it. When compute_ke is False, ke2 arrives pre-filled and is NOT
+    # zeroed — the caller owns it.
     vec_dtype = velocities.dtype
     chain_dtype = eta.dtype
     n_scale = num_systems if is_batched else 1
-    ke2.zero_()
-    if is_batched:
-        wp.launch(
-            _batch_compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
-            dim=num_atoms,
-            inputs=[velocities, masses, batch_idx, ke2],
-            device=device,
-        )
-    else:
-        wp.launch(
-            _compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
-            dim=num_atoms,
-            inputs=[velocities, masses, ke2],
-            device=device,
-        )
+    if compute_ke:
+        ke2.zero_()
+        if is_batched:
+            wp.launch(
+                _batch_compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
+                dim=num_atoms,
+                inputs=[velocities, masses, batch_idx, ke2],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _compute_2ke_kernel_overload[(vec_dtype, chain_dtype)],
+                dim=num_atoms,
+                inputs=[velocities, masses, ke2],
+                device=device,
+            )
 
     # Run Yoshida-Suzuki sub-steps
     for w in weights:
@@ -1307,6 +1385,7 @@ def nhc_thermostat_chain_update_out(
     batch_idx: wp.array = None,
     num_systems: int = 1,
     device: str = None,
+    compute_ke: bool = True,
 ) -> tuple[wp.array, wp.array, wp.array]:
     """
     Propagate Nosé-Hoover chain and scale velocities (non-mutating).
@@ -1330,7 +1409,10 @@ def nhc_thermostat_chain_update_out(
     ndof : wp.array(dtype=wp.float64)
         Degrees of freedom. Shape (1,) or (B,).
     ke2 : wp.array
-        Scratch array for 2*KE computation. Zeroed internally before each use.
+        2*KE = sum(m * v^2) per system. Zeroed and filled internally when
+        compute_ke is True (default); when compute_ke is False it is an INPUT
+        supplying a caller-precomputed 2*KE that is not zeroed. See
+        ``nhc_thermostat_chain_update``.
         Shape (1,) for single system, (num_systems,) for batched.
     total_scale : wp.array
         Scratch array for accumulated velocity scale factor.
@@ -1356,6 +1438,10 @@ def nhc_thermostat_chain_update_out(
         Number of systems for batched mode. Default: 1.
     device : str, optional
         Warp device. If None, inferred from velocities.
+    compute_ke : bool, optional
+        If True (default), recompute 2*KE internally. If False, use the
+        caller-supplied value in ``ke2``. See
+        ``nhc_thermostat_chain_update`` for details.
 
     Returns
     -------
@@ -1392,6 +1478,7 @@ def nhc_thermostat_chain_update_out(
         batch_idx=batch_idx,
         num_systems=num_systems,
         device=device,
+        compute_ke=compute_ke,
     )
 
     return velocities_out, eta_out, eta_dot_out
