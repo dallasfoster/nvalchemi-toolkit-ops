@@ -1902,10 +1902,23 @@ class TestEstimateMaxNeighborsDefaults:
         assert estimate_max_neighbors(-1.0) == 0
 
     @pytest.mark.parametrize("cutoff", [0.5, 1.5, 2.67])
-    def test_short_cutoff_respects_floor(self, cutoff):
-        """Short cutoffs must not collapse to the old 16-neighbor floor, which
-        underestimated clustered / non-equilibrium configurations."""
-        assert estimate_max_neighbors(cutoff) >= 64
+    def test_short_cutoff_respects_default_lower_bound(self, cutoff):
+        """Short cutoffs are floored at the default lower bound (16)."""
+        assert estimate_max_neighbors(cutoff) >= 16
+
+    @pytest.mark.parametrize("cutoff", [0.5, 1.5, 2.67])
+    def test_lower_bound_kwarg_raises_floor(self, cutoff):
+        """max_neighbors_lower_bound raises the floor for short cutoffs where the
+        density estimate would otherwise fall below it."""
+        assert estimate_max_neighbors(cutoff, max_neighbors_lower_bound=64) == 64
+
+    def test_lower_bound_does_not_cap_estimate(self):
+        """A lower bound below the density estimate leaves the estimate
+        unchanged (it is a floor, not a cap)."""
+        cutoff = 8.5
+        assert estimate_max_neighbors(
+            cutoff, max_neighbors_lower_bound=16
+        ) == estimate_max_neighbors(cutoff, max_neighbors_lower_bound=1)
 
     def test_density_scales_estimate(self):
         """A higher atomic_density must raise the estimate (the sole knob for
@@ -1939,32 +1952,3 @@ class TestEstimateMaxNeighborsDefaults:
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             estimate_max_neighbors(5.0, atomic_density=0.3)
-
-    def test_env_var_overrides_floor(self, monkeypatch):
-        """ALCHEMI_MIN_MAX_NEIGHBORS overrides the neighbor-count floor; bad
-        values fall back to the default."""
-        from nvalchemiops.neighbors import neighbor_utils
-
-        monkeypatch.setenv("ALCHEMI_MIN_MAX_NEIGHBORS", "256")
-        assert neighbor_utils._resolve_min_max_neighbors() == 256
-
-        monkeypatch.setenv("ALCHEMI_MIN_MAX_NEIGHBORS", "not-an-int")
-        with pytest.warns(RuntimeWarning, match="ALCHEMI_MIN_MAX_NEIGHBORS"):
-            assert neighbor_utils._resolve_min_max_neighbors() == 64
-
-        # Zero and negative are rejected: a zero floor would let short cutoffs
-        # collapse back to the 16-neighbor minimum the floor exists to prevent.
-        for bad in ("0", "-8"):
-            monkeypatch.setenv("ALCHEMI_MIN_MAX_NEIGHBORS", bad)
-            with pytest.warns(RuntimeWarning, match="non-positive"):
-                assert neighbor_utils._resolve_min_max_neighbors() == 64
-
-        monkeypatch.delenv("ALCHEMI_MIN_MAX_NEIGHBORS", raising=False)
-        assert neighbor_utils._resolve_min_max_neighbors() == 64
-
-    def test_floor_respects_env_override(self, monkeypatch):
-        """estimate_max_neighbors honors an overridden floor for short cutoffs."""
-        from nvalchemiops.neighbors import neighbor_utils
-
-        monkeypatch.setattr(neighbor_utils, "_MIN_MAX_NEIGHBORS", 128)
-        assert neighbor_utils.estimate_max_neighbors(0.5) == 128

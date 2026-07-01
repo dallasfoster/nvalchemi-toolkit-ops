@@ -213,13 +213,13 @@ def _make_estimate_cell_list_sizes_kernel(
 
         # Use int64 so the cell-count product cannot overflow int32 and wrap
         # negative (which would skip the clamp below).
-        max_nbins_64 = wp.int64(max_nbins)
+        max_nbins_dp = wp.int64(max_nbins)
         total_cells = (
             wp.int64(cells_per_dimension[0])
             * wp.int64(cells_per_dimension[1])
             * wp.int64(cells_per_dimension[2])
         )
-        while total_cells > max_nbins_64:
+        while total_cells > max_nbins_dp:
             for dim in range(3):
                 cells_per_dimension[dim] = max(cells_per_dimension[dim] // 2, 1)
             total_cells = (
@@ -381,14 +381,14 @@ def _make_construct_bin_size_kernel(
 
         # Use int64 so neither the product nor the num_systems multiply can
         # overflow int32 and wrap negative (which would skip the clamp below).
-        max_total_cells_64 = wp.int64(max_total_cells)
-        num_systems_64 = wp.int64(num_systems)
+        max_total_cells_dp = wp.int64(max_total_cells)
+        num_systems_dp = wp.int64(num_systems)
         total_cells = (
             wp.int64(cells_per_dimension[0])
             * wp.int64(cells_per_dimension[1])
             * wp.int64(cells_per_dimension[2])
         )
-        while total_cells * num_systems_64 > max_total_cells_64:
+        while total_cells * num_systems_dp > max_total_cells_dp:
             for dim in range(3):
                 cells_per_dimension[dim] = max(cells_per_dimension[dim] // 2, 1)
             total_cells = (
