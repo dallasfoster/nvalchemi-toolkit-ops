@@ -1557,10 +1557,11 @@ def compute_kinetic_tensor(
     batch_idx: wp.array = None,
     device: str = None,
 ) -> wp.array:
-    """
-    Fill kinetic_tensors[s] = sum_{i in s} m_i (v_i ⊗ v_i) (vec9 layout) — the
-    same accumulation ``compute_pressure_tensor`` performs internally, exposed
-    standalone.
+    r"""
+    Fill ``kinetic_tensors[s]`` with
+    :math:`\sum_{i \in s} m_i (\mathbf{v}_i \otimes \mathbf{v}_i)` (vec9 layout)
+    — the same accumulation ``compute_pressure_tensor`` performs internally,
+    exposed standalone.
 
     Lets a caller compute the kinetic tensor separately, optionally
     post-process it, and feed it back via
@@ -1585,7 +1586,8 @@ def compute_kinetic_tensor(
     Returns
     -------
     wp.array
-        The ``kinetic_tensors`` array, filled with sum m (v ⊗ v) per system.
+        The ``kinetic_tensors`` array, filled with
+        :math:`\sum_i m_i (\mathbf{v}_i \otimes \mathbf{v}_i)` per system.
     """
     if device is None:
         device = velocities.device
@@ -1616,10 +1618,10 @@ def compute_pressure_tensor(
     device: str = None,
     compute_kinetic: bool = True,
 ) -> wp.array:
-    """
-    Compute full pressure tensor.
-
-    P = (kinetic + virial) / V
+    r"""
+    Compute full pressure tensor :math:`\mathbf{P} = (\mathbf{K} + \mathbf{W}) / V`,
+    with kinetic term :math:`\mathbf{K}`, virial term :math:`\mathbf{W}`, and
+    cell volume :math:`V`.
 
     Parameters
     ----------
@@ -1632,9 +1634,10 @@ def compute_pressure_tensor(
     cells : wp.array(dtype=wp.mat33f or wp.mat33d)
         Cell matrices. Shape (B,).
     kinetic_tensors : wp.array(dtype=scalar, ndim=2)
-        Kinetic tensor K[s] = sum_{i in s} m_i (v_i ⊗ v_i), vec9 layout. Shape
-        (B, 9). When compute_kinetic is True (default) this is a scratch array
-        zeroed and filled internally from velocities/masses. When
+        Kinetic tensor
+        :math:`\mathbf{K}_s = \sum_{i \in s} m_i (\mathbf{v}_i \otimes \mathbf{v}_i)`,
+        vec9 layout. Shape (B, 9). When compute_kinetic is True (default) this is
+        a scratch array zeroed and filled internally from velocities/masses. When
         compute_kinetic is False it is an INPUT supplying a caller-precomputed
         kinetic tensor; it is not zeroed or recomputed.
     pressure_tensors : wp.array(dtype=vec9f or vec9d)

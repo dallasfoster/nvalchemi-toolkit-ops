@@ -1059,14 +1059,16 @@ def nhc_compute_2ke(
     batch_idx: wp.array = None,
     device: str = None,
 ) -> wp.array:
-    """
-    Fill ke2[s] = sum_{i in s} m_i * ||v_i||^2 — the same 2*KE reduction that
+    r"""
+    Fill ``ke2[s]`` with :math:`\sum_{i \in s} m_i \lVert \mathbf{v}_i \rVert^2`
+    (i.e. :math:`2\,\mathrm{KE}` per system) — the same reduction that
     ``nhc_thermostat_chain_update`` performs internally, exposed standalone.
 
-    Lets a caller compute 2*KE separately, optionally post-process it, and feed
-    it back via ``nhc_thermostat_chain_update(..., compute_ke=False)``. Using
-    this kernel for the reduction gives machine-precision parity with the
-    value the chain update would otherwise compute itself.
+    Lets a caller compute :math:`2\,\mathrm{KE}` separately, optionally
+    post-process it, and feed it back via
+    ``nhc_thermostat_chain_update(..., compute_ke=False)``. Using this kernel for
+    the reduction gives machine-precision parity with the value the chain update
+    would otherwise compute itself.
 
     Parameters
     ----------
@@ -1075,9 +1077,9 @@ def nhc_compute_2ke(
     masses : wp.array(dtype=wp.float32 or wp.float64)
         Atomic masses. Shape (N,).
     ke2 : wp.array
-        Output 2*KE. Shape (1,) for single system, (num_systems,) for batched
-        (its length sets the number of systems). Zeroed internally before
-        accumulation. MODIFIED in-place.
+        Output :math:`2\,\mathrm{KE}`. Shape (1,) for single system,
+        (num_systems,) for batched (its length sets the number of systems).
+        Zeroed internally before accumulation. MODIFIED in-place.
     batch_idx : wp.array(dtype=wp.int32), optional
         System index for each atom. Required for batched mode.
     device : str, optional
@@ -1086,7 +1088,7 @@ def nhc_compute_2ke(
     Returns
     -------
     wp.array
-        The ``ke2`` array, filled with 2*KE per system.
+        The ``ke2`` array, filled with :math:`2\,\mathrm{KE}` per system.
     """
     if device is None:
         device = velocities.device
