@@ -225,7 +225,7 @@ class TestBatchCellListAPI:
         batch_idx = torch.cat(batch_idx_list, dim=0)
 
         max_neighbors = estimate_max_neighbors(
-            cutoff, atomic_density=0.35, safety_factor=5.0
+            cutoff, atomic_density=0.35 * 5.0
         )
         neighbor_list, _, u = batch_cell_list(
             positions,
@@ -327,7 +327,7 @@ class TestBatchCellListAPI:
 
         if preallocate:
             max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35, safety_factor=5.0
+                cutoff, atomic_density=0.35 * 5.0
             )
             max_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
                 cell, pbc, cutoff
@@ -378,7 +378,7 @@ class TestBatchCellListAPI:
             )
         else:
             max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35, safety_factor=5.0
+                cutoff, atomic_density=0.35 * 5.0
             )
             results = batch_cell_list(
                 positions,
@@ -490,7 +490,7 @@ class TestBatchCellListAPI:
 
         estimated_density = num_atoms / cell[0].det().abs().item()
         max_neighbors = estimate_max_neighbors(
-            cutoff, atomic_density=estimated_density, safety_factor=5.0
+            cutoff, atomic_density=estimated_density * 5.0
         )
         neighbor_list, _, u = batch_cell_list(
             positions,
@@ -730,6 +730,69 @@ class TestBatchEdgeCases:
 
         with pytest.raises(ValueError, match="max_nbins must be positive"):
             estimate_batch_cell_list_sizes(cell, pbc, 1.0, max_nbins=0)
+
+    @pytest.mark.parametrize("box", [6.0e4, 1.0e5, 1.0e6])
+    def test_large_cell_does_not_overflow(self, device, dtype, box):
+        """A large cell whose per-dimension cell-count product exceeds int32
+        must still yield a positive, clamped estimate (never a negative count
+        from an overflowed multiply), and allocation must succeed."""
+        max_nbins = 8192
+        cell = (torch.eye(3, dtype=dtype, device=device) * box).reshape(1, 3, 3)
+        pbc = torch.ones((1, 3), dtype=torch.bool, device=device)
+
+        max_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
+            cell, pbc, cutoff=8.5, max_nbins=max_nbins
+        )
+        assert 1 <= max_cells <= max_nbins, max_cells
+        # The estimate must feed the allocator without a negative-dim crash.
+        allocate_cell_list(
+            10, max_cells, neighbor_search_radius, torch.device(device)
+        )
+
+    def test_large_cell_batched_mixed(self, device, dtype):
+        """A batch mixing a normal and a huge cell: every system contributes at
+        least one cell and the total stays within the per-system cap."""
+        max_nbins = 8192
+        normal = torch.eye(3, dtype=dtype, device=device) * 12.0
+        huge = torch.eye(3, dtype=dtype, device=device) * 1.0e5
+        cell = torch.stack([normal, huge], dim=0)
+        pbc = torch.ones((2, 3), dtype=torch.bool, device=device)
+
+        max_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
+            cell, pbc, cutoff=8.5, max_nbins=max_nbins
+        )
+        num_systems = 2
+        assert num_systems <= max_cells <= max_nbins * num_systems, max_cells
+        allocate_cell_list(
+            10, max_cells, neighbor_search_radius, torch.device(device)
+        )
+
+    def test_large_cell_build_finds_neighbors(self, device, dtype):
+        """Building on a large periodic cell must not overflow the cell-count
+        math (estimate and construct stay consistent) and must still find the
+        correct short-range pair. Two atoms 3.0 apart in an 8e4 box have only
+        each other within a 8.5 cutoff (periodic images are ~8e4 away)."""
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=dtype, device=device
+        )
+        cell = (torch.eye(3, dtype=dtype, device=device) * 8.0e4).reshape(1, 3, 3)
+        pbc = torch.ones((1, 3), dtype=torch.bool, device=device)
+        batch_idx = torch.zeros(2, dtype=torch.int32, device=device)
+        cutoff = 8.5
+
+        neighbor_list, _, _ = batch_cell_list(
+            positions, cutoff, cell, pbc, batch_idx, return_neighbor_list=True
+        )
+        i, j = neighbor_list
+        pairs = {(int(a), int(b)) for a, b in zip(i.tolist(), j.tolist())}
+        assert pairs == {(0, 1), (1, 0)}, pairs
+
+    def test_allocate_cell_list_rejects_negative(self, device, dtype):
+        """allocate_cell_list must reject a negative cell count with a clear
+        error rather than crashing inside torch.zeros."""
+        neighbor_search_radius = torch.ones((3,), dtype=torch.int32, device=device)
+        with pytest.raises(ValueError, match="max_total_cells=-1 < 0"):
+            allocate_cell_list(4, -1, neighbor_search_radius, torch.device(device))
 
     def test_empty_batch_build_cell_list(self, device, dtype):
         """Test with empty batch."""

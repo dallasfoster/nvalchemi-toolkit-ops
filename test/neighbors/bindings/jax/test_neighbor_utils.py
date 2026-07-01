@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import pytest
 
 from nvalchemiops.jax.neighbors.neighbor_utils import (
+    allocate_cell_list,
     compute_naive_num_shifts,
     get_neighbor_list_from_neighbor_matrix,
     prepare_batch_idx_ptr,
@@ -33,6 +34,22 @@ from nvalchemiops.neighbors.neighbor_utils import NeighborOverflowError
 from .conftest import requires_gpu
 
 pytestmark = requires_gpu
+
+# ==============================================================================
+# Tests: allocate_cell_list
+# ==============================================================================
+
+
+class TestAllocateCellList:
+    """Test allocate_cell_list guards."""
+
+    def test_rejects_negative_max_total_cells(self):
+        """A negative cell count must raise a clear error rather than crashing
+        inside the array allocation."""
+        neighbor_search_radius = jnp.ones((3,), dtype=jnp.int32)
+        with pytest.raises(ValueError, match="max_total_cells=-1 < 0"):
+            allocate_cell_list(4, -1, neighbor_search_radius)
+
 
 # ==============================================================================
 # Tests: compute_naive_num_shifts

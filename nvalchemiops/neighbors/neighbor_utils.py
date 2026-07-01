@@ -21,6 +21,7 @@ See `nvalchemiops.torch.neighbors` for PyTorch bindings.
 
 import contextlib
 import math
+import os
 import warnings
 from functools import lru_cache
 from typing import Any
@@ -950,10 +951,50 @@ def compute_naive_num_shifts(
     )
 
 
+# Default lower bound on the estimated neighbor count; short cutoffs otherwise
+# collapse toward the 16-neighbor alignment floor, underestimating dense systems.
+_DEFAULT_MIN_MAX_NEIGHBORS = 64
+
+
+def _resolve_min_max_neighbors() -> int:
+    """Resolve the neighbor-count floor, honoring ``ALCHEMI_MIN_MAX_NEIGHBORS``.
+
+    Systems whose local density routinely exceeds the bulk average can raise the
+    floor via the ``ALCHEMI_MIN_MAX_NEIGHBORS`` environment variable. A missing,
+    non-integer, or negative value falls back to the default.
+    """
+    raw = os.environ.get("ALCHEMI_MIN_MAX_NEIGHBORS")
+    if raw is None:
+        return _DEFAULT_MIN_MAX_NEIGHBORS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        warnings.warn(
+            f"Ignoring non-integer ALCHEMI_MIN_MAX_NEIGHBORS={raw!r}; "
+            f"using {_DEFAULT_MIN_MAX_NEIGHBORS}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_MIN_MAX_NEIGHBORS
+    if value < 0:
+        warnings.warn(
+            f"Ignoring negative ALCHEMI_MIN_MAX_NEIGHBORS={raw!r}; "
+            f"using {_DEFAULT_MIN_MAX_NEIGHBORS}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_MIN_MAX_NEIGHBORS
+    return value
+
+
+# Resolved once at import; override via the ALCHEMI_MIN_MAX_NEIGHBORS env var.
+_MIN_MAX_NEIGHBORS = _resolve_min_max_neighbors()
+
+
 def estimate_max_neighbors(
     cutoff: float,
     atomic_density: float = 0.2,
-    safety_factor: float = 1.0,
+    safety_factor: float | None = None,
 ) -> int:
     r"""Estimate maximum neighbors per atom based on volume calculations.
 
@@ -966,15 +1007,23 @@ def estimate_max_neighbors(
     cutoff : float
         Maximum distance for considering atoms as neighbors.
     atomic_density : float, optional
-        Atomic density in atoms per unit volume. Default is 0.2.
-    safety_factor : float
-        Safety factor to multiply the estimated number of neighbors. Default is 1.0.
+        Atomic density in atoms per unit volume. Default is 0.2. Increase this
+        for denser or clustered systems whose local density exceeds the bulk
+        average (it scales the estimate linearly).
+    safety_factor : float, optional
+        .. deprecated::
+            ``safety_factor`` scales the estimate identically to
+            ``atomic_density``; set ``atomic_density`` instead, or raise the
+            neighbor-count floor with the ``ALCHEMI_MIN_MAX_NEIGHBORS``
+            environment variable. When given, it is folded into
+            ``atomic_density`` (``atomic_density *= safety_factor``).
 
     Returns
     -------
     max_neighbors_estimate : int
         Conservative estimate of maximum neighbors per atom. Returns 0 for
-        empty systems.
+        empty systems, and never less than the neighbor-count floor (64 by
+        default, or ``ALCHEMI_MIN_MAX_NEIGHBORS``) for a positive cutoff.
 
     Notes
     -----
@@ -982,7 +1031,7 @@ def estimate_max_neighbors(
 
     .. math::
 
-        \text{neighbors} = \text{safety\_factor} \times \text{density} \times V_{\text{sphere}}
+        \text{neighbors} = \text{density} \times V_{\text{sphere}}
 
     where the cutoff sphere volume is:
 
@@ -990,14 +1039,26 @@ def estimate_max_neighbors(
 
         V_{\text{sphere}} = \frac{4}{3}\pi r^3
 
-    The result is rounded up to the multiple of 16 for memory alignment.
+    The result is floored at ``ALCHEMI_MIN_MAX_NEIGHBORS`` (64 by default) and
+    rounded up to the next multiple of 16 for memory alignment.
     """
+    if safety_factor is not None:
+        warnings.warn(
+            "The 'safety_factor' argument to estimate_max_neighbors is "
+            "deprecated; it scales the estimate identically to 'atomic_density'. "
+            "Set 'atomic_density' instead, or raise the neighbor-count floor via "
+            "the ALCHEMI_MIN_MAX_NEIGHBORS environment variable.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        atomic_density = safety_factor * atomic_density
     if cutoff <= 0:
         return 0
     cutoff_sphere_volume = atomic_density * (4.0 / 3.0) * math.pi * (cutoff**3)
 
-    # Estimate neighbors based on density and cutoff volume
-    expected_neighbors = max(1, safety_factor * cutoff_sphere_volume)
+    # Estimate neighbors from density and cutoff volume, floored to keep a
+    # safety margin for clustered / non-equilibrium configurations.
+    expected_neighbors = max(_MIN_MAX_NEIGHBORS, cutoff_sphere_volume)
 
     # Round up to multiple of 16 for memory alignment and safety
     max_neighbors_estimate = int(math.ceil(expected_neighbors / 16)) * 16

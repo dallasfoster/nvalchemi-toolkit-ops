@@ -31,6 +31,20 @@
 
 ### Fixed
 
+- Cell-list size estimation no longer overflows when a cell is large relative
+  to the cutoff: the per-dimension cell-count product is now computed
+  overflow-safe (int64) and clamped per system, so `estimate_cell_list_sizes` /
+  `estimate_batch_cell_list_sizes` always return a positive, capped count
+  instead of a negative one that crashed `allocate_cell_list`. The estimate
+  wrappers and `allocate_cell_list` (Torch and JAX) also validate the count and
+  raise a clear error on a bad value.
+- `estimate_max_neighbors` raises its minimum floor to 64 (overridable via the
+  `ALCHEMI_MIN_MAX_NEIGHBORS` environment variable), preventing
+  `NeighborOverflowError` at short cutoffs in clustered or non-equilibrium
+  configurations. Its `safety_factor` argument is deprecated (it scaled the
+  estimate identically to `atomic_density`); it now emits a `DeprecationWarning`
+  and is folded into `atomic_density`. Callers needing more headroom should
+  raise `atomic_density` or the floor env var (#114).
 - Naive PBC neighbor wrapping now leaves non-periodic axes unwrapped when
   per-axis `pbc` flags are supplied, fixing partial-PBC and non-periodic
   systems (#104).
