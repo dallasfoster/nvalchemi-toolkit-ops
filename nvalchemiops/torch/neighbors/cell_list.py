@@ -288,8 +288,18 @@ def estimate_cell_list_sizes(
         device=wp_device,
     )
 
+    total_cells = int(max_total_cells.item())
+    # A non-positive count means a bad (overflowed) estimate that must not reach
+    # the allocator.
+    if total_cells < 1:
+        raise RuntimeError(
+            "estimate_cell_list_sizes computed a non-positive cell count "
+            f"(max_total_cells={total_cells}) at cutoff={cutoff}. The cell must "
+            "yield at least one cell; check for a degenerate or excessively "
+            "large cell."
+        )
     return (
-        max_total_cells.item(),
+        total_cells,
         neighbor_search_radius,
     )
 

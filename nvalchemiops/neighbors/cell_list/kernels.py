@@ -194,7 +194,10 @@ def _make_estimate_cell_list_sizes_kernel(
             face_distance = type(cell_size)(1.0) / wp.length(
                 inverse_cell_transpose[dim]
             )
-            cells_per_dimension[dim] = max(wp.int32(face_distance / cell_size), 1)
+            # Clamp before the int32 cast: a single dimension never needs more
+            # than max_nbins cells, and an unclamped ratio would overflow.
+            ratio = wp.min(face_distance / cell_size, type(cell_size)(max_nbins))
+            cells_per_dimension[dim] = max(wp.int32(ratio), 1)
 
         for dim in range(3):
             pbc_dim = pbc_z
@@ -208,14 +211,21 @@ def _make_estimate_cell_list_sizes_kernel(
                 while cells_per_dimension[dim] < MIN_CELLS_PER_DIMENSION:
                     cells_per_dimension[dim] = cells_per_dimension[dim] * 2
 
-        total_cells = int(
-            cells_per_dimension[0] * cells_per_dimension[1] * cells_per_dimension[2]
+        # Use int64 so the cell-count product cannot overflow int32 and wrap
+        # negative (which would skip the clamp below).
+        max_nbins_dp = wp.int64(max_nbins)
+        total_cells = (
+            wp.int64(cells_per_dimension[0])
+            * wp.int64(cells_per_dimension[1])
+            * wp.int64(cells_per_dimension[2])
         )
-        while total_cells > max_nbins:
+        while total_cells > max_nbins_dp:
             for dim in range(3):
                 cells_per_dimension[dim] = max(cells_per_dimension[dim] // 2, 1)
-            total_cells = int(
-                cells_per_dimension[0] * cells_per_dimension[1] * cells_per_dimension[2]
+            total_cells = (
+                wp.int64(cells_per_dimension[0])
+                * wp.int64(cells_per_dimension[1])
+                * wp.int64(cells_per_dimension[2])
             )
 
         search_radius = wp.vec3i(0, 0, 0)
@@ -239,7 +249,8 @@ def _make_estimate_cell_list_sizes_kernel(
                     )
                 )
 
-        number_of_cells[system_idx] = total_cells
+        # total_cells is now in [1, max_nbins], so the int32 cast is safe.
+        number_of_cells[system_idx] = wp.int32(total_cells)
         if BATCHED:
             neighbor_search_radius_batch[system_idx] = search_radius
         else:
@@ -348,9 +359,13 @@ def _make_construct_bin_size_kernel(
             face_distance = type(target_cell_size)(1.0) / wp.length(
                 inverse_cell_transpose[dim]
             )
-            cells_per_dimension[dim] = max(
-                wp.int32(face_distance / target_cell_size), 1
+            # Clamp before the int32 cast: a single dimension never needs more
+            # than max_total_cells cells, and an unclamped ratio would overflow.
+            ratio = wp.min(
+                face_distance / target_cell_size,
+                type(target_cell_size)(max_total_cells),
             )
+            cells_per_dimension[dim] = max(wp.int32(ratio), 1)
 
         for dim in range(3):
             pbc_dim = pbc_z
@@ -364,14 +379,22 @@ def _make_construct_bin_size_kernel(
                 while cells_per_dimension[dim] < MIN_CELLS_PER_DIMENSION:
                     cells_per_dimension[dim] = cells_per_dimension[dim] * 2
 
-        total_cells = int(
-            cells_per_dimension[0] * cells_per_dimension[1] * cells_per_dimension[2]
+        # Use int64 so neither the product nor the num_systems multiply can
+        # overflow int32 and wrap negative (which would skip the clamp below).
+        max_total_cells_dp = wp.int64(max_total_cells)
+        num_systems_dp = wp.int64(num_systems)
+        total_cells = (
+            wp.int64(cells_per_dimension[0])
+            * wp.int64(cells_per_dimension[1])
+            * wp.int64(cells_per_dimension[2])
         )
-        while total_cells * num_systems > max_total_cells:
+        while total_cells * num_systems_dp > max_total_cells_dp:
             for dim in range(3):
                 cells_per_dimension[dim] = max(cells_per_dimension[dim] // 2, 1)
-            total_cells = int(
-                cells_per_dimension[0] * cells_per_dimension[1] * cells_per_dimension[2]
+            total_cells = (
+                wp.int64(cells_per_dimension[0])
+                * wp.int64(cells_per_dimension[1])
+                * wp.int64(cells_per_dimension[2])
             )
 
         if BATCHED:

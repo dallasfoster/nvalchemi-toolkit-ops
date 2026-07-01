@@ -235,8 +235,18 @@ def estimate_batch_cell_list_sizes(
         device=wp_device,
     )
 
+    total_cells = int(max_total_cells.sum().item())
+    # Each system contributes >= 1 cell, so a sum below num_systems means a bad
+    # (overflowed) count that must not reach the allocator.
+    if total_cells < num_systems:
+        raise RuntimeError(
+            "estimate_batch_cell_list_sizes computed a non-positive cell count "
+            f"(total cells summed over {num_systems} system(s) = {total_cells}) "
+            f"at cutoff={cutoff}. Each system must contribute at least one cell; "
+            "check for degenerate or excessively large cells."
+        )
     return (
-        max_total_cells.sum().item(),
+        total_cells,
         neighbor_search_radius,
     )
 

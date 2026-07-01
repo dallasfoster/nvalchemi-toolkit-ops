@@ -540,6 +540,11 @@ def allocate_cell_list(
     nvalchemiops.torch.neighbors.cell_list.build_cell_list : High-level PyTorch wrapper
     nvalchemiops.torch.neighbors.batch_cell_list.batch_build_cell_list : Batched version
     """
+    if max_total_cells < 0:
+        raise ValueError(
+            f"allocate_cell_list: max_total_cells={max_total_cells} < 0 "
+            "(cell-count overflow or bad estimate)."
+        )
     # Detect number of systems from neighbor_search_radius shape
     is_batched = neighbor_search_radius.ndim == 2
     num_systems = neighbor_search_radius.shape[0] if is_batched else 1

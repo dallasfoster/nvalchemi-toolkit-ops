@@ -953,7 +953,8 @@ def compute_naive_num_shifts(
 def estimate_max_neighbors(
     cutoff: float,
     atomic_density: float = 0.2,
-    safety_factor: float = 1.0,
+    safety_factor: float | None = None,
+    max_neighbors_lower_bound: int = 16,
 ) -> int:
     r"""Estimate maximum neighbors per atom based on volume calculations.
 
@@ -966,15 +967,25 @@ def estimate_max_neighbors(
     cutoff : float
         Maximum distance for considering atoms as neighbors.
     atomic_density : float, optional
-        Atomic density in atoms per unit volume. Default is 0.2.
-    safety_factor : float
-        Safety factor to multiply the estimated number of neighbors. Default is 1.0.
+        Atomic density in atoms per unit volume. Default is 0.2. Increase this
+        for denser or clustered systems whose local density exceeds the bulk
+        average (it scales the estimate linearly).
+    safety_factor : float, optional
+        .. deprecated::
+            ``safety_factor`` scales the estimate identically to
+            ``atomic_density``; set ``atomic_density`` instead. When given, it is
+            folded into ``atomic_density`` (``atomic_density *= safety_factor``).
+    max_neighbors_lower_bound : int, optional
+        Lower bound on the returned estimate. Default is 16. Raise it for dense
+        or clustered systems where short cutoffs would otherwise underestimate
+        the neighbor count.
 
     Returns
     -------
     max_neighbors_estimate : int
         Conservative estimate of maximum neighbors per atom. Returns 0 for
-        empty systems.
+        empty systems, and never less than ``max_neighbors_lower_bound`` for a
+        positive cutoff.
 
     Notes
     -----
@@ -982,7 +993,7 @@ def estimate_max_neighbors(
 
     .. math::
 
-        \text{neighbors} = \text{safety\_factor} \times \text{density} \times V_{\text{sphere}}
+        \text{neighbors} = \text{density} \times V_{\text{sphere}}
 
     where the cutoff sphere volume is:
 
@@ -990,14 +1001,24 @@ def estimate_max_neighbors(
 
         V_{\text{sphere}} = \frac{4}{3}\pi r^3
 
-    The result is rounded up to the multiple of 16 for memory alignment.
+    The result is floored at ``max_neighbors_lower_bound`` and rounded up to the
+    next multiple of 16 for memory alignment.
     """
+    if safety_factor is not None:
+        warnings.warn(
+            "The 'safety_factor' argument to estimate_max_neighbors is "
+            "deprecated; it scales the estimate identically to 'atomic_density'. "
+            "Set 'atomic_density' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        atomic_density = safety_factor * atomic_density
     if cutoff <= 0:
         return 0
     cutoff_sphere_volume = atomic_density * (4.0 / 3.0) * math.pi * (cutoff**3)
 
-    # Estimate neighbors based on density and cutoff volume
-    expected_neighbors = max(1, safety_factor * cutoff_sphere_volume)
+    # Floor the estimate so short cutoffs keep a safety margin for dense systems.
+    expected_neighbors = max(max_neighbors_lower_bound, cutoff_sphere_volume)
 
     # Round up to multiple of 16 for memory alignment and safety
     max_neighbors_estimate = int(math.ceil(expected_neighbors / 16)) * 16
