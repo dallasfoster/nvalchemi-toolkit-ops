@@ -682,9 +682,7 @@ class TestCellListOutputFormats:
             pbc = pbc.reshape(1, 3)
 
         if preallocate:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             max_cells, neighbor_search_radius = estimate_cell_list_sizes(
                 cell, pbc, cutoff
             )
@@ -724,9 +722,7 @@ class TestCellListOutputFormats:
                 num_neighbors=num_neighbors,
             )
         else:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             results = cell_list(
                 positions,
                 cutoff,
@@ -757,9 +753,7 @@ class TestCellListOutputFormats:
         cutoff = 3.0
 
         if preallocate:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             max_cells, neighbor_search_radius = estimate_cell_list_sizes(
                 cell, pbc, cutoff
             )
@@ -799,9 +793,7 @@ class TestCellListOutputFormats:
                 num_neighbors=num_neighbors,
             )
         else:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             results = cell_list(
                 positions,
                 cutoff,
@@ -1006,9 +998,7 @@ class TestCellListCompile:
             cutoff,
         )
         density = positions.shape[0] / cell.det()
-        max_neighbors = estimate_max_neighbors(
-            cutoff, atomic_density=density * 2.0
-        )
+        max_neighbors = estimate_max_neighbors(cutoff, atomic_density=density * 2.0)
         cell_list_cache_uncompiled = allocate_cell_list(
             positions.shape[0],
             max_cells,
@@ -1336,9 +1326,7 @@ class TestCellListComponentsAPI:
         positions, cell, _ = create_simple_cubic_system(dtype=dtype, device=device)
         cutoff = 1.1
         density = positions.shape[0] / cell.det().abs().item()
-        max_neighbors = estimate_max_neighbors(
-            cutoff, atomic_density=density * 5.0
-        )
+        max_neighbors = estimate_max_neighbors(cutoff, atomic_density=density * 5.0)
         assert max_neighbors > 0
         assert isinstance(max_neighbors, int)
 
@@ -1963,6 +1951,13 @@ class TestEstimateMaxNeighborsDefaults:
         monkeypatch.setenv("ALCHEMI_MIN_MAX_NEIGHBORS", "not-an-int")
         with pytest.warns(RuntimeWarning, match="ALCHEMI_MIN_MAX_NEIGHBORS"):
             assert neighbor_utils._resolve_min_max_neighbors() == 64
+
+        # Zero and negative are rejected: a zero floor would let short cutoffs
+        # collapse back to the 16-neighbor minimum the floor exists to prevent.
+        for bad in ("0", "-8"):
+            monkeypatch.setenv("ALCHEMI_MIN_MAX_NEIGHBORS", bad)
+            with pytest.warns(RuntimeWarning, match="non-positive"):
+                assert neighbor_utils._resolve_min_max_neighbors() == 64
 
         monkeypatch.delenv("ALCHEMI_MIN_MAX_NEIGHBORS", raising=False)
         assert neighbor_utils._resolve_min_max_neighbors() == 64

@@ -241,8 +241,8 @@ def estimate_batch_cell_list_sizes(
     if total_cells < num_systems:
         raise RuntimeError(
             "estimate_batch_cell_list_sizes computed a non-positive cell count "
-            f"(max_total_cells={total_cells}) for {num_systems} system(s) at "
-            f"cutoff={cutoff}. Each system must contribute at least one cell; "
+            f"(total cells summed over {num_systems} system(s) = {total_cells}) "
+            f"at cutoff={cutoff}. Each system must contribute at least one cell; "
             "check for degenerate or excessively large cells."
         )
     return (

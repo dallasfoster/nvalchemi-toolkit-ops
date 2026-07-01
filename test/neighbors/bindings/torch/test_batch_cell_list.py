@@ -224,9 +224,7 @@ class TestBatchCellListAPI:
         pbc = torch.cat(pbcs_list, dim=0)
         batch_idx = torch.cat(batch_idx_list, dim=0)
 
-        max_neighbors = estimate_max_neighbors(
-            cutoff, atomic_density=0.35 * 5.0
-        )
+        max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
         neighbor_list, _, u = batch_cell_list(
             positions,
             cutoff,
@@ -326,9 +324,7 @@ class TestBatchCellListAPI:
         cutoff = 3.0
 
         if preallocate:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             max_cells, neighbor_search_radius = estimate_batch_cell_list_sizes(
                 cell, pbc, cutoff
             )
@@ -377,9 +373,7 @@ class TestBatchCellListAPI:
                 num_neighbors=num_neighbors,
             )
         else:
-            max_neighbors = estimate_max_neighbors(
-                cutoff, atomic_density=0.35 * 5.0
-            )
+            max_neighbors = estimate_max_neighbors(cutoff, atomic_density=0.35 * 5.0)
             results = batch_cell_list(
                 positions,
                 cutoff,
@@ -745,9 +739,7 @@ class TestBatchEdgeCases:
         )
         assert 1 <= max_cells <= max_nbins, max_cells
         # The estimate must feed the allocator without a negative-dim crash.
-        allocate_cell_list(
-            10, max_cells, neighbor_search_radius, torch.device(device)
-        )
+        allocate_cell_list(10, max_cells, neighbor_search_radius, torch.device(device))
 
     def test_large_cell_batched_mixed(self, device, dtype):
         """A batch mixing a normal and a huge cell: every system contributes at
@@ -763,9 +755,7 @@ class TestBatchEdgeCases:
         )
         num_systems = 2
         assert num_systems <= max_cells <= max_nbins * num_systems, max_cells
-        allocate_cell_list(
-            10, max_cells, neighbor_search_radius, torch.device(device)
-        )
+        allocate_cell_list(10, max_cells, neighbor_search_radius, torch.device(device))
 
     def test_large_cell_build_finds_neighbors(self, device, dtype):
         """Building on a large periodic cell must not overflow the cell-count

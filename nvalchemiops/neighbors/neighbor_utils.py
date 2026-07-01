@@ -961,7 +961,9 @@ def _resolve_min_max_neighbors() -> int:
 
     Systems whose local density routinely exceeds the bulk average can raise the
     floor via the ``ALCHEMI_MIN_MAX_NEIGHBORS`` environment variable. A missing,
-    non-integer, or negative value falls back to the default.
+    non-integer, or non-positive value falls back to the default. A zero floor
+    is rejected because it lets short cutoffs collapse back to the 16-neighbor
+    alignment minimum that the floor exists to prevent.
     """
     raw = os.environ.get("ALCHEMI_MIN_MAX_NEIGHBORS")
     if raw is None:
@@ -976,9 +978,9 @@ def _resolve_min_max_neighbors() -> int:
             stacklevel=2,
         )
         return _DEFAULT_MIN_MAX_NEIGHBORS
-    if value < 0:
+    if value <= 0:
         warnings.warn(
-            f"Ignoring negative ALCHEMI_MIN_MAX_NEIGHBORS={raw!r}; "
+            f"Ignoring non-positive ALCHEMI_MIN_MAX_NEIGHBORS={raw!r}; "
             f"using {_DEFAULT_MIN_MAX_NEIGHBORS}.",
             RuntimeWarning,
             stacklevel=2,
@@ -987,7 +989,8 @@ def _resolve_min_max_neighbors() -> int:
     return value
 
 
-# Resolved once at import; override via the ALCHEMI_MIN_MAX_NEIGHBORS env var.
+# Resolved once at import (not per call), so ``ALCHEMI_MIN_MAX_NEIGHBORS`` must
+# be set before importing this module to take effect.
 _MIN_MAX_NEIGHBORS = _resolve_min_max_neighbors()
 
 
@@ -1040,7 +1043,9 @@ def estimate_max_neighbors(
         V_{\text{sphere}} = \frac{4}{3}\pi r^3
 
     The result is floored at ``ALCHEMI_MIN_MAX_NEIGHBORS`` (64 by default) and
-    rounded up to the next multiple of 16 for memory alignment.
+    rounded up to the next multiple of 16 for memory alignment. The floor is
+    read from the environment once at import, so ``ALCHEMI_MIN_MAX_NEIGHBORS``
+    must be set before importing this module to take effect.
     """
     if safety_factor is not None:
         warnings.warn(
