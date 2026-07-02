@@ -376,79 +376,6 @@ def _compute_kinetic_tensor_kernel(
 
 
 @wp.kernel
-def _compute_kinetic_tensor_tiled_kernel(
-    velocities: wp.array(dtype=Any),
-    masses: wp.array(dtype=Any),
-    batch_idx: wp.array(dtype=wp.int32),
-    kinetic_tensors: wp.array2d(dtype=Any),
-):
-    """Compute kinetic contribution to pressure tensor with tile reductions (batched).
-
-    Launch Grid: dim = [num_atoms], block_dim = TILE_DIM
-    """
-    atom_idx = wp.tid()
-    sys_id = batch_idx[atom_idx]
-    v = velocities[atom_idx]
-    m = masses[atom_idx]
-
-    # Compute local outer product components
-    p_xx = m * v[0] * v[0]
-    p_xy = m * v[0] * v[1]
-    p_xz = m * v[0] * v[2]
-    p_yx = m * v[1] * v[0]
-    p_yy = m * v[1] * v[1]
-    p_yz = m * v[1] * v[2]
-    p_zx = m * v[2] * v[0]
-    p_zy = m * v[2] * v[1]
-    p_zz = m * v[2] * v[2]
-
-    # Convert to tiles for block-level reduction
-    t_xx = wp.tile(p_xx)
-    t_xy = wp.tile(p_xy)
-    t_xz = wp.tile(p_xz)
-    t_yx = wp.tile(p_yx)
-    t_yy = wp.tile(p_yy)
-    t_yz = wp.tile(p_yz)
-    t_zx = wp.tile(p_zx)
-    t_zy = wp.tile(p_zy)
-    t_zz = wp.tile(p_zz)
-
-    # Cooperative sum within block
-    s_xx = wp.tile_sum(t_xx)
-    s_xy = wp.tile_sum(t_xy)
-    s_xz = wp.tile_sum(t_xz)
-    s_yx = wp.tile_sum(t_yx)
-    s_yy = wp.tile_sum(t_yy)
-    s_yz = wp.tile_sum(t_yz)
-    s_zx = wp.tile_sum(t_zx)
-    s_zy = wp.tile_sum(t_zy)
-    s_zz = wp.tile_sum(t_zz)
-
-    # Extract scalar values from tile sums
-    sum_xx = s_xx[0]
-    sum_xy = s_xy[0]
-    sum_xz = s_xz[0]
-    sum_yx = s_yx[0]
-    sum_yy = s_yy[0]
-    sum_yz = s_yz[0]
-    sum_zx = s_zx[0]
-    sum_zy = s_zy[0]
-    sum_zz = s_zz[0]
-
-    # Only first thread in block writes (9 atomics per block per system)
-    if atom_idx % TILE_DIM == 0:
-        wp.atomic_add(kinetic_tensors, sys_id, 0, sum_xx)
-        wp.atomic_add(kinetic_tensors, sys_id, 1, sum_xy)
-        wp.atomic_add(kinetic_tensors, sys_id, 2, sum_xz)
-        wp.atomic_add(kinetic_tensors, sys_id, 3, sum_yx)
-        wp.atomic_add(kinetic_tensors, sys_id, 4, sum_yy)
-        wp.atomic_add(kinetic_tensors, sys_id, 5, sum_yz)
-        wp.atomic_add(kinetic_tensors, sys_id, 6, sum_zx)
-        wp.atomic_add(kinetic_tensors, sys_id, 7, sum_zy)
-        wp.atomic_add(kinetic_tensors, sys_id, 8, sum_zz)
-
-
-@wp.kernel
 def _finalize_pressure_tensor_kernel(
     kinetic_tensors: wp.array2d(dtype=Any),
     virial_tensors: wp.array(dtype=Any),
@@ -1833,9 +1760,12 @@ def _compute_barostat_mass_kernel(
 # ==============================================================================
 
 # -- Kinetic tensor: single vs batched (tiled kernels, needs block_dim) ------
+# Batched uses the per-atom atomic kernel, not the tiled one: a tile block can
+# span multiple systems, and the block-wide tile_sum would misattribute the
+# whole block's contribution to the first thread's system.
 _KINETIC_TENSOR_FAMILY = KernelFamily(
     single=_compute_kinetic_tensor_single_tiled_kernel,
-    batch_idx=_compute_kinetic_tensor_tiled_kernel,
+    batch_idx=_compute_kinetic_tensor_kernel,
 )
 
 # -- Position update: single vs batched (shared by NPT and NPH) -------------
