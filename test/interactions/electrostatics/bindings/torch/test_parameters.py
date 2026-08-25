@@ -1033,3 +1033,127 @@ class TestMultipoleEwaldSummationAutoEstimate:
         # reciprocal sum uses atomic_add reductions whose order can vary
         # by a few ULPs between calls, so allow a tiny relative tolerance.
         assert torch.allclose(e_explicit, e_auto, rtol=1e-13, atol=1e-15)
+
+
+class TestMaxValidSigma:
+    """Tests for ``max_valid_sigma``."""
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    @pytest.mark.parametrize("estimator", ["ewald", "pme"])
+    def test_bound_is_the_estimators_accept_reject_edge(self, device, estimator):
+        """The reported bound must be exactly where the estimators flip.
+
+        This is the whole contract: a sigma just under the bound estimates, one
+        just over raises. If the helper ever drifts from the guard it mirrors,
+        it becomes worse than useless -- callers would trust a number that no
+        longer describes the call they are about to make.
+        """
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+            estimate_multipole_pme_parameters,
+            max_valid_sigma,
+        )
+
+        estimate = (
+            estimate_multipole_ewald_parameters
+            if estimator == "ewald"
+            else estimate_multipole_pme_parameters
+        )
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 10.0
+
+        bound = max_valid_sigma(positions, cell).item()
+        estimate(positions, cell, sigma=bound * (1.0 - 1e-9), accuracy=1e-6)
+        with pytest.raises(ValueError, match="too large"):
+            estimate(positions, cell, sigma=bound * (1.0 + 1e-9), accuracy=1e-6)
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_alpha_diverges_approaching_the_bound(self, device):
+        """The bound is a supremum to avoid, not a value to clamp to.
+
+        ``alpha`` grows without limit as sigma approaches it, and *at* the bound
+        rounding usually leaves the discriminant marginally positive -- so the
+        estimator returns an enormous finite alpha instead of raising. Pinned
+        here because a caller who clamps to the bound would otherwise get a
+        silently unusable split rather than an error.
+        """
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            estimate_multipole_ewald_parameters,
+            max_valid_sigma,
+        )
+
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 10.0
+        bound = max_valid_sigma(positions, cell).item()
+
+        alphas = [
+            estimate_multipole_ewald_parameters(
+                positions, cell, sigma=bound * frac, accuracy=1e-6
+            ).alpha.item()
+            for frac in (0.5, 0.9, 0.99, 0.999)
+        ]
+        assert all(b > a for a, b in zip(alphas, alphas[1:])), alphas
+        assert alphas[-1] > 10.0 * alphas[0]
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_cost_ratio_scales_bound_as_inverse_sixth_root(self, device):
+        """bound(R) = bound(1) / R**(1/6), matching the estimators' eta."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            max_valid_sigma,
+        )
+
+        positions = torch.randn(2000, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 30.0
+        base = max_valid_sigma(positions, cell, cost_ratio=1.0)
+        for ratio in (8.0, 30.0, 64.0):
+            scaled = max_valid_sigma(positions, cell, cost_ratio=ratio)
+            assert torch.allclose(
+                scaled, base / ratio ** (1.0 / 6.0), rtol=1e-12, atol=0
+            )
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_batched_returns_per_system_bound(self, device):
+        """One bound per system, ordered with ``cell``; a bigger cell allows more."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            max_valid_sigma,
+        )
+
+        cells = torch.stack(
+            [
+                torch.eye(3, device=device, dtype=torch.float64) * L
+                for L in (10.0, 20.0, 30.0)
+            ]
+        )
+        positions = torch.randn(120, 3, device=device, dtype=torch.float64)
+        batch_idx = torch.repeat_interleave(
+            torch.arange(3, device=device, dtype=torch.int32), 40
+        )
+        bounds = max_valid_sigma(positions, cells, batch_idx=batch_idx)
+        assert bounds.shape == (3,)
+        assert torch.all(bounds[1:] > bounds[:-1])
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_single_system_matches_batch_of_one(self, device):
+        """A ``(3, 3)`` cell and a ``(1, 3, 3)`` cell must agree."""
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            max_valid_sigma,
+        )
+
+        positions = torch.randn(100, 3, device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 15.0
+        assert torch.equal(
+            max_valid_sigma(positions, cell),
+            max_valid_sigma(positions, cell.unsqueeze(0)),
+        )
+
+    @pytest.mark.parametrize("device", [torch.device("cpu"), torch.device("cuda:0")])
+    def test_cost_ratio_must_be_positive(self, device):
+        from nvalchemiops.torch.interactions.electrostatics.parameters import (
+            max_valid_sigma,
+        )
+
+        positions = torch.zeros((100, 3), device=device, dtype=torch.float64)
+        cell = torch.eye(3, device=device, dtype=torch.float64) * 20.0
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError, match="cost_ratio must be positive"):
+                max_valid_sigma(positions, cell, cost_ratio=bad)

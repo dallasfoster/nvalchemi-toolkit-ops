@@ -394,6 +394,109 @@ def _prepare_sigma(
     return torch.full((num_systems,), float(sigma), dtype=dtype, device=device)
 
 
+def max_valid_sigma(
+    positions: torch.Tensor,
+    cell: torch.Tensor,
+    batch_idx: torch.Tensor | None = None,
+    cost_ratio: float = 1.0,
+) -> torch.Tensor:
+    r"""Largest GTO ``sigma`` admitting a valid Ewald/PME split, per system.
+
+    Both :func:`estimate_multipole_ewald_parameters` and
+    :func:`estimate_multipole_pme_parameters` solve
+    :math:`\alpha = 1 / (\sqrt{2}\,\sqrt{\eta^2 - 2\sigma^2})`, which exists only
+    where
+
+    .. math::
+
+        \eta^2 - 2\sigma^2 > 0
+        \quad\Longleftrightarrow\quad
+        \sigma < \eta / \sqrt{2},
+
+    using the cost-corrected :math:`\eta = \eta_{KP} / R^{1/6}`. Past that bound
+    the split is degenerate and both estimators raise. This returns the bound
+    itself, so a caller can pick ``sigma``, clamp a supplied one, or explain the
+    constraint to a user without provoking and then parsing an exception.
+
+    Treat the result as a supremum to stay well clear of, not a value to clamp
+    to. :math:`\alpha = 1/(\sqrt{2}\,\sqrt{\eta^2 - 2\sigma^2})` diverges as
+    :math:`\sigma` approaches it: at 99% of the bound ``alpha`` is already ~3x
+    its value at 50%, and *at* the bound floating-point rounding typically
+    leaves the discriminant marginally positive, so the estimators return a
+    huge-but-finite ``alpha`` (~1e7) rather than raising. That splits the sum
+    into a vanishing real-space cutoff and an enormous k-cutoff — numerically
+    valid, practically useless. Scale the bound down (0.5x is unremarkable)
+    rather than approaching it.
+
+    The bound also shrinks as ``cost_ratio`` grows, so pass the same
+    ``cost_ratio`` here that you will pass at estimation — otherwise the answer
+    does not describe the call you are about to make.
+
+    This is a *numerical validity* bound, not physical guidance. ``sigma`` is a
+    property of the basis the multipole moments were defined in, so it is
+    normally dictated by whatever produced the moments. Use this to check that
+    such a choice is representable at this system size — and to understand why a
+    small, dense cell rejects a width that a larger one accepts — rather than to
+    pick the value in the first place.
+
+    Parameters
+    ----------
+    positions : torch.Tensor, shape (N, 3) or (N_total, 3)
+        Atomic coordinates. Only the per-system atom count is used.
+    cell : torch.Tensor, shape (3, 3) or (B, 3, 3)
+        Unit cell matrix (rows are lattice vectors).
+    batch_idx : torch.Tensor, shape (N_total,), int32, optional
+        System index per atom. ``None`` selects single-system mode.
+    cost_ratio : float, default 1.0
+        Empirical ``C_r / C_k`` ratio, matching the estimators' knob. ``1.0``
+        reproduces canonical Kolafa-Perram.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(B,)``, dtype of ``positions``, on ``positions.device``. The
+        exclusive upper bound on ``sigma`` for each system.
+
+    Raises
+    ------
+    ValueError
+        If ``cost_ratio`` is not positive.
+
+    Examples
+    --------
+    Check a width before committing to it::
+
+        bound = max_valid_sigma(positions, cell)
+        if sigma >= bound.min():
+            raise ValueError(
+                f"sigma={sigma} exceeds the {bound.min().item():.4f} supported "
+                f"by this cell; use a larger cell or direct k-space."
+            )
+
+    See Also
+    --------
+    estimate_multipole_ewald_parameters : Consumes ``sigma`` under this bound.
+    estimate_multipole_pme_parameters : Same bound, same cost correction.
+    """
+    if cost_ratio <= 0.0:
+        raise ValueError(f"cost_ratio must be positive, got {cost_ratio}")
+
+    if cell.ndim == 2:
+        cell = cell.unsqueeze(0)
+    num_systems = cell.shape[0]
+
+    # Mirrors the estimators' own derivation exactly, so the bound this reports
+    # and the guard they apply cannot drift apart.
+    volume = torch.abs(torch.linalg.det(cell)).squeeze(-1)
+    num_atoms = _count_atoms_per_system(positions, num_systems, batch_idx).to(
+        positions.dtype
+    )
+    eta = _kp_eta(volume, num_atoms) / (cost_ratio ** (1.0 / 6.0))
+
+    bound = eta / math.sqrt(2.0)
+    return torch.atleast_1d(bound).expand(num_systems).contiguous()
+
+
 def estimate_multipole_ewald_parameters(
     positions: torch.Tensor,
     cell: torch.Tensor,
@@ -508,7 +611,9 @@ def estimate_multipole_ewald_parameters(
             f"{cost_ratio}. The cost-balanced eta={eta.tolist()} satisfies "
             f"eta**2 <= 2 sigma**2 (sigma={sigma_t.tolist()}). Either reduce "
             "sigma, increase the system, drop cost_ratio toward 1.0, or use "
-            "direct k-space (multipole_electrostatic_energy)."
+            "direct k-space (multipole_electrostatic_energy). Call "
+            "max_valid_sigma(positions, cell, cost_ratio=...) for the largest "
+            "sigma this system supports."
         )
     alpha = 1.0 / (math.sqrt(2.0) * torch.sqrt(discriminant))
 
@@ -603,6 +708,8 @@ def estimate_multipole_pme_parameters(
         raise ValueError(
             "Multipole PME parameter estimation: GTO sigma too large for "
             f"systems {bad} at cost_ratio={cost_ratio} (eta**2 <= 2 sigma**2). "
+            "Call max_valid_sigma(positions, cell, cost_ratio=...) for the "
+            "largest sigma this system supports. "
             "Reduce sigma, drop cost_ratio toward 1.0, or use direct k-space."
         )
     alpha = 1.0 / (math.sqrt(2.0) * torch.sqrt(discriminant))

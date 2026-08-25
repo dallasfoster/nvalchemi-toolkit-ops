@@ -78,6 +78,7 @@ from nvalchemiops.torch.interactions.electrostatics.parameters import (
     estimate_multipole_pme_parameters,
     estimate_pme_mesh_dimensions,
     estimate_pme_parameters,
+    max_valid_sigma,
     mesh_spacing_to_dimensions,
 )
 from nvalchemiops.torch.interactions.electrostatics.pme import (
@@ -211,5 +212,6 @@ __all__ = [
     "estimate_pme_mesh_dimensions",
     "estimate_multipole_ewald_parameters",
     "estimate_multipole_pme_parameters",
+    "max_valid_sigma",
     "mesh_spacing_to_dimensions",
 ]
