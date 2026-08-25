@@ -138,10 +138,12 @@ class MultipoleSCFCache:
     receiver_sigmas : tuple of float
         Receiver (feature) :math:`\sigma` widths, as an immutable tuple.
     l_max : int
-        Effective source multipole order this cache was built for (``0``
-        for charges-only, ``1`` otherwise). Used by the step functions for
-        bookkeeping; the kernels always run the l_max=1 path with zeros for
-        missing components.
+        Source multipole order this cache was built for: ``0`` (charges),
+        ``1`` (charges + dipoles), or ``2`` (adds quadrupoles). At ``2`` the
+        cache additionally carries ``source_coeff2``, which the step functions
+        require before they will accept a ``quadrupoles`` argument or an
+        ``(N, 9)`` packed moment tensor. The ``l <= 1`` kernels always run the
+        l_max=1 path with zeros for missing components.
     density_normalize, feature_normalize : NormMode
         Normalization modes used when the cache was built, stored so
         ``multipole_scf_step_*`` can validate consistency.
@@ -267,10 +269,14 @@ def prepare_multipole_scf_cache(
         (``(N_k, 3)`` float64 with origin at row 0). The batched build
         (``cell`` ``(B, 3, 3)``) requires ``k_cutoff``.
     l_max : int
-        Source multipole order the cache is being built for. ``0`` or
-        ``1``. Only affects the ``feature_overlap_constants`` layout
-        (the ``l=1`` column is zeroed when ``l_max = 0``); all other
-        tensors are ``l_max`` independent.
+        Source multipole order the cache is being built for: ``0``, ``1``, or
+        ``2``. At ``0`` and ``1`` this only affects the
+        ``feature_overlap_constants`` layout (the ``l=1`` column is zeroed when
+        ``l_max = 0``) and every other tensor is ``l_max`` independent. Build
+        with ``2`` to also populate ``source_coeff2``, without which
+        ``multipole_scf_step_energy`` / ``multipole_scf_step_features`` reject a
+        ``quadrupoles`` argument and ``multipole_ewald_scf_step_energy`` rejects
+        an ``(N, 9)`` moment tensor.
     feature_max_l : int, default 1
         Receiver feature angular cap (independent of the source ``l_max``).
         ``0``, ``1``, or ``2``. Selects the receiver :math:`\hat\phi` width
